@@ -1,7 +1,7 @@
 # Self-contained, endlessly running demo: Postgres + Kafka + Aqueduct + a workload generator.
 #   podman-compose -f docker-compose.sim.yml -p aqsim up -d --build
 #   UI: http://localhost:8088   (admin token: dev-token-change-me, override with AQUEDUCT_ADMIN_TOKEN)
-# Tune load with SIM_RATE (transactions per second, default 2). Stop with `down`; add `-v` to wipe data.
+# Tune load with SIM_RATE (transactions per second, default 15). Stop with `down`; add `-v` to wipe data.
 services:
   postgres:
     image: postgres:16
@@ -62,7 +62,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      RATE: ${SIM_RATE:-2}
+      RATE: ${SIM_RATE:-15}
     volumes:
       - ./sim/simulate.sh:/simulate.sh:ro
     entrypoint: ["bash", "/simulate.sh"]

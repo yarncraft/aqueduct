@@ -1,8 +1,8 @@
 #!/bin/bash
 # Endless workload: a few random inserts/updates/deletes per second across users, orders, payments.
-# RATE = loop iterations per second (default 2). Each iteration is one short transaction.
+# RATE = loop iterations per second (default 15). Each iteration is one short transaction.
 export PGHOST=postgres PGUSER=aqueduct PGPASSWORD=aqueduct PGDATABASE=app
-RATE="${RATE:-2}"
+RATE="${RATE:-15}"
 until pg_isready -q; do sleep 1; done
 echo "simulator: running at ~${RATE} tx/s"
 while true; do
