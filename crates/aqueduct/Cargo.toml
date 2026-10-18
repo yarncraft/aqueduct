@@ -8,6 +8,7 @@ license.workspace = true
 aqueduct-core = { path = "../aqueduct-core" }
 aqueduct-sinks = { path = "../aqueduct-sinks" }
 aqueduct-source-postgres = { path = "../aqueduct-source-postgres" }
+aqueduct-source-mongodb = { path = "../aqueduct-source-mongodb" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

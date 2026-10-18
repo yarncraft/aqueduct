@@ -53,8 +53,7 @@ pub enum SourceConfig {
     Kafka(toml::Table),
     #[allow(dead_code)]
     Sqlserver(toml::Table),
-    #[allow(dead_code)]
-    Mongodb(toml::Table),
+    Mongodb(aqueduct_source_mongodb::MongoConfig),
 }
 
 impl SourceConfig {
@@ -256,7 +255,7 @@ url='postgres://u@db/a'
         ))
         .unwrap();
         assert_eq!(new.source().unwrap().type_name(), "postgres");
-        for t in ["kafka", "sqlserver", "mongodb"] {
+        for t in ["kafka", "sqlserver"] {
             let c: Config = toml::from_str(&format!(
                 "[source]
 type='{t}'
@@ -264,6 +263,23 @@ type='{t}'
             ))
             .unwrap();
             assert_eq!(c.source().unwrap().type_name(), t);
+        }
+    }
+
+    #[test]
+    fn mongodb_source_is_typed() {
+        let c: Config = toml::from_str(&format!(
+            "[source]
+type='mongodb'
+uri='mongodb://h/?replicaSet=rs0'
+database='app'
+collections=['users']
+{SINK}"
+        ))
+        .unwrap();
+        match c.source().unwrap() {
+            SourceConfig::Mongodb(m) => assert_eq!(m.collections, ["users"]),
+            _ => panic!("expected mongodb"),
         }
     }
 
