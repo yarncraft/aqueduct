@@ -1,15 +1,23 @@
 health_addr = "0.0.0.0:8080"
 checkpoint_path = "/var/lib/aqueduct/checkpoint"
+# admin_token = "change-me"   # protects /api/* on the cockpit (or AQUEDUCT_ADMIN_TOKEN)
+# inspector_buffer = 500      # recent events kept for the cockpit inspector; 0 disables
 
 [postgres]
 url = "postgres://aqueduct:aqueduct@postgres:5432/app"
 slot = "aqueduct"
 publication = "aqueduct"
 
-# Sinks: stdout (default) | file | webhook
+# Sinks: stdout (default) | file | webhook | kafka
 [sink]
 type = "stdout"
 # type = "file"
 # path = "/var/lib/aqueduct/events.jsonl"
 # type = "webhook"
 # url = "https://example.com/hooks/cdc"
+# type = "kafka"
+# brokers = ["kafka:9092"]
+# topic = "cdc.{schema}.{table}"   # fallback
+# [[sink.routes]]
+# match = "public.orders"
+# topic = "orders-events"
