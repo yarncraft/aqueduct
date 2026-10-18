@@ -6,7 +6,11 @@
 //! (at-least-once delivery).
 
 mod event;
+mod metrics;
 mod pipeline;
 
 pub use event::{ChangeEvent, Lsn, Op};
-pub use pipeline::{run_pipeline, CheckpointStore, Error, Result, Sink, Source};
+pub use metrics::{Metrics, Snapshot, State};
+pub use pipeline::{
+    run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,
+};

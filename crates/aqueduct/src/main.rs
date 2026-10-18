@@ -1,8 +1,11 @@
+mod admin;
 mod checkpoint;
 mod config;
 mod sink;
 
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -33,7 +36,10 @@ async fn main() {
     let listener = TcpListener::bind(&cfg.health_addr)
         .await
         .expect("bind health_addr");
-    tokio::spawn(health_server(listener));
+    let metrics = Arc::new(aqueduct_core::Metrics::new());
+    let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone());
+    tokio::spawn(admin.clone().sample_forever());
+    tokio::spawn(admin::serve(listener, admin));
 
     let mut source = aqueduct_source_postgres::PostgresSource::new(
         aqueduct_source_postgres::PostgresSourceConfig::new(
@@ -52,7 +58,14 @@ async fn main() {
     let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());
 
     let mut pipeline = tokio::spawn(async move {
-        aqueduct_core::run_pipeline(&mut source, sink.as_mut(), &mut store, shutdown_rx).await
+        aqueduct_core::run_pipeline_with_metrics(
+            &mut source,
+            sink.as_mut(),
+            &mut store,
+            shutdown_rx,
+            &metrics,
+        )
+        .await
     });
 
     tokio::select! {
@@ -71,28 +84,12 @@ async fn main() {
     }
 }
 
-/// Minimal HTTP server: any request gets `200 ok` (used by the container HEALTHCHECK).
-async fn health_server(listener: TcpListener) {
-    loop {
-        let Ok((mut sock, _)) = listener.accept().await else {
-            continue;
-        };
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let _ = sock.read(&mut buf).await;
-            let _ = sock
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
-                .await;
-        });
-    }
-}
-
 /// Probe our own health endpoint; returns the process exit code.
 async fn healthcheck() -> i32 {
     let addr = std::env::var("AQUEDUCT_HEALTH_PROBE").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let probe = async {
         let mut sock = tokio::net::TcpStream::connect(&addr).await.ok()?;
-        sock.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        sock.write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
             .await
             .ok()?;
         let mut buf = [0u8; 64];

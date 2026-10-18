@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aqueduct cockpit</title>
+<style>
+  :root { --bg:#0f1318; --panel:#171d25; --line:#232c38; --fg:#e6ebf2; --mute:#8896a8;
+          --ok:#3ecf8e; --warn:#f5a524; --bad:#f2555a; --acc:#4aa3ff;
+          --ins:#3ecf8e; --upd:#4aa3ff; --del:#f2555a; --trn:#c28bff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,Segoe UI,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 22px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:17px; margin:0; letter-spacing:.3px; }
+  .pill { padding:3px 10px; border-radius:99px; font-size:12px; font-weight:600; background:#2a3340; }
+  .pill.streaming { background:#143826; color:var(--ok); }
+  .pill.starting { background:#3a2e12; color:var(--warn); }
+  .pill.failed { background:#3d1a1c; color:var(--bad); }
+  .pill.stopped { background:#2a3340; color:var(--mute); }
+  .conn { margin-left:auto; color:var(--mute); font-size:12px; }
+  .conn i { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--bad); margin-right:6px; }
+  .conn.live i { background:var(--ok); }
+  main { padding:20px 22px; display:grid; gap:16px; max-width:1200px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+  .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .k { color:var(--mute); font-size:12px; text-transform:uppercase; letter-spacing:.6px; }
+  .card .v { font-size:26px; font-weight:650; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .card .s { color:var(--mute); font-size:12px; margin-top:2px; }
+  .panel h2 { margin:0 0 10px; font-size:13px; color:var(--mute); text-transform:uppercase; letter-spacing:.6px; }
+  .grid2 { display:grid; grid-template-columns:2fr 1fr; gap:16px; }
+  @media (max-width:800px){ .grid2{ grid-template-columns:1fr; } }
+  svg { width:100%; height:180px; display:block; }
+  .bar { display:flex; height:14px; border-radius:7px; overflow:hidden; background:#222a35; margin-bottom:10px; }
+  .legend { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; font-size:13px; }
+  .legend b { font-variant-numeric:tabular-nums; float:right; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { text-align:left; padding:7px 4px; border-bottom:1px solid var(--line); }
+  th { color:var(--mute); font-weight:500; font-size:12px; }
+  td.n { text-align:right; }
+  .share { height:6px; border-radius:3px; background:var(--acc); }
+  .err { color:var(--bad); font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; word-break:break-word; }
+  .muted { color:var(--mute); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐝 Aqueduct cockpit</h1>
+  <span id="state" class="pill starting">starting</span>
+  <span id="conn" class="conn"><i></i><span>connecting…</span></span>
+</header>
+<main>
+  <section class="cards">
+    <div class="card"><div class="k">Throughput</div><div class="v" id="rate">0</div><div class="s">events / sec</div></div>
+    <div class="card"><div class="k">Total events</div><div class="v" id="total">0</div><div class="s" id="lsn">no events yet</div></div>
+    <div class="card"><div class="k">Replication lag</div><div class="v" id="lag">–</div><div class="s">commit → delivered</div></div>
+    <div class="card"><div class="k">Sink latency</div><div class="v" id="sinkavg">–</div><div class="s" id="sinkdet">avg per event</div></div>
+    <div class="card"><div class="k">Errors</div><div class="v" id="errors">0</div><div class="s" id="uptime">uptime 0s</div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel"><h2>Events / sec (last 2 min)</h2><svg id="chart" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    <div class="panel">
+      <h2>By operation</h2>
+      <div class="bar" id="opbar"></div>
+      <div class="legend" id="oplegend"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Tables</h2>
+    <table><thead><tr><th>Table</th><th class="n">Events</th><th style="width:35%">Share</th></tr></thead><tbody id="tables"></tbody></table>
+  </section>
+
+  <section class="panel" id="errpanel" hidden>
+    <h2>Last error</h2>
+    <div class="err" id="lasterr"></div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const token = new URLSearchParams(location.search).get('token');
+const qs = token ? '?token=' + encodeURIComponent(token) : '';
+const OPS = [['inserts','insert','--ins'],['updates','update','--upd'],['deletes','delete','--del'],['truncates','truncate','--trn']];
+const fmt = n => n.toLocaleString();
+const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : Math.floor(s/3600) + 'h ' + Math.floor(s%3600/60) + 'm';
+const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v/1000).toFixed(1) + ' s';
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function chart(h) {
+  const W = 600, H = 180, P = 4, max = Math.max(5, ...h);
+  const n = Math.max(h.length, 2);
+  const x = i => P + (W - 2*P) * i / (n - 1);
+  const y = v => H - P - (H - 2*P) * v / max;
+  const pts = h.map((v, i) => x(i) + ',' + y(v)).join(' ');
+  let g = '';
+  for (let i = 0; i <= 4; i++) {
+    const yy = P + (H - 2*P) * i / 4;
+    g += `<line x1="0" x2="${W}" y1="${yy}" y2="${yy}" stroke="#232c38"/>`;
+    g += `<text x="6" y="${yy - 3}" fill="#8896a8" font-size="11">${Math.round(max * (1 - i/4))}</text>`;
+  }
+  $('chart').innerHTML = g + (h.length > 1
+    ? `<polygon points="${x(0)},${H-P} ${pts} ${x(h.length-1)},${H-P}" fill="#4aa3ff22"/>` +
+      `<polyline points="${pts}" fill="none" stroke="#4aa3ff" stroke-width="2" vector-effect="non-scaling-stroke"/>` : '');
+}
+
+function render(d) {
+  const st = $('state'); st.textContent = d.state; st.className = 'pill ' + d.state;
+  $('rate').textContent = fmt(d.events_per_sec);
+  $('total').textContent = fmt(d.events_total);
+  $('lsn').textContent = d.last_lsn ? 'last LSN ' + d.last_lsn : 'no events yet';
+  $('lag').textContent = d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
+  $('sinkavg').textContent = d.events_total ? ms(d.sink_avg_ms) : '–';
+  $('sinkdet').textContent = d.events_total ? `last ${ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'avg per event';
+  $('errors').textContent = fmt(d.errors);
+  $('errors').style.color = d.errors ? 'var(--bad)' : '';
+  $('uptime').textContent = 'uptime ' + dur(d.uptime_secs);
+  chart(d.history);
+
+  const total = OPS.reduce((a, [k]) => a + d[k], 0);
+  $('opbar').innerHTML = OPS.map(([k,, c]) => d[k] ? `<div style="width:${100*d[k]/total}%;background:var(${c})"></div>` : '').join('');
+  $('oplegend').innerHTML = OPS.map(([k, label, c]) => `<div><span class="dot" style="background:var(${c})"></span>${label}<b>${fmt(d[k])}</b></div>`).join('');
+
+  const rows = Object.entries(d.tables).sort((a, b) => b[1] - a[1]);
+  $('tables').innerHTML = rows.length ? rows.map(([t, n]) =>
+    `<tr><td>${esc(t)}</td><td class="n">${fmt(n)}</td><td><div class="share" style="width:${100*n/d.events_total}%"></div></td></tr>`).join('')
+    : '<tr><td colspan="3" class="muted">no events yet</td></tr>';
+
+  $('errpanel').hidden = !d.last_error;
+  if (d.last_error) $('lasterr').textContent = d.last_error;
+}
+
+function setConn(live, text) {
+  $('conn').className = 'conn' + (live ? ' live' : '');
+  $('conn').lastChild.textContent = text;
+}
+
+function connect() {
+  const es = new EventSource('/api/stream' + qs);
+  es.onopen = () => setConn(true, 'live');
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { setConn(false, 'reconnecting…'); };
+}
+connect();
+</script>
+</body>
+</html>

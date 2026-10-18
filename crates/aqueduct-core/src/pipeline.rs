@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use crate::{ChangeEvent, Lsn};
+use std::time::Instant;
+
+use crate::{ChangeEvent, Lsn, Metrics, State};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,10 +53,40 @@ pub async fn run_pipeline(
     source: &mut dyn Source,
     sink: &mut dyn Sink,
     store: &mut dyn CheckpointStore,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    run_pipeline_with_metrics(source, sink, store, shutdown, &Metrics::new()).await
+}
+
+/// Like [`run_pipeline`], reporting progress and failures to `metrics`.
+pub async fn run_pipeline_with_metrics(
+    source: &mut dyn Source,
+    sink: &mut dyn Sink,
+    store: &mut dyn CheckpointStore,
+    shutdown: watch::Receiver<bool>,
+    metrics: &Metrics,
+) -> Result<()> {
+    let res = drive(source, sink, store, shutdown, metrics).await;
+    match &res {
+        Ok(()) => metrics.set_state(State::Stopped),
+        Err(e) => {
+            metrics.record_error(e.to_string());
+            metrics.set_state(State::Failed);
+        }
+    }
+    res
+}
+
+async fn drive(
+    source: &mut dyn Source,
+    sink: &mut dyn Sink,
+    store: &mut dyn CheckpointStore,
     mut shutdown: watch::Receiver<bool>,
+    metrics: &Metrics,
 ) -> Result<()> {
     let start = store.load().await?;
     source.start(start).await?;
+    metrics.set_state(State::Streaming);
     loop {
         let event = tokio::select! {
             _ = shutdown.changed() => break,
@@ -63,8 +95,10 @@ pub async fn run_pipeline(
                 None => break,
             },
         };
+        let began = Instant::now();
         sink.send(&event).await?;
         sink.flush().await?;
+        metrics.record_event(&event, began.elapsed());
         store.save(event.lsn).await?;
         source.ack(event.lsn).await?;
     }

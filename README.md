@@ -44,3 +44,9 @@ The Postgres source lives in `aqueduct-source-postgres`.
 ## Status
 
 Not yet compiled or run end to end: CI is the first build.
+
+## Admin cockpit
+
+The HTTP port (`health_addr`, default `:8080`) serves a live dashboard at `/`: throughput chart, total events, replication lag, sink latency, errors, per-operation and per-table breakdown, last error. Data streams over Server-Sent Events (`/api/stream`, 1 snapshot/s); `/api/metrics` returns one JSON snapshot and `/healthz` is the container health probe.
+
+Set `admin_token` in the config (or `AQUEDUCT_ADMIN_TOKEN`) to require it for `/api/*`; open the dashboard as `http://host:8080/?token=<token>`. The dashboard page itself is public, so do not expose the port to untrusted networks without a token.

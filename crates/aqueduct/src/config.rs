@@ -7,6 +7,10 @@ pub struct Config {
     pub sink: SinkConfig,
     #[serde(default = "default_health_addr")]
     pub health_addr: String,
+    /// Protects `/api/*` on the admin cockpit when set. Also read from
+    /// `AQUEDUCT_ADMIN_TOKEN`.
+    #[serde(default)]
+    pub admin_token: Option<String>,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
 }
@@ -67,6 +71,9 @@ impl Config {
             .unwrap_or_else(|_| "/etc/aqueduct/aqueduct.toml".into());
         let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
         let mut cfg: Config = toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        if let Ok(t) = std::env::var("AQUEDUCT_ADMIN_TOKEN") {
+            cfg.admin_token = Some(t);
+        }
         if let Ok(url) = std::env::var("AQUEDUCT_PG_URL") {
             cfg.postgres.url = url;
         }
