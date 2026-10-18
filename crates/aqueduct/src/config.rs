@@ -52,8 +52,7 @@ pub enum SourceConfig {
     // Placeholders: the raw table is not read until the source crate lands.
     #[allow(dead_code)]
     Sqlserver(toml::Table),
-    #[allow(dead_code)]
-    Mongodb(toml::Table),
+    Mongodb(aqueduct_source_mongodb::MongoConfig),
 }
 
 impl SourceConfig {
@@ -351,7 +350,7 @@ topics=['in.*']
             panic!("kafka source")
         };
         assert!(kc.source_config().is_ok());
-        for t in ["sqlserver", "mongodb"] {
+        for t in ["sqlserver"] {
             let c: Config = toml::from_str(&format!(
                 "[source]
 type='{t}'
@@ -359,6 +358,23 @@ type='{t}'
             ))
             .unwrap();
             assert_eq!(c.source().unwrap().type_name(), t);
+        }
+    }
+
+    #[test]
+    fn mongodb_source_is_typed() {
+        let c: Config = toml::from_str(&format!(
+            "[source]
+type='mongodb'
+uri='mongodb://h/?replicaSet=rs0'
+database='app'
+collections=['users']
+{SINK}"
+        ))
+        .unwrap();
+        match c.source().unwrap() {
+            SourceConfig::Mongodb(m) => assert_eq!(m.collections, ["users"]),
+            _ => panic!("expected mongodb"),
         }
     }
 

@@ -73,6 +73,13 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+        config::SourceConfig::Mongodb(m) => {
+            if let Err(e) = m.validate() {
+                tracing::error!(error = %e, "invalid mongodb config");
+                std::process::exit(1);
+            }
+            Box::new(aqueduct_source_mongodb::MongoSource::new(m))
+        }
         other => {
             tracing::error!(
                 source = other.type_name(),
