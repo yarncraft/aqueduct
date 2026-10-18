@@ -136,6 +136,26 @@ checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) 
 encrypted and logs a warning if the connection is plaintext to a non-loopback host, or encrypted but unverified.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
 
+### `[source]` (alternative sources)
+
+`[postgres]` is shorthand for `[source] type = "postgres"` with the same keys. Set exactly one of the two.
+`type` can also be `kafka` (below); `sqlserver` and `mongodb` are reserved and not implemented yet.
+
+#### Kafka source
+
+Reads topics through the pipeline, e.g. to re-key or fan out events. Offsets are kept in Aqueduct's own
+checkpoint (no consumer group, nothing committed to the broker) and saved only after the sink has the events.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `brokers`, `topics` | required | Topic names may use `*` wildcards. Partitions are discovered at start; restart to pick up new ones. |
+| `start_at` | `earliest` | Where partitions without a checkpoint begin: `earliest` or `latest`. |
+| `format` | `auto` | `auto`: Aqueduct event JSON passes through, other values are wrapped. `raw`: always wrap as `schema=kafka`, `table=<topic>`, `op=insert`, `after=<value>`. |
+| `tls`, `tls_ca_file`, `sasl_*` | as for the sink | SASL secrets: `AQUEDUCT_KAFKA_SOURCE_SASL_USERNAME` / `_PASSWORD`. |
+
+Do not point the source and sink at the same topics: the pipeline would feed itself. A checkpoint ahead of the
+log (topic recreated) stops startup; one behind retention logs a warning and restarts at the earliest offset.
+
 ### `[sink]`
 
 Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`,
