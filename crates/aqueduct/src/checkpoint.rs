@@ -29,16 +29,33 @@ impl CheckpointStore for FileCheckpoint {
     }
 
     async fn save(&mut self, lsn: Lsn) -> Result<()> {
-        let map = |e: std::io::Error| Error::Checkpoint(e.to_string());
-        if let Some(dir) = self.path.parent() {
-            tokio::fs::create_dir_all(dir).await.map_err(map)?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        tokio::fs::write(&tmp, lsn.0.to_string())
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || write_durable(&path, lsn.0))
             .await
-            .map_err(map)?;
-        tokio::fs::rename(&tmp, &self.path).await.map_err(map)
+            .map_err(|e| Error::Checkpoint(e.to_string()))?
+            .map_err(|e| Error::Checkpoint(e.to_string()))
     }
+}
+
+/// tmp file + fsync + rename + fsync of the directory, so a power loss leaves either the old
+/// or the new value, never a torn or empty file.
+fn write_durable(path: &std::path::Path, value: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(value.to_string().as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

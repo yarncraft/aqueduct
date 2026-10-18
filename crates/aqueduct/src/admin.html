@@ -83,15 +83,17 @@
   </section>
 
   <!-- Event inspector -->
-  <section class="rounded-sm border border-ink-600 bg-ink-800">
+  <section id="inspector" class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
       <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Event inspector</h2>
+      <span class="font-mono text-[11px] text-ink-500">from Kafka</span>
       <span id="evcount" class="font-mono text-[11px] text-ink-300">0 events</span>
       <div class="ml-auto flex flex-wrap items-center gap-2 font-mono text-[12px]">
         <input id="evsearch" type="search" placeholder="Search payload…" class="w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 placeholder:text-ink-500 focus:border-blue focus:outline-none">
         <select id="evop" class="rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none">
           <option value="">All ops</option><option value="insert">insert</option><option value="update">update</option><option value="delete">delete</option><option value="truncate">truncate</option>
         </select>
+        <select id="evtopic" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All topics</option></select>
         <select id="evtable" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All tables</option></select>
         <button id="evpause" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Pause</button>
         <button id="evclear" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Clear</button>
@@ -101,8 +103,8 @@
       <table class="w-full text-left">
         <thead class="sticky top-0 bg-ink-800">
           <tr class="border-b border-ink-600 text-[11px] uppercase tracking-widest text-ink-300">
-            <th class="px-4 py-2 font-medium">Seq</th>
-            <th class="px-4 py-2 font-medium">Delivered</th>
+            <th class="px-4 py-2 font-medium">Topic / offset</th>
+            <th class="px-4 py-2 font-medium">Time</th>
             <th class="px-4 py-2 font-medium">Op</th>
             <th class="px-4 py-2 font-medium">Relation</th>
             <th class="px-4 py-2 font-medium">LSN</th>
@@ -182,6 +184,7 @@ function render(d) {
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
   $('uptime').textContent = dur(d.uptime_secs);
 
+  $('inspector').hidden = !d.inspector;
   $('rate').textContent = fmt(d.events_per_sec);
   $('peak').textContent = fmt(Math.max(0, ...d.history));
   $('total').textContent = fmt(d.events_total);
@@ -221,13 +224,13 @@ const OP_BADGE = {
   insert: 'bg-green/15 text-green', update: 'bg-blue/15 text-blue',
   delete: 'bg-red/15 text-red', truncate: 'bg-violet/15 text-violet',
 };
-const MAX_EVENTS = 500;
-let evs = [];          // newest first
-let lastSeq = 0;
+const FETCH_EVENTS = 100;
+let evs = [];          // newest first, as read from Kafka
 let paused = false;
-let openSeq = null;
+let openId = null;
 
-const rel = e => e.event.schema + '.' + e.event.table;
+const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
+const rel = e => (e.event.schema || '?') + '.' + (e.event.table || '?');
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
 const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v); return t.length > 28 ? t.slice(0, 27) + '…' : t; };
 const summary = ev => {
@@ -248,19 +251,19 @@ function side(title, row, other) {
 function detail(e) {
   const ev = e.event;
   const isUpd = ev.op === 'update';
-  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>xid ${ev.xid}</span><span>commit ${esc(new Date(ev.commit_ts_micros / 1000).toISOString())}</span><button type="button" data-copy="${e.seq}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
+  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${ev.xid}</span><span>commit ${esc(new Date(ev.commit_ts_micros / 1000).toISOString())}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
 }
 
 function renderEvents() {
   const q = $('evsearch').value.trim().toLowerCase();
   const op = $('evop').value, tb = $('evtable').value;
   const rows = evs.filter(e => (!op || e.event.op === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
-  $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' buffered' : rows.length + ' of ' + evs.length;
+  $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
-    const ev = e.event;
-    const row = `<tr data-seq="${e.seq}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openSeq === e.seq ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${e.seq}</td><td class="px-4 py-1.5 tabular-nums text-ink-200">${clock(e.delivered_unix_ms)}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[ev.op] || ''}">${ev.op}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(ev.lsn))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
-    return openSeq === e.seq ? row + detail(e) : row;
-  }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events received yet'}</td></tr>`;
+    const ev = e.event, id = evid(e);
+    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${e.partition} @${e.offset}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${clock(e.timestamp_ms)}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[ev.op] || ''}">${esc(ev.op || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(ev.lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
+    return openId === id ? row + detail(e) : row;
+  }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events in Kafka yet'}</td></tr>`;
 }
 
 function syncTableFilter() {
@@ -271,43 +274,52 @@ function syncTableFilter() {
   sel.value = cur;
 }
 
+function syncTopicFilter(topics) {
+  const sel = $('evtopic'), cur = sel.value;
+  if (topics.join() === [...sel.options].slice(1).map(o => o.value).join()) return;
+  sel.innerHTML = '<option value="">All topics</option>' + topics.map(n => `<option>${esc(n)}</option>`).join('');
+  sel.value = cur;
+}
+
 async function pollEvents() {
   if (paused) return;
   try {
-    const r = await fetch('/api/events?after=' + lastSeq + '&limit=' + MAX_EVENTS + (token ? '&token=' + encodeURIComponent(token) : ''));
+    const r = await fetch('/api/events?limit=' + FETCH_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value) + (token ? '&token=' + encodeURIComponent(token) : ''));
+    if (r.status === 403 || r.status === 401) {
+      paused = true; clearInterval(pollTimer);
+      $('events').innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${r.status === 403 ? 'Inspector disabled. Set admin_token to enable it (it exposes row data).' : 'Unauthorized. Open the page with ?token=...'}</td></tr>`;
+      return;
+    }
     if (!r.ok) return;
     const d = await r.json();
-    if (d.latest_seq < lastSeq) { evs = []; lastSeq = 0; }   // server restarted
-    if (d.events.length) {
-      lastSeq = d.events[d.events.length - 1].seq;
-      evs = d.events.slice().reverse().concat(evs).slice(0, MAX_EVENTS);
-      syncTableFilter();
-      renderEvents();
-    }
+    evs = d.events;
+    syncTopicFilter(d.topics);
+    syncTableFilter();
+    renderEvents();
   } catch (_) { /* the connection badge covers outages */ }
 }
 
 $('events').addEventListener('click', ev => {
   const copy = ev.target.closest('[data-copy]');
   if (copy) {
-    const e = evs.find(x => x.seq == copy.dataset.copy);
+    const e = evs.find(x => evid(x) === copy.dataset.copy);
     if (e && navigator.clipboard) navigator.clipboard.writeText(JSON.stringify(e.event, null, 2));
     return;
   }
-  const tr = ev.target.closest('tr[data-seq]');
+  const tr = ev.target.closest('tr[data-id]');
   if (!tr) return;
-  const seq = Number(tr.dataset.seq);
-  openSeq = openSeq === seq ? null : seq;
+  openId = openId === tr.dataset.id ? null : tr.dataset.id;
   renderEvents();
 });
 for (const id of ['evsearch', 'evop', 'evtable']) $(id).addEventListener('input', renderEvents);
+$('evtopic').addEventListener('input', pollEvents);
 $('evpause').addEventListener('click', () => {
   paused = !paused;
   $('evpause').textContent = paused ? 'Resume' : 'Pause';
   if (!paused) pollEvents();
 });
-$('evclear').addEventListener('click', () => { evs = []; openSeq = null; syncTableFilter(); renderEvents(); });
-setInterval(pollEvents, 1000);
+$('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
+const pollTimer = setInterval(pollEvents, 3000);
 pollEvents();
 
 const es = new EventSource('/api/stream' + qs);

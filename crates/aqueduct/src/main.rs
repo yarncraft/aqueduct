@@ -36,33 +36,35 @@ async fn main() {
     let listener = TcpListener::bind(&cfg.health_addr)
         .await
         .expect("bind health_addr");
-    let metrics = Arc::new(aqueduct_core::Metrics::with_recent_capacity(
-        cfg.inspector_buffer,
-    ));
-    let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone());
-    tokio::spawn(admin.clone().sample_forever());
-    tokio::spawn(admin::serve(listener, admin));
-
-    let mut source = aqueduct_source_postgres::PostgresSource::new(
-        aqueduct_source_postgres::PostgresSourceConfig::new(
-            cfg.postgres.url.clone(),
-            cfg.postgres.slot.clone(),
-            cfg.postgres.publication.clone(),
-        ),
-    );
-    let mut sink = match sink::build(&cfg.sink).await {
+    let metrics = Arc::new(aqueduct_core::Metrics::new());
+    let (mut sink, inspector) = match sink::build(&cfg.sink).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "failed to build sink");
             std::process::exit(1);
         }
     };
+    // The inspector shows row data, so it needs the admin token as well.
+    let inspector = (cfg.inspector && cfg.admin_token.as_deref().is_some_and(|t| !t.is_empty()))
+        .then_some(inspector);
+    let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone(), inspector);
+    tokio::spawn(admin.clone().sample_forever());
+    tokio::spawn(admin::serve(listener, admin));
+
+    let source_cfg = match cfg.postgres.source_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid postgres config");
+            std::process::exit(1);
+        }
+    };
+    let mut source = aqueduct_source_postgres::PostgresSource::new(source_cfg);
     let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());
 
     let mut pipeline = tokio::spawn(async move {
         aqueduct_core::run_pipeline_with_metrics(
             &mut source,
-            sink.as_mut(),
+            &mut sink,
             &mut store,
             shutdown_rx,
             &metrics,
@@ -71,10 +73,14 @@ async fn main() {
     });
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received, draining");
             let _ = shutdown_tx.send(true);
-            let _ = pipeline.await;
+            // Stay inside the orchestrator's grace period (docker stop = 10 s by default).
+            match tokio::time::timeout(std::time::Duration::from_secs(25), &mut pipeline).await {
+                Ok(_) => tracing::info!("clean shutdown"),
+                Err(_) => tracing::error!("pipeline did not stop within 25 s, exiting"),
+            }
         }
         res = &mut pipeline => {
             match res {
@@ -83,6 +89,29 @@ async fn main() {
                 Err(e) => { tracing::error!(error = %e, "pipeline task panicked"); std::process::exit(1); }
             }
         }
+    }
+}
+
+/// Resolves on SIGINT or (on Unix) SIGTERM, which is what `docker stop` and Kubernetes send.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

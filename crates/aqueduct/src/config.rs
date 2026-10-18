@@ -1,20 +1,37 @@
 use serde::Deserialize;
 
+/// A credential that never shows up in `Debug` output (and so not in logs).
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn expose(&self) -> String {
+        self.0.clone()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub postgres: PostgresConfig,
-    #[serde(default)]
-    pub sink: SinkConfig,
+    /// The Kafka sink (the only sink).
+    pub sink: KafkaConfig,
     #[serde(default = "default_health_addr")]
     pub health_addr: String,
     /// Protects `/api/*` on the admin cockpit when set. Also read from
     /// `AQUEDUCT_ADMIN_TOKEN`.
     #[serde(default)]
     pub admin_token: Option<String>,
-    /// How many recent events the cockpit's event inspector keeps in memory
-    /// (`0` disables it; events contain row data, so protect the port).
-    #[serde(default = "default_inspector_buffer")]
-    pub inspector_buffer: usize,
+    /// Serve the cockpit's event inspector, which reads recent events back from
+    /// Kafka. It exposes row data, so it also needs `admin_token`.
+    #[serde(default = "default_true")]
+    pub inspector: bool,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
 }
@@ -26,33 +43,61 @@ pub struct PostgresConfig {
     pub slot: String,
     #[serde(default = "default_publication")]
     pub publication: String,
+    /// Start a fresh slot even if a checkpoint exists (data between is lost). Default: refuse.
+    #[serde(default)]
+    pub allow_slot_recreate: bool,
+    /// `disable | prefer | require | verify-ca | verify-full`. Overrides `sslmode`
+    /// in the URL; default is the URL's, else `prefer`.
+    #[serde(default)]
+    pub ssl_mode: Option<String>,
+    /// PEM CA bundle used to verify the server (overrides `sslrootcert` in the URL).
+    #[serde(default)]
+    pub ssl_root_cert: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum SinkConfig {
-    #[default]
-    Stdout,
-    File {
-        path: String,
-    },
-    Webhook {
-        url: String,
-    },
-    /// Produce events to Kafka. Keyed by `schema.table` so all changes to a
-    /// table stay ordered within one partition. Each event goes to the first
-    /// matching `routes` entry, else to `topic`.
-    Kafka {
-        brokers: Vec<String>,
-        /// Fallback topic for tables no route matches; may use `{schema}`/`{table}`.
-        #[serde(default)]
-        topic: Option<String>,
-        /// Partitions to create topics with if they do not exist.
-        #[serde(default = "default_partitions")]
-        partitions: i32,
-        #[serde(default)]
-        routes: Vec<KafkaRouteConfig>,
-    },
+impl PostgresConfig {
+    pub fn source_config(&self) -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
+        let mut c = aqueduct_source_postgres::PostgresSourceConfig::new(
+            self.url.clone(),
+            self.slot.clone(),
+            self.publication.clone(),
+        );
+        c.ssl_mode = self.ssl_mode.as_deref().map(str::parse).transpose()?;
+        c.ssl_root_cert = self.ssl_root_cert.clone();
+        c.allow_slot_recreate = self.allow_slot_recreate;
+        Ok(c)
+    }
+}
+
+/// Produce events to Kafka. Keyed by `schema.table` so all changes to a table
+/// stay ordered within one partition. Each event goes to the first matching
+/// `routes` entry, else to `topic`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KafkaConfig {
+    pub brokers: Vec<String>,
+    /// Fallback topic for tables no route matches; may use `{schema}`/`{table}`.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Partitions to create topics with if they do not exist.
+    #[serde(default = "default_partitions")]
+    pub partitions: i32,
+    #[serde(default)]
+    pub routes: Vec<KafkaRouteConfig>,
+    /// Encrypt with TLS and verify the broker certificate.
+    #[serde(default)]
+    pub tls: bool,
+    /// PEM CA bundle for brokers with a private CA.
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
+    /// `plain | scram-sha-256 | scram-sha-512`; requires username and password.
+    #[serde(default)]
+    pub sasl_mechanism: Option<String>,
+    /// Or `AQUEDUCT_KAFKA_SASL_USERNAME`.
+    #[serde(default)]
+    pub sasl_username: Option<String>,
+    /// Or `AQUEDUCT_KAFKA_SASL_PASSWORD`.
+    #[serde(default)]
+    pub sasl_password: Option<Secret>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,8 +109,8 @@ pub struct KafkaRouteConfig {
     pub topic: String,
 }
 
-fn default_inspector_buffer() -> usize {
-    aqueduct_core::DEFAULT_RECENT_EVENTS
+fn default_true() -> bool {
+    true
 }
 
 fn default_partitions() -> i32 {
@@ -99,6 +144,75 @@ impl Config {
         if let Ok(url) = std::env::var("AQUEDUCT_PG_URL") {
             cfg.postgres.url = url;
         }
+        cfg.apply_secret_env();
         Ok(cfg)
+    }
+
+    /// Credentials may come from the environment so they stay out of config files.
+    fn apply_secret_env(&mut self) {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        if let Some(v) = env("AQUEDUCT_KAFKA_SASL_USERNAME") {
+            self.sink.sasl_username = Some(v);
+        }
+        if let Some(v) = env("AQUEDUCT_KAFKA_SASL_PASSWORD") {
+            self.sink.sasl_password = Some(Secret(v));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_redacted_in_debug() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [postgres]
+            url = "postgres://u@db/app"
+            [sink]
+            brokers = ["b:9093"]
+            topic = "t"
+            tls = true
+            sasl_mechanism = "scram-sha-512"
+            sasl_username = "svc"
+            sasl_password = "hunter2"
+            "#,
+        )
+        .unwrap();
+        let d = format!("{cfg:?}");
+        assert!(!d.contains("hunter2") && d.contains("svc"));
+    }
+
+    #[test]
+    fn rejects_bad_ssl_mode() {
+        let mut p = PostgresConfig {
+            url: "postgres://u@db/app".into(),
+            slot: "s".into(),
+            publication: "p".into(),
+            ssl_mode: Some("sometimes".into()),
+            ssl_root_cert: None,
+            allow_slot_recreate: false,
+        };
+        assert!(p.source_config().is_err());
+        p.ssl_mode = Some("verify-full".into());
+        assert!(p.source_config().is_ok());
+    }
+
+    #[test]
+    fn example_config_is_kafka_only() {
+        let cfg: Config =
+            toml::from_str(include_str!("../../../config/aqueduct.example.toml")).unwrap();
+        assert_eq!(cfg.sink.brokers, vec!["kafka:9092"]);
+        assert!(cfg.inspector);
+        // Other sink types are gone: a stdout sink has no brokers, so it is rejected.
+        assert!(toml::from_str::<Config>(
+            "[postgres]
+url='x'
+[sink]
+type='stdout'
+"
+        )
+        .is_err());
     }
 }
