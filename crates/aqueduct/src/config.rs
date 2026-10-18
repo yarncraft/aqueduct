@@ -81,6 +81,10 @@ pub struct KafkaConfig {
     /// Partitions to create topics with if they do not exist.
     #[serde(default = "default_partitions")]
     pub partitions: i32,
+    /// `table` (default): key `schema.table`, per-table ordering. `key`: key also includes the
+    /// primary-key values, spreading a table over partitions with per-row ordering.
+    #[serde(default)]
+    pub partition_by: Option<String>,
     #[serde(default)]
     pub routes: Vec<KafkaRouteConfig>,
     /// Encrypt with TLS and verify the broker certificate.

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::value::RawValue;
 
 /// Postgres log sequence number.
 #[derive(
@@ -24,7 +24,7 @@ pub enum Op {
 }
 
 /// One row-level change, emitted at transaction commit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {
     pub lsn: Lsn,
     pub xid: u32,
@@ -34,7 +34,14 @@ pub struct ChangeEvent {
     pub table: String,
     pub op: Op,
     /// Row before the change (update/delete, when replica identity allows).
-    pub before: Option<Map<String, Value>>,
+    ///
+    /// Held as pre-serialised JSON: the decoder writes it straight from the wire tuple, so
+    /// no `serde_json::Value` tree is built, and the Kafka record embeds the bytes as is.
+    pub before: Option<Box<RawValue>>,
     /// Row after the change (insert/update).
-    pub after: Option<Map<String, Value>>,
+    pub after: Option<Box<RawValue>>,
+    /// Replica-identity (primary key) values, used to pick a Kafka partition when
+    /// `partition_by = "key"`. Not part of the serialised event.
+    #[serde(skip)]
+    pub key: Option<String>,
 }

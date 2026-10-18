@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Error, Lsn, Op, Result, Source};
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -11,7 +11,7 @@ use crate::tls::{self, SslMode};
 
 use crate::decoder::{decode, Message, RelationCache};
 
-type Row = Map<String, Value>;
+type Row = Box<RawValue>;
 
 #[derive(Debug, Clone)]
 pub struct PostgresSourceConfig {
@@ -181,6 +181,7 @@ impl PostgresSource {
         op: Op,
         before: Option<Row>,
         after: Option<Row>,
+        key: Option<String>,
     ) {
         if lsn.0 > self.emitted {
             self.emitted = lsn.0;
@@ -193,6 +194,7 @@ impl PostgresSource {
                 op,
                 before,
                 after,
+                key,
             });
         }
     }
@@ -213,10 +215,11 @@ impl PostgresSource {
         let (mut xid, mut ts) = (0u32, 0i64);
         let mut tx_last = 0u64;
         for row in rows {
-            let lsn_text: String = row.get(0);
-            let data: Vec<u8> = row.get(1);
-            let lsn = parse_lsn(&lsn_text)?;
-            let msg = decode(&data)
+            // Borrow from the result buffer instead of copying each change out of it.
+            let lsn_text: &str = row.get(0);
+            let data: &[u8] = row.get(1);
+            let lsn = parse_lsn(lsn_text)?;
+            let msg = decode(data)
                 .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
             if matches!(
                 msg,
@@ -242,7 +245,8 @@ impl PostgresSource {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    self.queue(lsn, xid, ts, name, Op::Insert, None, after);
+                    let key = cache.key(relation, &new).map_err(dec)?;
+                    self.queue(lsn, xid, ts, name, Op::Insert, None, after, key);
                 }
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
@@ -252,19 +256,21 @@ impl PostgresSource {
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    self.queue(lsn, xid, ts, name, Op::Update, before, after);
+                    let key = cache.key(relation, &new).map_err(dec)?;
+                    self.queue(lsn, xid, ts, name, Op::Update, before, after, key);
                 }
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
-                    self.queue(lsn, xid, ts, name, Op::Delete, before, None);
+                    let key = cache.key(relation, &old).map_err(dec)?;
+                    self.queue(lsn, xid, ts, name, Op::Delete, before, None, key);
                 }
                 Message::Truncate { relations } => {
                     for id in relations {
                         let r = cache.get(id).map_err(dec)?;
                         let name = (r.schema.clone(), r.name.clone());
-                        self.queue(lsn, xid, ts, name, Op::Truncate, None, None);
+                        self.queue(lsn, xid, ts, name, Op::Truncate, None, None, None);
                     }
                 }
                 Message::Commit { end_lsn, .. } => {
@@ -347,6 +353,10 @@ impl Source for PostgresSource {
                 tokio::time::sleep(self.cfg.poll_interval).await;
             }
         }
+    }
+
+    fn try_next(&mut self) -> Option<ChangeEvent> {
+        self.buffer.pop_front()
     }
 
     async fn ack(&mut self, lsn: Lsn) -> Result<()> {

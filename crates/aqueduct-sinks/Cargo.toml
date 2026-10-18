@@ -12,6 +12,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+futures = "0.3"
 rskafka = { version = "0.6", features = ["transport-tls"] }
 aqueduct-tls = { path = "../aqueduct-tls" }
 hmac = "0.12"

@@ -84,6 +84,31 @@ impl KafkaSecurity {
     }
 }
 
+/// How the record key, and so the partition, is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartitionBy {
+    /// Key `schema.table`: all changes to a table share a partition (total per-table order).
+    #[default]
+    Table,
+    /// Key `schema.table` plus the primary-key values: rows of one table spread across
+    /// partitions, and changes to one row keep their order. Tables without a key fall back
+    /// to `Table`.
+    Key,
+}
+
+impl std::str::FromStr for PartitionBy {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "table" => Ok(Self::Table),
+            "key" => Ok(Self::Key),
+            o => Err(format!(
+                "unknown partition_by `{o}` (expected table or key)"
+            )),
+        }
+    }
+}
+
 /// Sends events whose `schema.table` matches `pattern` to `topic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaRoute {
@@ -170,6 +195,7 @@ pub struct KafkaSink {
     client: Client,
     router: TopicRouter,
     new_topic_partitions: i32,
+    partition_by: PartitionBy,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
 }
 
@@ -195,6 +221,7 @@ impl KafkaSink {
             client,
             router,
             new_topic_partitions: new_topic_partitions.max(1),
+            partition_by: PartitionBy::default(),
             topics: HashMap::new(),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
@@ -203,6 +230,12 @@ impl KafkaSink {
             sink.open_topic(&t).await?;
         }
         Ok(sink)
+    }
+
+    /// Choose how records are keyed and partitioned (default: by table).
+    pub fn with_partition_by(mut self, by: PartitionBy) -> Self {
+        self.partition_by = by;
+        self
     }
 
     async fn partition_ids(&self, topic: &str) -> Result<Vec<i32>> {
@@ -270,8 +303,15 @@ fn partition_index(key: &str, n: usize) -> usize {
     (h % n as u64) as usize
 }
 
-fn record(event: &ChangeEvent) -> Result<Record> {
-    let key = format!("{}.{}", event.schema, event.table);
+/// Record key: `schema.table`, plus `:` and the primary-key values when partitioning by key.
+fn record_key(event: &ChangeEvent, by: PartitionBy) -> String {
+    match (by, &event.key) {
+        (PartitionBy::Key, Some(k)) => format!("{}.{}:{k}", event.schema, event.table),
+        _ => format!("{}.{}", event.schema, event.table),
+    }
+}
+
+fn record(event: &ChangeEvent, key: String) -> Result<Record> {
     let mut headers = BTreeMap::new();
     headers.insert(
         "op".to_string(),
@@ -291,23 +331,43 @@ fn record(event: &ChangeEvent) -> Result<Record> {
 #[async_trait]
 impl Sink for KafkaSink {
     async fn send(&mut self, event: &ChangeEvent) -> Result<()> {
-        let topic = self
-            .router
-            .topic_for(&event.schema, &event.table)
-            .ok_or_else(|| {
-                Error::Sink(format!(
-                    "no kafka route or default topic for {}.{}",
-                    event.schema, event.table
-                ))
-            })?;
-        self.open_topic(&topic).await?;
-        let rec = record(event)?;
-        let key = format!("{}.{}", event.schema, event.table);
-        let parts = &self.topics[&topic];
-        parts[partition_index(&key, parts.len())]
-            .produce(vec![rec], Compression::NoCompression)
-            .await
-            .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))?;
+        self.send_batch(std::slice::from_ref(event)).await
+    }
+
+    /// Group the batch by destination partition (keeping event order inside each) and
+    /// produce every group with one request, all partitions in parallel. Returns once the
+    /// broker has acknowledged all of them.
+    async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
+        let mut groups: HashMap<(String, usize), Vec<Record>> = HashMap::new();
+        for event in events {
+            let topic = self
+                .router
+                .topic_for(&event.schema, &event.table)
+                .ok_or_else(|| {
+                    Error::Sink(format!(
+                        "no kafka route or default topic for {}.{}",
+                        event.schema, event.table
+                    ))
+                })?;
+            self.open_topic(&topic).await?;
+            let key = record_key(event, self.partition_by);
+            let part = partition_index(&key, self.topics[&topic].len());
+            groups
+                .entry((topic, part))
+                .or_default()
+                .push(record(event, key)?);
+        }
+        let sends = groups.into_iter().map(|((topic, part), records)| {
+            let client = self.topics[&topic][part].clone();
+            async move {
+                client
+                    .produce(records, Compression::NoCompression)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
+            }
+        });
+        futures::future::try_join_all(sends).await?;
         Ok(())
     }
 }
@@ -377,11 +437,26 @@ mod tests {
 
     #[test]
     fn record_has_key_headers_and_json_value() {
-        let r = record(&crate::sample()).unwrap();
+        let e = crate::sample();
+        let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
         assert_eq!(r.key.as_deref(), Some(&b"public.users"[..]));
         assert_eq!(r.headers["op"], b"insert");
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
         assert_eq!(v["table"], "users");
+    }
+
+    #[test]
+    fn key_mode_adds_primary_key_and_spreads_rows() {
+        let mut e = crate::sample();
+        assert_eq!(record_key(&e, PartitionBy::Key), "public.users:1");
+        e.key = None;
+        assert_eq!(record_key(&e, PartitionBy::Key), "public.users");
+        let parts: std::collections::HashSet<usize> = (0..200)
+            .map(|i| partition_index(&format!("public.users:{i}"), 6))
+            .collect();
+        assert!(parts.len() > 1);
+        assert_eq!("key".parse::<PartitionBy>(), Ok(PartitionBy::Key));
+        assert!("x".parse::<PartitionBy>().is_err());
     }
 
     #[test]

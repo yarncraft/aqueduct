@@ -185,6 +185,7 @@ mod tests {
             op,
             before: None,
             after: None,
+            key: None,
         }
     }
 

@@ -13,4 +13,5 @@ pub use event::{ChangeEvent, Lsn, Op};
 pub use metrics::{Metrics, Snapshot, State};
 pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,
+    MAX_BATCH,
 };

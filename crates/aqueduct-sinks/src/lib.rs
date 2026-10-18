@@ -5,7 +5,9 @@ mod inspect;
 mod kafka;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
-pub use kafka::{KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, SaslMechanism, TopicRouter};
+pub use kafka::{
+    KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism, TopicRouter,
+};
 
 use aqueduct_core::{ChangeEvent, Error, Result};
 
@@ -24,8 +26,7 @@ pub(crate) fn sample() -> ChangeEvent {
         table: "users".into(),
         op: Op::Insert,
         before: None,
-        after: serde_json::json!({"id": 1, "name": "ada"})
-            .as_object()
-            .cloned(),
+        after: serde_json::value::RawValue::from_string(r#"{"id":1,"name":"ada"}"#.into()).ok(),
+        key: Some("1".into()),
     }
 }

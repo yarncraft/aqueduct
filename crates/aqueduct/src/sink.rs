@@ -1,6 +1,6 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
-    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, TopicRouter,
+    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, TopicRouter,
 };
 
 use crate::config::KafkaConfig;
@@ -44,6 +44,12 @@ pub async fn build(cfg: &KafkaConfig) -> Result<(KafkaSink, KafkaInspector)> {
     let router = router(cfg)?;
     let security = security(cfg)?;
     let inspector = KafkaInspector::new(cfg.brokers.clone(), &router, security.clone());
-    let sink = KafkaSink::connect(cfg.brokers.clone(), router, cfg.partitions, &security).await?;
+    let by: PartitionBy = match &cfg.partition_by {
+        Some(s) => s.parse().map_err(Error::Config)?,
+        None => PartitionBy::default(),
+    };
+    let sink = KafkaSink::connect(cfg.brokers.clone(), router, cfg.partitions, &security)
+        .await?
+        .with_partition_by(by);
     Ok((sink, inspector))
 }

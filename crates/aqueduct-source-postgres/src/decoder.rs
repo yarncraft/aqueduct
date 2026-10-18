@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use serde_json::{Map, Value};
+use std::fmt::Write;
+
+use serde_json::value::RawValue;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecodeError {
@@ -16,6 +18,8 @@ pub enum DecodeError {
     Utf8,
     #[error("data for unknown relation {0}")]
     UnknownRelation(u32),
+    #[error("column value is not valid JSON")]
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,41 +252,115 @@ impl RelationCache {
         self.0.get(&id).ok_or(DecodeError::UnknownRelation(id))
     }
 
-    /// Turn a tuple into a JSON object keyed by column name. `Unchanged`
-    /// TOAST columns are omitted.
-    pub fn row(&self, id: u32, tuple: &Tuple) -> Result<Map<String, Value>, DecodeError> {
+    /// Turn a tuple into a JSON object keyed by column name, written straight into one
+    /// string (no intermediate `Value` tree). `Unchanged` TOAST columns are omitted.
+    /// `json`/`jsonb` text is passed through verbatim: Postgres only emits valid JSON there.
+    pub fn row(&self, id: u32, tuple: &Tuple) -> Result<Box<RawValue>, DecodeError> {
         let rel = self.get(id)?;
-        let mut out = Map::new();
+        let mut out = String::with_capacity(64 + tuple.len() * 24);
+        out.push('{');
+        let mut first = true;
         for (col, datum) in rel.columns.iter().zip(tuple) {
-            let v = match datum {
-                Datum::Unchanged => continue,
-                Datum::Null => Value::Null,
-                Datum::Text(s) => text_to_json(col.type_oid, s),
-                Datum::Binary(b) => Value::String(b.iter().map(|x| format!("{x:02x}")).collect()),
-            };
-            out.insert(col.name.clone(), v);
+            if matches!(datum, Datum::Unchanged) {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            push_json_str(&mut out, &col.name);
+            out.push(':');
+            match datum {
+                Datum::Unchanged => {}
+                Datum::Null => out.push_str("null"),
+                Datum::Text(s) => push_text(&mut out, col.type_oid, s),
+                Datum::Binary(b) => {
+                    out.push('"');
+                    for x in b {
+                        let _ = write!(out, "{x:02x}");
+                    }
+                    out.push('"');
+                }
+            }
         }
-        Ok(out)
+        out.push('}');
+        RawValue::from_string(out).map_err(|_| DecodeError::Json)
+    }
+
+    /// Replica-identity key values of `tuple` joined with the unit separator (0x1f), or `None` when the table
+    /// has no key columns. Used to partition by primary key.
+    pub fn key(&self, id: u32, tuple: &Tuple) -> Result<Option<String>, DecodeError> {
+        let rel = self.get(id)?;
+        let mut out = String::new();
+        let mut any = false;
+        for (col, datum) in rel.columns.iter().zip(tuple) {
+            if !col.key {
+                continue;
+            }
+            if any {
+                out.push('\u{1f}');
+            }
+            any = true;
+            match datum {
+                Datum::Text(s) => out.push_str(s),
+                Datum::Binary(b) => {
+                    for x in b {
+                        let _ = write!(out, "{x:02x}");
+                    }
+                }
+                Datum::Null | Datum::Unchanged => {}
+            }
+        }
+        Ok(any.then_some(out))
     }
 }
 
-/// Map Postgres text output to JSON using well-known type OIDs; anything
-/// unrecognised stays a string.
-fn text_to_json(oid: u32, s: &str) -> Value {
+/// Append `s` as a JSON string literal.
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        let esc = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if (c as u32) < 0x20 => {
+                out.push_str(&s[start..i]);
+                let _ = write!(out, "\\u{:04x}", c as u32);
+                start = i + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        out.push_str(&s[start..i]);
+        out.push_str(esc);
+        start = i + c.len_utf8();
+    }
+    out.push_str(&s[start..]);
+    out.push('"');
+}
+
+/// Append Postgres text output as JSON using well-known type OIDs; anything
+/// unrecognised becomes a string.
+fn push_text(out: &mut String, oid: u32, s: &str) {
     match oid {
-        16 => Value::Bool(s == "t"),
-        20 | 21 | 23 => s
-            .parse::<i64>()
-            .map(Value::from)
-            .unwrap_or_else(|_| Value::String(s.into())),
-        700 | 701 => s
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.into())), // NaN / Infinity
-        114 | 3802 => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.into())),
-        _ => Value::String(s.into()),
+        16 => out.push_str(if s == "t" { "true" } else { "false" }),
+        20 | 21 | 23 => match s.parse::<i64>() {
+            Ok(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Err(_) => push_json_str(out, s),
+        },
+        700 | 701 => match s.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            Some(n) => {
+                let _ = write!(out, "{n}");
+            }
+            None => push_json_str(out, s), // NaN / Infinity
+        },
+        114 | 3802 if !s.trim().is_empty() => out.push_str(s),
+        _ => push_json_str(out, s),
     }
 }
 
@@ -355,8 +433,8 @@ mod tests {
             panic!()
         };
         let row = cache.row(relation, &new).unwrap();
-        assert_eq!(row["id"], Value::from(5));
-        assert_eq!(row["name"], Value::Null);
+        assert_eq!(row.get(), r#"{"id":5,"name":null}"#);
+        assert_eq!(cache.key(relation, &new).unwrap().as_deref(), Some("5"));
     }
 
     #[test]
@@ -417,10 +495,27 @@ mod tests {
         assert_eq!(decode(b"?"), Err(DecodeError::UnknownTag(b'?')));
     }
 
+    fn text(oid: u32, s: &str) -> String {
+        let mut out = String::new();
+        push_text(&mut out, oid, s);
+        out
+    }
+
     #[test]
     fn json_and_bool_types() {
-        assert_eq!(text_to_json(16, "t"), Value::Bool(true));
-        assert_eq!(text_to_json(3802, r#"{"a":1}"#)["a"], Value::from(1));
-        assert_eq!(text_to_json(701, "NaN"), Value::String("NaN".into()));
+        assert_eq!(text(16, "t"), "true");
+        assert_eq!(text(3802, r#"{"a":1}"#), r#"{"a":1}"#);
+        assert_eq!(text(701, "NaN"), r#""NaN""#);
+        assert_eq!(text(23, "-7"), "-7");
+        assert_eq!(text(701, "1.5"), "1.5");
+    }
+
+    #[test]
+    fn strings_are_escaped() {
+        let mut out = String::new();
+        push_json_str(&mut out, "a\"b\\c\nd\u{1}é");
+        assert_eq!(out, r#""a\"b\\c\nd\u0001é""#);
+        let v: String = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, "a\"b\\c\nd\u{1}é");
     }
 }
