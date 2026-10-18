@@ -104,8 +104,9 @@ impl KafkaSink {
             new_topic_partitions: new_topic_partitions.max(1),
             topics: HashMap::new(),
         };
-        // Fail fast on a bad broker/topic: open the default topic now.
-        if let Some(t) = sink.router.default.clone() {
+        // Fail fast on a bad broker/topic: open the default topic now (a templated
+        // default like `cdc.{table}` only resolves per event, so it opens on first use).
+        if let Some(t) = sink.router.default.clone().filter(|t| !t.contains('{')) {
             sink.open_topic(&t).await?;
         }
         Ok(sink)
