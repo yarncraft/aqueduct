@@ -11,6 +11,10 @@ pub struct Config {
     /// `AQUEDUCT_ADMIN_TOKEN`.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// How many recent events the cockpit's event inspector keeps in memory
+    /// (`0` disables it; events contain row data, so protect the port).
+    #[serde(default = "default_inspector_buffer")]
+    pub inspector_buffer: usize,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
 }
@@ -58,6 +62,10 @@ pub struct KafkaRouteConfig {
     pub pattern: String,
     /// Destination topic; `{schema}` and `{table}` are substituted.
     pub topic: String,
+}
+
+fn default_inspector_buffer() -> usize {
+    aqueduct_core::DEFAULT_RECENT_EVENTS
 }
 
 fn default_partitions() -> i32 {

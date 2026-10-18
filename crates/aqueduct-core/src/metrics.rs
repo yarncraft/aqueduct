@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +28,18 @@ impl State {
     }
 }
 
+/// Default number of recent events kept for the admin event inspector.
+pub const DEFAULT_RECENT_EVENTS: usize = 500;
+
+/// An event kept in the inspector buffer. `seq` increases by one per event.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedEvent {
+    pub seq: u64,
+    /// When the sink accepted the event (Unix ms).
+    pub delivered_unix_ms: u64,
+    pub event: ChangeEvent,
+}
+
 /// Live counters updated by the pipeline and read by the admin server.
 pub struct Metrics {
     started: Instant,
@@ -46,6 +58,8 @@ pub struct Metrics {
     sink_us_max: AtomicU64,
     tables: Mutex<BTreeMap<String, u64>>,
     last_error: Mutex<Option<String>>,
+    recent: Mutex<VecDeque<RecordedEvent>>,
+    recent_cap: usize,
 }
 
 impl Default for Metrics {
@@ -84,6 +98,11 @@ fn now_ms() -> u64 {
 
 impl Metrics {
     pub fn new() -> Self {
+        Self::with_recent_capacity(DEFAULT_RECENT_EVENTS)
+    }
+
+    /// Keep the last `cap` events for inspection (`0` disables the buffer).
+    pub fn with_recent_capacity(cap: usize) -> Self {
         Self {
             started: Instant::now(),
             state: AtomicU8::new(State::Starting as u8),
@@ -101,6 +120,8 @@ impl Metrics {
             sink_us_max: AtomicU64::new(0),
             tables: Mutex::new(BTreeMap::new()),
             last_error: Mutex::new(None),
+            recent: Mutex::new(VecDeque::new()),
+            recent_cap: cap,
         }
     }
 
@@ -130,8 +151,36 @@ impl Metrics {
         self.sink_us_total.fetch_add(us, Relaxed);
         self.sink_us_last.store(us, Relaxed);
         self.sink_us_max.fetch_max(us, Relaxed);
-        let mut t = self.tables.lock().unwrap();
-        *t.entry(format!("{}.{}", ev.schema, ev.table)).or_default() += 1;
+        {
+            let mut t = self.tables.lock().unwrap();
+            *t.entry(format!("{}.{}", ev.schema, ev.table)).or_default() += 1;
+        }
+        if self.recent_cap > 0 {
+            let mut r = self.recent.lock().unwrap();
+            if r.len() == self.recent_cap {
+                r.pop_front();
+            }
+            r.push_back(RecordedEvent {
+                // `events` was already incremented, so it is this event's 1-based sequence.
+                seq: self.events.load(Relaxed),
+                delivered_unix_ms: now_ms(),
+                event: ev.clone(),
+            });
+        }
+    }
+
+    /// Up to `limit` newest buffered events with `seq > after`, oldest first.
+    pub fn recent(&self, after: u64, limit: usize) -> Vec<RecordedEvent> {
+        let r = self.recent.lock().unwrap();
+        let mut out: Vec<RecordedEvent> = r
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > after)
+            .take(limit)
+            .cloned()
+            .collect();
+        out.reverse();
+        out
     }
 
     pub fn record_error(&self, msg: impl Into<String>) {
@@ -204,5 +253,21 @@ mod tests {
         assert!((s.sink_avg_ms - 4.0).abs() < 0.01);
         assert!((s.sink_max_ms - 6.0).abs() < 0.01);
         assert_eq!(s.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn recent_buffer_is_bounded_and_resumable() {
+        let m = Metrics::with_recent_capacity(3);
+        for i in 1..=5 {
+            m.record_event(&ev(Op::Insert, "a", i), Duration::ZERO);
+        }
+        let seqs = |v: Vec<RecordedEvent>| v.into_iter().map(|e| e.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(m.recent(0, 10)), vec![3, 4, 5]);
+        assert_eq!(seqs(m.recent(3, 10)), vec![4, 5]);
+        assert_eq!(seqs(m.recent(0, 2)), vec![4, 5]);
+        assert!(m.recent(5, 10).is_empty());
+        let off = Metrics::with_recent_capacity(0);
+        off.record_event(&ev(Op::Insert, "a", 1), Duration::ZERO);
+        assert!(off.recent(0, 10).is_empty());
     }
 }

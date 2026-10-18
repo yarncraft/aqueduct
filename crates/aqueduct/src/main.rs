@@ -36,7 +36,9 @@ async fn main() {
     let listener = TcpListener::bind(&cfg.health_addr)
         .await
         .expect("bind health_addr");
-    let metrics = Arc::new(aqueduct_core::Metrics::new());
+    let metrics = Arc::new(aqueduct_core::Metrics::with_recent_capacity(
+        cfg.inspector_buffer,
+    ));
     let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone());
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin));

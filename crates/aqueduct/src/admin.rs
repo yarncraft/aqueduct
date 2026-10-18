@@ -3,6 +3,7 @@
 //! - `GET /`            dashboard (embedded HTML + Tailwind CSS at `/admin.css`)
 //! - `GET /healthz`     `200 ok` (container HEALTHCHECK)
 //! - `GET /api/metrics` JSON snapshot
+//! - `GET /api/events`  recent events for the inspector (`?after=<seq>&limit=<n>`)
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
 //!
 //! If `admin_token` is configured, the `/api/*` routes require it as
@@ -75,6 +76,7 @@ struct Request {
     path: String,
     bearer: Option<String>,
     query_token: Option<String>,
+    query: String,
 }
 
 fn parse(raw: &str) -> Option<Request> {
@@ -99,6 +101,7 @@ fn parse(raw: &str) -> Option<Request> {
         path: path.to_string(),
         bearer,
         query_token,
+        query: query.to_string(),
     })
 }
 
@@ -132,7 +135,7 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
         }
         "/admin.css" => respond(&mut sock, "200 OK", "text/css; charset=utf-8", STYLES).await,
         "/healthz" => respond(&mut sock, "200 OK", "text/plain", "ok").await,
-        "/api/metrics" | "/api/stream" if !admin.authorized(&req) => {
+        "/api/metrics" | "/api/stream" | "/api/events" if !admin.authorized(&req) => {
             respond(
                 &mut sock,
                 "401 Unauthorized",
@@ -142,6 +145,21 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             .await
         }
         "/api/metrics" => respond(&mut sock, "200 OK", "application/json", &admin.payload()).await,
+        "/api/events" => {
+            let param = |k: &str| {
+                req.query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                    .and_then(|v| v.parse::<u64>().ok())
+            };
+            let limit = param("limit").unwrap_or(200).min(1000) as usize;
+            let events = admin.metrics.recent(param("after").unwrap_or(0), limit);
+            let body = json!({
+                "latest_seq": admin.metrics.events_total(),
+                "events": events,
+            });
+            respond(&mut sock, "200 OK", "application/json", &body.to_string()).await
+        }
         "/api/stream" => {
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\nconnection: keep-alive\r\n\r\n";
             if sock.write_all(head.as_bytes()).await.is_err() {
@@ -219,5 +237,8 @@ mod tests {
         assert!(get(addr, "/api/metrics").await.starts_with("HTTP/1.1 401"));
         let ok = get(addr, "/api/metrics?token=k").await;
         assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("\"events_total\":0"));
+        let ev = get(addr, "/api/events?after=0&limit=5&token=k").await;
+        assert!(ev.starts_with("HTTP/1.1 200") && ev.contains("\"events\":[]"));
+        assert!(get(addr, "/api/events").await.starts_with("HTTP/1.1 401"));
     }
 }
