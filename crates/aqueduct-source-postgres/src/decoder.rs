@@ -414,7 +414,7 @@ mod tests {
     fn truncated_and_unknown() {
         assert_eq!(decode(&[]), Err(DecodeError::Eof));
         assert_eq!(decode(&[b'I', 0, 0]), Err(DecodeError::Eof));
-        assert_eq!(decode(&[b'?']), Err(DecodeError::UnknownTag(b'?')));
+        assert_eq!(decode(b"?"), Err(DecodeError::UnknownTag(b'?')));
     }
 
     #[test]

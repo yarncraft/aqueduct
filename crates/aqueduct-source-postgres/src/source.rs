@@ -5,6 +5,9 @@ use aqueduct_core::{ChangeEvent, Error, Lsn, Op, Result, Source};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
+
+use crate::tls::{self, SslMode};
 
 use crate::decoder::{decode, Message, RelationCache};
 
@@ -22,6 +25,13 @@ pub struct PostgresSourceConfig {
     pub poll_interval: Duration,
     /// Approximate max changes fetched per poll (whole transactions are never split).
     pub batch_size: i32,
+    /// If the slot is missing but a checkpoint exists, changes made while the slot was gone are
+    /// lost. By default that is a startup error; set this to accept it and start a fresh slot.
+    pub allow_slot_recreate: bool,
+    /// TLS policy; overrides `sslmode` in the URL when set. Default: URL, else `prefer`.
+    pub ssl_mode: Option<SslMode>,
+    /// PEM CA bundle to verify the server against; overrides `sslrootcert` in the URL.
+    pub ssl_root_cert: Option<String>,
 }
 
 impl PostgresSourceConfig {
@@ -36,7 +46,16 @@ impl PostgresSourceConfig {
             publication: publication.into(),
             poll_interval: Duration::from_millis(500),
             batch_size: 1000,
+            allow_slot_recreate: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
         }
+    }
+
+    /// See [`PostgresSourceConfig::allow_slot_recreate`].
+    pub fn allow_slot_recreate(mut self, allow: bool) -> Self {
+        self.allow_slot_recreate = allow;
+        self
     }
 }
 
@@ -74,6 +93,53 @@ impl PostgresSource {
             tx_ends: VecDeque::new(),
             last_end: 0,
         }
+    }
+
+    /// Open the SQL connection according to the TLS policy.
+    async fn connect(&self) -> Result<Client> {
+        let parsed = tls::parse(&self.cfg.url)?;
+        let mode = self.cfg.ssl_mode.or(parsed.url_mode).unwrap_or_default();
+        let root = self.cfg.ssl_root_cert.clone().or(parsed.url_root_cert);
+        let local = tls::is_local(&parsed.config);
+        let mut pg = parsed.config;
+        pg.ssl_mode(mode.pg());
+
+        let client = if mode == SslMode::Disable {
+            let (client, conn) = pg.connect(NoTls).await.map_err(src_err)?;
+            spawn_conn(conn);
+            client
+        } else {
+            let cfg = aqueduct_tls::client_config(root.as_deref(), mode.verify(root.is_some()))
+                .map_err(Error::Config)?;
+            let (client, conn) = pg
+                .connect(MakeRustlsConnect::new((*cfg).clone()))
+                .await
+                .map_err(src_err)?;
+            spawn_conn(conn);
+            client
+        };
+
+        // Authoritative check of what was negotiated (tokio-postgres hides it).
+        let encrypted: bool = client
+            .query_one(
+                "SELECT COALESCE((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false)",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        match (encrypted, local) {
+            (true, _) => {
+                if matches!(mode, SslMode::Prefer | SslMode::Require) && root.is_none() {
+                    tracing::warn!("postgres connection is encrypted but the server certificate is NOT verified; set sslmode=verify-full and a CA (postgres.ssl_root_cert)");
+                }
+            }
+            (false, true) => tracing::info!("postgres connection is plaintext (local host)"),
+            (false, false) => tracing::warn!(
+                "postgres connection is PLAINTEXT to a non-loopback host: credentials and row data cross the network unencrypted; set postgres.ssl_mode = \"verify-full\""
+            ),
+        }
+        Ok(client)
     }
 
     fn client(&self) -> Result<&Client> {
@@ -218,17 +284,11 @@ impl PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Lsn>) -> Result<()> {
-        let (client, conn) = tokio_postgres::connect(&self.cfg.url, NoTls)
-            .await
-            .map_err(src_err)?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::error!(error = %e, "postgres connection closed");
-            }
-        });
+        let client = self.connect().await?;
         self.client = Some(client);
 
         let slot = self.cfg.slot.clone();
+        let mut recreated = false;
         let existing = self
             .client()?
             .query_opt(
@@ -247,6 +307,17 @@ impl Source for PostgresSource {
                     .map_or(0, |l| l.0);
             }
             None => {
+                if let Some(lsn) = start {
+                    if !self.cfg.allow_slot_recreate {
+                        return Err(Error::Source(format!(
+                            "replication slot {slot:?} does not exist but a checkpoint exists (LSN {lsn}); \
+                             changes made while the slot was missing would be lost. Restore the slot or \
+                             set postgres.allow_slot_recreate = true to start a fresh stream"
+                        )));
+                    }
+                    tracing::warn!(slot = %slot, checkpoint = %lsn, "slot missing; recreating (allow_slot_recreate)");
+                }
+                recreated = true;
                 self.client()?
                     .execute(
                         "SELECT pg_create_logical_replication_slot($1::text::name, 'pgoutput')",
@@ -259,7 +330,8 @@ impl Source for PostgresSource {
         }
         // The checkpoint can be ahead of the slot if we crashed between save and ack, and
         // the slot replays whole transactions: skip changes already delivered.
-        if let Some(Lsn(l)) = start {
+        // A recreated slot starts a new stream, so the old checkpoint no longer applies.
+        if let (Some(Lsn(l)), false) = (start, recreated) {
             self.emitted = l;
         }
         Ok(())
@@ -341,4 +413,16 @@ mod ack_tests {
         assert_eq!(ack_target(&mut q, 200), Some(220));
         assert!(q.is_empty());
     }
+}
+
+fn spawn_conn<S, T>(conn: tokio_postgres::Connection<S, T>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!(error = %e, "postgres connection closed");
+        }
+    });
 }
