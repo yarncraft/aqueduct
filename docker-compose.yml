@@ -20,7 +20,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app?replication=database
+      AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app
     volumes:
       - aqueduct-state:/var/lib/aqueduct
     ports:
