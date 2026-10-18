@@ -1,4 +1,5 @@
 mod config;
+mod sink;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -6,6 +7,10 @@ use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() {
+    // `aqueduct --healthcheck`: used by the container HEALTHCHECK (the runtime image has no curl).
+    if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
+        std::process::exit(healthcheck().await);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse().unwrap()),
@@ -49,5 +54,25 @@ async fn health_server(listener: TcpListener) {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
                 .await;
         });
+    }
+}
+
+/// Probe our own health endpoint; returns the process exit code.
+async fn healthcheck() -> i32 {
+    let addr = std::env::var("AQUEDUCT_HEALTH_PROBE").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let probe = async {
+        let mut sock = tokio::net::TcpStream::connect(&addr).await.ok()?;
+        sock.write_all(b"GET / HTTP/1.1
+host: localhost
+connection: close
+
+").await.ok()?;
+        let mut buf = [0u8; 64];
+        let n = sock.read(&mut buf).await.ok()?;
+        buf[..n].starts_with(b"HTTP/1.1 200").then_some(())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(3), probe).await {
+        Ok(Some(())) => 0,
+        _ => 1,
     }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aqueduct-core = { path = "../aqueduct-core" }
+aqueduct-sinks = { path = "../aqueduct-sinks" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

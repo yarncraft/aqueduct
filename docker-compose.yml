@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    environment:
+      POSTGRES_USER: aqueduct
+      POSTGRES_PASSWORD: aqueduct
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./config/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aqueduct -d app"]
+      interval: 5s
+      retries: 10
+
+  aqueduct:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app?replication=database
+    volumes:
+      - aqueduct-state:/var/lib/aqueduct
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  aqueduct-state:
