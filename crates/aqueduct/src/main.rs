@@ -1,3 +1,4 @@
+mod checkpoint;
 mod config;
 mod sink;
 
@@ -34,14 +35,40 @@ async fn main() {
         .expect("bind health_addr");
     tokio::spawn(health_server(listener));
 
-    // TODO(pipeline): build the Postgres source (aqueduct-source-postgres), the
-    // configured sink and a file checkpoint store, then call
-    // aqueduct_core::run_pipeline(..., shutdown_rx).
-    let _ = shutdown_rx;
+    let mut source = aqueduct_source_postgres::PostgresSource::new(
+        aqueduct_source_postgres::PostgresSourceConfig::new(
+            cfg.postgres.url.clone(),
+            cfg.postgres.slot.clone(),
+            cfg.postgres.publication.clone(),
+        ),
+    );
+    let mut sink = match sink::build(&cfg.sink).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build sink");
+            std::process::exit(1);
+        }
+    };
+    let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());
 
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!("shutting down");
-    let _ = shutdown_tx.send(true);
+    let mut pipeline = tokio::spawn(async move {
+        aqueduct_core::run_pipeline(&mut source, sink.as_mut(), &mut store, shutdown_rx).await
+    });
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+            let _ = shutdown_tx.send(true);
+            let _ = pipeline.await;
+        }
+        res = &mut pipeline => {
+            match res {
+                Ok(Ok(())) => tracing::info!("pipeline finished"),
+                Ok(Err(e)) => { tracing::error!(error = %e, "pipeline failed"); std::process::exit(1); }
+                Err(e) => { tracing::error!(error = %e, "pipeline task panicked"); std::process::exit(1); }
+            }
+        }
+    }
 }
 
 /// Minimal HTTP server: any request gets `200 ok` (used by the container HEALTHCHECK).

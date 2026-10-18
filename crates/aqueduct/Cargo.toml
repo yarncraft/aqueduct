@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 aqueduct-core = { path = "../aqueduct-core" }
 aqueduct-sinks = { path = "../aqueduct-sinks" }
+aqueduct-source-postgres = { path = "../aqueduct-source-postgres" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -4,7 +4,6 @@ use aqueduct_sinks::{FileSink, StdoutSink, WebhookSink};
 use crate::config::SinkConfig;
 
 /// Build the sink selected in the config.
-#[allow(dead_code)] // wired into run_pipeline once the Postgres source lands
 pub async fn build(cfg: &SinkConfig) -> Result<Box<dyn Sink>> {
     Ok(match cfg {
         SinkConfig::Stdout => Box::new(StdoutSink::new()),

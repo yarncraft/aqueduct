@@ -17,6 +17,8 @@ version = "0.1.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-sinks",
+ "aqueduct-source-postgres",
+ "async-trait",
  "serde",
  "serde_json",
  "tokio",
