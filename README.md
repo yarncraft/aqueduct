@@ -4,7 +4,7 @@ Postgres change-data-capture (CDC) over logical replication (`pgoutput`), writte
 built to run **only in a container**. Aqueduct streams row-level changes to a sink with
 at-least-once delivery: the LSN is checkpointed and acknowledged to Postgres only after the sink succeeds.
 
-- Sinks: stdout, JSON-lines file, HTTP webhook, **Kafka** (with per-table topic routing)
+- Sink: **Kafka** (the only sink), with per-table topic routing
 - **Admin cockpit**: live throughput, lag, latency, per-table stats and an event inspector
 - Distroless, non-root image; state in one volume
 
@@ -15,13 +15,13 @@ Docker or Podman (with `podman-compose`; use `podman build --format docker` if y
 ```sh
 docker compose up --build
 docker compose exec postgres psql -U aqueduct app -c "INSERT INTO users(name) VALUES ('ada')"
-docker compose logs -f aqueduct
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic cdc.public.users --from-beginning
 ```
 
 Then open the cockpit at <http://localhost:8080/>.
 
 The compose file starts Postgres 16 with `wal_level=logical`, creates a `users` table and an
-`aqueduct` publication (`config/init.sql`), and runs Aqueduct against it.
+`aqueduct` publication (`config/init.sql`), a single-node Kafka (KRaft), and runs Aqueduct against both.
 
 ## Configuration
 
@@ -37,31 +37,14 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_token` | unset | Protects `/api/*` when set. Override with `AQUEDUCT_ADMIN_TOKEN` |
-| `inspector_buffer` | `500` | Recent events kept in memory for the inspector (`0` disables) |
+| `inspector` | `true` | Event inspector in the cockpit; reads recent events back from Kafka. Also needs `admin_token` |
 
-### Sinks
+### Kafka sink
 
-| Sink | Config | Behaviour |
-|------|--------|-----------|
-| stdout | `type = "stdout"` | JSON lines to the container log |
-| file | `type = "file"`, `path` | JSON lines, fsynced on flush |
-| webhook | `type = "webhook"`, `url` | `POST` JSON; retries network errors, 5xx and 429 with backoff |
-| kafka | `type = "kafka"`, `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created) | JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing |
+Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created). Records: JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing.
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
-
-### Try the Kafka sink
-
-```sh
-docker compose --profile kafka up --build kafka aqueduct-kafka   # also starts postgres
-docker compose exec postgres psql -U aqueduct app -c "INSERT INTO users(name) VALUES ('ada')"
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic cdc.public.users --from-beginning
-```
-
-`aqueduct-kafka` reads `config/aqueduct.kafka.example.toml` (own slot `aqueduct_kafka`, one topic per table) and publishes no host port. The default `docker compose up` is unchanged.
-
-### Kafka topic routing
 
 Each event goes to the first `[[sink.routes]]` entry whose `match` fits its `schema.table` (`*` is a wildcard), otherwise to `topic`. Topic names may use `{schema}` and `{table}`. Topics are created on first use. An event that matches no route while `topic` is unset fails the pipeline rather than being dropped.
 
@@ -84,7 +67,7 @@ topic = "audit"
 
 The HTTP port serves a dark operations console at `/`: throughput chart, total events, end-to-end lag,
 sink latency, errors, operation and per-table breakdown, last fault, and an **event inspector**
-(last `inspector_buffer` events; filter by op/table, search payloads, pause, click a row for a
+(reads the newest events straight from the Kafka topics, nothing is buffered in the pipeline; pick a topic, filter by op/table, search payloads, pause, click a row for a
 before/after diff and Copy JSON).
 
 | Route | Purpose |
@@ -93,7 +76,7 @@ before/after diff and Copy JSON).
 | `GET /healthz` | `200 ok`, used by the image `HEALTHCHECK` (`aqueduct --healthcheck`) |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/events?after=<seq>&limit=<n>` | Buffered events newer than `seq` |
+| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 
 With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` or `?token=<token>`; open the
 dashboard as `http://host:8080/?token=<token>`. The page itself is public and **events contain row data**,
@@ -111,7 +94,7 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 ```
 
 Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source) ·
-`aqueduct-sinks` (stdout/file/webhook/kafka) · `aqueduct` (binary: config, checkpoint, admin server and UI).
+`aqueduct-sinks` (Kafka sink + inspector reader) · `aqueduct` (binary: config, checkpoint, admin server and UI).
 See `CLAUDE.md` for contributor and agent notes.
 
 The cockpit CSS is generated by the Tailwind v4 standalone CLI and committed:
@@ -119,5 +102,5 @@ The cockpit CSS is generated by the Tailwind v4 standalone CLI and committed:
 
 ## Status
 
-Built and run end to end under Podman: Postgres 16 to the file sink with insert/update/delete, restart
+Built and run end to end under Podman: Postgres 16 to Kafka with insert/update/delete, restart
 without duplicates or gaps. The Kafka sink and topic routing were verified against a real broker (Apache Kafka 4, KRaft): two routes plus a templated fallback, topics created on first use, and a restart with no duplicates or gaps.

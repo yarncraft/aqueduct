@@ -1,0 +1,138 @@
+# Aqueduct operations runbook
+
+Failure handling, recovery and disaster recovery. Read `docs/DEPLOYMENT.md` first for the delivery model.
+Chaos scenarios that exercise the cases below live in `scripts/chaos/` (`scripts/chaos/run.sh`).
+
+**Delivery contract:** at-least-once. After any crash, the events of at most the in-flight transaction are replayed
+(deduplicate on `lsn` plus row key). Gaps are never expected; a gap is a bug or a lost slot (section 4).
+
+**State that matters**
+
+| State | Where | If lost |
+|-------|-------|---------|
+| Replication slot | Postgres | Position and unconsumed changes are gone. **Data loss.** See section 4 |
+| Checkpoint file | `/var/lib/aqueduct/checkpoint` | Harmless: the slot decides what is pending; at most replay |
+
+## 1. Failure matrix
+
+| Event | What happens | Operator action |
+|-------|--------------|-----------------|
+| Container `kill -9` / OOM / node reboot | Restarts (`restart: unless-stopped` or orchestrator). Resumes from slot + checkpoint. Replay of the in-flight transaction possible | None |
+| Postgres restart or brief outage | The source has no reconnect loop: the next poll fails, the pipeline fails, the process exits non-zero and is restarted by the orchestrator, retrying until Postgres is back | None; make sure the restart policy is on, and alert if restarts loop |
+| Kafka down | Sink send fails, pipeline fails, process restarts and retries. Nothing is acknowledged, WAL accumulates in Postgres | Restore the sink; watch slot lag (section 3) |
+| State volume full | Checkpoint or file-sink write fails, pipeline stops without acknowledging; slot is not advanced | Free space; the process recovers on its own |
+| Checkpoint file deleted | Slot position is authoritative; replay limited to un-advanced transactions | None |
+| Checkpoint file corrupt (unparseable) | Startup fails with a checkpoint error, crash loop | Delete the file (replay from slot) and restart |
+| Replication slot dropped, checkpoint present | With the `feat/hardening` guard: refuses to start. Without it: a new slot is created from "now" and the gap is silent | Section 4 |
+| Two instances on one slot | Both poll and advance; events split or duplicated | Never do this; one instance per slot |
+
+## 2. Recovery procedures
+
+### Restart after a crash loop
+1. `docker logs aqueduct --tail 100`: logs are JSON; look for `pipeline failed` and the error text.
+2. Fix the cause (sink reachable, Postgres reachable, disk space, config), then `docker restart aqueduct`.
+
+### Corrupt checkpoint
+```sh
+docker stop aqueduct
+docker run --rm -v aqueduct-state:/v busybox rm -f /v/checkpoint
+docker start aqueduct       # resumes from the slot; may replay recent transactions
+```
+
+### Deliberately reset a slot (accepting loss of everything not yet delivered)
+Only when the pipeline's backlog is unwanted, or after a restore (section 4).
+```sh
+docker stop aqueduct
+psql -c "SELECT pg_drop_replication_slot('aqueduct');"
+docker run --rm -v aqueduct-state:/v busybox rm -f /v/checkpoint
+# acknowledge the slot recreation explicitly (guard from feat/hardening):
+#   [postgres] allow_slot_recreate = true     (remove again after the first start)
+docker start aqueduct       # creates a new slot from "now"
+```
+Anything committed between the drop and the new slot is not delivered: take a snapshot/backfill of the affected tables
+from the database for consumers that need it (Aqueduct has no initial snapshot).
+
+### Stuck on a poison event (oversized Kafka record)
+The pipeline stops on non-retryable errors by design (no silent skip). Fix the receiver or the event source, then restart.
+Skipping requires advancing the slot manually and is data loss for that event:
+`SELECT pg_replication_slot_advance('aqueduct', '<lsn after the bad txn>');` with Aqueduct stopped.
+
+## 3. Monitoring
+
+### Slot lag and WAL retention (alert on these in Postgres)
+```sql
+-- bytes of WAL the slot is holding back; alert above your disk headroom (for example 1 GB, and rising)
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)               AS lag_bytes
+FROM pg_replication_slots WHERE slot_type = 'logical';
+```
+- `wal_status = 'lost'` means the slot was invalidated (`max_slot_wal_keep_size` exceeded): treat as slot loss (section 4).
+  Alert on `unreserved` too: invalidation is imminent.
+- Set `max_slot_wal_keep_size` (PG13+). It protects the database disk at the price of invalidating a stuck slot.
+  Size it to the longest outage you want to survive without data loss.
+- Note: the source reads with `peek` and advances after delivery, so `active` is often `false`; do not alert on it.
+  Alert on lag growth plus no recent progress instead.
+
+### Aqueduct signals
+| Signal | Alert when |
+|--------|------------|
+| `GET /healthz` != 200 / container unhealthy | 2 consecutive failures |
+| Container restart count | more than 3 in 10 minutes (crash loop) |
+| `GET /api/metrics`: `state` | not `streaming` for more than 1 minute |
+| `GET /api/metrics`: error count / `last_error` | increases |
+| Throughput stays 0 while slot lag grows | 5 minutes |
+| Sink latency (p95) | sustained above your SLO |
+| State volume free space | below 20% |
+
+When the Prometheus endpoint from `feat/hardening` is available, alert on the equivalents of the above; confirm the
+metric names against that release before wiring dashboards (this runbook deliberately does not guess them).
+
+## 4. Disaster recovery
+
+### Where the guarantees stop
+The slot lives inside Postgres. Anything that loses or rewinds Postgres state (failover to a replica without the slot,
+restore from backup, `pg_basebackup`, major upgrade by dump/restore, slot invalidation) loses the slot, and the changes
+between the last delivered LSN and the new slot position are **not recoverable from Aqueduct**. Recovery means
+re-syncing consumers from the database, then starting a fresh stream.
+
+### Postgres failover to a replica
+- Physical replicas do **not** carry logical slots before PG17. After promotion the slot is missing.
+- PG17+ with failover slots: create the slot with `failover = true` (`pg_create_logical_replication_slot(..., failover => true)`),
+  set `sync_replication_slots = on` and `primary_slot_name` on the standby, and keep `hot_standby_feedback = on`. Aqueduct creates its slot
+  without this flag today: create the slot yourself with `failover => true` before the first start, Aqueduct then reuses it.
+  Verify on the standby: `SELECT slot_name, synced FROM pg_replication_slots;` before relying on it.
+- Procedure after an unsynced failover:
+  1. Keep Aqueduct stopped (the guard refuses to start without the slot, which is what you want).
+  2. Promote, point `AQUEDUCT_PG_URL` at the new primary. Confirm the publication exists (publications replicate physically).
+  3. Decide the recovery point: last delivered change = the value in the checkpoint file (`cat /var/lib/aqueduct/checkpoint`, decimal LSN) or the newest event at the sink.
+  4. Re-sync consumers for rows changed since then (`updated_at > ...` backfill, or full table reload), then reset the slot (section 2) and start.
+  5. Make consumers idempotent on key during the overlap.
+
+### Restore Postgres from backup / PITR
+Same as failover: the slot is gone, the restored database may be *behind* what consumers already received.
+Consumers can hold changes the restored database never had. Reset the slot, decide per consumer whether to roll back or reload, then start.
+
+### Backup of Aqueduct state
+- The checkpoint is a single small file and is optional for correctness; back it up with the volume snapshot if convenient.
+  Do not restore an old checkpoint over a newer slot position blindly: the source skips every change at or below the checkpoint LSN,
+  so a checkpoint **ahead** of the real delivery position (restored from a different cluster/timeline) silently drops events.
+  When restoring a database from backup, delete the checkpoint.
+- Config and secrets: keep the TOML, `AQUEDUCT_PG_URL` and `AQUEDUCT_ADMIN_TOKEN` in your secret store, not only on the host.
+
+### Region / host loss
+Aqueduct is stateless apart from the above. Recreate the container anywhere that can reach Postgres and the sink and run
+the failover procedure if Postgres moved. RTO is the container start time; RPO is zero while the slot survives, and is
+"everything since the last delivered LSN, re-synced from the database" when it does not.
+
+## 5. Planned maintenance
+- **Upgrade Aqueduct:** `docker stop` (graceful, finishes the in-flight event), deploy the new image on the same volume, start.
+- **Postgres minor upgrade/restart:** nothing to do; Aqueduct restarts itself. Major upgrade: treat as a restore (slot is lost, section 4).
+- **Decommission:** stop the container, then `SELECT pg_drop_replication_slot('aqueduct');`, or the slot holds WAL forever.
+- **Drain before risky changes:** wait until `lag_bytes` is near 0 so a slot loss costs nothing.
+
+## 6. Verifying this runbook
+
+`scripts/chaos/run.sh` (needs Docker/Podman with compose v2, `curl`, `bash`) runs each scenario against the compose stack with a file sink
+and checks for no gaps and bounded duplicates: `kill9`, `postgres-restart`, `sink-volume-full`, `checkpoint-delete`,
+`checkpoint-corrupt`, `slot-loss`. Run one with `scripts/chaos/run.sh kill9`.

@@ -6,7 +6,7 @@ COPY crates ./crates
 # No cache mount on /src/target: cargo trusts mtimes, so a persistent target dir can silently
 # reuse a stale binary after the sources change.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release -p aqueduct && mkdir /state && cp target/release/aqueduct /aqueduct
+    cargo build --release --locked -p aqueduct && mkdir /state && cp target/release/aqueduct /aqueduct
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /aqueduct /usr/local/bin/aqueduct

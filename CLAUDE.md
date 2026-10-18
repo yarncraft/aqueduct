@@ -13,7 +13,7 @@ a container (Docker or Podman). Keep every feature working inside the distroless
 |-------|------|
 | `aqueduct-core` | `ChangeEvent`/`Lsn`/`Op`, `Source`/`Sink`/`CheckpointStore` traits, `run_pipeline`, `Metrics` |
 | `aqueduct-source-postgres` | Pure pgoutput decoder (`decoder.rs`) and the polling `Source` (`source.rs`) |
-| `aqueduct-sinks` | stdout, file, webhook, Kafka (`rskafka`, pure Rust) |
+| `aqueduct-sinks` | Kafka sink and the Kafka-backed event inspector reader (`rskafka`, pure Rust). Kafka is the only sink |
 | `aqueduct` | Binary: TOML config, file checkpoint, admin HTTP server (`admin.rs`, `admin.html`, `admin.css`) |
 
 ## Commands
@@ -57,8 +57,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 ## Conventions
 
 - Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes.
-- New sinks: implement `Sink` in `aqueduct-sinks`, add a `SinkConfig` variant in `config.rs`, wire it in `sink.rs`,
-  add unit tests, document in the README table.
+- Kafka is the only sink by design; do not add others. The inspector reads from Kafka, never from an in-process buffer.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
 - Git push to the Buzz relay needs a working `git-credential-nostr`; if it prints no credential, the push cannot succeed from that session.

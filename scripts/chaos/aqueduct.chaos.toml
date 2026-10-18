@@ -1,0 +1,13 @@
+# NOTE: Kafka is now the only sink; this harness still audits a file sink and needs porting (see issue).
+# Config used by scripts/chaos/run.sh: file sink on the state volume so the harness can audit delivery.
+health_addr = "0.0.0.0:8080"
+checkpoint_path = "/var/lib/aqueduct/checkpoint"
+
+[postgres]
+url = "postgres://aqueduct:aqueduct@postgres:5432/app"
+slot = "aqueduct"
+publication = "aqueduct"
+
+[sink]
+type = "file"
+path = "/var/lib/aqueduct/events.jsonl"

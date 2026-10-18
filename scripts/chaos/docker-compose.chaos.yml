@@ -1,0 +1,7 @@
+# Overlay: `docker compose -f docker-compose.yml -f scripts/chaos/docker-compose.chaos.yml up -d --build`
+services:
+  aqueduct:
+    environment:
+      AQUEDUCT_CONFIG: /etc/aqueduct/aqueduct.chaos.toml
+    volumes:
+      - ./scripts/chaos/aqueduct.chaos.toml:/etc/aqueduct/aqueduct.chaos.toml:ro

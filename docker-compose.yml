@@ -19,18 +19,24 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_started
     environment:
       AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app
+      # Dev default; set a real secret in production. Without a token the event inspector is off.
+      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:-dev-token-change-me}
     volumes:
       - aqueduct-state:/var/lib/aqueduct
     ports:
       - "8080:8080"
     restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
 
-  # Optional: `docker compose --profile kafka up --build kafka aqueduct-kafka`
   kafka:
     image: apache/kafka:latest
-    profiles: ["kafka"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -43,22 +49,6 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
-  aqueduct-kafka:
-    build: .
-    profiles: ["kafka"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_started
-    environment:
-      AQUEDUCT_CONFIG: /etc/aqueduct/aqueduct.kafka.toml
-    volumes:
-      - ./config/aqueduct.kafka.example.toml:/etc/aqueduct/aqueduct.kafka.toml:ro
-      - aqueduct-kafka-state:/var/lib/aqueduct
-    restart: unless-stopped
-
 volumes:
   pgdata:
   aqueduct-state:
-  aqueduct-kafka-state:
