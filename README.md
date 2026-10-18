@@ -1,9 +1,11 @@
 # Aqueduct
 
-Postgres change-data-capture (CDC) over logical replication (`pgoutput`), written in Rust and
-built to run **only in a container**. Aqueduct streams row-level changes to a sink with
-at-least-once delivery: the LSN is checkpointed and acknowledged to Postgres only after the sink succeeds.
+Change-data-capture (CDC) written in Rust and built to run **only in a container**. Aqueduct reads
+changes from a source (**Postgres** logical replication via `pgoutput`, **Kafka** topics, or **MongoDB**
+change streams) and streams them to a sink with at-least-once delivery: the source position (Postgres LSN,
+Kafka offsets, Mongo resume token) is checkpointed and acknowledged only after the sink succeeds.
 
+- Sources: **Postgres** (default), **Kafka**, **MongoDB**, chosen with `[source] type`; a top-level `[postgres]` table still works
 - Sink: **Kafka** (the only sink), with per-table topic routing
 - **Admin cockpit**: live throughput, lag, latency, per-table stats and an event inspector
 - Distroless, non-root image; state in one volume
@@ -34,7 +36,8 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 |-----|---------|---------|
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
-| `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically |
+| `source.type` | `postgres` | `postgres`, `kafka` or `mongodb`. Without a `[source]` table, `[postgres]` is used |
+| `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN, offsets or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_token` | unset | Protects `/api/*` when set. Override with `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Event inspector in the cockpit; reads recent events back from Kafka. Also needs `admin_token` |
@@ -62,6 +65,10 @@ topic = "orders-events"
 match = "*.audit_*"                   # any schema, tables starting with audit_
 topic = "audit"
 ```
+
+### Kafka source
+
+`[source] type = "kafka"` with `brokers`, `topics` (`*` wildcard), optional `start_at` (`earliest` default, or `latest`), `format` (`auto` or `raw`), `tls`, `tls_ca_file` and SASL keys. The position is the per-partition offsets, kept in Aqueduct's checkpoint (no consumer group). Details in `docs/DEPLOYMENT.md`; integration test: `crates/aqueduct-source-kafka/tests/broker.rs`.
 
 ### MongoDB source
 
@@ -110,7 +117,7 @@ so always set a token and keep the port off untrusted networks.
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source) ·
+Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source), `aqueduct-source-kafka`, `aqueduct-source-mongodb` ·
 `aqueduct-sinks` (Kafka sink + inspector reader) · `aqueduct` (binary: config, checkpoint, admin server and UI).
 See `CLAUDE.md` for contributor and agent notes.
 

@@ -4,15 +4,17 @@ Guidance for Claude Code and other agents working in this repository.
 
 ## What this is
 
-Aqueduct: Postgres CDC (logical replication, `pgoutput`) in Rust. **Container-only**: it must always run in
+Aqueduct: CDC in Rust. Sources are Postgres (logical replication, `pgoutput`), Kafka and MongoDB, picked by `[source] type`; Kafka is the only sink. **Container-only**: it must always run in
 a container (Docker or Podman). Keep every feature working inside the distroless, non-root image.
 
 ## Crates
 
 | Crate | Role |
 |-------|------|
-| `aqueduct-core` | `ChangeEvent`/`Lsn`/`Op`, `Source`/`Sink`/`CheckpointStore` traits, `run_pipeline`, `Metrics` |
+| `aqueduct-core` | `ChangeEvent`/`Position` (`Lsn(u64)` or `Text`)/`Op`, `Source`/`Sink`/`CheckpointStore` traits, `run_pipeline`, `Metrics` |
 | `aqueduct-source-postgres` | Pure pgoutput decoder (`decoder.rs`) and the polling `Source` (`source.rs`) |
+| `aqueduct-source-kafka` | Kafka source (`rskafka`): topics, per-partition offsets as the `Position`, TLS/SASL shared with the sink |
+| `aqueduct-source-mongodb` | MongoDB change-stream source; resume token as the `Position` |
 | `aqueduct-sinks` | Kafka sink and the Kafka-backed event inspector reader (`rskafka`, pure Rust). Kafka is the only sink |
 | `aqueduct` | Binary: TOML config, file checkpoint, admin HTTP server (`admin.rs`, `admin.html`, `admin.css`) |
 
@@ -33,6 +35,7 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
 
 - **At-least-once**: the pipeline checkpoints and acks the source only after `sink.send` and `flush` succeed.
   Sinks must tolerate redelivery; never ack earlier for speed.
+- **Positions**: sources own their `Position` encoding. The event JSON field is still `lsn`, and text positions are checkpointed as `~<text>`. Adding a source = new crate, a `SourceConfig` variant in `config.rs` and a match arm in `main.rs`. SQL Server and Redis were dropped on purpose.
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.
 - Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it.
