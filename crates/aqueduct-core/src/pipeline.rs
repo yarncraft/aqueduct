@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{ChangeEvent, Lsn, Metrics, State};
 
@@ -46,6 +46,11 @@ pub trait CheckpointStore: Send {
     async fn load(&mut self) -> Result<Option<Lsn>>;
     async fn save(&mut self, lsn: Lsn) -> Result<()>;
 }
+
+/// A sink call that takes longer than this is treated as a failure, so a hung broker or
+/// endpoint cannot stall the pipeline silently. The process exits and is restarted by the
+/// orchestrator; the event is redelivered (at-least-once).
+const SINK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Drive `source` -> `sink` until the stream ends or `shutdown` flips to true.
 /// The LSN is checkpointed and acked only after the sink succeeds.
@@ -96,8 +101,13 @@ async fn drive(
             },
         };
         let began = Instant::now();
-        sink.send(&event).await?;
-        sink.flush().await?;
+        let delivered = tokio::time::timeout(SINK_TIMEOUT, async {
+            sink.send(&event).await?;
+            sink.flush().await
+        })
+        .await
+        .map_err(|_| Error::Sink(format!("sink timed out after {}s", SINK_TIMEOUT.as_secs())))?;
+        delivered?;
         metrics.record_event(&event, began.elapsed());
         store.save(event.lsn).await?;
         source.ack(event.lsn).await?;

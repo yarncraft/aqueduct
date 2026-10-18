@@ -1,15 +1,11 @@
-//! Built-in [`Sink`](aqueduct_core::Sink) implementations: stdout, JSON-lines
-//! file, HTTP webhook, and Kafka. All encode events as one JSON object per event.
+//! The Kafka [`Sink`](aqueduct_core::Sink) (the only sink) and the Kafka-backed
+//! event inspector. Events are encoded as one JSON object per record.
 
-mod file;
+mod inspect;
 mod kafka;
-mod stdout;
-mod webhook;
 
-pub use file::FileSink;
-pub use kafka::{KafkaRoute, KafkaSink, TopicRouter};
-pub use stdout::StdoutSink;
-pub use webhook::WebhookSink;
+pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
+pub use kafka::{KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, SaslMechanism, TopicRouter};
 
 use aqueduct_core::{ChangeEvent, Error, Result};
 

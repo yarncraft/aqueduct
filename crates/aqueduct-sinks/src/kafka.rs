@@ -4,8 +4,85 @@ use std::sync::Arc;
 use aqueduct_core::{ChangeEvent, Error, Result, Sink};
 use async_trait::async_trait;
 use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
-use rskafka::client::{Client, ClientBuilder};
+use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
 use rskafka::record::Record;
+
+/// SASL mechanism for broker authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaslMechanism {
+    Plain,
+    ScramSha256,
+    ScramSha512,
+}
+
+impl std::str::FromStr for SaslMechanism {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "plain" => Ok(Self::Plain),
+            "scram-sha-256" => Ok(Self::ScramSha256),
+            "scram-sha-512" => Ok(Self::ScramSha512),
+            o => Err(format!(
+                "unknown sasl mechanism `{o}` (expected plain, scram-sha-256 or scram-sha-512)"
+            )),
+        }
+    }
+}
+
+/// Broker credentials. The password is never included in `Debug` output.
+#[derive(Clone)]
+pub struct KafkaSasl {
+    pub mechanism: SaslMechanism,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for KafkaSasl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSasl")
+            .field("mechanism", &self.mechanism)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Transport security for the broker connection.
+#[derive(Debug, Clone, Default)]
+pub struct KafkaSecurity {
+    /// Encrypt with TLS and verify the broker certificate and hostname.
+    pub tls: bool,
+    /// PEM CA bundle; defaults to the bundled public roots.
+    pub tls_ca_file: Option<String>,
+    pub sasl: Option<KafkaSasl>,
+}
+
+impl KafkaSecurity {
+    pub(crate) fn apply(&self, mut builder: ClientBuilder) -> Result<ClientBuilder> {
+        if self.sasl.is_some() && !self.tls {
+            tracing::warn!(
+                "kafka SASL without TLS: credentials are sent unencrypted; set tls = true"
+            );
+        }
+        if self.tls {
+            let cfg = aqueduct_tls::client_config(
+                self.tls_ca_file.as_deref(),
+                aqueduct_tls::Verify::Full,
+            )
+            .map_err(Error::Config)?;
+            builder = builder.tls_config(cfg);
+        }
+        if let Some(s) = &self.sasl {
+            let creds = Credentials::new(s.username.clone(), s.password.clone());
+            builder = builder.sasl_config(match s.mechanism {
+                SaslMechanism::Plain => SaslConfig::Plain(creds),
+                SaslMechanism::ScramSha256 => SaslConfig::ScramSha256(creds),
+                SaslMechanism::ScramSha512 => SaslConfig::ScramSha512(creds),
+            });
+        }
+        Ok(builder)
+    }
+}
 
 /// Sends events whose `schema.table` matches `pattern` to `topic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +126,22 @@ impl TopicRouter {
     }
 }
 
+impl TopicRouter {
+    /// Globs matching every topic this router can produce to: each route and the
+    /// default topic, with `{schema}`/`{table}` placeholders turned into `*`.
+    pub fn topic_globs(&self) -> Vec<String> {
+        let wild = |t: &str| t.replace("{schema}", "*").replace("{table}", "*");
+        self.routes
+            .iter()
+            .map(|r| r.topic.as_str())
+            .chain(self.default.as_deref())
+            .map(wild)
+            .collect()
+    }
+}
+
 /// `*` matches any run of characters (including none and dots); everything else is literal.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == text;
@@ -93,8 +184,10 @@ impl KafkaSink {
         brokers: Vec<String>,
         router: TopicRouter,
         new_topic_partitions: i32,
+        security: &KafkaSecurity,
     ) -> Result<Self> {
-        let client = ClientBuilder::new(brokers)
+        let client = security
+            .apply(ClientBuilder::new(brokers))?
             .build()
             .await
             .map_err(|e| err("connect", &e))?;
@@ -231,6 +324,48 @@ mod tests {
     }
 
     #[test]
+    fn sasl_debug_redacts_password() {
+        let s = KafkaSasl {
+            mechanism: SaslMechanism::ScramSha512,
+            username: "svc".into(),
+            password: "hunter2".into(),
+        };
+        let d = format!("{s:?}");
+        assert!(d.contains("svc") && !d.contains("hunter2"));
+    }
+
+    #[test]
+    fn sasl_mechanism_parsing() {
+        assert_eq!(
+            "SCRAM-SHA-256".parse::<SaslMechanism>(),
+            Ok(SaslMechanism::ScramSha256)
+        );
+        assert!("gssapi".parse::<SaslMechanism>().is_err());
+    }
+
+    #[test]
+    fn security_builds_with_tls_and_sasl() {
+        let sec = KafkaSecurity {
+            tls: true,
+            tls_ca_file: None,
+            sasl: Some(KafkaSasl {
+                mechanism: SaslMechanism::Plain,
+                username: "u".into(),
+                password: "p".into(),
+            }),
+        };
+        assert!(sec.apply(ClientBuilder::new(vec!["b:9093".into()])).is_ok());
+        let bad = KafkaSecurity {
+            tls: true,
+            tls_ca_file: Some("/nope.pem".into()),
+            sasl: None,
+        };
+        assert!(bad
+            .apply(ClientBuilder::new(vec!["b:9093".into()]))
+            .is_err());
+    }
+
+    #[test]
     fn partition_is_stable_and_in_range() {
         for k in ["public.users", "public.orders", "sales.items"] {
             let p = partition_index(k, 6);
@@ -277,6 +412,16 @@ mod tests {
         assert_eq!(r.topic_for("public", "users").unwrap(), "pub.users");
         assert_eq!(r.topic_for("hr", "audit_log").unwrap(), "audit");
         assert_eq!(r.topic_for("hr", "staff").unwrap(), "cdc.hr.staff");
+    }
+
+    #[test]
+    fn topic_globs_cover_routes_and_default() {
+        let r = TopicRouter::new(
+            vec![route("public.orders", "orders-events")],
+            Some("cdc.{schema}.{table}".into()),
+        )
+        .unwrap();
+        assert_eq!(r.topic_globs(), vec!["orders-events", "cdc.*.*"]);
     }
 
     #[test]
