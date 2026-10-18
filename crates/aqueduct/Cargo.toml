@@ -1,0 +1,14 @@
+[package]
+name = "aqueduct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aqueduct-core = { path = "../aqueduct-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
