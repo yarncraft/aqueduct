@@ -45,6 +45,7 @@ pub struct Metrics {
     sink_us_last: AtomicU64,
     sink_us_max: AtomicU64,
     tables: Mutex<BTreeMap<String, u64>>,
+    table_ops: Mutex<BTreeMap<String, [u64; 4]>>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -72,6 +73,8 @@ pub struct Snapshot {
     pub sink_last_ms: f64,
     pub sink_max_ms: f64,
     pub tables: BTreeMap<String, u64>,
+    /// Per table counts as `[insert, update, delete, truncate]`.
+    pub table_ops: BTreeMap<String, [u64; 4]>,
     pub last_error: Option<String>,
 }
 
@@ -100,6 +103,7 @@ impl Metrics {
             sink_us_last: AtomicU64::new(0),
             sink_us_max: AtomicU64::new(0),
             tables: Mutex::new(BTreeMap::new()),
+            table_ops: Mutex::new(BTreeMap::new()),
             last_error: Mutex::new(None),
         }
     }
@@ -134,6 +138,16 @@ impl Metrics {
             let mut t = self.tables.lock().unwrap();
             *t.entry(format!("{}.{}", ev.schema, ev.table)).or_default() += 1;
         }
+        {
+            let slot = match ev.op {
+                Op::Insert => 0,
+                Op::Update => 1,
+                Op::Delete => 2,
+                Op::Truncate => 3,
+            };
+            let mut t = self.table_ops.lock().unwrap();
+            t.entry(format!("{}.{}", ev.schema, ev.table)).or_default()[slot] += 1;
+        }
     }
 
     pub fn record_error(&self, msg: impl Into<String>) {
@@ -166,6 +180,7 @@ impl Metrics {
             sink_last_ms: self.sink_us_last.load(Relaxed) as f64 / 1000.0,
             sink_max_ms: self.sink_us_max.load(Relaxed) as f64 / 1000.0,
             tables: self.tables.lock().unwrap().clone(),
+            table_ops: self.table_ops.lock().unwrap().clone(),
             last_error: self.last_error.lock().unwrap().clone(),
         }
     }
@@ -204,6 +219,8 @@ mod tests {
             (3, 2, 1, 1)
         );
         assert_eq!(s.tables["public.a"], 2);
+        assert_eq!(s.table_ops["public.a"], [2, 0, 0, 0]);
+        assert_eq!(s.table_ops["public.b"], [0, 0, 1, 0]);
         assert_eq!(s.last_lsn.as_deref(), Some("0/C"));
         assert!((s.sink_avg_ms - 4.0).abs() < 0.01);
         assert!((s.sink_max_ms - 6.0).abs() < 0.01);

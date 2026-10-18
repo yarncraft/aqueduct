@@ -15,7 +15,7 @@
 //! Defensive limits: request read timeout, a cap on concurrent connections and on SSE streams,
 //! write timeouts, constant-time token comparison and standard security headers.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,8 @@ pub struct Admin {
     token: Option<String>,
     /// Events/second, one sample per second, oldest first.
     history: Mutex<VecDeque<f64>>,
+    /// Per table `[insert, update, delete, truncate]` events/second, aligned with `history`.
+    detail: Mutex<BTreeMap<String, VecDeque<[u64; 4]>>>,
     streams: AtomicUsize,
     inspector: Option<KafkaInspector>,
     inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
@@ -67,6 +69,7 @@ impl Admin {
             metrics,
             token: token.filter(|t| !t.is_empty()),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
+            detail: Mutex::new(BTreeMap::new()),
             streams: AtomicUsize::new(0),
             inspector,
             inspect_cache: tokio::sync::Mutex::new(None),
@@ -77,14 +80,39 @@ impl Admin {
     pub async fn sample_forever(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last = self.metrics.events_total();
+        let mut last_ops: BTreeMap<String, [u64; 4]> = BTreeMap::new();
         loop {
             tick.tick().await;
             let now = self.metrics.events_total();
-            let mut h = self.history.lock().unwrap();
-            if h.len() == HISTORY_LEN {
-                h.pop_front();
+            let ops = self.metrics.snapshot().table_ops;
+            {
+                let mut h = self.history.lock().unwrap();
+                if h.len() == HISTORY_LEN {
+                    h.pop_front();
+                }
+                h.push_back(now.saturating_sub(last) as f64);
+                let len = h.len();
+                let mut d = self.detail.lock().unwrap();
+                for (t, c) in &ops {
+                    let prev = last_ops.get(t).copied().unwrap_or_default();
+                    let mut delta = [0u64; 4];
+                    for i in 0..4 {
+                        delta[i] = c[i].saturating_sub(prev[i]);
+                    }
+                    let series = d.entry(t.clone()).or_default();
+                    // A table seen for the first time is zero-filled back to the window start.
+                    while series.len() + 1 < len {
+                        series.push_back([0; 4]);
+                    }
+                    series.push_back(delta);
+                }
+                for series in d.values_mut() {
+                    while series.len() > HISTORY_LEN {
+                        series.pop_front();
+                    }
+                }
             }
-            h.push_back(now.saturating_sub(last) as f64);
+            last_ops = ops;
             last = now;
         }
     }
@@ -95,6 +123,7 @@ impl Admin {
         let mut v = serde_json::to_value(self.metrics.snapshot()).unwrap_or_default();
         v["events_per_sec"] = json!(rate);
         v["history"] = json!(history);
+        v["history_ops"] = json!(*self.detail.lock().unwrap());
         v["inspector"] = json!(self.inspector.is_some());
         v.to_string()
     }
