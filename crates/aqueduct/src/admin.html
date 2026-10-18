@@ -1,147 +1,193 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="bg-ink-900">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aqueduct cockpit</title>
-<style>
-  :root { --bg:#0f1318; --panel:#171d25; --line:#232c38; --fg:#e6ebf2; --mute:#8896a8;
-          --ok:#3ecf8e; --warn:#f5a524; --bad:#f2555a; --acc:#4aa3ff;
-          --ins:#3ecf8e; --upd:#4aa3ff; --del:#f2555a; --trn:#c28bff; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,Segoe UI,sans-serif; }
-  header { display:flex; align-items:center; gap:14px; padding:14px 22px; border-bottom:1px solid var(--line); }
-  header h1 { font-size:17px; margin:0; letter-spacing:.3px; }
-  .pill { padding:3px 10px; border-radius:99px; font-size:12px; font-weight:600; background:#2a3340; }
-  .pill.streaming { background:#143826; color:var(--ok); }
-  .pill.starting { background:#3a2e12; color:var(--warn); }
-  .pill.failed { background:#3d1a1c; color:var(--bad); }
-  .pill.stopped { background:#2a3340; color:var(--mute); }
-  .conn { margin-left:auto; color:var(--mute); font-size:12px; }
-  .conn i { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--bad); margin-right:6px; }
-  .conn.live i { background:var(--ok); }
-  main { padding:20px 22px; display:grid; gap:16px; max-width:1200px; margin:0 auto; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
-  .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
-  .card .k { color:var(--mute); font-size:12px; text-transform:uppercase; letter-spacing:.6px; }
-  .card .v { font-size:26px; font-weight:650; margin-top:4px; font-variant-numeric:tabular-nums; }
-  .card .s { color:var(--mute); font-size:12px; margin-top:2px; }
-  .panel h2 { margin:0 0 10px; font-size:13px; color:var(--mute); text-transform:uppercase; letter-spacing:.6px; }
-  .grid2 { display:grid; grid-template-columns:2fr 1fr; gap:16px; }
-  @media (max-width:800px){ .grid2{ grid-template-columns:1fr; } }
-  svg { width:100%; height:180px; display:block; }
-  .bar { display:flex; height:14px; border-radius:7px; overflow:hidden; background:#222a35; margin-bottom:10px; }
-  .legend { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; font-size:13px; }
-  .legend b { font-variant-numeric:tabular-nums; float:right; }
-  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
-  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
-  td, th { text-align:left; padding:7px 4px; border-bottom:1px solid var(--line); }
-  th { color:var(--mute); font-weight:500; font-size:12px; }
-  td.n { text-align:right; }
-  .share { height:6px; border-radius:3px; background:var(--acc); }
-  .err { color:var(--bad); font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; word-break:break-word; }
-  .muted { color:var(--mute); }
-</style>
+<title>Aqueduct · Operations</title>
+<link rel="stylesheet" href="/admin.css">
 </head>
-<body>
-<header>
-  <h1>🐝 Aqueduct cockpit</h1>
-  <span id="state" class="pill starting">starting</span>
-  <span id="conn" class="conn"><i></i><span>connecting…</span></span>
-</header>
-<main>
-  <section class="cards">
-    <div class="card"><div class="k">Throughput</div><div class="v" id="rate">0</div><div class="s">events / sec</div></div>
-    <div class="card"><div class="k">Total events</div><div class="v" id="total">0</div><div class="s" id="lsn">no events yet</div></div>
-    <div class="card"><div class="k">Replication lag</div><div class="v" id="lag">–</div><div class="s">commit → delivered</div></div>
-    <div class="card"><div class="k">Sink latency</div><div class="v" id="sinkavg">–</div><div class="s" id="sinkdet">avg per event</div></div>
-    <div class="card"><div class="k">Errors</div><div class="v" id="errors">0</div><div class="s" id="uptime">uptime 0s</div></div>
-  </section>
+<body class="min-h-screen bg-ink-900 font-sans text-sm text-ink-200 antialiased">
 
-  <section class="grid2">
-    <div class="panel"><h2>Events / sec (last 2 min)</h2><svg id="chart" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
-    <div class="panel">
-      <h2>By operation</h2>
-      <div class="bar" id="opbar"></div>
-      <div class="legend" id="oplegend"></div>
+<!-- Top bar -->
+<header class="sticky top-0 z-10 flex h-12 items-center gap-4 border-b border-ink-600 bg-ink-950 px-5">
+  <div class="flex items-center gap-2.5">
+    <svg viewBox="0 0 24 24" class="h-5 w-5 text-blue" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 18h18M5 18V9a3 3 0 0 1 6 0v9m2 0V9a3 3 0 0 1 6 0v9"/></svg>
+    <span class="text-[13px] font-semibold uppercase tracking-[0.18em] text-ink-100">Aqueduct</span>
+    <span class="text-ink-500">/</span>
+    <span class="text-[12px] uppercase tracking-widest text-ink-300">Stream operations</span>
+  </div>
+  <span id="state" class="ml-2 inline-flex items-center gap-1.5 rounded-sm border border-ink-600 bg-ink-800 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider text-ink-200">
+    <i id="state-dot" class="h-1.5 w-1.5 rounded-full bg-amber"></i><span id="state-text">starting</span>
+  </span>
+  <div class="ml-auto flex items-center gap-5 font-mono text-[11px] uppercase tracking-wider text-ink-300">
+    <span>Uptime <b id="uptime" class="font-medium text-ink-100">0s</b></span>
+    <span id="conn" class="inline-flex items-center gap-1.5"><i id="conn-dot" class="h-1.5 w-1.5 rounded-full bg-red"></i><span id="conn-text">connecting</span></span>
+  </div>
+</header>
+
+<main class="mx-auto max-w-[1400px] space-y-4 p-5">
+
+  <!-- KPI strip -->
+  <section class="grid grid-cols-2 gap-px overflow-hidden rounded-sm border border-ink-600 bg-ink-600 lg:grid-cols-5">
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Throughput</div>
+      <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="rate">0</span><span class="ml-1 text-xs text-ink-300">evt/s</span></div>
+      <div class="mt-1 font-mono text-[11px] text-ink-300">peak <span id="peak" class="text-ink-200">0</span> /s</div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Events delivered</div>
+      <div id="total" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
+      <div class="mt-1 truncate font-mono text-[11px] text-ink-300">LSN <span id="lsn" class="text-ink-200">–</span></div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">End-to-end lag</div>
+      <div id="lag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+      <div class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
+      <div id="sinkavg" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+      <div id="sinkdet" class="mt-1 font-mono text-[11px] text-ink-300">mean per event</div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
+      <div id="errors" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
+      <div id="errsub" class="mt-1 font-mono text-[11px] text-ink-300">no faults</div>
     </div>
   </section>
 
-  <section class="panel">
-    <h2>Tables</h2>
-    <table><thead><tr><th>Table</th><th class="n">Events</th><th style="width:35%">Share</th></tr></thead><tbody id="tables"></tbody></table>
+  <!-- Chart + operations -->
+  <section class="grid gap-4 lg:grid-cols-3">
+    <div class="rounded-sm border border-ink-600 bg-ink-800 lg:col-span-2">
+      <div class="flex items-center justify-between border-b border-ink-600 px-4 py-2.5">
+        <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Event rate</h2>
+        <span class="font-mono text-[11px] text-ink-300">last 120 s · 1 s resolution</span>
+      </div>
+      <svg id="chart" viewBox="0 0 800 220" preserveAspectRatio="none" class="block h-56 w-full"></svg>
+    </div>
+
+    <div class="rounded-sm border border-ink-600 bg-ink-800">
+      <div class="border-b border-ink-600 px-4 py-2.5">
+        <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Operations</h2>
+      </div>
+      <div class="space-y-4 p-4">
+        <div id="opbar" class="flex h-2 overflow-hidden rounded-sm bg-ink-700"></div>
+        <ul class="space-y-2.5 font-mono text-[12px]">
+          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-green"></i><span class="text-ink-200">INSERT</span><b id="op-inserts" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-inserts" class="w-12 text-right text-ink-300">–</span></li>
+          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-blue"></i><span class="text-ink-200">UPDATE</span><b id="op-updates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-updates" class="w-12 text-right text-ink-300">–</span></li>
+          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-red"></i><span class="text-ink-200">DELETE</span><b id="op-deletes" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-deletes" class="w-12 text-right text-ink-300">–</span></li>
+          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-violet"></i><span class="text-ink-200">TRUNCATE</span><b id="op-truncates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-truncates" class="w-12 text-right text-ink-300">–</span></li>
+        </ul>
+      </div>
+    </div>
   </section>
 
-  <section class="panel" id="errpanel" hidden>
-    <h2>Last error</h2>
-    <div class="err" id="lasterr"></div>
+  <!-- Tables -->
+  <section class="rounded-sm border border-ink-600 bg-ink-800">
+    <div class="flex items-center justify-between border-b border-ink-600 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Replicated tables</h2>
+      <span id="tablecount" class="font-mono text-[11px] text-ink-300">0 tables</span>
+    </div>
+    <table class="w-full text-left">
+      <thead>
+        <tr class="border-b border-ink-600 text-[11px] uppercase tracking-widest text-ink-300">
+          <th class="px-4 py-2 font-medium">Relation</th>
+          <th class="px-4 py-2 text-right font-medium">Events</th>
+          <th class="w-1/3 px-4 py-2 font-medium">Share of stream</th>
+        </tr>
+      </thead>
+      <tbody id="tables" class="font-mono text-[12px]"></tbody>
+    </table>
   </section>
+
+  <!-- Last error -->
+  <section id="errpanel" hidden class="rounded-sm border border-red/40 bg-red/5">
+    <div class="border-b border-red/30 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-red">Last fault</h2>
+    </div>
+    <pre id="lasterr" class="whitespace-pre-wrap break-words p-4 font-mono text-[12px] text-red"></pre>
+  </section>
+
+  <footer class="pb-2 font-mono text-[11px] text-ink-500">Aqueduct · Postgres change data capture · stream refreshes every second</footer>
 </main>
+
 <script>
 const $ = id => document.getElementById(id);
 const token = new URLSearchParams(location.search).get('token');
 const qs = token ? '?token=' + encodeURIComponent(token) : '';
-const OPS = [['inserts','insert','--ins'],['updates','update','--upd'],['deletes','delete','--del'],['truncates','truncate','--trn']];
-const fmt = n => n.toLocaleString();
-const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : Math.floor(s/3600) + 'h ' + Math.floor(s%3600/60) + 'm';
-const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v/1000).toFixed(1) + ' s';
-const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const OPS = ['inserts', 'updates', 'deletes', 'truncates'];
+const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet' };
+const fmt = n => n.toLocaleString('en-US');
+const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
+const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red', stopped: 'bg-ink-300' };
+const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
 function chart(h) {
-  const W = 600, H = 180, P = 4, max = Math.max(5, ...h);
+  const W = 800, H = 220, PL = 34, PR = 8, PT = 10, PB = 8;
+  const max = Math.max(5, ...h);
   const n = Math.max(h.length, 2);
-  const x = i => P + (W - 2*P) * i / (n - 1);
-  const y = v => H - P - (H - 2*P) * v / max;
-  const pts = h.map((v, i) => x(i) + ',' + y(v)).join(' ');
+  const x = i => PL + (W - PL - PR) * i / (n - 1);
+  const y = v => H - PB - (H - PT - PB) * v / max;
   let g = '';
   for (let i = 0; i <= 4; i++) {
-    const yy = P + (H - 2*P) * i / 4;
-    g += `<line x1="0" x2="${W}" y1="${yy}" y2="${yy}" stroke="#232c38"/>`;
-    g += `<text x="6" y="${yy - 3}" fill="#8896a8" font-size="11">${Math.round(max * (1 - i/4))}</text>`;
+    const yy = PT + (H - PT - PB) * i / 4;
+    g += `<line x1="${PL}" x2="${W - PR}" y1="${yy}" y2="${yy}" stroke="#2f343c" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+    g += `<text x="${PL - 6}" y="${yy + 3}" text-anchor="end" fill="#738091" font-size="10" font-family="ui-monospace,Consolas,monospace">${Math.round(max * (1 - i / 4))}</text>`;
   }
-  $('chart').innerHTML = g + (h.length > 1
-    ? `<polygon points="${x(0)},${H-P} ${pts} ${x(h.length-1)},${H-P}" fill="#4aa3ff22"/>` +
-      `<polyline points="${pts}" fill="none" stroke="#4aa3ff" stroke-width="2" vector-effect="non-scaling-stroke"/>` : '');
+  if (h.length > 1) {
+    const pts = h.map((v, i) => x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+    g += `<polygon points="${x(0)},${H - PB} ${pts} ${x(h.length - 1)},${H - PB}" fill="#4c90f0" fill-opacity="0.12"/>`;
+    g += `<polyline points="${pts}" fill="none" stroke="#4c90f0" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  }
+  $('chart').innerHTML = g;
 }
 
 function render(d) {
-  const st = $('state'); st.textContent = d.state; st.className = 'pill ' + d.state;
+  $('state-text').textContent = d.state;
+  $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
+  $('uptime').textContent = dur(d.uptime_secs);
+
   $('rate').textContent = fmt(d.events_per_sec);
+  $('peak').textContent = fmt(Math.max(0, ...d.history));
   $('total').textContent = fmt(d.events_total);
-  $('lsn').textContent = d.last_lsn ? 'last LSN ' + d.last_lsn : 'no events yet';
+  $('lsn').textContent = d.last_lsn || '–';
   $('lag').textContent = d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
   $('sinkavg').textContent = d.events_total ? ms(d.sink_avg_ms) : '–';
-  $('sinkdet').textContent = d.events_total ? `last ${ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'avg per event';
+  $('sinkdet').textContent = d.events_total ? `last ${ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'mean per event';
   $('errors').textContent = fmt(d.errors);
-  $('errors').style.color = d.errors ? 'var(--bad)' : '';
-  $('uptime').textContent = 'uptime ' + dur(d.uptime_secs);
+  $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
+  $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
   chart(d.history);
 
-  const total = OPS.reduce((a, [k]) => a + d[k], 0);
-  $('opbar').innerHTML = OPS.map(([k,, c]) => d[k] ? `<div style="width:${100*d[k]/total}%;background:var(${c})"></div>` : '').join('');
-  $('oplegend').innerHTML = OPS.map(([k, label, c]) => `<div><span class="dot" style="background:var(${c})"></span>${label}<b>${fmt(d[k])}</b></div>`).join('');
+  const total = OPS.reduce((a, k) => a + d[k], 0);
+  $('opbar').innerHTML = OPS.map(k => d[k] ? `<div class="${OPBAR[k]}" style="width:${100 * d[k] / total}%"></div>` : '').join('');
+  for (const k of OPS) {
+    $('op-' + k).textContent = fmt(d[k]);
+    $('pc-' + k).textContent = total ? (100 * d[k] / total).toFixed(1) + '%' : '–';
+  }
 
   const rows = Object.entries(d.tables).sort((a, b) => b[1] - a[1]);
+  $('tablecount').textContent = rows.length + (rows.length === 1 ? ' table' : ' tables');
   $('tables').innerHTML = rows.length ? rows.map(([t, n]) =>
-    `<tr><td>${esc(t)}</td><td class="n">${fmt(n)}</td><td><div class="share" style="width:${100*n/d.events_total}%"></div></td></tr>`).join('')
-    : '<tr><td colspan="3" class="muted">no events yet</td></tr>';
+    `<tr class="border-b border-ink-700 last:border-0 hover:bg-ink-700/50"><td class="px-4 py-2 text-ink-100">${esc(t)}</td><td class="px-4 py-2 text-right tabular-nums text-ink-100">${fmt(n)}</td><td class="px-4 py-2"><div class="flex items-center gap-2"><div class="h-1.5 flex-1 rounded-sm bg-ink-700"><div class="h-1.5 rounded-sm bg-blue-d" style="width:${100 * n / d.events_total}%"></div></div><span class="w-12 text-right text-ink-300">${(100 * n / d.events_total).toFixed(1)}%</span></div></td></tr>`).join('')
+    : '<tr><td colspan="3" class="px-4 py-6 text-center text-ink-300">No events received yet</td></tr>';
 
   $('errpanel').hidden = !d.last_error;
   if (d.last_error) $('lasterr').textContent = d.last_error;
 }
 
 function setConn(live, text) {
-  $('conn').className = 'conn' + (live ? ' live' : '');
-  $('conn').lastChild.textContent = text;
+  $('conn-dot').className = DOT_BASE + (live ? 'bg-green' : 'bg-red');
+  $('conn-text').textContent = text;
 }
 
-function connect() {
-  const es = new EventSource('/api/stream' + qs);
-  es.onopen = () => setConn(true, 'live');
-  es.onmessage = e => render(JSON.parse(e.data));
-  es.onerror = () => { setConn(false, 'reconnecting…'); };
-}
-connect();
+const es = new EventSource('/api/stream' + qs);
+es.onopen = () => setConn(true, 'live');
+es.onmessage = e => render(JSON.parse(e.data));
+es.onerror = () => setConn(false, 'reconnecting');
 </script>
 </body>
 </html>
