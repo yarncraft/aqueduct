@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aqueduct-core", "crates/aqueduct"]
+members = ["crates/aqueduct-core", "crates/aqueduct", "crates/aqueduct-sinks"]
 
 [workspace.package]
 version = "0.1.0"

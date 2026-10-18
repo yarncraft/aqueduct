@@ -25,6 +25,9 @@ pub struct PostgresConfig {
 pub enum SinkConfig {
     #[default]
     Stdout,
+    File {
+        path: String,
+    },
     Webhook {
         url: String,
     },

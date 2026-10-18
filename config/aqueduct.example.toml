@@ -1,0 +1,15 @@
+health_addr = "0.0.0.0:8080"
+checkpoint_path = "/var/lib/aqueduct/checkpoint"
+
+[postgres]
+url = "postgres://aqueduct:aqueduct@postgres:5432/app?replication=database"
+slot = "aqueduct"
+publication = "aqueduct"
+
+# Sinks: stdout (default) | file | webhook
+[sink]
+type = "stdout"
+# type = "file"
+# path = "/var/lib/aqueduct/events.jsonl"
+# type = "webhook"
+# url = "https://example.com/hooks/cdc"
