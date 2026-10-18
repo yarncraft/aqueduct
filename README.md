@@ -25,6 +25,8 @@ The compose file starts Postgres 16 with `wal_level=logical`, creates a `users` 
 
 ## Configuration
 
+Full deployment guide (Postgres setup, Docker/Kubernetes, every config key, operations, troubleshooting): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`). See
 `config/aqueduct.example.toml`. Mount your own file over it.
 

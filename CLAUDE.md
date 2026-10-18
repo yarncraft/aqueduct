@@ -56,7 +56,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 
 ## Conventions
 
-- Keep README.md current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes.
+- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes.
 - New sinks: implement `Sink` in `aqueduct-sinks`, add a `SinkConfig` variant in `config.rs`, wire it in `sink.rs`,
   add unit tests, document in the README table.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
