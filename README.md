@@ -49,6 +49,16 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
 
+### Try the Kafka sink
+
+```sh
+docker compose --profile kafka up --build kafka aqueduct-kafka   # also starts postgres
+docker compose exec postgres psql -U aqueduct app -c "INSERT INTO users(name) VALUES ('ada')"
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic cdc.public.users --from-beginning
+```
+
+`aqueduct-kafka` reads `config/aqueduct.kafka.example.toml` (own slot `aqueduct_kafka`, one topic per table) and publishes no host port. The default `docker compose up` is unchanged.
+
 ### Kafka topic routing
 
 Each event goes to the first `[[sink.routes]]` entry whose `match` fits its `schema.table` (`*` is a wildcard), otherwise to `topic`. Topic names may use `{schema}` and `{table}`. Topics are created on first use. An event that matches no route while `topic` is unset fails the pipeline rather than being dropped.

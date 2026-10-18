@@ -27,6 +27,38 @@ services:
       - "8080:8080"
     restart: unless-stopped
 
+  # Optional: `docker compose --profile kafka up --build kafka aqueduct-kafka`
+  kafka:
+    image: apache/kafka:latest
+    profiles: ["kafka"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+  aqueduct-kafka:
+    build: .
+    profiles: ["kafka"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      AQUEDUCT_CONFIG: /etc/aqueduct/aqueduct.kafka.toml
+    volumes:
+      - ./config/aqueduct.kafka.example.toml:/etc/aqueduct/aqueduct.kafka.toml:ro
+      - aqueduct-kafka-state:/var/lib/aqueduct
+    restart: unless-stopped
+
 volumes:
   pgdata:
   aqueduct-state:
+  aqueduct-kafka-state:
