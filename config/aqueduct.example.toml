@@ -2,7 +2,7 @@ health_addr = "0.0.0.0:8080"
 checkpoint_path = "/var/lib/aqueduct/checkpoint"
 
 [postgres]
-url = "postgres://aqueduct:aqueduct@postgres:5432/app?replication=database"
+url = "postgres://aqueduct:aqueduct@postgres:5432/app"
 slot = "aqueduct"
 publication = "aqueduct"
 
