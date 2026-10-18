@@ -17,9 +17,9 @@ pub(crate) fn encode(event: &ChangeEvent) -> Result<String> {
 
 #[cfg(test)]
 pub(crate) fn sample() -> ChangeEvent {
-    use aqueduct_core::{Lsn, Op};
+    use aqueduct_core::{Op, Position};
     ChangeEvent {
-        lsn: Lsn(0x16_B374_D848),
+        position: Position::Lsn(0x16_B374_D848),
         xid: 7,
         commit_ts_micros: 1_700_000_000_000_000,
         schema: "public".into(),

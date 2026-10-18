@@ -1,16 +1,46 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-/// Postgres log sequence number.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct Lsn(pub u64);
+/// Where an event sits in its source's change stream: the unit that is checkpointed and
+/// acked. Sources choose the representation; the pipeline only stores and hands it back.
+///
+/// `Lsn` is the Postgres log sequence number. `Text` is any other source's token (a Kafka
+/// offset map, a Mongo resume token, a SQL Server CDC LSN in hex...), kept as opaque text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Position {
+    Lsn(u64),
+    Text(String),
+}
 
-impl std::fmt::Display for Lsn {
+impl Position {
+    /// Durable text form for checkpoint files. Plain decimal digits stay an `Lsn`, so
+    /// checkpoints written before `Position` existed still load.
+    pub fn to_checkpoint(&self) -> String {
+        match self {
+            Position::Lsn(n) => n.to_string(),
+            Position::Text(t) => format!("~{t}"),
+        }
+    }
+
+    pub fn from_checkpoint(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        match s.strip_prefix('~') {
+            Some(t) => Ok(Position::Text(t.to_string())),
+            None => s
+                .parse::<u64>()
+                .map(Position::Lsn)
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Position {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFF_FFFF)
+        match self {
+            Position::Lsn(n) => write!(f, "{:X}/{:X}", n >> 32, n & 0xFFFF_FFFF),
+            Position::Text(t) => f.write_str(t),
+        }
     }
 }
 
@@ -26,7 +56,9 @@ pub enum Op {
 /// One row-level change, emitted at transaction commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {
-    pub lsn: Lsn,
+    /// Serialised as `lsn` to keep the wire format of existing consumers.
+    #[serde(rename = "lsn")]
+    pub position: Position,
     pub xid: u32,
     /// Commit timestamp, microseconds since the Unix epoch.
     pub commit_ts_micros: i64,

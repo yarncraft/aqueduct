@@ -30,7 +30,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    tracing::info!(slot = %cfg.postgres.slot, publication = %cfg.postgres.publication, "aqueduct starting");
+    let source_cfg = match cfg.source() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid source config");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(source = source_cfg.type_name(), "aqueduct starting");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let listener = TcpListener::bind(&cfg.health_addr)
@@ -51,19 +58,27 @@ async fn main() {
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin));
 
-    let source_cfg = match cfg.postgres.source_config() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "invalid postgres config");
+    let mut source: Box<dyn aqueduct_core::Source> = match source_cfg {
+        config::SourceConfig::Postgres(p) => match p.source_config() {
+            Ok(c) => Box::new(aqueduct_source_postgres::PostgresSource::new(c)),
+            Err(e) => {
+                tracing::error!(error = %e, "invalid postgres config");
+                std::process::exit(1);
+            }
+        },
+        other => {
+            tracing::error!(
+                source = other.type_name(),
+                "source type not implemented yet"
+            );
             std::process::exit(1);
         }
     };
-    let mut source = aqueduct_source_postgres::PostgresSource::new(source_cfg);
     let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());
 
     let mut pipeline = tokio::spawn(async move {
         aqueduct_core::run_pipeline_with_metrics(
-            &mut source,
+            &mut *source,
             &mut sink,
             &mut store,
             shutdown_rx,

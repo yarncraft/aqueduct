@@ -19,7 +19,12 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub postgres: PostgresConfig,
+    /// Shorthand for `[source] type = "postgres"`; kept so existing configs keep working.
+    #[serde(default)]
+    pub postgres: Option<PostgresConfig>,
+    /// The change source. Omit it to use the top-level `[postgres]` table.
+    #[serde(default)]
+    pub source: Option<SourceConfig>,
     /// The Kafka sink (the only sink).
     pub sink: KafkaConfig,
     #[serde(default = "default_health_addr")]
@@ -34,6 +39,33 @@ pub struct Config {
     pub inspector: bool,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
+}
+
+/// Which system changes are read from, picked by `type`. Only `postgres` is implemented so
+/// far; the other variants reserve their names so each source crate can be filled in without
+/// touching this enum's shape (their settings are carried as raw TOML until then).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SourceConfig {
+    Postgres(PostgresConfig),
+    // Placeholders: the raw table is not read until the source crate lands.
+    #[allow(dead_code)]
+    Kafka(toml::Table),
+    #[allow(dead_code)]
+    Sqlserver(toml::Table),
+    #[allow(dead_code)]
+    Mongodb(toml::Table),
+}
+
+impl SourceConfig {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            SourceConfig::Postgres(_) => "postgres",
+            SourceConfig::Kafka(_) => "kafka",
+            SourceConfig::Sqlserver(_) => "sqlserver",
+            SourceConfig::Mongodb(_) => "mongodb",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,10 +178,24 @@ impl Config {
             cfg.admin_token = Some(t);
         }
         if let Ok(url) = std::env::var("AQUEDUCT_PG_URL") {
-            cfg.postgres.url = url;
+            match (&mut cfg.postgres, &mut cfg.source) {
+                (Some(p), _) => p.url = url,
+                (None, Some(SourceConfig::Postgres(p))) => p.url = url,
+                _ => {}
+            }
         }
         cfg.apply_secret_env();
         Ok(cfg)
+    }
+
+    /// The configured source: `[source]`, or the legacy top-level `[postgres]` table.
+    pub fn source(&self) -> Result<SourceConfig, String> {
+        match (&self.source, &self.postgres) {
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(p)) => Ok(SourceConfig::Postgres(p.clone())),
+            (Some(_), Some(_)) => Err("set either [source] or [postgres], not both".into()),
+            (None, None) => Err("no source configured: add a [source] table".into()),
+        }
     }
 
     /// Credentials may come from the environment so they stay out of config files.
@@ -186,6 +232,61 @@ mod tests {
         .unwrap();
         let d = format!("{cfg:?}");
         assert!(!d.contains("hunter2") && d.contains("svc"));
+    }
+
+    const SINK: &str = "[sink]
+brokers = ['b:9092']
+topic = 't'
+";
+
+    #[test]
+    fn source_table_and_legacy_postgres_both_work() {
+        let legacy: Config = toml::from_str(&format!(
+            "[postgres]
+url='postgres://u@db/a'
+{SINK}"
+        ))
+        .unwrap();
+        assert_eq!(legacy.source().unwrap().type_name(), "postgres");
+        let new: Config = toml::from_str(&format!(
+            "[source]
+type='postgres'
+url='postgres://u@db/a'
+{SINK}"
+        ))
+        .unwrap();
+        assert_eq!(new.source().unwrap().type_name(), "postgres");
+        for t in ["kafka", "sqlserver", "mongodb"] {
+            let c: Config = toml::from_str(&format!(
+                "[source]
+type='{t}'
+{SINK}"
+            ))
+            .unwrap();
+            assert_eq!(c.source().unwrap().type_name(), t);
+        }
+    }
+
+    #[test]
+    fn source_requires_exactly_one_definition() {
+        let none: Config = toml::from_str(SINK).unwrap();
+        assert!(none.source().is_err());
+        let both: Config = toml::from_str(&format!(
+            "[postgres]
+url='x'
+[source]
+type='postgres'
+url='y'
+{SINK}"
+        ))
+        .unwrap();
+        assert!(both.source().is_err());
+        assert!(toml::from_str::<Config>(&format!(
+            "[source]
+type='redis'
+{SINK}"
+        ))
+        .is_err());
     }
 
     #[test]

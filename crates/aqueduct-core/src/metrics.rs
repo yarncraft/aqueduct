@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::{ChangeEvent, Lsn, Op};
+use crate::{ChangeEvent, Op};
 
 /// Pipeline lifecycle, shown on the admin cockpit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,7 +38,7 @@ pub struct Metrics {
     deletes: AtomicU64,
     truncates: AtomicU64,
     errors: AtomicU64,
-    last_lsn: AtomicU64,
+    last_position: Mutex<Option<String>>,
     last_commit_ts_micros: AtomicI64,
     last_event_unix_ms: AtomicU64,
     sink_us_total: AtomicU64,
@@ -93,7 +93,7 @@ impl Metrics {
             deletes: AtomicU64::new(0),
             truncates: AtomicU64::new(0),
             errors: AtomicU64::new(0),
-            last_lsn: AtomicU64::new(0),
+            last_position: Mutex::new(None),
             last_commit_ts_micros: AtomicI64::new(0),
             last_event_unix_ms: AtomicU64::new(0),
             sink_us_total: AtomicU64::new(0),
@@ -122,7 +122,7 @@ impl Metrics {
             Op::Truncate => &self.truncates,
         }
         .fetch_add(1, Relaxed);
-        self.last_lsn.store(ev.lsn.0, Relaxed);
+        *self.last_position.lock().unwrap() = Some(ev.position.to_string());
         self.last_commit_ts_micros
             .store(ev.commit_ts_micros, Relaxed);
         self.last_event_unix_ms.store(now_ms(), Relaxed);
@@ -143,7 +143,7 @@ impl Metrics {
 
     pub fn snapshot(&self) -> Snapshot {
         let events = self.events.load(Relaxed);
-        let last_lsn = self.last_lsn.load(Relaxed);
+
         let ts = self.last_commit_ts_micros.load(Relaxed);
         let last_ms = self.last_event_unix_ms.load(Relaxed);
         Snapshot {
@@ -155,7 +155,7 @@ impl Metrics {
             deletes: self.deletes.load(Relaxed),
             truncates: self.truncates.load(Relaxed),
             errors: self.errors.load(Relaxed),
-            last_lsn: (events > 0).then(|| Lsn(last_lsn).to_string()),
+            last_lsn: self.last_position.lock().unwrap().clone(),
             lag_ms: (events > 0 && ts > 0).then(|| now_ms() as i64 - ts / 1000),
             last_event_unix_ms: (last_ms > 0).then_some(last_ms),
             sink_avg_ms: if events > 0 {
@@ -174,10 +174,11 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Position;
 
     fn ev(op: Op, table: &str, lsn: u64) -> ChangeEvent {
         ChangeEvent {
-            lsn: Lsn(lsn),
+            position: Position::Lsn(lsn),
             xid: 1,
             commit_ts_micros: 1,
             schema: "public".into(),

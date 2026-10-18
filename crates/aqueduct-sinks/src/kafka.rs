@@ -317,7 +317,10 @@ fn record(event: &ChangeEvent, key: String) -> Result<Record> {
         "op".to_string(),
         format!("{:?}", event.op).to_lowercase().into_bytes(),
     );
-    headers.insert("lsn".to_string(), event.lsn.0.to_string().into_bytes());
+    headers.insert(
+        "lsn".to_string(),
+        event.position.to_checkpoint().into_bytes(),
+    );
     let timestamp = chrono::DateTime::from_timestamp_micros(event.commit_ts_micros)
         .unwrap_or_else(chrono::Utc::now);
     Ok(Record {

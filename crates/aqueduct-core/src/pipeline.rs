@@ -3,7 +3,7 @@ use tokio::sync::watch;
 
 use std::time::{Duration, Instant};
 
-use crate::{ChangeEvent, Lsn, Metrics, State};
+use crate::{ChangeEvent, Metrics, Position, State};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -23,7 +23,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[async_trait]
 pub trait Source: Send {
     /// Start streaming from `start` (the last durable checkpoint, if any).
-    async fn start(&mut self, start: Option<Lsn>) -> Result<()>;
+    async fn start(&mut self, start: Option<Position>) -> Result<()>;
     /// Next event; `Ok(None)` means the stream ended cleanly.
     async fn next(&mut self) -> Result<Option<ChangeEvent>>;
     /// An already-buffered event, if any, without waiting. The pipeline uses it to gather a
@@ -31,8 +31,8 @@ pub trait Source: Send {
     fn try_next(&mut self) -> Option<ChangeEvent> {
         None
     }
-    /// Tell the source everything up to `lsn` is durably delivered.
-    async fn ack(&mut self, lsn: Lsn) -> Result<()>;
+    /// Tell the source everything up to `position` is durably delivered.
+    async fn ack(&mut self, position: Position) -> Result<()>;
 }
 
 /// Delivers change events somewhere. Events may be redelivered after a crash,
@@ -56,8 +56,8 @@ pub trait Sink: Send {
 /// Persists the last acknowledged LSN.
 #[async_trait]
 pub trait CheckpointStore: Send {
-    async fn load(&mut self) -> Result<Option<Lsn>>;
-    async fn save(&mut self, lsn: Lsn) -> Result<()>;
+    async fn load(&mut self) -> Result<Option<Position>>;
+    async fn save(&mut self, position: &Position) -> Result<()>;
 }
 
 /// A sink call that takes longer than this is treated as a failure, so a hung broker or
@@ -70,7 +70,7 @@ const SINK_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_BATCH: usize = 1000;
 
 /// Drive `source` -> `sink` until the stream ends or `shutdown` flips to true.
-/// The LSN is checkpointed and acked only after the sink succeeds.
+/// The position is checkpointed and acked only after the sink succeeds.
 pub async fn run_pipeline(
     source: &mut dyn Source,
     sink: &mut dyn Sink,
@@ -140,8 +140,8 @@ async fn drive(
             metrics.record_event(event, per_event);
         }
         // One checkpoint write and one ack for the whole batch, after the sink succeeded.
-        let last = batch[batch.len() - 1].lsn;
-        store.save(last).await?;
+        let last = batch[batch.len() - 1].position.clone();
+        store.save(&last).await?;
         source.ack(last).await?;
     }
     sink.flush().await
@@ -153,10 +153,10 @@ mod tests {
     use crate::Op;
     use std::collections::VecDeque;
 
-    struct VecSource(VecDeque<ChangeEvent>, Vec<Lsn>);
+    struct VecSource(VecDeque<ChangeEvent>, Vec<Position>);
     #[async_trait]
     impl Source for VecSource {
-        async fn start(&mut self, _: Option<Lsn>) -> Result<()> {
+        async fn start(&mut self, _: Option<Position>) -> Result<()> {
             Ok(())
         }
         async fn next(&mut self) -> Result<Option<ChangeEvent>> {
@@ -165,16 +165,16 @@ mod tests {
         fn try_next(&mut self) -> Option<ChangeEvent> {
             self.0.pop_front()
         }
-        async fn ack(&mut self, lsn: Lsn) -> Result<()> {
-            self.1.push(lsn);
+        async fn ack(&mut self, position: Position) -> Result<()> {
+            self.1.push(position);
             Ok(())
         }
     }
-    struct VecSink(Vec<Lsn>, usize);
+    struct VecSink(Vec<Position>, usize);
     #[async_trait]
     impl Sink for VecSink {
         async fn send(&mut self, e: &ChangeEvent) -> Result<()> {
-            self.0.push(e.lsn);
+            self.0.push(e.position.clone());
             Ok(())
         }
         async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
@@ -185,21 +185,21 @@ mod tests {
             Ok(())
         }
     }
-    struct MemStore(Option<Lsn>);
+    struct MemStore(Option<Position>);
     #[async_trait]
     impl CheckpointStore for MemStore {
-        async fn load(&mut self) -> Result<Option<Lsn>> {
-            Ok(self.0)
+        async fn load(&mut self) -> Result<Option<Position>> {
+            Ok(self.0.clone())
         }
-        async fn save(&mut self, l: Lsn) -> Result<()> {
-            self.0 = Some(l);
+        async fn save(&mut self, l: &Position) -> Result<()> {
+            self.0 = Some(l.clone());
             Ok(())
         }
     }
 
     fn ev(n: u64) -> ChangeEvent {
         ChangeEvent {
-            lsn: Lsn(n),
+            position: Position::Lsn(n),
             xid: 1,
             commit_ts_micros: 0,
             schema: "public".into(),
@@ -220,10 +220,13 @@ mod tests {
         run_pipeline(&mut src, &mut sink, &mut store, rx)
             .await
             .unwrap();
-        assert_eq!(sink.0, vec![Lsn(1), Lsn(2), Lsn(3)]);
+        assert_eq!(
+            sink.0,
+            vec![Position::Lsn(1), Position::Lsn(2), Position::Lsn(3)]
+        );
         // One batch: a single sink call and a single ack for the last LSN.
         assert_eq!(sink.1, 1);
-        assert_eq!(src.1, vec![Lsn(3)]);
-        assert_eq!(store.0, Some(Lsn(3)));
+        assert_eq!(src.1, vec![Position::Lsn(3)]);
+        assert_eq!(store.0, Some(Position::Lsn(3)));
     }
 }

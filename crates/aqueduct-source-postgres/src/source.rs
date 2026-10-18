@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aqueduct_core::{ChangeEvent, Error, Lsn, Op, Result, Source};
+use aqueduct_core::{ChangeEvent, Error, Op, Position, Result, Source};
 use async_trait::async_trait;
 use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
@@ -163,7 +163,7 @@ impl PostgresSource {
         self.client()?
             .execute(
                 "SELECT pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
-                &[&self.cfg.slot, &Lsn(lsn).to_string()],
+                &[&self.cfg.slot, &Position::Lsn(lsn).to_string()],
             )
             .await
             .map_err(src_err)?;
@@ -174,7 +174,7 @@ impl PostgresSource {
     #[allow(clippy::too_many_arguments)]
     fn queue(
         &mut self,
-        lsn: Lsn,
+        lsn: u64,
         xid: u32,
         commit_ts_micros: i64,
         (schema, table): (String, String),
@@ -183,10 +183,10 @@ impl PostgresSource {
         after: Option<Row>,
         key: Option<String>,
     ) {
-        if lsn.0 > self.emitted {
-            self.emitted = lsn.0;
+        if lsn > self.emitted {
+            self.emitted = lsn;
             self.buffer.push_back(ChangeEvent {
-                lsn,
+                position: Position::Lsn(lsn),
                 xid,
                 commit_ts_micros,
                 schema,
@@ -228,7 +228,7 @@ impl PostgresSource {
                     | Message::Delete { .. }
                     | Message::Truncate { .. }
             ) {
-                tx_last = tx_last.max(lsn.0);
+                tx_last = tx_last.max(lsn);
             }
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
@@ -289,7 +289,7 @@ impl PostgresSource {
 
 #[async_trait]
 impl Source for PostgresSource {
-    async fn start(&mut self, start: Option<Lsn>) -> Result<()> {
+    async fn start(&mut self, start: Option<Position>) -> Result<()> {
         let client = self.connect().await?;
         self.client = Some(client);
 
@@ -306,14 +306,10 @@ impl Source for PostgresSource {
         match existing {
             Some(row) => {
                 let flushed: Option<String> = row.get(0);
-                self.acked = flushed
-                    .as_deref()
-                    .map(parse_lsn)
-                    .transpose()?
-                    .map_or(0, |l| l.0);
+                self.acked = flushed.as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
             }
             None => {
-                if let Some(lsn) = start {
+                if let Some(lsn) = &start {
                     if !self.cfg.allow_slot_recreate {
                         return Err(Error::Source(format!(
                             "replication slot {slot:?} does not exist but a checkpoint exists (LSN {lsn}); \
@@ -337,8 +333,15 @@ impl Source for PostgresSource {
         // The checkpoint can be ahead of the slot if we crashed between save and ack, and
         // the slot replays whole transactions: skip changes already delivered.
         // A recreated slot starts a new stream, so the old checkpoint no longer applies.
-        if let (Some(Lsn(l)), false) = (start, recreated) {
-            self.emitted = l;
+        if let (Some(pos), false) = (start, recreated) {
+            match pos {
+                Position::Lsn(l) => self.emitted = l,
+                Position::Text(t) => {
+                    return Err(Error::Checkpoint(format!(
+                        "checkpoint {t:?} is not a Postgres LSN; it belongs to another source type"
+                    )))
+                }
+            }
         }
         Ok(())
     }
@@ -359,8 +362,11 @@ impl Source for PostgresSource {
         self.buffer.pop_front()
     }
 
-    async fn ack(&mut self, lsn: Lsn) -> Result<()> {
-        self.advance_acked(lsn.0).await
+    async fn ack(&mut self, position: Position) -> Result<()> {
+        match position {
+            Position::Lsn(l) => self.advance_acked(l).await,
+            Position::Text(t) => Err(Error::Source(format!("cannot ack non-LSN position {t:?}"))),
+        }
     }
 }
 
@@ -369,12 +375,12 @@ fn src_err(e: tokio_postgres::Error) -> Error {
 }
 
 /// Parse Postgres `X/Y` hex LSN text.
-pub fn parse_lsn(s: &str) -> Result<Lsn> {
+pub fn parse_lsn(s: &str) -> Result<u64> {
     let bad = || Error::Source(format!("invalid LSN {s:?}"));
     let (hi, lo) = s.split_once('/').ok_or_else(bad)?;
     let hi = u64::from_str_radix(hi, 16).map_err(|_| bad())?;
     let lo = u64::from_str_radix(lo, 16).map_err(|_| bad())?;
-    Ok(Lsn((hi << 32) | lo))
+    Ok((hi << 32) | lo)
 }
 
 #[cfg(test)]
@@ -384,8 +390,8 @@ mod tests {
     #[test]
     fn lsn_roundtrip() {
         let l = parse_lsn("16/B374D848").unwrap();
-        assert_eq!(l, Lsn(0x16_B374_D848));
-        assert_eq!(l.to_string(), "16/B374D848");
+        assert_eq!(l, 0x16_B374_D848);
+        assert_eq!(Position::Lsn(l).to_string(), "16/B374D848");
         assert!(parse_lsn("garbage").is_err());
     }
 }
