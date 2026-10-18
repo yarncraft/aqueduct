@@ -55,6 +55,12 @@ pub struct PostgresSource {
     emitted: u64,
     /// Highest LSN the slot has been advanced to.
     acked: u64,
+    /// Completed transactions as (last change LSN, commit end LSN). The slot can only
+    /// be advanced to a commit end LSN: advancing to a mid-transaction change LSN
+    /// leaves `confirmed_flush_lsn` unmoved and the whole transaction is replayed.
+    tx_ends: VecDeque<(u64, u64)>,
+    /// Highest commit end LSN recorded in `tx_ends`.
+    last_end: u64,
 }
 
 impl PostgresSource {
@@ -65,6 +71,8 @@ impl PostgresSource {
             buffer: VecDeque::new(),
             emitted: 0,
             acked: 0,
+            tx_ends: VecDeque::new(),
+            last_end: 0,
         }
     }
 
@@ -72,6 +80,14 @@ impl PostgresSource {
         self.client
             .as_ref()
             .ok_or_else(|| Error::Source("source not started".into()))
+    }
+
+    /// Advance the slot past every fully acknowledged transaction (all changes <= `lsn`).
+    async fn advance_acked(&mut self, lsn: u64) -> Result<()> {
+        if let Some(target) = ack_target(&mut self.tx_ends, lsn) {
+            self.advance(target).await?;
+        }
+        Ok(())
     }
 
     async fn advance(&mut self, lsn: u64) -> Result<()> {
@@ -129,12 +145,22 @@ impl PostgresSource {
 
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
+        let mut tx_last = 0u64;
         for row in rows {
             let lsn_text: String = row.get(0);
             let data: Vec<u8> = row.get(1);
             let lsn = parse_lsn(&lsn_text)?;
             let msg = decode(&data)
                 .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
+            if matches!(
+                msg,
+                Message::Insert { .. }
+                    | Message::Update { .. }
+                    | Message::Delete { .. }
+                    | Message::Truncate { .. }
+            ) {
+                tx_last = tx_last.max(lsn.0);
+            }
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
                 Message::Begin {
@@ -175,7 +201,14 @@ impl PostgresSource {
                         self.queue(lsn, xid, ts, name, Op::Truncate, None, None);
                     }
                 }
-                Message::Commit { .. } | Message::Ignored => {}
+                Message::Commit { end_lsn, .. } => {
+                    if end_lsn > self.last_end {
+                        self.last_end = end_lsn;
+                        self.tx_ends.push_back((tx_last, end_lsn));
+                    }
+                    tx_last = 0;
+                }
+                Message::Ignored => {}
             }
         }
         Ok(())
@@ -224,9 +257,10 @@ impl Source for PostgresSource {
                 tracing::info!(slot = %slot, "created replication slot");
             }
         }
-        // The checkpoint can be ahead of the slot if we crashed between save and ack.
+        // The checkpoint can be ahead of the slot if we crashed between save and ack, and
+        // the slot replays whole transactions: skip changes already delivered.
         if let Some(Lsn(l)) = start {
-            self.advance(l).await?;
+            self.emitted = l;
         }
         Ok(())
     }
@@ -244,7 +278,7 @@ impl Source for PostgresSource {
     }
 
     async fn ack(&mut self, lsn: Lsn) -> Result<()> {
-        self.advance(lsn.0).await
+        self.advance_acked(lsn.0).await
     }
 }
 
@@ -271,5 +305,40 @@ mod tests {
         assert_eq!(l, Lsn(0x16_B374_D848));
         assert_eq!(l.to_string(), "16/B374D848");
         assert!(parse_lsn("garbage").is_err());
+    }
+}
+
+/// Pops every transaction whose changes are all <= `lsn` and returns the commit end LSN
+/// of the last one: the only position the slot can safely be advanced to.
+fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
+    let mut target = None;
+    while let Some(&(last, end)) = tx_ends.front() {
+        if last > lsn {
+            break;
+        }
+        target = Some(end);
+        tx_ends.pop_front();
+    }
+    target
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+
+    #[test]
+    fn ack_mid_transaction_does_not_advance() {
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(ack_target(&mut q, 150), Some(120));
+        // Acking inside the second transaction must not advance past its commit end.
+        assert_eq!(ack_target(&mut q, 199), None);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn ack_last_change_advances_to_commit_end() {
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(ack_target(&mut q, 200), Some(220));
+        assert!(q.is_empty());
     }
 }

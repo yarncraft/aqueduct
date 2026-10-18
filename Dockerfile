@@ -3,10 +3,10 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
+# No cache mount on /src/target: cargo trusts mtimes, so a persistent target dir can silently
+# reuse a stale binary after the sources change.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p aqueduct 2>/dev/null || cargo build --release -p aqueduct; \
-    cp target/release/aqueduct /aqueduct
+    cargo build --release -p aqueduct && cp target/release/aqueduct /aqueduct
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /aqueduct /usr/local/bin/aqueduct
