@@ -239,3 +239,18 @@ routes to, using its own connection (created on first use). A closed tab costs n
 1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
 4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
+
+## Always-on simulation
+
+`docker-compose.sim.yml` runs Postgres, Kafka, Aqueduct and a workload generator (`sim/simulate.sh`) that
+keeps inserting, updating and deleting rows in `users`, `orders` and `payments` forever (tables are capped
+at roughly 2000 recent rows; Kafka retention is capped at 256 MiB / 24 h).
+
+```sh
+podman-compose -f docker-compose.sim.yml -p aqsim up -d --build   # or: docker compose -f ... -p aqsim up -d --build
+# UI: http://localhost:8088   admin token: dev-token-change-me (override with AQUEDUCT_ADMIN_TOKEN)
+SIM_RATE=10 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator   # change load (tx/s)
+podman-compose -f docker-compose.sim.yml -p aqsim down      # add -v to wipe data
+```
+
+All services use `restart: unless-stopped`. It publishes only port 8088, so it does not clash with the main compose file (8080).

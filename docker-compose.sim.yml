@@ -1,0 +1,73 @@
+# Self-contained, endlessly running demo: Postgres + Kafka + Aqueduct + a workload generator.
+#   podman-compose -f docker-compose.sim.yml -p aqsim up -d --build
+#   UI: http://localhost:8088   (admin token: dev-token-change-me, override with AQUEDUCT_ADMIN_TOKEN)
+# Tune load with SIM_RATE (transactions per second, default 2). Stop with `down`; add `-v` to wipe data.
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    environment:
+      POSTGRES_USER: aqueduct
+      POSTGRES_PASSWORD: aqueduct
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sim/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aqueduct -d app"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:latest
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_BYTES: 268435456   # cap disk use for a run-forever demo
+      KAFKA_LOG_RETENTION_HOURS: 24
+    restart: unless-stopped
+
+  aqueduct:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:-dev-token-change-me}
+    volumes:
+      - ./sim/aqueduct.sim.toml:/etc/aqueduct/aqueduct.toml:ro
+      - aqueduct-state:/var/lib/aqueduct
+    ports:
+      - "8088:8080"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  simulator:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RATE: ${SIM_RATE:-2}
+    volumes:
+      - ./sim/simulate.sh:/simulate.sh:ro
+    entrypoint: ["bash", "/simulate.sh"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  aqueduct-state:

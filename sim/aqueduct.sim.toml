@@ -1,0 +1,13 @@
+health_addr = "0.0.0.0:8080"
+checkpoint_path = "/var/lib/aqueduct/checkpoint"
+inspector = true   # token comes from AQUEDUCT_ADMIN_TOKEN
+
+[postgres]
+url = "postgres://aqueduct:aqueduct@postgres:5432/app"
+slot = "aqueduct"
+publication = "aqueduct"
+
+[sink]
+brokers = ["kafka:9092"]
+topic = "cdc.{schema}.{table}"
+partitions = 1
