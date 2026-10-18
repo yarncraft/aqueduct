@@ -25,7 +25,7 @@ Postgres URL with `AQUEDUCT_PG_URL`). See `config/aqueduct.example.toml`. Mount 
 | stdout | `type = "stdout"` | JSON lines to the container log |
 | file | `type = "file"`, `path` | JSON lines, fsynced on flush |
 | webhook | `type = "webhook"`, `url` | `POST` JSON; retries network errors, 5xx and 429 with backoff |
-| kafka | `type = "kafka"`, `brokers = ["host:9092"]`, `topic`, optional `partitions` (default 1, used only if the topic must be created) | JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing |
+| kafka | `type = "kafka"`, `brokers = ["host:9092"]`, `topic` (fallback), `[[sink.routes]]` (`match`, `topic`), optional `partitions` (default 1, for topics that must be created) | JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing. See below for routing |
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
@@ -50,3 +50,22 @@ Not yet compiled or run end to end: CI is the first build.
 The HTTP port (`health_addr`, default `:8080`) serves a live dashboard at `/`: throughput chart, total events, replication lag, sink latency, errors, per-operation and per-table breakdown, last error. Data streams over Server-Sent Events (`/api/stream`, 1 snapshot/s); `/api/metrics` returns one JSON snapshot and `/healthz` is the container health probe.
 
 Set `admin_token` in the config (or `AQUEDUCT_ADMIN_TOKEN`) to require it for `/api/*`; open the dashboard as `http://host:8080/?token=<token>`. The dashboard page itself is public, so do not expose the port to untrusted networks without a token.
+
+### Kafka topic routing
+
+Each event goes to the first `[[sink.routes]]` entry whose `match` fits its `schema.table` (`*` is a wildcard), otherwise to `topic`. Topic names may use `{schema}` and `{table}`. Topics are created on first use. An event that matches no route while `topic` is unset fails the pipeline rather than being dropped.
+
+```toml
+[sink]
+type = "kafka"
+brokers = ["kafka:9092"]
+topic = "cdc.{schema}.{table}"        # fallback: one topic per table
+
+[[sink.routes]]
+match = "public.orders"               # exact table
+topic = "orders-events"
+
+[[sink.routes]]
+match = "*.audit_*"                   # any schema, tables starting with audit_
+topic = "audit"
+```

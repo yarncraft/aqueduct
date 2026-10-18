@@ -1,5 +1,5 @@
 use aqueduct_core::{Result, Sink};
-use aqueduct_sinks::{FileSink, KafkaSink, StdoutSink, WebhookSink};
+use aqueduct_sinks::{FileSink, KafkaRoute, KafkaSink, StdoutSink, TopicRouter, WebhookSink};
 
 use crate::config::SinkConfig;
 
@@ -13,6 +13,17 @@ pub async fn build(cfg: &SinkConfig) -> Result<Box<dyn Sink>> {
             brokers,
             topic,
             partitions,
-        } => Box::new(KafkaSink::connect(brokers.clone(), topic.clone(), *partitions).await?),
+            routes,
+        } => {
+            let routes = routes
+                .iter()
+                .map(|r| KafkaRoute {
+                    pattern: r.pattern.clone(),
+                    topic: r.topic.clone(),
+                })
+                .collect();
+            let router = TopicRouter::new(routes, topic.clone())?;
+            Box::new(KafkaSink::connect(brokers.clone(), router, *partitions).await?)
+        }
     })
 }

@@ -7,7 +7,7 @@ mod stdout;
 mod webhook;
 
 pub use file::FileSink;
-pub use kafka::KafkaSink;
+pub use kafka::{KafkaRoute, KafkaSink, TopicRouter};
 pub use stdout::StdoutSink;
 pub use webhook::WebhookSink;
 

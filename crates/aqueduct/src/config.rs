@@ -36,14 +36,28 @@ pub enum SinkConfig {
         url: String,
     },
     /// Produce events to Kafka. Keyed by `schema.table` so all changes to a
-    /// table stay ordered within one partition.
+    /// table stay ordered within one partition. Each event goes to the first
+    /// matching `routes` entry, else to `topic`.
     Kafka {
         brokers: Vec<String>,
-        topic: String,
-        /// Partitions to create the topic with if it does not exist.
+        /// Fallback topic for tables no route matches; may use `{schema}`/`{table}`.
+        #[serde(default)]
+        topic: Option<String>,
+        /// Partitions to create topics with if they do not exist.
         #[serde(default = "default_partitions")]
         partitions: i32,
+        #[serde(default)]
+        routes: Vec<KafkaRouteConfig>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KafkaRouteConfig {
+    /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Destination topic; `{schema}` and `{table}` are substituted.
+    pub topic: String,
 }
 
 fn default_partitions() -> i32 {
