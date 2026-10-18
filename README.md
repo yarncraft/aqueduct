@@ -63,6 +63,23 @@ match = "*.audit_*"                   # any schema, tables starting with audit_
 topic = "audit"
 ```
 
+### MongoDB source
+
+```toml
+[source]
+type = "mongodb"
+uri = "mongodb://user:pass@host:27017/?replicaSet=rs0&tls=true"
+database = "app"
+collections = ["users", "orders"]   # empty = whole database
+pre_images = true                   # fullDocumentBeforeChange when the collection has it enabled
+```
+
+Needs a replica set (change streams). `schema` is the database, `table` the collection; the position is the
+change-stream resume token, so a restart resumes just after the last checkpointed event. Updates use
+`updateLookup`, so `after` is the document as it is when the source reads it (it can be newer than the change,
+or only the `_id` if the document was deleted meanwhile). Deletes carry the pre-image, or just the `_id`.
+Integration test: `crates/aqueduct-source-mongodb/tests/replica_set.rs` (see its header).
+
 ## Admin cockpit
 
 The HTTP port serves a dark operations console at `/`: throughput chart, total events, end-to-end lag,
