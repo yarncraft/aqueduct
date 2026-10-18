@@ -25,6 +25,7 @@ Postgres URL with `AQUEDUCT_PG_URL`). See `config/aqueduct.example.toml`. Mount 
 | stdout | `type = "stdout"` | JSON lines to the container log |
 | file | `type = "file"`, `path` | JSON lines, fsynced on flush |
 | webhook | `type = "webhook"`, `url` | `POST` JSON; retries network errors, 5xx and 429 with backoff |
+| kafka | `type = "kafka"`, `brokers = ["host:9092"]`, `topic`, optional `partitions` (default 1, used only if the topic must be created) | JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing |
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
@@ -37,7 +38,7 @@ Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `tabl
 
 ## Layout
 
-`aqueduct-core` (types, traits, pipeline) · `aqueduct-sinks` (stdout/file/webhook) · `aqueduct` (binary).
+`aqueduct-core` (types, traits, pipeline) · `aqueduct-sinks` (stdout/file/webhook/kafka) · `aqueduct` (binary).
 The Postgres source lives in `aqueduct-source-postgres`.
 
 ## Status

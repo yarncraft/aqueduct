@@ -1,11 +1,13 @@
 //! Built-in [`Sink`](aqueduct_core::Sink) implementations: stdout, JSON-lines
-//! file, and HTTP webhook. All encode events as one JSON object per event.
+//! file, HTTP webhook, and Kafka. All encode events as one JSON object per event.
 
 mod file;
+mod kafka;
 mod stdout;
 mod webhook;
 
 pub use file::FileSink;
+pub use kafka::KafkaSink;
 pub use stdout::StdoutSink;
 pub use webhook::WebhookSink;
 

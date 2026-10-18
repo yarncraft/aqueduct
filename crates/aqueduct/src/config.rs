@@ -31,6 +31,19 @@ pub enum SinkConfig {
     Webhook {
         url: String,
     },
+    /// Produce events to Kafka. Keyed by `schema.table` so all changes to a
+    /// table stay ordered within one partition.
+    Kafka {
+        brokers: Vec<String>,
+        topic: String,
+        /// Partitions to create the topic with if it does not exist.
+        #[serde(default = "default_partitions")]
+        partitions: i32,
+    },
+}
+
+fn default_partitions() -> i32 {
+    1
 }
 
 fn default_slot() -> String {
