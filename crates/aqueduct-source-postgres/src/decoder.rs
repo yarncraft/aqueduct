@@ -48,13 +48,33 @@ pub type Tuple = Vec<Datum>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    Begin { final_lsn: u64, commit_ts_micros: i64, xid: u32 },
-    Commit { commit_lsn: u64, end_lsn: u64, commit_ts_micros: i64 },
+    Begin {
+        final_lsn: u64,
+        commit_ts_micros: i64,
+        xid: u32,
+    },
+    Commit {
+        commit_lsn: u64,
+        end_lsn: u64,
+        commit_ts_micros: i64,
+    },
     Relation(Relation),
-    Insert { relation: u32, new: Tuple },
-    Update { relation: u32, old: Option<Tuple>, new: Tuple },
-    Delete { relation: u32, old: Tuple },
-    Truncate { relations: Vec<u32> },
+    Insert {
+        relation: u32,
+        new: Tuple,
+    },
+    Update {
+        relation: u32,
+        old: Option<Tuple>,
+        new: Tuple,
+    },
+    Delete {
+        relation: u32,
+        old: Tuple,
+    },
+    Truncate {
+        relations: Vec<u32>,
+    },
     /// Origin / Type / logical messages: nothing we emit.
     Ignored,
 }
@@ -92,7 +112,11 @@ impl<'a> Reader<'a> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn cstr(&mut self) -> Result<String, DecodeError> {
-        let end = self.0.iter().position(|&b| b == 0).ok_or(DecodeError::Eof)?;
+        let end = self
+            .0
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(DecodeError::Eof)?;
         let s = std::str::from_utf8(&self.0[..end]).map_err(|_| DecodeError::Utf8)?;
         self.0 = &self.0[end + 1..];
         Ok(s.to_owned())
@@ -109,7 +133,9 @@ impl<'a> Reader<'a> {
                     let bytes = self.take(len)?;
                     if kind == b't' {
                         Datum::Text(
-                            std::str::from_utf8(bytes).map_err(|_| DecodeError::Utf8)?.to_owned(),
+                            std::str::from_utf8(bytes)
+                                .map_err(|_| DecodeError::Utf8)?
+                                .to_owned(),
                         )
                     } else {
                         Datum::Binary(bytes.to_vec())
@@ -151,14 +177,26 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
                 let name = r.cstr()?;
                 let type_oid = r.u32()?;
                 let _typmod = r.i32()?;
-                columns.push(Column { name, type_oid, key: flags & 1 != 0 });
+                columns.push(Column {
+                    name,
+                    type_oid,
+                    key: flags & 1 != 0,
+                });
             }
-            Message::Relation(Relation { id, schema, name, columns })
+            Message::Relation(Relation {
+                id,
+                schema,
+                name,
+                columns,
+            })
         }
         b'I' => {
             let relation = r.u32()?;
             let _n = r.u8()?; // 'N'
-            Message::Insert { relation, new: r.tuple()? }
+            Message::Insert {
+                relation,
+                new: r.tuple()?,
+            }
         }
         b'U' => {
             let relation = r.u32()?;
@@ -169,12 +207,19 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
                 tag = r.u8()?; // 'N'
             }
             let _ = tag;
-            Message::Update { relation, old, new: r.tuple()? }
+            Message::Update {
+                relation,
+                old,
+                new: r.tuple()?,
+            }
         }
         b'D' => {
             let relation = r.u32()?;
             let _k = r.u8()?; // 'K' or 'O'
-            Message::Delete { relation, old: r.tuple()? }
+            Message::Delete {
+                relation,
+                old: r.tuple()?,
+            }
         }
         b'T' => {
             let n = r.i32()?.max(0) as usize;
@@ -226,7 +271,10 @@ impl RelationCache {
 fn text_to_json(oid: u32, s: &str) -> Value {
     match oid {
         16 => Value::Bool(s == "t"),
-        20 | 21 | 23 => s.parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(s.into())),
+        20 | 21 | 23 => s
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(s.into())),
         700 | 701 => s
             .parse::<f64>()
             .ok()
@@ -281,13 +329,19 @@ mod tests {
         b.extend(7u32.to_be_bytes());
         assert_eq!(
             decode(&b).unwrap(),
-            Message::Begin { final_lsn: 100, commit_ts_micros: PG_EPOCH_OFFSET_MICROS, xid: 7 }
+            Message::Begin {
+                final_lsn: 100,
+                commit_ts_micros: PG_EPOCH_OFFSET_MICROS,
+                xid: 7
+            }
         );
     }
 
     #[test]
     fn relation_insert_roundtrip_to_json() {
-        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else { panic!() };
+        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
+            panic!()
+        };
         assert_eq!(rel.schema, "public");
         assert!(rel.columns[0].key && !rel.columns[1].key);
         let mut cache = RelationCache::default();
@@ -297,7 +351,9 @@ mod tests {
         ins.extend(42u32.to_be_bytes());
         ins.push(b'N');
         ins.extend(tuple_bytes(&[Some("5"), None]));
-        let Message::Insert { relation, new } = decode(&ins).unwrap() else { panic!() };
+        let Message::Insert { relation, new } = decode(&ins).unwrap() else {
+            panic!()
+        };
         let row = cache.row(relation, &new).unwrap();
         assert_eq!(row["id"], Value::from(5));
         assert_eq!(row["name"], Value::Null);
@@ -311,7 +367,9 @@ mod tests {
         u.extend(tuple_bytes(&[Some("1"), None]));
         u.push(b'N');
         u.extend(tuple_bytes(&[Some("1"), Some("bob")]));
-        let Message::Update { old, new, .. } = decode(&u).unwrap() else { panic!() };
+        let Message::Update { old, new, .. } = decode(&u).unwrap() else {
+            panic!()
+        };
         assert!(old.is_some());
         assert_eq!(new[1], Datum::Text("bob".into()));
     }
@@ -322,7 +380,10 @@ mod tests {
         u.extend(42u32.to_be_bytes());
         u.push(b'N');
         u.extend(tuple_bytes(&[Some("1"), Some("x")]));
-        assert!(matches!(decode(&u).unwrap(), Message::Update { old: None, .. }));
+        assert!(matches!(
+            decode(&u).unwrap(),
+            Message::Update { old: None, .. }
+        ));
     }
 
     #[test]
@@ -331,14 +392,22 @@ mod tests {
         d.extend(42u32.to_be_bytes());
         d.push(b'K');
         d.extend(tuple_bytes(&[Some("1"), None]));
-        assert!(matches!(decode(&d).unwrap(), Message::Delete { relation: 42, .. }));
+        assert!(matches!(
+            decode(&d).unwrap(),
+            Message::Delete { relation: 42, .. }
+        ));
 
         let mut t = vec![b'T'];
         t.extend(2i32.to_be_bytes());
         t.push(0);
         t.extend(1u32.to_be_bytes());
         t.extend(2u32.to_be_bytes());
-        assert_eq!(decode(&t).unwrap(), Message::Truncate { relations: vec![1, 2] });
+        assert_eq!(
+            decode(&t).unwrap(),
+            Message::Truncate {
+                relations: vec![1, 2]
+            }
+        );
     }
 
     #[test]

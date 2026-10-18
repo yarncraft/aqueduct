@@ -13,7 +13,8 @@ async fn main() {
     }
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("info".parse().unwrap()),
         )
         .json()
         .init();
@@ -28,7 +29,9 @@ async fn main() {
     tracing::info!(slot = %cfg.postgres.slot, publication = %cfg.postgres.publication, "aqueduct starting");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let listener = TcpListener::bind(&cfg.health_addr).await.expect("bind health_addr");
+    let listener = TcpListener::bind(&cfg.health_addr)
+        .await
+        .expect("bind health_addr");
     tokio::spawn(health_server(listener));
 
     // TODO(pipeline): build the Postgres source (aqueduct-source-postgres), the
@@ -62,11 +65,9 @@ async fn healthcheck() -> i32 {
     let addr = std::env::var("AQUEDUCT_HEALTH_PROBE").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let probe = async {
         let mut sock = tokio::net::TcpStream::connect(&addr).await.ok()?;
-        sock.write_all(b"GET / HTTP/1.1
-host: localhost
-connection: close
-
-").await.ok()?;
+        sock.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .ok()?;
         let mut buf = [0u8; 64];
         let n = sock.read(&mut buf).await.ok()?;
         buf[..n].starts_with(b"HTTP/1.1 200").then_some(())

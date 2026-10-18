@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Postgres log sequence number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Lsn(pub u64);
 

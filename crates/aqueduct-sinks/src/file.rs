@@ -28,12 +28,21 @@ impl Sink for FileSink {
     async fn send(&mut self, event: &ChangeEvent) -> Result<()> {
         let mut line = crate::encode(event)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes()).await.map_err(|e| Error::Sink(e.to_string()))
+        self.file
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| Error::Sink(e.to_string()))
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.file.flush().await.map_err(|e| Error::Sink(e.to_string()))?;
-        self.file.sync_data().await.map_err(|e| Error::Sink(e.to_string()))
+        self.file
+            .flush()
+            .await
+            .map_err(|e| Error::Sink(e.to_string()))?;
+        self.file
+            .sync_data()
+            .await
+            .map_err(|e| Error::Sink(e.to_string()))
     }
 }
 

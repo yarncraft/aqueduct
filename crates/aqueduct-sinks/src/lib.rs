@@ -26,6 +26,8 @@ pub(crate) fn sample() -> ChangeEvent {
         table: "users".into(),
         op: Op::Insert,
         before: None,
-        after: serde_json::json!({"id": 1, "name": "ada"}).as_object().cloned(),
+        after: serde_json::json!({"id": 1, "name": "ada"})
+            .as_object()
+            .cloned(),
     }
 }

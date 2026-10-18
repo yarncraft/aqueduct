@@ -9,7 +9,9 @@ pub struct StdoutSink {
 
 impl StdoutSink {
     pub fn new() -> Self {
-        Self { out: tokio::io::stdout() }
+        Self {
+            out: tokio::io::stdout(),
+        }
     }
 }
 
@@ -24,10 +26,16 @@ impl Sink for StdoutSink {
     async fn send(&mut self, event: &ChangeEvent) -> Result<()> {
         let mut line = crate::encode(event)?;
         line.push('\n');
-        self.out.write_all(line.as_bytes()).await.map_err(|e| Error::Sink(e.to_string()))
+        self.out
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| Error::Sink(e.to_string()))
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.out.flush().await.map_err(|e| Error::Sink(e.to_string()))
+        self.out
+            .flush()
+            .await
+            .map_err(|e| Error::Sink(e.to_string()))
     }
 }

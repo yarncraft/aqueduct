@@ -130,7 +130,9 @@ mod tests {
         let mut sink = VecSink(vec![]);
         let mut store = MemStore(None);
         let (_tx, rx) = watch::channel(false);
-        run_pipeline(&mut src, &mut sink, &mut store, rx).await.unwrap();
+        run_pipeline(&mut src, &mut sink, &mut store, rx)
+            .await
+            .unwrap();
         assert_eq!(sink.0, vec![Lsn(1), Lsn(2), Lsn(3)]);
         assert_eq!(src.1, sink.0);
         assert_eq!(store.0, Some(Lsn(3)));

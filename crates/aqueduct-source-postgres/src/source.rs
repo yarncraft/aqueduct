@@ -25,7 +25,11 @@ pub struct PostgresSourceConfig {
 }
 
 impl PostgresSourceConfig {
-    pub fn new(url: impl Into<String>, slot: impl Into<String>, publication: impl Into<String>) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        slot: impl Into<String>,
+        publication: impl Into<String>,
+    ) -> Self {
         Self {
             url: url.into(),
             slot: slot.into(),
@@ -55,11 +59,19 @@ pub struct PostgresSource {
 
 impl PostgresSource {
     pub fn new(cfg: PostgresSourceConfig) -> Self {
-        Self { cfg, client: None, buffer: VecDeque::new(), emitted: 0, acked: 0 }
+        Self {
+            cfg,
+            client: None,
+            buffer: VecDeque::new(),
+            emitted: 0,
+            acked: 0,
+        }
     }
 
     fn client(&self) -> Result<&Client> {
-        self.client.as_ref().ok_or_else(|| Error::Source("source not started".into()))
+        self.client
+            .as_ref()
+            .ok_or_else(|| Error::Source("source not started".into()))
     }
 
     async fn advance(&mut self, lsn: u64) -> Result<()> {
@@ -90,7 +102,16 @@ impl PostgresSource {
     ) {
         if lsn.0 > self.emitted {
             self.emitted = lsn.0;
-            self.buffer.push_back(ChangeEvent { lsn, xid, commit_ts_micros, schema, table, op, before, after });
+            self.buffer.push_back(ChangeEvent {
+                lsn,
+                xid,
+                commit_ts_micros,
+                schema,
+                table,
+                op,
+                before,
+                after,
+            });
         }
     }
 
@@ -112,10 +133,15 @@ impl PostgresSource {
             let lsn_text: String = row.get(0);
             let data: Vec<u8> = row.get(1);
             let lsn = parse_lsn(&lsn_text)?;
-            let msg = decode(&data).map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
+            let msg = decode(&data)
+                .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
-                Message::Begin { xid: x, commit_ts_micros, .. } => {
+                Message::Begin {
+                    xid: x,
+                    commit_ts_micros,
+                    ..
+                } => {
                     xid = x;
                     ts = commit_ts_micros;
                 }
@@ -129,7 +155,10 @@ impl PostgresSource {
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
-                    let before = old.map(|t| cache.row(relation, &t)).transpose().map_err(dec)?;
+                    let before = old
+                        .map(|t| cache.row(relation, &t))
+                        .transpose()
+                        .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     self.queue(lsn, xid, ts, name, Op::Update, before, after);
                 }
@@ -156,7 +185,9 @@ impl PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Lsn>) -> Result<()> {
-        let (client, conn) = tokio_postgres::connect(&self.cfg.url, NoTls).await.map_err(src_err)?;
+        let (client, conn) = tokio_postgres::connect(&self.cfg.url, NoTls)
+            .await
+            .map_err(src_err)?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::error!(error = %e, "postgres connection closed");
@@ -176,11 +207,18 @@ impl Source for PostgresSource {
         match existing {
             Some(row) => {
                 let flushed: Option<String> = row.get(0);
-                self.acked = flushed.as_deref().map(parse_lsn).transpose()?.map_or(0, |l| l.0);
+                self.acked = flushed
+                    .as_deref()
+                    .map(parse_lsn)
+                    .transpose()?
+                    .map_or(0, |l| l.0);
             }
             None => {
                 self.client()?
-                    .execute("SELECT pg_create_logical_replication_slot($1::text::name, 'pgoutput')", &[&slot])
+                    .execute(
+                        "SELECT pg_create_logical_replication_slot($1::text::name, 'pgoutput')",
+                        &[&slot],
+                    )
                     .await
                     .map_err(src_err)?;
                 tracing::info!(slot = %slot, "created replication slot");

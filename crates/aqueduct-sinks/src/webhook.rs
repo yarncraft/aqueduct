@@ -18,7 +18,10 @@ impl WebhookSink {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| Error::Sink(e.to_string()))?;
-        Ok(Self { client, url: url.into() })
+        Ok(Self {
+            client,
+            url: url.into(),
+        })
     }
 }
 
@@ -40,7 +43,9 @@ impl Sink for WebhookSink {
                 Err(e) => e.to_string(),
             };
             if attempt == MAX_ATTEMPTS {
-                return Err(Error::Sink(format!("webhook failed after {attempt} attempts: {err}")));
+                return Err(Error::Sink(format!(
+                    "webhook failed after {attempt} attempts: {err}"
+                )));
             }
             tracing::warn!(attempt, %err, "webhook delivery failed, retrying");
             tokio::time::sleep(delay).await;
@@ -66,7 +71,8 @@ mod tests {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 8192];
                 let _ = sock.read(&mut buf).await;
-                let resp = format!("HTTP/1.1 {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let resp =
+                    format!("HTTP/1.1 {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
                 sock.write_all(resp.as_bytes()).await.unwrap();
                 n += 1;
             }
