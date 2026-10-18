@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-sinks",
+ "aqueduct-source-kafka",
  "aqueduct-source-postgres",
  "async-trait",
  "serde",
@@ -69,6 +70,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aqueduct-source-kafka"
+version = "0.1.0"
+dependencies = [
+ "aqueduct-core",
+ "aqueduct-sinks",
+ "async-trait",
+ "futures",
+ "rskafka",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -48,9 +48,8 @@ pub struct Config {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceConfig {
     Postgres(PostgresConfig),
+    Kafka(KafkaSourceConfig),
     // Placeholders: the raw table is not read until the source crate lands.
-    #[allow(dead_code)]
-    Kafka(toml::Table),
     #[allow(dead_code)]
     Sqlserver(toml::Table),
     #[allow(dead_code)]
@@ -65,6 +64,81 @@ impl SourceConfig {
             SourceConfig::Sqlserver(_) => "sqlserver",
             SourceConfig::Mongodb(_) => "mongodb",
         }
+    }
+}
+
+/// Consume Kafka topics as the change source. Offsets are kept in Aqueduct's checkpoint, not in
+/// a consumer group.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KafkaSourceConfig {
+    pub brokers: Vec<String>,
+    /// Topic names to read; `*` matches any run of characters.
+    pub topics: Vec<String>,
+    /// Where partitions without a checkpoint begin: `earliest` (default) or `latest`.
+    #[serde(default)]
+    pub start_at: Option<String>,
+    /// `auto` (default): Aqueduct events pass through, other values are wrapped. `raw`: always wrap.
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
+    /// `plain | scram-sha-256 | scram-sha-512`; requires username and password.
+    #[serde(default)]
+    pub sasl_mechanism: Option<String>,
+    /// Or `AQUEDUCT_KAFKA_SOURCE_SASL_USERNAME`.
+    #[serde(default)]
+    pub sasl_username: Option<String>,
+    /// Or `AQUEDUCT_KAFKA_SOURCE_SASL_PASSWORD`.
+    #[serde(default)]
+    pub sasl_password: Option<Secret>,
+}
+
+impl KafkaSourceConfig {
+    pub fn source_config(&self) -> Result<aqueduct_source_kafka::KafkaSourceConfig, String> {
+        if self.brokers.is_empty() || self.topics.is_empty() {
+            return Err("kafka source needs brokers and topics".into());
+        }
+        let sasl = match (
+            &self.sasl_mechanism,
+            &self.sasl_username,
+            &self.sasl_password,
+        ) {
+            (None, None, None) => None,
+            (Some(m), Some(u), Some(p)) => Some(aqueduct_sinks::KafkaSasl {
+                mechanism: m.parse()?,
+                username: u.clone(),
+                password: p.expose(),
+            }),
+            _ => {
+                return Err(
+                    "kafka sasl needs sasl_mechanism, sasl_username and sasl_password together"
+                        .into(),
+                )
+            }
+        };
+        Ok(aqueduct_source_kafka::KafkaSourceConfig {
+            brokers: self.brokers.clone(),
+            topics: self.topics.clone(),
+            security: aqueduct_sinks::KafkaSecurity {
+                tls: self.tls,
+                tls_ca_file: self.tls_ca_file.clone(),
+                sasl,
+            },
+            start_at: self
+                .start_at
+                .as_deref()
+                .map(str::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            format: self
+                .format
+                .as_deref()
+                .map(str::parse)
+                .transpose()?
+                .unwrap_or_default(),
+        })
     }
 }
 
@@ -201,6 +275,14 @@ impl Config {
     /// Credentials may come from the environment so they stay out of config files.
     fn apply_secret_env(&mut self) {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        if let Some(SourceConfig::Kafka(k)) = &mut self.source {
+            if let Some(v) = env("AQUEDUCT_KAFKA_SOURCE_SASL_USERNAME") {
+                k.sasl_username = Some(v);
+            }
+            if let Some(v) = env("AQUEDUCT_KAFKA_SOURCE_SASL_PASSWORD") {
+                k.sasl_password = Some(Secret(v));
+            }
+        }
         if let Some(v) = env("AQUEDUCT_KAFKA_SASL_USERNAME") {
             self.sink.sasl_username = Some(v);
         }
@@ -256,7 +338,20 @@ url='postgres://u@db/a'
         ))
         .unwrap();
         assert_eq!(new.source().unwrap().type_name(), "postgres");
-        for t in ["kafka", "sqlserver", "mongodb"] {
+        let k: Config = toml::from_str(&format!(
+            "[source]
+type='kafka'
+brokers=['k:9092']
+topics=['in.*']
+{SINK}"
+        ))
+        .unwrap();
+        assert_eq!(k.source().unwrap().type_name(), "kafka");
+        let SourceConfig::Kafka(kc) = k.source().unwrap() else {
+            panic!("kafka source")
+        };
+        assert!(kc.source_config().is_ok());
+        for t in ["sqlserver", "mongodb"] {
             let c: Config = toml::from_str(&format!(
                 "[source]
 type='{t}'

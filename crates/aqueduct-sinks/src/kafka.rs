@@ -58,7 +58,7 @@ pub struct KafkaSecurity {
 }
 
 impl KafkaSecurity {
-    pub(crate) fn apply(&self, mut builder: ClientBuilder) -> Result<ClientBuilder> {
+    pub fn apply(&self, mut builder: ClientBuilder) -> Result<ClientBuilder> {
         if self.sasl.is_some() && !self.tls {
             tracing::warn!(
                 "kafka SASL without TLS: credentials are sent unencrypted; set tls = true"
@@ -166,7 +166,7 @@ impl TopicRouter {
 }
 
 /// `*` matches any run of characters (including none and dots); everything else is literal.
-pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == text;

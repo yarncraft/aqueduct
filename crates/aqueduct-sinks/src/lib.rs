@@ -6,7 +6,8 @@ mod kafka;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{
-    KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism, TopicRouter,
+    glob_match, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism,
+    TopicRouter,
 };
 
 use aqueduct_core::{ChangeEvent, Error, Result};
