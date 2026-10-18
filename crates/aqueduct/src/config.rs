@@ -41,17 +41,12 @@ pub struct Config {
     pub checkpoint_path: String,
 }
 
-/// Which system changes are read from, picked by `type`. Only `postgres` is implemented so
-/// far; the other variants reserve their names so each source crate can be filled in without
-/// touching this enum's shape (their settings are carried as raw TOML until then).
+/// Which system changes are read from, picked by `type`: postgres, kafka or mongodb.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceConfig {
     Postgres(PostgresConfig),
     Kafka(KafkaSourceConfig),
-    // Placeholders: the raw table is not read until the source crate lands.
-    #[allow(dead_code)]
-    Sqlserver(toml::Table),
     Mongodb(aqueduct_source_mongodb::MongoConfig),
 }
 
@@ -60,7 +55,6 @@ impl SourceConfig {
         match self {
             SourceConfig::Postgres(_) => "postgres",
             SourceConfig::Kafka(_) => "kafka",
-            SourceConfig::Sqlserver(_) => "sqlserver",
             SourceConfig::Mongodb(_) => "mongodb",
         }
     }
@@ -350,15 +344,6 @@ topics=['in.*']
             panic!("kafka source")
         };
         assert!(kc.source_config().is_ok());
-        for t in ["sqlserver"] {
-            let c: Config = toml::from_str(&format!(
-                "[source]
-type='{t}'
-{SINK}"
-            ))
-            .unwrap();
-            assert_eq!(c.source().unwrap().type_name(), t);
-        }
     }
 
     #[test]

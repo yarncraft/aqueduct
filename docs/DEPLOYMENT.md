@@ -139,7 +139,7 @@ Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_h
 ### `[source]` (alternative sources)
 
 `[postgres]` is shorthand for `[source] type = "postgres"` with the same keys. Set exactly one of the two.
-`type` can also be `kafka` (below); `sqlserver` and `mongodb` are reserved and not implemented yet.
+`type` can also be `kafka` (below) or `mongodb` (see the README).
 
 #### Kafka source
 

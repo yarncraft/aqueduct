@@ -80,13 +80,6 @@ async fn main() {
             }
             Box::new(aqueduct_source_mongodb::MongoSource::new(m))
         }
-        other => {
-            tracing::error!(
-                source = other.type_name(),
-                "source type not implemented yet"
-            );
-            std::process::exit(1);
-        }
     };
     let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());
 
