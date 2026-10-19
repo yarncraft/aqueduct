@@ -64,12 +64,12 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 |-----|---------|---------|
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
-| `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default. Plaintext to a non-loopback host aborts startup unless `ssl_mode = "disable"` is set explicitly |
+| `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default, so a server without TLS fails startup, even on localhost. For a non-TLS dev Postgres set `ssl_mode = "disable"` explicitly |
 | `source.type` | `postgres` | `postgres`, `kafka` or `mongodb`. Without a `[source]` table, `[postgres]` is used |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN, offsets or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_insecure_no_auth` | `false` | Opt out of the token requirement on a non-loopback `health_addr` (logs a warning) |
-| `admin_token` | unset | Protects `/api/*`. **Required** when `health_addr` is not loopback (startup refuses otherwise; an empty value counts as unset). Override with `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_token` | unset | Protects `/metrics` and `/api/*` (Bearer header only). **Required** when `health_addr` is not loopback (startup refuses otherwise; an empty value counts as unset). Override with `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Event inspector in the cockpit; reads recent events back from Kafka. Also needs `admin_token` |
 
 ### Kafka sink

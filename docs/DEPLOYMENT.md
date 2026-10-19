@@ -20,7 +20,7 @@ Limits to know about:
 
 - Only changes made after the slot is created are captured. There is **no initial table snapshot**.
 - One Aqueduct instance per slot. Run a second instance with a different `slot` name, never two on one slot.
-- Postgres connections use TLS with certificate and hostname verification (`ssl_mode = "verify-full"`) by default. Plaintext to a non-loopback host is refused at startup unless you set `ssl_mode = "disable"` explicitly.
+- Postgres connections use TLS with certificate and hostname verification (`ssl_mode = "verify-full"`) by default, so a server without TLS fails at startup, **including on localhost**. Plaintext needs an explicit `ssl_mode = "disable"` (non-loopback plaintext then logs a warning).
 - DDL is not streamed. Add a new table to the publication, and expect `before` images only if the table's `REPLICA IDENTITY` allows it.
 
 ## 1. Prepare Postgres
