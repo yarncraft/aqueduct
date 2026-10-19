@@ -51,6 +51,27 @@ pub enum Op {
     Update,
     Delete,
     Truncate,
+    /// Carries only a position, no row. A source emits it to move the checkpoint while it
+    /// has nothing to deliver (idle or filtered stream). The pipeline checkpoints it but
+    /// never hands it to a sink or counts it in metrics.
+    Heartbeat,
+}
+
+impl ChangeEvent {
+    /// A position-only event, see [`Op::Heartbeat`].
+    pub fn heartbeat(position: Position, commit_ts_micros: i64) -> Self {
+        Self {
+            position,
+            xid: 0,
+            commit_ts_micros,
+            schema: String::new(),
+            table: String::new(),
+            op: Op::Heartbeat,
+            before: None,
+            after: None,
+            key: None,
+        }
+    }
 }
 
 /// One row-level change, emitted at transaction commit.

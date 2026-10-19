@@ -10,6 +10,7 @@ use mongodb::options::{FullDocumentBeforeChangeType, FullDocumentType};
 use mongodb::Client;
 use serde_json::value::to_raw_value;
 use serde_json::{Map, Value};
+use std::time::{Duration, Instant};
 
 type Stream = ChangeStream<Document>;
 
@@ -19,11 +20,47 @@ type Stream = ChangeStream<Document>;
 pub struct MongoSource {
     cfg: MongoConfig,
     stream: Option<Stream>,
+    /// How often an idle or filtered stream may emit a heartbeat that moves the checkpoint.
+    heartbeat_every: Duration,
+    /// Token text of the last position handed to the pipeline (event or heartbeat).
+    last_token: Option<String>,
+    last_heartbeat: Instant,
 }
+
+/// Long enough to be cheap, far inside any realistic oplog window.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 impl MongoSource {
     pub fn new(cfg: MongoConfig) -> Self {
-        Self { cfg, stream: None }
+        Self {
+            cfg,
+            stream: None,
+            heartbeat_every: HEARTBEAT_EVERY,
+            last_token: None,
+            last_heartbeat: Instant::now(),
+        }
+    }
+
+    /// Override the heartbeat interval (tests).
+    pub fn with_heartbeat_every(mut self, every: Duration) -> Self {
+        self.heartbeat_every = every;
+        self
+    }
+
+    /// A heartbeat carrying the stream's current resume token, if it moved since the last
+    /// position handed out. The token includes the server's postBatchResumeToken, so it
+    /// advances even when every event was filtered out or nothing happened.
+    fn heartbeat(&mut self) -> Result<Option<ChangeEvent>> {
+        self.last_heartbeat = Instant::now();
+        let Some(token) = self.stream.as_ref().and_then(Stream::resume_token) else {
+            return Ok(None);
+        };
+        let text = token_text(&token)?;
+        if self.last_token.as_deref() == Some(text.as_str()) {
+            return Ok(None);
+        }
+        self.last_token = Some(text.clone());
+        Ok(Some(ChangeEvent::heartbeat(Position::Text(text), 0)))
     }
 }
 
@@ -36,6 +73,12 @@ fn parse_token(text: &str) -> Result<ResumeToken> {
     let json: Value = serde_json::from_str(text).map_err(src_err)?;
     let bson = Bson::try_from(json).map_err(src_err)?;
     mongodb::bson::from_bson(bson).map_err(src_err)
+}
+
+/// Driver token -> the same JSON text that change events use as their position.
+fn token_text(token: &ResumeToken) -> Result<String> {
+    let bson = mongodb::bson::to_bson(token).map_err(src_err)?;
+    Ok(bson.into_relaxed_extjson().to_string())
 }
 
 /// `clusterTime` (a BSON timestamp, seconds in the high word) to microseconds.
@@ -95,23 +138,42 @@ impl Source for MongoSource {
         }
         if let Some(Position::Text(t)) = start {
             watch = watch.start_after(parse_token(&t)?);
+            self.last_token = Some(t);
         }
+        self.last_heartbeat = Instant::now();
         self.stream = Some(watch.await.map_err(src_err)?.with_type::<Document>());
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<ChangeEvent>> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| Error::Source("source not started".into()))?;
-        while let Some(doc) = stream.next().await {
-            let doc = doc.map_err(src_err)?;
-            if let Some(ev) = to_change_event(&doc)? {
-                return Ok(Some(ev));
+        loop {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| Error::Source("source not started".into()))?;
+            let wait = self
+                .heartbeat_every
+                .saturating_sub(self.last_heartbeat.elapsed());
+            match tokio::time::timeout(wait, stream.next()).await {
+                Ok(Some(doc)) => {
+                    let doc = doc.map_err(src_err)?;
+                    if let Some(ev) = to_change_event(&doc)? {
+                        if let Position::Text(t) = &ev.position {
+                            self.last_token = Some(t.clone());
+                        }
+                        return Ok(Some(ev));
+                    }
+                }
+                Ok(None) => return Ok(None),
+                Err(_) => {}
+            }
+            // Idle, or only skipped events arrived: let the checkpoint follow the stream.
+            if self.last_heartbeat.elapsed() >= self.heartbeat_every {
+                if let Some(hb) = self.heartbeat()? {
+                    return Ok(Some(hb));
+                }
             }
         }
-        Ok(None)
     }
 
     async fn ack(&mut self, _position: Position) -> Result<()> {
@@ -128,6 +190,12 @@ mod tests {
         let t = r#"{"_data":"8265A1"}"#;
         assert!(parse_token(t).is_ok());
         assert!(parse_token("not json").is_err());
+    }
+
+    #[test]
+    fn token_text_matches_event_position_form() {
+        let t = r#"{"_data":"8265A1"}"#;
+        assert_eq!(token_text(&parse_token(t).unwrap()).unwrap(), t);
     }
 
     #[test]

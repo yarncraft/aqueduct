@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use aqueduct_core::{ChangeEvent, Error, Result, Sink};
+use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
 use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
@@ -331,6 +331,11 @@ fn record(event: &ChangeEvent, key: String) -> Result<Record> {
     })
 }
 
+/// The events that become Kafka records: heartbeats carry no row and produce nothing.
+fn deliverable(events: &[ChangeEvent]) -> impl Iterator<Item = &ChangeEvent> {
+    events.iter().filter(|e| e.op != Op::Heartbeat)
+}
+
 #[async_trait]
 impl Sink for KafkaSink {
     async fn send(&mut self, event: &ChangeEvent) -> Result<()> {
@@ -342,7 +347,7 @@ impl Sink for KafkaSink {
     /// broker has acknowledged all of them.
     async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
         let mut groups: HashMap<(String, usize), Vec<Record>> = HashMap::new();
-        for event in events {
+        for event in deliverable(events) {
             let topic = self
                 .router
                 .topic_for(&event.schema, &event.table)
@@ -436,6 +441,14 @@ mod tests {
             assert_eq!(p, partition_index(k, 6));
         }
         assert_eq!(partition_index("anything", 1), 0);
+    }
+
+    #[test]
+    fn heartbeats_produce_no_records() {
+        let hb = ChangeEvent::heartbeat(aqueduct_core::Position::Text("t".into()), 0);
+        let batch = [hb.clone(), crate::sample(), hb];
+        assert_eq!(deliverable(&batch).count(), 1);
+        assert_eq!(deliverable(&batch[..1]).count(), 0);
     }
 
     #[test]

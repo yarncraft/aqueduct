@@ -67,3 +67,30 @@ async fn insert_update_delete_then_resume() {
 
     client.database(&db_name).drop().await.unwrap();
 }
+
+/// Writes to a collection the source filters out; the source must still hand the pipeline a
+/// heartbeat so the checkpoint follows the stream. Not run here (needs a replica set).
+#[tokio::test]
+#[ignore]
+async fn filtered_writes_produce_a_heartbeat() {
+    let db_name = format!("aq_hb_{}", std::process::id());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let db = client.database(&db_name);
+    db.collection::<Document>("watched")
+        .insert_one(doc! {"_id": 0})
+        .await
+        .unwrap();
+
+    let mut c = cfg(&db_name);
+    c.collections = vec!["watched".into()];
+    let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
+    src.start(None).await.unwrap();
+    db.collection::<Document>("other")
+        .insert_one(doc! {"_id": 1})
+        .await
+        .unwrap();
+
+    let hb = next(&mut src).await;
+    assert_eq!(hb.op, Op::Heartbeat);
+    assert!(matches!(hb.position, aqueduct_core::Position::Text(_)));
+}
