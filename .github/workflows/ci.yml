@@ -33,6 +33,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
   integration:
+    needs: rust
     # Runs the tests that need a live Kafka broker and a MongoDB replica set.
     # Containers are started with `docker run` because service containers cannot
     # pass `--replSet` to mongod.
@@ -59,14 +60,17 @@ jobs:
       - name: Start MongoDB (single-node replica set)
         run: |
           docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          ok=0
           for i in $(seq 1 30); do
-            docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' && break
+            if docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok'; then ok=1; break; fi
             sleep 2
           done
+          [ "$ok" = 1 ] || { echo "mongod never answered ping"; exit 1; }
           docker exec mongo mongosh --quiet --eval \
             "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})"
           for i in $(seq 1 30); do
-            docker exec mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' | grep -q PRIMARY && exit 0
+            state=$(docker exec mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' || true)
+            [ "$state" = PRIMARY ] && exit 0
             sleep 2
           done
           echo "replica set never became primary"; exit 1
