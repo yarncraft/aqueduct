@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
 use aqueduct_source_postgres::{parse_lsn, PostgresSource, PostgresSourceConfig, SslMode};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 fn addr() -> String {
@@ -110,10 +111,23 @@ impl Fixture {
     /// A failing test never gets here; the next run's [`sweep_leftovers`] covers that.
     async fn cleanup(self, source: PostgresSource) {
         drop(source);
-        self.db
-            .execute("SELECT pg_drop_replication_slot($1::text)", &[&self.slot])
-            .await
-            .unwrap();
+        // Dropping the source does not close its connection at once, so the slot can still be
+        // active (55006) for a moment. Retry instead of failing the test.
+        let mut tries = 0;
+        loop {
+            match self
+                .db
+                .execute("SELECT pg_drop_replication_slot($1::text)", &[&self.slot])
+                .await
+            {
+                Ok(_) => break,
+                Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("dropping slot {}: {e}", self.slot),
+            }
+        }
         self.db
             .batch_execute(&format!(
                 "DROP PUBLICATION {}; DROP TABLE {}, {};",
