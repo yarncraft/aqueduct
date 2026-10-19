@@ -59,7 +59,11 @@ async fn fails_with(s: PostgresSource, any_of: &[&str]) {
     );
 }
 
-const UNTRUSTED: &[&str] = &["unknownissuer", "unknown issuer", "unknown certificate authority"];
+const UNTRUSTED: &[&str] = &[
+    "unknownissuer",
+    "unknown issuer",
+    "unknown certificate authority",
+];
 const HOSTNAME: &[&str] = &["notvalidforname", "not valid for name"];
 const NO_TLS: &[&str] = &["server does not support tls"];
 
