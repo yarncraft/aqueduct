@@ -10,6 +10,7 @@
 //! change record, so positions are not monotonic across transactions. `queue()` drops every
 //! change at or below the last emitted position; this test overlaps two writers to see whether
 //! that drops a row. Every other integration test runs one transaction at a time.
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Op, Source};
@@ -19,6 +20,12 @@ use tokio_postgres::NoTls;
 fn addr() -> String {
     std::env::var("AQUEDUCT_TEST_PG_PLAIN")
         .unwrap_or_else(|_| panic!("set AQUEDUCT_TEST_PG_PLAIN, see the module docs"))
+}
+
+/// The `k` column of an insert's row image.
+fn key_of(e: &ChangeEvent) -> i64 {
+    let row: serde_json::Value = serde_json::from_str(e.after.as_ref().unwrap().get()).unwrap();
+    row["k"].as_i64().expect("integer key k")
 }
 
 async fn next_event(s: &mut PostgresSource) -> Option<ChangeEvent> {
@@ -77,9 +84,9 @@ async fn overlapping_transactions_lose_no_rows() {
     let mut got = Vec::new();
     while let Some(e) = next_event(&mut s).await {
         assert_eq!(e.op, Op::Insert);
-        got.push(e.after.expect("insert has a row").get().to_owned());
+        got.push(key_of(&e));
     }
-    got.sort();
+    let got: BTreeSet<i64> = got.into_iter().collect();
 
     drop(s);
     db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
@@ -152,10 +159,10 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     // Commit order: T2's row arrives first. Ack it alone, as the pipeline would after a batch
     // that ended there, then "crash".
     let first = next_event(&mut s).await.expect("the first committed row");
-    let mut seen = vec![first.after.clone().unwrap().get().to_owned()];
+    let mut seen = vec![key_of(&first)];
     let checkpoint = first.position;
     assert!(
-        seen[0].contains("t2"),
+        seen[0] == 2,
         "commit order puts T2 first, got {seen:?}"
     );
     s.ack(checkpoint).await.unwrap();
@@ -164,10 +171,9 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     let mut s = new_source();
     s.start(Some(checkpoint)).await.unwrap();
     while let Some(e) = next_event(&mut s).await {
-        seen.push(e.after.expect("insert has a row").get().to_owned());
+        seen.push(key_of(&e));
     }
-    seen.sort();
-    seen.dedup();
+    let seen: BTreeSet<i64> = seen.into_iter().collect();
 
     drop(s);
     db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
@@ -180,9 +186,9 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     .unwrap();
 
     assert_eq!(
-        seen.len(),
-        3,
-        "after the restart all three rows must have been seen, got {seen:?}"
+        seen,
+        BTreeSet::from([1, 2, 3]),
+        "after the restart all three rows must have been seen"
     );
 }
 
@@ -241,11 +247,11 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
     let mut last = None;
     for _ in 0..2 {
         let e = next_event(&mut s).await.expect("a Ta row");
-        seen.push(e.after.clone().unwrap().get().to_owned());
+        seen.push(key_of(&e));
         last = Some(e.position);
     }
     assert!(
-        seen.iter().all(|r| r.contains("ta-")),
+        seen.iter().all(|k| *k == 2 || *k == 3),
         "commit order puts Ta first, got {seen:?}"
     );
     let checkpoint = last.unwrap();
@@ -255,10 +261,9 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
     let mut s = new_source();
     s.start(Some(checkpoint)).await.unwrap();
     while let Some(e) = next_event(&mut s).await {
-        seen.push(e.after.expect("insert has a row").get().to_owned());
+        seen.push(key_of(&e));
     }
-    seen.sort();
-    seen.dedup();
+    let seen: BTreeSet<i64> = seen.into_iter().collect();
 
     drop(s);
     db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
@@ -270,8 +275,9 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
     .await
     .unwrap();
 
-    assert!(
-        seen.iter().any(|r| r.contains("\"tb\"")),
-        "Tb was never delivered after the restart, got {seen:?} (the ack moved the slot past it)"
+    assert_eq!(
+        seen,
+        BTreeSet::from([1, 2, 3]),
+        "Tb (k=1) was never delivered after the restart (the ack moved the slot past it)"
     );
 }
