@@ -141,4 +141,14 @@ mod tests {
         assert!(e.after.unwrap().get().contains("\"n\":\"a\""));
         assert_eq!(e.key.as_deref(), Some(r#"{"_id":1}"#));
     }
+
+    #[tokio::test]
+    async fn srv_uri_is_resolved_not_rejected() {
+        // Needs the driver's `dns-resolver` feature; without it the error names that feature.
+        let err = Client::with_uri_str("mongodb+srv://aqueduct.invalid/")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("dns-resolver"), "{err}");
+    }
 }
