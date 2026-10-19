@@ -371,10 +371,7 @@ admin_insecure_no_auth = true",
         let c = admin_cfg("admin_token = \"0123456789abcdef\"");
         assert_eq!(c.check_admin_token(), Ok(()));
         // Empty stays "unset": loopback without a token is still fine.
-        let c = admin_cfg(
-            "health_addr = \"127.0.0.1:8080\"
-admin_token = \"\"",
-        );
+        let c = admin_cfg("health_addr = \"127.0.0.1:8080\"\nadmin_token = \"\"");
         assert_eq!(c.check_admin_exposure(), Ok(false));
     }
 
