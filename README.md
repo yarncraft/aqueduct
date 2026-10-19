@@ -132,7 +132,7 @@ before/after diff and Copy JSON).
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 
 With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` (a `?token=` query parameter is rejected; URLs leak into logs, history and Referer); open the
-dashboard once as `http://host:8080/#token=<token>` (the fragment is never sent to the server). The page itself is public and **events contain row data**,
+dashboard once as `http://host:8080/#token=<token>` (the fragment is never sent to the server; the page moves it into session storage and strips it from the URL). The page itself is public and **events contain row data**,
 so always set a token and keep the port off untrusted networks.
 
 ## Operations
