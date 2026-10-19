@@ -642,11 +642,7 @@ Authorization: Bearer {token}
         let addr = start(Some("k")).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(
-            b"GET /api/stream HTTP/1.1
-host: x
-Authorization: Bearer k
-
-",
+            b"GET /api/stream HTTP/1.1\r\nhost: x\r\nAuthorization: Bearer k\r\n\r\n",
         )
         .await
         .unwrap();
@@ -658,9 +654,7 @@ Authorization: Bearer k
                 assert!(n > 0, "stream closed before first frame");
                 buf.extend_from_slice(&chunk[..n]);
                 let text = String::from_utf8_lossy(&buf);
-                if text.contains("data: ") && text.ends_with("
-
-") {
+                if text.contains("data: ") && text.ends_with("\n\n") {
                     return text.into_owned();
                 }
             }
@@ -668,9 +662,7 @@ Authorization: Bearer k
         .await
         .expect("no SSE frame within 5s");
         assert!(got.starts_with("HTTP/1.1 200") && got.contains("text/event-stream"));
-        let frame = got.split("
-
-").nth(1).unwrap();
+        let frame = got.split("\r\n\r\n").nth(1).unwrap();
         let data = frame.lines().next().unwrap().strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(data).unwrap();
         assert!(v.get("events_per_sec").is_some());
