@@ -154,8 +154,27 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const token = new URLSearchParams(location.search).get('token');
-const qs = token ? '?token=' + encodeURIComponent(token) : '';
+// The token is sent only as an Authorization header. Only a one-time #token=... in the address bar
+// is accepted: it is moved into sessionStorage and stripped from the URL so it never reaches
+// history, Referer or screenshots. A ?token= in the page URL is ignored (and stripped), because
+// loading such a link would already have sent the secret in the GET request line.
+const token = (() => {
+  const u = new URL(location.href);
+  const h = new URLSearchParams(u.hash.slice(1));
+  const given = h.get('token');
+  if (given || u.searchParams.has('token')) {
+    u.searchParams.delete('token');
+    h.delete('token');
+    u.hash = h.toString();
+    history.replaceState(null, '', u.pathname + u.search + u.hash);
+  }
+  if (given) {
+    try { sessionStorage.setItem('aqueduct_token', given); } catch (_) { /* storage blocked: keep in memory */ }
+    return given;
+  }
+  try { return sessionStorage.getItem('aqueduct_token'); } catch (_) { return null; }
+})();
+const authInit = extra => Object.assign({}, extra, token ? { headers: { Authorization: 'Bearer ' + token } } : {});
 const OPS = ['inserts', 'updates', 'deletes', 'truncates'];
 const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet' };
 const fmt = n => n.toLocaleString('en-US');
@@ -314,10 +333,10 @@ function syncTopicFilter(topics) {
 async function pollEvents() {
   if (paused) return;
   try {
-    const r = await fetch('/api/events?limit=' + FETCH_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value) + (token ? '&token=' + encodeURIComponent(token) : ''));
+    const r = await fetch('/api/events?limit=' + FETCH_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value), authInit());
     if (r.status === 403 || r.status === 401) {
       paused = true; clearInterval(pollTimer);
-      $('events').innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${r.status === 403 ? 'Inspector disabled. Set admin_token to enable it (it exposes row data).' : 'Unauthorized. Open the page with ?token=...'}</td></tr>`;
+      $('events').innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${r.status === 403 ? 'Inspector disabled. Set admin_token to enable it (it exposes row data).' : 'Unauthorized. Open the page once with #token=... (it is moved to session storage and removed from the URL).'}</td></tr>`;
       return;
     }
     if (!r.ok) return;
@@ -353,10 +372,46 @@ $('evclear').addEventListener('click', () => { evs = []; openId = null; syncTabl
 const pollTimer = setInterval(pollEvents, 3000);
 pollEvents();
 
-const es = new EventSource('/api/stream' + qs);
-es.onopen = () => setConn(true, 'live');
-es.onmessage = e => render(JSON.parse(e.data));
-es.onerror = () => setConn(false, 'reconnecting');
+// SSE over fetch: EventSource cannot set headers. Each frame is a full snapshot, so a reconnect
+// needs no resume position, only a backoff. The server sends a frame every second, so STALL_MS
+// without any bytes means the connection is hung: abort it and reconnect.
+const STALL_MS = 10000;
+async function streamLoop() {
+  let delay = 1000;
+  for (;;) {
+    const ctl = new AbortController();
+    let stall = setTimeout(() => ctl.abort(), STALL_MS);
+    try {
+      const r = await fetch('/api/stream', authInit({ signal: ctl.signal }));
+      if (r.status === 401 || r.status === 403) { clearTimeout(stall); setConn(false, r.status === 401 ? 'unauthorized' : 'disabled'); return; }
+      if (!r.ok || !r.body) throw new Error('stream ' + r.status);
+      setConn(true, 'live');
+      delay = 1000;
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        clearTimeout(stall);
+        stall = setTimeout(() => ctl.abort(), STALL_MS);
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const data = frame.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
+          if (data) render(JSON.parse(data));
+        }
+      }
+    } catch (_) { /* fall through to reconnect */ }
+    clearTimeout(stall);
+    ctl.abort();
+    setConn(false, 'reconnecting');
+    await new Promise(res => setTimeout(res, delay));
+    delay = Math.min(delay * 2, 15000);
+  }
+}
+streamLoop();
 </script>
 </body>
 </html>
