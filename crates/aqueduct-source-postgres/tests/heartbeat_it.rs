@@ -398,7 +398,10 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     let checkpoint = lsn(&last_old.unwrap());
     drop(first);
     let behind = f.confirmed().await;
-    assert!(behind < checkpoint, "the slot must still be behind the checkpoint");
+    assert!(
+        behind < checkpoint,
+        "the slot must still be behind the checkpoint"
+    );
 
     // `X` sits in the committed WAL behind the replay window.
     f.insert_published("after-window").await;
