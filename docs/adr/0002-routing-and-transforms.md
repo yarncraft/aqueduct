@@ -86,10 +86,23 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
   `before`). `<path>` is a column name, dotted for nested MongoDB documents (`after.address.city`).
 - **Operators:** `==` `!=` `<` `<=` `>` `>=`, `in [..]`, `is null`, `is not null`, `and`, `or`, `not`,
   and parentheses. Literals: strings, numbers, `true`/`false`, `null`.
-- A missing field is `null`. Comparisons with `null` are false, except `is null`. Type mismatch is false.
-- **No** functions, arithmetic, regex or scripting in v1. A hand-written parser with no new dependency;
-  the expression is compiled at startup, so a bad expression fails config validation, not at runtime.
-- **Templates** (`topic`, outbox `topic`) use `{schema}`, `{table}`, `{op}` and any field path.
+- A missing field is `null`. Comparisons with `null` are false, except `is null` (SQL `WHERE` semantics).
+- **Comparisons are typed by the literal, and a type mismatch is an error, never `false`.** The decoder writes
+  only int2/4/8, float4/8 and bool as JSON numbers or booleans (`decoder.rs::push_text`). `numeric`, `uuid`,
+  dates, timestamps and the rest arrive as JSON strings. So:
+  - A **number literal** compares numerically against a JSON number **or a string that parses as a
+    decimal** (`numeric` text). The comparison is exact decimal on the normalised digits, not `f64`. Any other
+    value is a type error.
+  - A **string literal** allows only `==`, `!=` and `in`. Ordering a string (`<` on a timestamp) is rejected
+    at **startup**, because Postgres timestamp text depends on the session `TimeZone` and does not sort reliably.
+  - A **bool literal** matches a JSON bool only.
+  - A type error **propagates through `not`, `and` and `or`**. It is never coerced to true or false, so
+    `not (...)` cannot let a mis-typed row through. The event then follows the error policy (§5a).
+- **No** functions, arithmetic, regex or scripting in v1. The parser is hand-written and adds no new
+  dependency. It is limited to 4 KiB of input and nesting depth 32, so a hostile or accidental config cannot
+  overflow the stack at startup. Expressions are compiled at startup, so a syntax error fails config validation.
+- **Templates** (`topic`, outbox `topic`) use `{schema}`, `{table}`, `{op}` and any field path, under the
+  rules in §5 "Content routing".
 
 ### 4. Cost
 
@@ -105,26 +118,85 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
 ### 5. Semantics per capability
 
 - **Filter:** `ops` is a list of insert, update, delete, truncate, read (read is from ADR 0001). `where`
-  is a predicate. A dropped event counts as `filtered`.
-- **Content routing:** if a template field is null or missing, or the rendered name is not a legal
-  Kafka topic (`[A-Za-z0-9._-]`, max 249 characters), the event goes to `topic_fallback`. With no
-  fallback, the pipeline fails (fail closed, as an unrouted event does today).
-  New guard: `sink.max_dynamic_topics` (default 100) caps how many distinct topics templates may create,
-  so a high-cardinality column cannot auto-create thousands of topics. Going over it fails the pipeline
-  with a clear error.
+  is a predicate. A dropped event counts as `filtered`. **Rows leaving the filter:** `where` sees only the
+  event's own row, so an update `status: paid → refunded` under `where = "row.status == 'paid'"` is dropped,
+  and the consumer keeps the row as "paid". DEPLOYMENT.md says this next to `where`. A follow-up issue adds
+  `on_leave = "drop" | "delete" | "tombstone"`: it evaluates `where` on `before` too (this needs before-images,
+  i.e. `REPLICA IDENTITY FULL`) and emits a delete or a tombstone when a row leaves the filter.
+- **Content routing.** Row data must not be able to choose an arbitrary topic. Validation enforces:
+  - Every dynamic template starts with a **static, non-empty prefix** that does not start with `_`
+    (`orders.{row.region}` is allowed, `{row.tenant}` is rejected). So no value reaches `__consumer_offsets`,
+    another internal topic, or a bare topic of its own choosing.
+  - Each substituted value is **one segment**, `[A-Za-z0-9_-]{1,64}`. A `.` inside a value is not allowed, so
+    `eu` is fine and `x.payments` is not.
+  - **No static topic** anywhere in the config (route `topic`, `sink.topic`, other fallbacks) may match the
+    template's glob. So `orders.{row.region}` cannot be pointed at another route's `orders.eu`.
+  - An optional `topic_values = ["eu", "us"]` allow-list.
+  - **`topic_fallback` is required** on every template that reads a row field. A null or missing field, a
+    value that breaks the rules, a value not in `topic_values`, or the cap below sends the event to the
+    fallback and counts it under `fallback`. So there is no runtime "no topic" failure on dynamic routes:
+    one bad row can never stall the pipeline, pin the slot and fill the primary's disk.
+  - **`sink.max_dynamic_topics`** (default 100) is counted **from the broker**: at startup, the topics that
+    match each template's glob, plus the ones created since. The count therefore survives restarts, and a
+    crash loop cannot create 100 more topics on every start. When the cap is reached, the event goes to the
+    fallback and is counted under `fallback`, with a warn-once log. It never fails the pipeline.
 - **Key:** `key = ["col", ...]` sets the record key to `schema.table:<values joined 0x1f>` (the
   `partition_by = "key"` format) and partitions by it, overriding `partition_by` for that route. It
   reads `row`, so deletes key by the before-image. This is the explicit escape hatch for #45: a route can
   pin the key to immutable PK columns whatever the replica identity is.
-- **Fields:** `include` and `exclude` are mutually exclusive. `mask` replaces the value with `"***"`
-  (null stays null). `hash` is **HMAC-SHA256** with `sink.hash_key` (env `AQUEDUCT_HASH_KEY`, never logged,
-  required when any route hashes), giving lowercase hex. A plain SHA-256 of low-entropy PII (emails,
-  phone numbers) can be reversed with a dictionary. `rename` maps old names to new ones; table renames
-  are done with `topic`.
+- **Fields:** `include` and `exclude` are mutually exclusive. They take **top-level column names only**,
+  so a dotted path is a validation error (nested MongoDB fields are not supported by field operations in v1),
+  and a `rename` target that collides with an existing or another renamed column is also rejected.
+  - **`mask`:** strings become `"***"`. Every other non-null type becomes `null`, so the JSON type is kept or
+    goes null, and an int never turns into a string. `null` stays `null`.
+  - **`hash`:** **HMAC-SHA256** (`ring::hmac`, which `aqueduct-tls` already uses), giving lowercase hex. The
+    input is the **canonical text** of the value: the unescaped content of a JSON string, the JSON text of a
+    number or bool as written (`42`, `true`), or the compact JSON of an object or array (MongoDB `ObjectId`
+    is its relaxed extended-JSON form). `null` is not hashed. Postgres `int4 42` and MongoDB int `42` give
+    the same digest, so consumers can join. MongoDB doubles (`42.0`) do not match Postgres ints, and the
+    docs say so.
+  - **The key comes from `AQUEDUCT_HASH_KEY` or `sink.hash_key_file` only.** A `hash_key` in the TOML is
+    rejected, the key is redacted from the config's `Debug`, and it is never logged. `sink.hash_key_id`
+    (a short label) goes on every record of a hashing route as the header `aqueduct-hash-key-id`. Rotation
+    means a new key and a new id, and consumers join per id.
+  - **A configured field that never appears** (a typo like `card_last_4`) cannot be caught at startup,
+    because columns are only known when rows arrive. The plan counts, per route and field, how many rows of a
+    matched table were seen without that column. After 1000 such rows it logs a warn-once and raises
+    `aqueduct_route_field_unseen{route, field}`, which the cockpit shows as a warning.
+- **No row data may bypass the field operations.** Steps 2–3 read the original row, so validation
+  **rejects** a route where any `exclude`d, `mask`ed or `hash`ed column (or, with `include`, any column that
+  is not included) appears in `key`, in a topic template, in `topic_values`, or in the outbox `aggregate_id`
+  or `topic`. A route with field operations **must declare `key = [...]` explicitly** when
+  `partition_by = "key"` applies. The sink cannot see which columns the opaque replica-identity key holds,
+  so it would otherwise risk putting a hashed `email` PK in the record key in plaintext. Headers only ever
+  carry `op`, `lsn` and `aqueduct-hash-key-id`, never row data.
 - **`format = "row"` (unwrap):** the value is `after` (insert, update, read). Deletes follow `deletes`:
   `tombstone` (null value, the default), `drop`, or `row` (before plus `"__deleted": true`). Truncates
   are dropped and counted. `op` and `lsn` stay in the headers, so nothing is lost for consumers that need
   them.
+- **TOAST.** The decoder omits `Unchanged` TOAST columns (`decoder.rs::row`). So in `format = "row"` an
+  update can lack a large column, and a compacted consumer that replaces whole rows loses it. A `where` on
+  that column sees `null`. Two answers:
+  - **Route option** `unchanged = "omit" | "dead_letter"` (default `omit`, documented): `dead_letter` sends
+    any row with an omitted column to the dead-letter topic instead of producing an incomplete row.
+  - **Decoder follow-up:** under `REPLICA IDENTITY FULL` the old tuple is logged in full, so the decoder can
+    fill `Unchanged` columns of `after` from `before`. That makes FULL a real workaround, for live events too.
+    It needs a separate issue and a test (it reuses #50's TOAST fixture).
+
+#### 5a. Error policy: never silent, never a stall from one row
+
+A **row-level evaluation error** has two sources: a type error in `where`, or an outbox row missing its
+`aggregate_id` / `payload`. Neither drops the event nor guesses an outcome.
+
+- When `sink.dead_letter_topic` is set, the event goes there. The value is the envelope **with the route's
+  field operations applied**, so the DLQ never holds data the route would have masked. The key is
+  `schema.table`, and an `aqueduct-error` header holds the reason (the expression and the type, no values).
+  The event is counted under `errors`, and the batch acks normally.
+- Without a dead-letter topic, the pipeline fails with the route, the table and the reason. Validation
+  **warns at startup** when any route uses `where`, outbox or `unchanged = "dead_letter"` without
+  `sink.dead_letter_topic`, so this choice is visible up front.
+
+Dynamic topics never reach this path (§5 "Content routing" always has a fallback).
 - **Tombstones (envelope format):** `tombstones = true` emits a null-value record with the same key after
   every delete. Config validation **rejects** it unless the route's key is per row (`key = [...]` or
   `partition_by = "key"`): a tombstone keyed `schema.table` would erase the whole table from a compacted
