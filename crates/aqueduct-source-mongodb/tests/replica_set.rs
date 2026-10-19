@@ -112,20 +112,33 @@ async fn skipped_ddl_still_produces_a_heartbeat() {
     let db_name = format!("aq_ddl_{}", std::process::id());
     let client = Client::with_uri_str(uri()).await.unwrap();
     let db = client.database(&db_name);
-    let watched = db.collection::<Document>("watched");
-    watched.insert_one(doc! {"_id": 0}).await.unwrap();
+    db.collection::<Document>("watched")
+        .insert_one(doc! {"_id": 0})
+        .await
+        .unwrap();
 
     let mut c = cfg(&db_name);
     c.collections = vec!["watched".into()];
     let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
     src.start(None).await.unwrap();
 
+    // Recreate the collection each round so every drop writes an oplog entry. `create` events
+    // need `showExpandedEvents`, which the source does not set, so only unmapped `drop` events
+    // arrive, and getMores keep returning data for longer than the 1s heartbeat interval.
+    let churn_db = db.clone();
     let churn = tokio::spawn(async move {
-        for _ in 0..40 {
-            let _ = watched.drop().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < end {
+            churn_db.create_collection("watched").await.unwrap();
+            churn_db
+                .collection::<Document>("watched")
+                .drop()
+                .await
+                .unwrap();
         }
     });
+    // Smoke test only: it cannot show which branch emitted the heartbeat. The unit test
+    // `skipped_doc_token_is_its_own_id` and code review cover that.
     let hb = next(&mut src).await;
     assert_eq!(hb.op, Op::Heartbeat);
     assert!(matches!(hb.position, aqueduct_core::Position::Text(_)));
