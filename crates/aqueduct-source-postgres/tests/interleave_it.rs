@@ -281,3 +281,143 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
         "Tb (k=1) was never delivered after the restart (the ack moved the slot past it)"
     );
 }
+
+/// Same-position variants. `COPY` is decoded from `heap_multi_insert`, so every row in one WAL
+/// record carries that record's LSN, and a multi-table `TRUNCATE` is one message for all its
+/// tables. A position-only dedupe keeps one event per position and drops the rest.
+const COPY_3_ROWS: &str =
+    r#"COPY {t} (k, v) FROM PROGRAM 'printf "1	a
+2	b
+3	c
+"'"#;
+
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn copy_rows_and_multi_table_truncate_lose_no_events() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let (t, u) = (format!("same_lsn_t_{id}"), format!("same_lsn_u_{id}"));
+    let publication = format!("aq_sl_pub_{id}");
+    let slot = format!("aq_sl_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {t} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE TABLE {u} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION {publication} FOR TABLE {t}, {u};"
+    ))
+    .await
+    .unwrap();
+
+    let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.poll_interval = Duration::from_millis(100);
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+
+    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t)).await.unwrap();
+    db.batch_execute(&format!("TRUNCATE {t}, {u}")).await.unwrap();
+
+    let mut inserted = BTreeSet::new();
+    let mut truncated = BTreeSet::new();
+    while let Some(e) = next_event(&mut s).await {
+        match e.op {
+            Op::Insert => {
+                inserted.insert(key_of(&e));
+            }
+            Op::Truncate => {
+                truncated.insert(e.table.clone());
+            }
+            op => panic!("unexpected {op:?}"),
+        }
+    }
+
+    drop(s);
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+        .await
+        .unwrap();
+    db.batch_execute(&format!("DROP PUBLICATION {publication}; DROP TABLE {t}, {u};"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inserted,
+        BTreeSet::from([1, 2, 3]),
+        "every COPY row must arrive, not one per WAL record"
+    );
+    assert_eq!(
+        truncated,
+        BTreeSet::from([t, u]),
+        "a multi-table TRUNCATE must give one event per table"
+    );
+}
+
+/// Cut inside a same-position group: only the first COPY row is delivered and acked, then the
+/// process "crashes". The other rows share its position, so a position-based ack must not move
+/// the slot past them.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn restart_after_acking_part_of_a_copy_loses_no_rows() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let t = format!("same_lsn_r_{id}");
+    let publication = format!("aq_slr_pub_{id}");
+    let slot = format!("aq_slr_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {t} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION {publication} FOR TABLE {t};"
+    ))
+    .await
+    .unwrap();
+
+    let new_source = || {
+        let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.ssl_mode = Some(SslMode::Disable);
+        cfg.poll_interval = Duration::from_millis(100);
+        PostgresSource::new(cfg)
+    };
+    let mut s = new_source();
+    s.start(None).await.unwrap();
+
+    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t)).await.unwrap();
+
+    let first = next_event(&mut s).await.expect("the first COPY row");
+    let mut seen = BTreeSet::from([key_of(&first)]);
+    let checkpoint = first.position;
+    s.ack(checkpoint).await.unwrap();
+    drop(s);
+
+    let mut s = new_source();
+    s.start(Some(checkpoint)).await.unwrap();
+    while let Some(e) = next_event(&mut s).await {
+        seen.insert(key_of(&e));
+    }
+
+    drop(s);
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+        .await
+        .unwrap();
+    db.batch_execute(&format!("DROP PUBLICATION {publication}; DROP TABLE {t};"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        seen,
+        BTreeSet::from([1, 2, 3]),
+        "rows sharing the acked position must be redelivered after the restart"
+    );
+}
