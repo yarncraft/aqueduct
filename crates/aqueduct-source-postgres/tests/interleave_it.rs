@@ -318,23 +318,26 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     let mut s = PostgresSource::new(cfg);
     s.start(None).await.unwrap();
 
+    let raw_slot = format!("{slot}_raw");
+    db.execute(
+        "SELECT pg_create_logical_replication_slot($1::text, 'pgoutput')",
+        &[&raw_slot],
+    )
+    .await
+    .unwrap();
     db.batch_execute(&COPY_3_ROWS.replace("{t}", &t)).await.unwrap();
     db.batch_execute(&format!("TRUNCATE {t}, {u}")).await.unwrap();
 
     let mut inserted = BTreeSet::new();
     let mut truncated = BTreeSet::new();
-    let mut insert_lsns = Vec::new();
-    let mut truncate_lsns = Vec::new();
     while let Some(e) = next_event(&mut s).await {
         eprintln!("event {:?} {} at {:?}", e.op, e.table, e.position);
         match e.op {
             Op::Insert => {
                 inserted.insert(key_of(&e));
-                insert_lsns.push(e.position);
             }
             Op::Truncate => {
                 truncated.insert(e.table.clone());
-                truncate_lsns.push(e.position);
             }
             op => panic!("unexpected {op:?}"),
         }
@@ -348,16 +351,36 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
         .await
         .unwrap();
 
-    // The fixture is only valid if the rows really share a position. Otherwise this test could
-    // pass on a position-only dedupe for the wrong reason.
+    // The fixture is only valid if the rows really share a position. Check it from a second
+    // slot's raw peek: the source under test may already have dropped rows, so its own events
+    // cannot prove it. Otherwise this test could pass for the wrong reason.
+    let raw = db
+        .query(
+            "SELECT lsn::text, get_byte(data, 0)::int FROM pg_logical_slot_peek_binary_changes(             $1::text, NULL, NULL, 'proto_version', '1', 'publication_names', $2::text)",
+            &[&raw_slot, &publication],
+        )
+        .await
+        .unwrap();
+    let lsns_of = |tag: u8| -> Vec<String> {
+        raw.iter()
+            .filter(|r| r.get::<_, i32>(1) == tag as i32)
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    };
+    let inserts = lsns_of(b'I');
+    eprintln!("raw insert LSNs: {inserts:?}");
     assert!(
-        insert_lsns.len() == 3 && insert_lsns.windows(2).all(|w| w[0] == w[1]),
-        "invalid fixture: the 3 COPY rows do not share one LSN: {insert_lsns:?}"
+        inserts.len() == 3 && inserts.iter().all(|l| *l == inserts[0]),
+        "invalid fixture: the 3 COPY rows do not share one LSN: {inserts:?}"
     );
-    assert!(
-        truncate_lsns.len() == 2 && truncate_lsns[0] == truncate_lsns[1],
-        "invalid fixture: the 2 TRUNCATE events do not share one LSN: {truncate_lsns:?}"
+    assert_eq!(
+        lsns_of(b'T').len(),
+        1,
+        "invalid fixture: a multi-table TRUNCATE must be a single message"
     );
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&raw_slot])
+        .await
+        .unwrap();
     assert_eq!(
         inserted,
         BTreeSet::from([1, 2, 3]),
