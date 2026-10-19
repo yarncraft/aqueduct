@@ -42,7 +42,8 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.
 - Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it.
-- Kafka: record key is `schema.table`, partition is a stable FNV-1a hash of the key (per-table ordering).
+- Kafka: record key is `schema.table` (default `partition_by = "table"`, per-table ordering) or `schema.table:<pk>`
+  (`partition_by = "key"`, per-row ordering); partition is a stable FNV-1a hash of the key (`kafka.rs::record_key`).
 - Rows are sensitive. The event inspector exposes row data over HTTP; keep it behind `admin_token`
   and never log tokens.
 - **Fail closed**: the admin server refuses a non-loopback `health_addr` without `admin_token` (`Config::check_admin_exposure`,
