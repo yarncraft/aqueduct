@@ -7,6 +7,9 @@ use serde::Serialize;
 
 use crate::{ChangeEvent, Op};
 
+/// Per-table op counters: `[insert, update, delete, truncate, read]`.
+pub const OP_SLOTS: usize = 5;
+
 /// Metrics are best-effort telemetry: a panic elsewhere that poisoned a lock must not
 /// cascade into the pipeline, so recover the guard instead of unwrapping.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -43,6 +46,7 @@ pub struct Metrics {
     updates: AtomicU64,
     deletes: AtomicU64,
     truncates: AtomicU64,
+    reads: AtomicU64,
     errors: AtomicU64,
     last_position: Mutex<Option<String>>,
     last_commit_ts_micros: AtomicI64,
@@ -51,7 +55,7 @@ pub struct Metrics {
     sink_us_last: AtomicU64,
     sink_us_max: AtomicU64,
     tables: Mutex<BTreeMap<String, u64>>,
-    table_ops: Mutex<BTreeMap<String, [u64; 4]>>,
+    table_ops: Mutex<BTreeMap<String, [u64; OP_SLOTS]>>,
     last_error: Mutex<Option<String>>,
     /// Slot lag in bytes, or `-1` when unknown (no slot, or the source has none).
     slot_lag_bytes: AtomicI64,
@@ -81,6 +85,7 @@ pub struct Snapshot {
     pub updates: u64,
     pub deletes: u64,
     pub truncates: u64,
+    pub reads: u64,
     pub errors: u64,
     pub last_lsn: Option<String>,
     /// Commit-time to delivery-time of the newest event, in ms.
@@ -90,8 +95,8 @@ pub struct Snapshot {
     pub sink_last_ms: f64,
     pub sink_max_ms: f64,
     pub tables: BTreeMap<String, u64>,
-    /// Per table counts as `[insert, update, delete, truncate]`.
-    pub table_ops: BTreeMap<String, [u64; 4]>,
+    /// Per table counts as `[insert, update, delete, truncate, read]`.
+    pub table_ops: BTreeMap<String, [u64; OP_SLOTS]>,
     pub last_error: Option<String>,
     /// Replication slot lag in bytes (WAL head minus `confirmed_flush_lsn`); `None` when unknown
     /// or the source has no slot.
@@ -131,6 +136,7 @@ impl Metrics {
             updates: AtomicU64::new(0),
             deletes: AtomicU64::new(0),
             truncates: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_position: Mutex::new(None),
             last_commit_ts_micros: AtomicI64::new(0),
@@ -197,6 +203,7 @@ impl Metrics {
             Op::Update => &self.updates,
             Op::Delete => &self.deletes,
             Op::Truncate => &self.truncates,
+            Op::Read => &self.reads,
             // Unreachable: heartbeats return at the top; the arm keeps the match exhaustive.
             Op::Heartbeat => return,
         }
@@ -219,6 +226,7 @@ impl Metrics {
                 Op::Update => 1,
                 Op::Delete => 2,
                 Op::Truncate => 3,
+                Op::Read => 4,
                 // Unreachable: heartbeats return at the top of `record_event`; the arm only
                 // keeps the match exhaustive.
                 Op::Heartbeat => return,
@@ -246,6 +254,7 @@ impl Metrics {
             updates: self.updates.load(Relaxed),
             deletes: self.deletes.load(Relaxed),
             truncates: self.truncates.load(Relaxed),
+            reads: self.reads.load(Relaxed),
             errors: self.errors.load(Relaxed),
             last_lsn: lock(&self.last_position).clone(),
             lag_ms: (events > 0 && ts > 0).then(|| now_ms() as i64 - ts / 1000),
@@ -297,6 +306,17 @@ mod tests {
     }
 
     #[test]
+    fn read_events_count_as_events_and_per_table_reads() {
+        let m = Metrics::new();
+        m.record_event(&ev(Op::Read, "a", 10), Duration::from_millis(1));
+        m.record_event(&ev(Op::Read, "a", 11), Duration::from_millis(1));
+        m.record_event(&ev(Op::Insert, "a", 12), Duration::from_millis(1));
+        let s = m.snapshot();
+        assert_eq!((s.events_total, s.reads, s.inserts), (3, 2, 1));
+        assert_eq!(s.table_ops["public.a"], [1, 0, 0, 0, 2]);
+    }
+
+    #[test]
     fn counts_by_op_and_table() {
         let m = Metrics::new();
         assert!(m.snapshot().last_lsn.is_none());
@@ -310,8 +330,8 @@ mod tests {
             (3, 2, 1, 1)
         );
         assert_eq!(s.tables["public.a"], 2);
-        assert_eq!(s.table_ops["public.a"], [2, 0, 0, 0]);
-        assert_eq!(s.table_ops["public.b"], [0, 0, 1, 0]);
+        assert_eq!(s.table_ops["public.a"], [2, 0, 0, 0, 0]);
+        assert_eq!(s.table_ops["public.b"], [0, 0, 1, 0, 0]);
         assert_eq!(s.last_lsn.as_deref(), Some("0/C"));
         assert!((s.sink_avg_ms - 4.0).abs() < 0.01);
         assert!((s.sink_max_ms - 6.0).abs() < 0.01);

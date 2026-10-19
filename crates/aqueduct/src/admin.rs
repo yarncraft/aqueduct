@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{Metrics, Snapshot, State};
+use aqueduct_core::{Metrics, Snapshot, State, OP_SLOTS};
 use aqueduct_sinks::KafkaInspector;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,8 +59,8 @@ pub struct Admin {
     token: Option<String>,
     /// Events/second, one sample per second, oldest first.
     history: Mutex<VecDeque<f64>>,
-    /// Per table `[insert, update, delete, truncate]` events/second, aligned with `history`.
-    detail: Mutex<BTreeMap<String, VecDeque<[u64; 4]>>>,
+    /// Per table `[insert, update, delete, truncate, read]` events/second, aligned with `history`.
+    detail: Mutex<BTreeMap<String, VecDeque<[u64; OP_SLOTS]>>>,
     streams: AtomicUsize,
     inspector: Option<KafkaInspector>,
     inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
@@ -87,7 +87,7 @@ impl Admin {
     pub async fn sample_forever(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last = self.metrics.events_total();
-        let mut last_ops: BTreeMap<String, [u64; 4]> = BTreeMap::new();
+        let mut last_ops: BTreeMap<String, [u64; OP_SLOTS]> = BTreeMap::new();
         loop {
             tick.tick().await;
             let now = self.metrics.events_total();
@@ -102,14 +102,14 @@ impl Admin {
                 let mut d = lock(&self.detail);
                 for (t, c) in &ops {
                     let prev = last_ops.get(t).copied().unwrap_or_default();
-                    let mut delta = [0u64; 4];
+                    let mut delta = [0u64; OP_SLOTS];
                     for i in 0..4 {
                         delta[i] = c[i].saturating_sub(prev[i]);
                     }
                     let series = d.entry(t.clone()).or_default();
                     // A table seen for the first time is zero-filled back to the window start.
                     while series.len() + 1 < len {
-                        series.push_back([0; 4]);
+                        series.push_back([0; OP_SLOTS]);
                     }
                     series.push_back(delta);
                 }
@@ -227,6 +227,7 @@ fn prometheus(s: &Snapshot) -> String {
         ("update", s.updates),
         ("delete", s.deletes),
         ("truncate", s.truncates),
+        ("read", s.reads),
     ] {
         let _ = writeln!(o, "aqueduct_events_total{{op=\"{op}\"}} {n}");
     }
