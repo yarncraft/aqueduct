@@ -323,13 +323,18 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
 
     let mut inserted = BTreeSet::new();
     let mut truncated = BTreeSet::new();
+    let mut insert_lsns = Vec::new();
+    let mut truncate_lsns = Vec::new();
     while let Some(e) = next_event(&mut s).await {
+        eprintln!("event {:?} {} at {:?}", e.op, e.table, e.position);
         match e.op {
             Op::Insert => {
                 inserted.insert(key_of(&e));
+                insert_lsns.push(e.position);
             }
             Op::Truncate => {
                 truncated.insert(e.table.clone());
+                truncate_lsns.push(e.position);
             }
             op => panic!("unexpected {op:?}"),
         }
@@ -343,6 +348,16 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
         .await
         .unwrap();
 
+    // The fixture is only valid if the rows really share a position. Otherwise this test could
+    // pass on a position-only dedupe for the wrong reason.
+    assert!(
+        insert_lsns.len() == 3 && insert_lsns.windows(2).all(|w| w[0] == w[1]),
+        "invalid fixture: the 3 COPY rows do not share one LSN: {insert_lsns:?}"
+    );
+    assert!(
+        truncate_lsns.len() == 2 && truncate_lsns[0] == truncate_lsns[1],
+        "invalid fixture: the 2 TRUNCATE events do not share one LSN: {truncate_lsns:?}"
+    );
     assert_eq!(
         inserted,
         BTreeSet::from([1, 2, 3]),
