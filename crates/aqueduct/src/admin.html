@@ -180,7 +180,7 @@ const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', trun
 const fmt = n => n.toLocaleString('en-US');
 const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
-const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red', stopped: 'bg-ink-300' };
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
@@ -281,7 +281,7 @@ let openId = null;
 const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
 const rel = e => (e.event.schema || '?') + '.' + (e.event.table || '?');
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
-const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v); return t.length > 28 ? t.slice(0, 27) + '…' : t; };
+const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v) ?? ''; return t.length > 28 ? t.slice(0, 27) + '…' : t; };
 const summary = ev => {
   const row = ev.after || ev.before;
   return row ? Object.entries(row).slice(0, 4).map(([k, v]) => `<span class="text-ink-300">${esc(k)}=</span>${esc(short(v))}`).join(' ') : '<span class="text-ink-500">–</span>';
@@ -300,7 +300,7 @@ function side(title, row, other) {
 function detail(e) {
   const ev = e.event;
   const isUpd = ev.op === 'update';
-  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${ev.xid}</span><span>commit ${esc(new Date(ev.commit_ts_micros / 1000).toISOString())}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
+  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${esc(ev.xid ?? '–')}</span><span>commit ${esc(new Date(ev.commit_ts_micros / 1000).toISOString())}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
 }
 
 function renderEvents() {
@@ -310,7 +310,7 @@ function renderEvents() {
   $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
     const ev = e.event, id = evid(e);
-    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${e.partition} @${e.offset}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${clock(e.timestamp_ms)}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[ev.op] || ''}">${esc(ev.op || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(ev.lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
+    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[ev.op] || ''}">${esc(ev.op || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(ev.lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
     return openId === id ? row + detail(e) : row;
   }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events in Kafka yet'}</td></tr>`;
 }
