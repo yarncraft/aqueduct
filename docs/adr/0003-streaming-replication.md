@@ -1,6 +1,6 @@
 # ADR 0003: Streaming replication for the Postgres source
 
-- Status: proposed
+- Status: proposed (revised after Megatron's review of f1614cc; Lucas accepted the three recommendations)
 - Issue: #58 (related: #57, #47, #63, ADR 0001)
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author)
 - Date: 2026-10-19
@@ -43,7 +43,7 @@ fallback for setups where a replication connection is not available: PgBouncer a
 `max_wal_senders = 0`, or a `pg_hba.conf` that the operator can't change.
 
 Both transports use **the same slot, the same decoder and the same positions**. A checkpoint written in one mode
-is valid in the other, so switching needs no migration (§5).
+is valid in the other, so switching needs no migration (§4, §5).
 
 ### 2. Client: a small hand-written replication client on crates already in the tree
 
@@ -78,7 +78,10 @@ password and dbname from the same parsed `tokio_postgres::Config` (`tls::parse`)
   `heartbeat_action_query`.
 - **Replication connection**, owned by a **spawned task** that runs whether or not the pipeline is in `next()`:
   - It reads `CopyData` and forwards `(lsn, payload)` into a **bounded channel**, bounded by bytes
-    (`stream_buffer_bytes`, default 64 MiB; a single message larger than the bound is still admitted alone).
+    (`stream_buffer_bytes`, default 64 MiB). A single message larger than that bound is admitted on its own, but
+    **no frame may exceed 1 GiB** (Postgres' own message limit, `MaxAllocSize`). A larger length header is a
+    protocol error that closes the connection before anything is allocated, so a hostile or MITM'd server can't
+    make us allocate 4 GiB.
     When the channel is full, the task stops reading the socket. TCP flow control then stalls the walsender, so
     the server holds the backlog (it spills to disk past `logical_decoding_work_mem`), not our heap.
   - It sends a Standby Status Update **every `status_interval` (10 s)** from a timer, and immediately when a
@@ -90,38 +93,61 @@ password and dbname from the same parsed `tokio_postgres::Config` (`tls::parse`)
   `RelationCache` lives for the **connection** rather than for one poll, because Relation messages are sent once
   per session and again on schema change. A new connection starts with an empty cache.
 
-### 4. What we confirm, and when
+### 4. Positions: a commit-ordered key, not the change LSN
 
-- **`write` = `flush` = `apply` = the `ack_target` result**, i.e. the highest commit-end LSN whose changes are all
-  checkpointed. It is the same function and the same rule as today, so mid-transaction acks still don't move the
-  slot.
-- **Idle progress replaces #47's peek-time heartbeat in stream mode.** A keepalive `k` carries the walsender's
-  sent position. Because the socket is ordered, every message before that keepalive has already reached the
-  channel. Pgoutput v1 only sends committed transactions, so between two transactions nothing is half-delivered.
-  So when the source pops a keepalive from the channel, it emits an **`Op::Heartbeat` event at that position**,
-  at most once per `heartbeat_interval`. That event goes through the pipeline in order behind every real event.
-  Once it is saved and acked, everything before it has been delivered, and `ack` may confirm to it. No WAL query
-  and no `drained` flag are needed: ordering gives the guarantee that `heartbeat_targets` reconstructs in poll mode.
-  The MongoDB source already uses `Op::Heartbeat` this way.
-  - **To verify in implementation:** that a logical walsender's keepalive position is `sentPtr` (walsender.c
-    `WalSndKeepalive`). pg_recvlogical confirms to that position the same way when it has no pending output. If
-    a supported version differs, fall back to a WAL-position heartbeat on the control connection under §3's
-    rules. #47's `heartbeat_it` suite must pass in both modes either way.
-  - On PG 10–14 the walsender sends empty BEGIN/COMMIT pairs for unpublished transactions. They arrive as normal
-    commits in `tx_ends` and advance the slot as they do today.
-- `heartbeat_action_query` keeps its meaning (a timer on the control connection) for servers where the WAL never
-  moves without it.
+Megatron's review found, and I reproduced on PG16 (thread, 2026-10-19), that **change LSNs are not monotonic
+across transactions**. Transactions are decoded in commit order, so a transaction that started earlier but
+commits later has changes with LSNs **below** changes already delivered. Main has two losses from this: `queue`
+drops those changes as `<= emitted`, and `ack_target` pops a later-committing transaction whose last change LSN
+is below the acked change LSN, advancing the slot past it before it was delivered. The P0 fix on main (Ironhide)
+and this ADR use one model:
 
-### 5. Start position and replay
+- **Key K = `(commit_lsn, change_lsn)`.** `commit_lsn` is `Begin.final_lsn`, which equals the Commit message's
+  `commit_lsn` and is known at BEGIN, before any change. The stream is strictly increasing in K. Transactions
+  arrive in commit order, and changes within one transaction are monotonic. Both transports report the same K
+  for the same change.
+- **Checkpoint = K.** The P0 fix pulls ADR 0001 S1's `ChangeEvent.checkpoint` forward, and Postgres sets it to
+  `Position::Text("<commit>@<change>")`. The pipeline saves and acks that value. The wire `lsn` stays the change
+  LSN, and DEPLOYMENT.md says it is not monotonic across transactions.
+- **Dedupe:** the K high-water mark replaces `emitted`. Skip a transaction with `commit_lsn < mark.commit`. For
+  `commit_lsn == mark.commit`, skip changes with `change_lsn <= mark.change`. Deliver everything with
+  `commit_lsn > mark.commit`. The decision is taken at BEGIN. An old plain-LSN checkpoint has no commit part:
+  that first start skips nothing and replays from the slot (duplicates only, logged once).
+- **Feedback** (`write` = `flush` = `apply`): `tx_ends` holds `(commit_lsn, last_change, end)` in commit order.
+  `ack(k)` pops while `commit_lsn < k.commit`, or while `commit_lsn == k.commit && last_change <= k.change`, and
+  reports the last popped `end`. Change LSNs are never compared across transactions. Mid-transaction acks still
+  don't move the slot.
 
-- `START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn> (proto_version '1', publication_names '<pub>')`,
-  plus `messages 'true'` when ADR 0001 snapshots are enabled.
-- We request the slot's **own `confirmed_flush_lsn`**, never the checkpoint. A requested start above
-  `confirmed_flush_lsn` makes the server skip transactions that commit before it. A checkpoint can be ahead of
-  the slot (a crash between `save` and `ack`), so requesting from the checkpoint would rely on that skip being
-  exact. Instead the local `emitted` filter drops replayed changes, the same as `poll` does after a restart.
-- The `lsn` of each `XLogData` is the same write location that the peek's `lsn` column reports (both come from
-  `ctx->write_location`). **Positions are identical in both modes.** T3's equivalence test checks it.
+### 5. Idle progress, start position and replay
+
+- **Keepalives become ordered heartbeats.** A keepalive `k` carries the walsender's sent position. When the
+  source pops one from the channel between transactions, it emits an **`Op::Heartbeat` event with checkpoint
+  K = `(walEnd, 0)`**, at most once per `heartbeat_interval`. It means "every transaction with
+  `commit_lsn < walEnd` is delivered". The event goes through the pipeline behind every real event, so once it is
+  saved and acked that is true, and `ack` may confirm to `walEnd`. A transaction that began before `walEnd` and
+  commits after it has `commit_lsn > walEnd`, so a restart from that checkpoint does not skip it (Megatron's
+  case 1). That is the reason the key is commit-ordered.
+- **The `sentPtr` premise, verified in the source before approval:**
+  - `WalSndKeepalive` writes `sentPtr` on REL_14_STABLE (walsender.c:3552). On REL_16_STABLE it writes
+    `writePtr` when given and `sentPtr` otherwise (walsender.c:3799). The only caller that passes `writePtr`
+    is `WalSndUpdateProgress` for a skipped empty transaction under synchronous replication, with that
+    transaction's end LSN (walsender.c:1554).
+  - For logical decoding `sentPtr` is `reader->EndRecPtr` after each record is decoded (walsender.c:3171).
+    Decoded output is written to the socket before the next record is read, so every transaction whose commit
+    record ends at or below `sentPtr` precedes the keepalive on the wire.
+  - Confirming to `sentPtr` while a transaction is still open is safe. The slot's `restart_lsn` stays behind the
+    open transaction, and the server re-sends every transaction that commits after `confirmed_flush_lsn`.
+  - REL_10–13 have the REL_14 form. T3 still runs #47's `heartbeat_it` suite in both modes.
+- On PG 10–14 the walsender sends empty BEGIN/COMMIT pairs for unpublished transactions. They arrive as normal
+  commits in `tx_ends` and advance the slot as today. `heartbeat_action_query` keeps its meaning, as a timer on
+  the control connection.
+- **Start:** `START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn> (proto_version '1', publication_names
+  '<pub>')`, plus `messages 'true'` when ADR 0001 snapshots are enabled. We request the slot's own
+  `confirmed_flush_lsn`, never the checkpoint, because a requested start above it makes the server skip
+  transactions that commit before it. Replayed transactions are dropped by the K dedupe above.
+- The `lsn` of each `XLogData` is the same write location the peek reports (both come from
+  `ctx->write_location`), and `final_lsn` comes from the same Begin message. **K is identical in both modes.**
+  T3's equivalence test checks this with overlapping transactions.
 - `IDENTIFY_SYSTEM` returns `systemid`. In stream mode, #63 can compare it without an extra query. #63's SQL check
   stays the source of truth for both modes.
 
@@ -132,9 +158,16 @@ password and dbname from the same parsed `tokio_postgres::Config` (`tls::parse`)
   SQL connection. On `N`, only `prefer` may continue in plaintext. Then `tls::check_negotiated(mode, encrypted,
   local, has_root)` runs unchanged. In stream mode `encrypted` is known directly rather than read from
   `pg_stat_ssl`.
-- With TLS, SCRAM uses channel binding (`tls-server-end-point`) when the server offers `SCRAM-SHA-256-PLUS`.
-  Cleartext password auth is refused over plaintext to a non-loopback host, so the password never goes over the
-  network unencrypted.
+- **Authentication requirements:**
+  - **No hand-written crypto.** SCRAM-SHA-256 and the md5 hash come from `postgres-protocol`
+    (`authentication::sasl::ScramSha256`, `authentication::md5_hash`). We only frame the messages.
+  - **Cleartext and md5 are both refused** on a plaintext connection to a non-loopback host. md5 is replayable
+    by anyone who records the exchange, so it gets the same rule as cleartext.
+  - With TLS, SCRAM uses channel binding (`tls-server-end-point`) when the server offers `SCRAM-SHA-256-PLUS`.
+    **Under `verify-full`, if TLS is up and the server offered `-PLUS`, falling back to plain SCRAM is
+    refused.** A downgrade there can only mean tampering.
+  - The server's SCRAM final message is verified (`ScramSha256::finish`) before we treat authentication as done,
+    so a server that doesn't know the password can't impersonate one that does.
 - Not in v1, which matches the SQL path today: GSSAPI/SSPI and client certificates (`tls::parse` handles only
   `sslmode` and `sslrootcert`).
 - The role needs nothing new. It already has `REPLICATION`. The server needs `max_wal_senders` greater than the
@@ -170,7 +203,7 @@ flips only when, on the same machine:
 
 A broken replication connection (EOF, TLS error, `wal_sender_timeout` on the server, a protocol error) becomes
 `Error::Source` from `next()`. The pipeline fails and the container restarts, which is today's behaviour for a
-failed peek. On restart, §5's replay rules apply. Reconnecting in-process with backoff is a possible follow-up,
+failed peek. On restart, the K dedupe in §4 applies. Reconnecting in-process with backoff is a possible follow-up,
 not v1: it would duplicate the supervisor and hide failures from `/healthz`.
 
 ## Consequences
@@ -187,17 +220,22 @@ not v1: it would duplicate the supervisor and hide failures from `/healthz`.
 ## Implementation issues (after approval)
 
 1. **T1. Wire client:** startup, `SSLRequest` and rustls using the shared policy, auth (trust, cleartext, md5,
-   SCRAM ± PLUS), simple query, `CopyBoth` framing. AC: integration tests against the TLS Postgres fixture (#18)
+   SCRAM ± PLUS through `postgres-protocol`), simple query, `CopyBoth` framing with the 1 GiB frame cap. AC: integration tests against the TLS Postgres fixture (#18)
    for every `ssl_mode` and every auth method, including plaintext to non-loopback being refused and a bad
-   certificate being refused under `verify-full`. A unit test checks that framing errors are errors, not panics.
+   certificate being refused under `verify-full`. Also: cleartext **and md5** refused over plaintext to
+   non-loopback; no `-PLUS` downgrade under `verify-full`; a bad SCRAM server signature rejected; an over-cap
+   length header rejected before allocation. A **fuzz target** over the backend message and `CopyBoth` frame
+   parser runs briefly in CI and shows errors, never a panic or an unbounded allocation.
 2. **T2. Replication task:** `IDENTIFY_SYSTEM`, `START_REPLICATION`, `XLogData` and keepalive parsing, timer and
    on-request status updates, the byte-bounded channel, and the `watch` for flush. AC: unit tests over a scripted
-   byte stream (keepalive with a reply request, a full channel still sends status updates, an oversize message).
+   byte stream (keepalive with a reply request, a full channel still sends status updates, an oversize message, an over-cap frame). A **fuzz target** over `XLogData` and keepalive parsing.
 3. **T3. `transport = "stream"` in `PostgresSource`:** config and validation, the per-connection relation cache,
-   `emitted` replay, ack to feedback through `ack_target`, and keepalive heartbeats. AC: the whole Postgres
+   K-based dedupe and feedback (§4), and keepalive heartbeats with K = `(walEnd, 0)`. It reuses the
+   P0 fix's K code rather than duplicating it, so it lands after that fix. AC: the whole Postgres
    integration suite (including #47's `heartbeat_it` and Megatron's capped-peek restart test) runs in both modes.
-   An **equivalence test** shows the same workload yields the same events with the same positions in both
-   modes. A **slow-sink test** blocks the sink for 20 s with `wal_sender_timeout = 5s` and the connection
+   An **equivalence test** shows the same workload yields the same events with the same K in both modes,
+   and the workload **includes overlapping transactions** (an early-starting, late-committing transaction across
+   a batch boundary and across a keepalive heartbeat, then a restart). A **slow-sink test** blocks the sink for 20 s with `wal_sender_timeout = 5s` and the connection
    survives. A 1M-row transaction keeps RSS under a bound with every row delivered.
 4. **T4. Bench:** `aqueduct-bench` Postgres source with `--transport`, with the §8 numbers posted.
 5. **T5. Docs:** DEPLOYMENT.md (`transport`, `max_wal_senders`, `pg_hba`, poolers, `stream_buffer_bytes`),
@@ -206,12 +244,11 @@ not v1: it would duplicate the supervisor and hide failures from `/healthz`.
    streaming.
 
 Order: T1 → T2 → T3 → T4 → T5 (docs ship with T3 where behaviour is user-visible). T1 and T2 do not touch
-`source.rs`, so they can run alongside #57 and #63. T3 goes after #63.
+`source.rs`, so they can run alongside #57 and #63. T3 goes after the P0 position fix and #63.
 
-## Open questions for approval
+## Decisions (Lucas, 2026-10-19)
 
-1. Hand-written client on `postgres-protocol` + `tokio-rustls` instead of `pgwire-replication` or a fork?
-   Recommendation: hand-written (no new dependency, the TLS policy stays in one place).
-2. Ship `stream` opt-in and flip the default only after the §8 numbers and a soak? Recommendation: yes.
-3. Keep `poll` permanently as the fallback, which means #57 still gets the cursor fix for `poll`?
-   Recommendation: yes, because poolers and `max_wal_senders = 0` setups exist.
+1. Hand-written client on `postgres-protocol` + `tokio-rustls`, not `pgwire-replication` or a fork: **accepted**,
+   with the frame cap, the fuzzing and the auth requirements in §3, §6 and T1/T2.
+2. `stream` ships opt-in, and the default flips after the §8 numbers and a soak period: **accepted**.
+3. `poll` stays permanently, so #57 gets the cursor fix for `poll`: **accepted**.
