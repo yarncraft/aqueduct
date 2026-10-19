@@ -87,4 +87,15 @@ Titles must make sense to someone who has not read the plan. Reviewers send back
 - PR titles end with `(#issue)`.
 - Examples: `Routing: set the Kafka message key per route (R5)`, `Postgres source: decode logical replication messages, needed for snapshot watermarks (S3)`.
 
-Commit messages and branch names are not affected.
+Branch names are not affected. Commit messages follow the next section.
+
+## Commit messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope>): <summary>`.
+
+- Types: `feat` (new behaviour), `fix` (bug fix), `docs`, `test`, `refactor` (no behaviour change), `perf`, `build`, `ci`, `chore`.
+- Scopes match the title areas: `postgres`, `mongodb`, `kafka`, `routing`, `snapshots`, `cockpit`, `pipeline`, `ci`, `docs`. Leave the scope out if a change spans several areas.
+- Summary: imperative, lower case, no trailing period, plain words as in titles. For example, `fix(postgres): stop skipping rows on multi-table TRUNCATE`.
+- Breaking changes: add `!` after the scope (`feat(routing)!: ...`) and a `BREAKING CHANGE:` footer with the upgrade step, matching the `CHANGELOG.md` entry.
+- The body explains why. Agent-authored commits end with the `Co-Authored-By` line.
+- When squash-merging, rewrite the PR title into this form and keep the PR number: `feat(routing): set the Kafka message key per route (#81) (#105)`.
