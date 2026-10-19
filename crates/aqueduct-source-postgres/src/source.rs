@@ -221,9 +221,29 @@ impl PostgresSource {
             return Ok(None);
         }
         self.last_heartbeat = Instant::now();
-        if let Some(q) = &self.cfg.heartbeat_action_query {
-            self.client()?.batch_execute(q).await.map_err(src_err)?;
+        // A heartbeat only saves WAL; a failure (lock timeout, revoked grant) must not halt the
+        // stream, which would pin WAL harder than having no heartbeat. Skip this beat.
+        if let Some(q) = self.cfg.heartbeat_action_query.clone() {
+            let ran = match self.client() {
+                Ok(c) => c.batch_execute(&q).await.map_err(src_err),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = ran {
+                tracing::warn!(error = %e, "heartbeat action query failed; skipping this heartbeat");
+                return Ok(None);
+            }
         }
+        match self.wal_position().await {
+            Ok(wal) => Ok(wal),
+            Err(e) => {
+                tracing::warn!(error = %e, "heartbeat WAL position query failed; skipping this heartbeat");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The server's WAL flush position (replay position on a standby).
+    async fn wal_position(&self) -> Result<Option<u64>> {
         let row = self
             .client()?
             .query_one(
@@ -411,6 +431,18 @@ impl Source for PostgresSource {
         if let (Some(pos), false) = (start, recreated) {
             match pos {
                 Position::Lsn(l) => {
+                    // A checkpoint ahead of this server's WAL comes from another cluster (restored
+                    // dump, copied state volume). Treating it as acknowledged would move the slot
+                    // past data that was never delivered, so refuse it.
+                    if let Some(wal) = self.wal_position().await? {
+                        if l > wal {
+                            return Err(Error::Checkpoint(format!(
+                                "checkpoint LSN {} is ahead of this server's WAL position {};                                  it belongs to another cluster. Remove the checkpoint to start over",
+                                Position::Lsn(l),
+                                Position::Lsn(wal)
+                            )));
+                        }
+                    }
                     self.emitted = l;
                     self.checkpointed = l;
                 }

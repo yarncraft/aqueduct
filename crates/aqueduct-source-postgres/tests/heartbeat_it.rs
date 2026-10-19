@@ -435,10 +435,59 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     );
     assert!(f.confirmed().await <= lsn(&ev));
 
+    // Nothing else arrives, in particular no second copy of X, over more than one interval.
+    assert!(
+        drive(&mut s, Duration::from_millis(2500)).await.is_none(),
+        "an extra event arrived after X"
+    );
+
     // After the ack the slot moves past the delivered row and catches up to the end of the WAL.
     s.ack(ev.position.clone()).await.unwrap();
     f.drive_until_confirmed(&mut s, lsn(&ev) + 1).await;
     let target = f.wal().await;
     f.drive_until_confirmed(&mut s, target).await;
+    f.cleanup(s).await;
+}
+
+/// A checkpoint ahead of the server's WAL belongs to another cluster; accepting it would let the
+/// heartbeat acknowledge (and skip) data that was never delivered.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn checkpoint_ahead_of_the_wal_is_rejected() {
+    let f = Fixture::new("foreign").await;
+    let mut s = f.source(Duration::from_secs(1));
+    s.start(None).await.unwrap();
+    drop(s);
+    let mut s = f.source(Duration::from_secs(1));
+    let err = s
+        .start(Some(Position::Lsn(f.wal().await + (1 << 32))))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, aqueduct_core::Error::Checkpoint(_)),
+        "unexpected error: {err:?}"
+    );
+    f.cleanup(s).await;
+}
+
+/// A failing action query must not stop the stream.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn failing_action_query_does_not_stop_the_stream() {
+    let f = Fixture::new("badaction").await;
+    let mut s = f.source_with(
+        Duration::from_secs(1),
+        Some("SELECT * FROM no_such_table".into()),
+    );
+    s.start(None).await.unwrap();
+    f.insert_published("still-flows").await;
+    let ev = drive(&mut s, Duration::from_secs(5))
+        .await
+        .expect("the event never arrived");
+    assert!(ev.after.as_ref().unwrap().get().contains("still-flows"));
+    // Let at least one failing heartbeat run, then check the stream is still alive.
+    assert!(drive(&mut s, Duration::from_millis(2500)).await.is_none());
+    f.insert_published("second").await;
+    assert!(drive(&mut s, Duration::from_secs(5)).await.is_some());
     f.cleanup(s).await;
 }

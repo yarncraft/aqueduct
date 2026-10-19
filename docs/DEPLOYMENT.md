@@ -264,6 +264,12 @@ WAL position alone is enough on a normal server. If your Postgres produces no WA
 (for example a low-traffic managed database), give the heartbeat something to write with `heartbeat_action_query`.
 Run it once before each heartbeat. A small published table works:
 
+With a published action table the heartbeat row is itself delivered as an event, so the slot moves when that event is
+acknowledged; the jump to the server's WAL position then rarely fires. Both paths are safe. If the action query or the
+WAL position query fails, the source logs a warning and skips that heartbeat instead of stopping. A standby cannot run
+an `UPDATE` action query, so leave it unset there. A checkpoint ahead of the server's WAL position (a state volume
+copied from another cluster) is rejected at startup.
+
 ```sql
 CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
 INSERT INTO aqueduct_heartbeat VALUES (1, now());
