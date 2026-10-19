@@ -44,8 +44,7 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
 - Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it.
 - Kafka: record key is `schema.table` (default `partition_by = "table"`, per-table ordering) or `schema.table:<identity>`
   (`partition_by = "key"`); partition is a stable FNV-1a hash of the key (`kafka.rs::record_key`). The identity part is the
-  replica-identity columns joined with `0x1f`, binary datums hex (`decoder.rs::key`), or the MongoDB `documentKey` JSON; it is not
-  the PK under `REPLICA IDENTITY FULL`, so `key` mode only orders per row while identity columns are immutable. Truncates use `schema.table`.
+  replica-identity columns joined with `0x1f`, binary datums hex (`decoder.rs::key`), or the MongoDB `documentKey` JSON; under `REPLICA IDENTITY FULL` `decoder.rs::key` returns `None` (the whole row would be the key), so those tables use `schema.table`; `key` mode otherwise only orders per row while identity columns are immutable. Truncates use `schema.table`.
 - Rows are sensitive. The event inspector exposes row data over HTTP; keep it behind `admin_token`
   and never log tokens.
 - **Fail closed**: the admin server refuses a non-loopback `health_addr` without `admin_token` (`Config::check_admin_exposure`,

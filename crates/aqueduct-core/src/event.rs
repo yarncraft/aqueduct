@@ -94,7 +94,9 @@ pub struct ChangeEvent {
     /// Row after the change (insert/update).
     pub after: Option<Box<RawValue>>,
     /// Replica-identity (primary key) values, used to pick a Kafka partition when
-    /// `partition_by = "key"`. Not part of the serialised event.
+    /// `partition_by = "key"`. Not part of the serialised event. `None` means "fall back to the table
+    /// key", not "no primary key": it is set for `REPLICA IDENTITY FULL`/`NOTHING` tables, TRUNCATE,
+    /// and unchanged-TOAST key columns.
     #[serde(skip)]
     pub key: Option<String>,
 }
