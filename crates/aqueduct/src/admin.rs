@@ -92,35 +92,43 @@ impl Admin {
             tick.tick().await;
             let now = self.metrics.events_total();
             let ops = self.metrics.snapshot().table_ops;
-            {
-                let mut h = lock(&self.history);
-                if h.len() == HISTORY_LEN {
-                    h.pop_front();
-                }
-                h.push_back(now.saturating_sub(last) as f64);
-                let len = h.len();
-                let mut d = lock(&self.detail);
-                for (t, c) in &ops {
-                    let prev = last_ops.get(t).copied().unwrap_or_default();
-                    let mut delta = [0u64; OP_SLOTS];
-                    for i in 0..4 {
-                        delta[i] = c[i].saturating_sub(prev[i]);
-                    }
-                    let series = d.entry(t.clone()).or_default();
-                    // A table seen for the first time is zero-filled back to the window start.
-                    while series.len() + 1 < len {
-                        series.push_back([0; OP_SLOTS]);
-                    }
-                    series.push_back(delta);
-                }
-                for series in d.values_mut() {
-                    while series.len() > HISTORY_LEN {
-                        series.pop_front();
-                    }
-                }
-            }
+            self.record_sample(now.saturating_sub(last) as f64, &ops, &last_ops);
             last_ops = ops;
             last = now;
+        }
+    }
+
+    /// Adds one second's sample: the total rate and the per-table per-op deltas since `last_ops`.
+    fn record_sample(
+        &self,
+        rate: f64,
+        ops: &BTreeMap<String, [u64; OP_SLOTS]>,
+        last_ops: &BTreeMap<String, [u64; OP_SLOTS]>,
+    ) {
+        let mut h = lock(&self.history);
+        if h.len() == HISTORY_LEN {
+            h.pop_front();
+        }
+        h.push_back(rate);
+        let len = h.len();
+        let mut d = lock(&self.detail);
+        for (t, c) in ops {
+            let prev = last_ops.get(t).copied().unwrap_or_default();
+            let mut delta = [0u64; OP_SLOTS];
+            for (i, slot) in delta.iter_mut().enumerate() {
+                *slot = c[i].saturating_sub(prev[i]);
+            }
+            let series = d.entry(t.clone()).or_default();
+            // A table seen for the first time is zero-filled back to the window start.
+            while series.len() + 1 < len {
+                series.push_back([0; OP_SLOTS]);
+            }
+            series.push_back(delta);
+        }
+        for series in d.values_mut() {
+            while series.len() > HISTORY_LEN {
+                series.pop_front();
+            }
         }
     }
 
@@ -511,6 +519,21 @@ mod tests {
 
     /// Every element the dashboard script looks up by id must exist in the HTML,
     /// otherwise the script throws on load and every handler after it is dead.
+    #[test]
+    fn history_carries_every_op_slot_including_reads() {
+        let admin = Admin::new(Arc::new(Metrics::new()), None, None);
+        let mut ops = BTreeMap::new();
+        ops.insert("public.t".to_string(), [3, 2, 1, 4, 5]);
+        admin.record_sample(15.0, &ops, &BTreeMap::new());
+        // The second tick sees only the increase since the first.
+        let mut next = ops.clone();
+        next.insert("public.t".to_string(), [4, 2, 1, 4, 9]);
+        admin.record_sample(5.0, &next, &ops);
+        let d = lock(&admin.detail);
+        let series: Vec<_> = d["public.t"].iter().copied().collect();
+        assert_eq!(series, vec![[3, 2, 1, 4, 5], [1, 0, 0, 0, 4]]);
+    }
+
     #[test]
     fn dashboard_script_ids_exist_in_html() {
         let ids = |prefix: &str, suffix: &str| -> Vec<&str> {

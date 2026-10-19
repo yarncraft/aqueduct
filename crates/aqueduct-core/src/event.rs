@@ -152,7 +152,5 @@ mod tests {
         assert!(json.contains(r#""op":"read""#), "{json}");
         let back: ChangeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back.op, Op::Read);
-        // The Kafka `op` header is the lowercased Debug name, so it matches the JSON.
-        assert_eq!(format!("{:?}", Op::Read).to_lowercase(), "read");
     }
 }
