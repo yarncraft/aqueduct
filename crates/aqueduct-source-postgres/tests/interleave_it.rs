@@ -185,3 +185,93 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
         "after the restart all three rows must have been seen, got {seen:?}"
     );
 }
+
+/// `ack_target` variant. Tb inserts first and commits last; Ta inserts twice and commits in
+/// between. Decoding order is Ta, Tb, but Tb's only change has a position below Ta's last one.
+/// Acking Ta's last change must not advance the slot past Tb, which was never delivered: a
+/// crash right after would lose Tb on the server side, and no local dedupe could recover it.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let (tb, conn1) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn1);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let table = format!("interleave_a_{id}");
+    let publication = format!("aq_ila_pub_{id}");
+    let slot = format!("aq_ila_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    let new_source = || {
+        let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.ssl_mode = Some(SslMode::Disable);
+        cfg.poll_interval = Duration::from_millis(100);
+        PostgresSource::new(cfg)
+    };
+    let mut s = new_source();
+    s.start(None).await.unwrap();
+
+    // Tb: first change, commits last. Ta: two changes, commits in between.
+    tb.batch_execute(&format!("BEGIN; INSERT INTO {table} VALUES (1, 'tb')"))
+        .await
+        .unwrap();
+    db.batch_execute(&format!(
+        "BEGIN; INSERT INTO {table} VALUES (2, 'ta-1'); INSERT INTO {table} VALUES (3, 'ta-2'); COMMIT;"
+    ))
+    .await
+    .unwrap();
+    tb.batch_execute("COMMIT").await.unwrap();
+
+    // Deliver exactly Ta (two events), ack at its last change as the pipeline would after a
+    // batch ending there, then "crash".
+    let mut seen = Vec::new();
+    let mut last = None;
+    for _ in 0..2 {
+        let e = next_event(&mut s).await.expect("a Ta row");
+        seen.push(e.after.clone().unwrap().get().to_owned());
+        last = Some(e.position);
+    }
+    assert!(
+        seen.iter().all(|r| r.contains("ta-")),
+        "commit order puts Ta first, got {seen:?}"
+    );
+    let checkpoint = last.unwrap();
+    s.ack(checkpoint).await.unwrap();
+    drop(s);
+
+    let mut s = new_source();
+    s.start(Some(checkpoint)).await.unwrap();
+    while let Some(e) = next_event(&mut s).await {
+        seen.push(e.after.expect("insert has a row").get().to_owned());
+    }
+    seen.sort();
+    seen.dedup();
+
+    drop(s);
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+        .await
+        .unwrap();
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    assert!(
+        seen.iter().any(|r| r.contains("\"tb\"")),
+        "Tb was never delivered after the restart, got {seen:?} (the ack moved the slot past it)"
+    );
+}
