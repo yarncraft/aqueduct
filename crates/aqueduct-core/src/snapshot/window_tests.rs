@@ -1,5 +1,7 @@
 use super::window::*;
 
+const T: &str = "public.a";
+
 fn rows(keys: &[&str]) -> Vec<ChunkRow<u32>> {
     keys.iter()
         .enumerate()
@@ -12,7 +14,7 @@ fn rows(keys: &[&str]) -> Vec<ChunkRow<u32>> {
 
 fn keys(o: Outcome<u32>) -> Vec<String> {
     match o {
-        Outcome::Emit(r) => r.into_iter().map(|r| r.key).collect(),
+        Outcome::Emit { rows, .. } => rows.into_iter().map(|r| r.key).collect(),
         Outcome::None => panic!("expected Emit"),
     }
 }
@@ -20,17 +22,17 @@ fn keys(o: Outcome<u32>) -> Vec<String> {
 /// Run one window: `before` events precede the low watermark, `inside` fall in the window.
 fn run(chunk: &[&str], before: &[&str], inside: &[&str], truncate: bool) -> Vec<String> {
     let mut w = Window::new();
-    w.expect(1).unwrap();
+    w.expect(1, T).unwrap();
     w.set_chunk(rows(chunk)).unwrap();
     for k in before {
-        w.live_key(k);
+        w.live_key(T, k);
     }
     w.mark(Mark::Low(1)).unwrap();
     for k in inside {
-        w.live_key(k);
+        w.live_key(T, k);
     }
     if truncate {
-        w.live_truncate();
+        w.live_truncate(T);
     }
     keys(w.mark(Mark::High(1)).unwrap())
 }
@@ -71,8 +73,8 @@ fn truncate_in_the_window_drops_the_whole_chunk() {
 #[test]
 fn truncate_before_the_low_watermark_does_not_drop_the_chunk() {
     let mut w = Window::new();
-    w.expect(1).unwrap();
-    w.live_truncate();
+    w.expect(1, T).unwrap();
+    w.live_truncate(T);
     w.set_chunk(rows(&["1"])).unwrap();
     w.mark(Mark::Low(1)).unwrap();
     assert_eq!(keys(w.mark(Mark::High(1)).unwrap()), ["1"]);
@@ -87,13 +89,13 @@ fn empty_chunk_emits_nothing() {
 fn stale_watermarks_are_ignored() {
     let mut w = Window::new();
     assert_eq!(w.mark(Mark::High(3)), Ok(Outcome::None)); // nothing in flight
-    w.expect(5).unwrap();
+    w.expect(5, T).unwrap();
     w.set_chunk(rows(&["1", "2"])).unwrap();
     assert_eq!(w.mark(Mark::Low(4)), Ok(Outcome::None));
     assert_eq!(w.mark(Mark::High(4)), Ok(Outcome::None)); // replay of chunk 4
-    w.live_key("1"); // low of chunk 5 not seen: outside the window
+    w.live_key(T, "1"); // low of chunk 5 not seen: outside the window
     assert_eq!(w.mark(Mark::Low(5)), Ok(Outcome::None));
-    w.live_key("2");
+    w.live_key(T, "2");
     assert_eq!(w.mark(Mark::High(6)), Ok(Outcome::None)); // a later id is stale too
     assert_eq!(w.in_flight(), Some(5));
     assert_eq!(keys(w.mark(Mark::High(5)).unwrap()), ["1"]);
@@ -103,10 +105,10 @@ fn stale_watermarks_are_ignored() {
 #[test]
 fn a_repeated_low_watermark_keeps_the_window_open() {
     let mut w = Window::new();
-    w.expect(1).unwrap();
+    w.expect(1, T).unwrap();
     w.set_chunk(rows(&["1", "2"])).unwrap();
     w.mark(Mark::Low(1)).unwrap();
-    w.live_key("1");
+    w.live_key(T, "1");
     w.mark(Mark::Low(1)).unwrap();
     assert_eq!(keys(w.mark(Mark::High(1)).unwrap()), ["2"]);
 }
@@ -115,7 +117,7 @@ fn a_repeated_low_watermark_keeps_the_window_open() {
 fn window_is_reusable_after_emit() {
     let mut w = Window::new();
     for id in 1..=3 {
-        w.expect(id).unwrap();
+        w.expect(id, T).unwrap();
         w.set_chunk(rows(&["a"])).unwrap();
         w.mark(Mark::Low(id)).unwrap();
         assert_eq!(keys(w.mark(Mark::High(id)).unwrap()), ["a"]);
@@ -126,8 +128,8 @@ fn window_is_reusable_after_emit() {
 fn protocol_misuse_is_an_error() {
     let mut w: Window<u32> = Window::new();
     assert_eq!(w.set_chunk(rows(&[])), Err(WindowError::NoChunk));
-    w.expect(1).unwrap();
-    assert_eq!(w.expect(2), Err(WindowError::Busy(1)));
+    w.expect(1, T).unwrap();
+    assert_eq!(w.expect(2, T), Err(WindowError::Busy(1)));
     assert_eq!(w.mark(Mark::High(1)), Err(WindowError::HighBeforeLow(1)));
     w.mark(Mark::Low(1)).unwrap();
     assert_eq!(w.mark(Mark::High(1)), Err(WindowError::ChunkMissing(1)));
@@ -163,7 +165,7 @@ fn random_interleavings_never_emit_a_row_the_stream_already_carries() {
             w.set_chunk(r).unwrap();
         };
         let mut w = Window::new();
-        w.expect(9).unwrap();
+        w.expect(9, T).unwrap();
         // the chunk is handed over before low, inside the window, or just before high
         let read_at = next(3);
         if read_at == 0 {
@@ -180,11 +182,11 @@ fn random_interleavings_never_emit_a_row_the_stream_already_carries() {
             }
             for _ in 0..next(8) {
                 if next(10) == 0 && phase == 1 {
-                    w.live_truncate();
+                    w.live_truncate(T);
                     truncated = true;
                 } else {
                     let k = next(26).to_string(); // overlaps the chunk's even keys
-                    w.live_key(&k);
+                    w.live_key(T, &k);
                     if phase == 1 {
                         window_keys.push(k);
                     }
@@ -206,4 +208,54 @@ fn random_interleavings_never_emit_a_row_the_stream_already_carries() {
             .collect();
         assert_eq!(got, want);
     }
+}
+
+#[test]
+fn live_events_of_other_tables_do_not_touch_the_chunk() {
+    let mut w = Window::new();
+    w.expect(1, T).unwrap();
+    w.set_chunk(rows(&["42", "43"])).unwrap();
+    w.mark(Mark::Low(1)).unwrap();
+    w.live_key("public.b", "42");
+    w.live_truncate("public.b");
+    assert_eq!(keys(w.mark(Mark::High(1)).unwrap()), ["42", "43"]);
+}
+
+#[test]
+fn emit_names_the_last_row_read_even_when_none_survive() {
+    let mut w = Window::new();
+    w.expect(1, T).unwrap();
+    w.set_chunk(rows(&["1", "2", "3"])).unwrap();
+    w.mark(Mark::Low(1)).unwrap();
+    w.live_key(T, "3");
+    w.live_key(T, "1");
+    w.live_key(T, "2");
+    assert_eq!(
+        w.mark(Mark::High(1)).unwrap(),
+        Outcome::Emit {
+            rows: Vec::new(),
+            last_key: Some("3".into())
+        }
+    );
+    w.expect(2, T).unwrap();
+    w.set_chunk(rows(&["4"])).unwrap();
+    w.mark(Mark::Low(2)).unwrap();
+    w.live_truncate(T);
+    assert_eq!(
+        w.mark(Mark::High(2)).unwrap(),
+        Outcome::Emit {
+            rows: Vec::new(),
+            last_key: Some("4".into())
+        }
+    );
+    w.expect(3, T).unwrap();
+    w.set_chunk(rows(&[])).unwrap();
+    w.mark(Mark::Low(3)).unwrap();
+    assert_eq!(
+        w.mark(Mark::High(3)).unwrap(),
+        Outcome::Emit {
+            rows: Vec::new(),
+            last_key: None
+        }
+    );
 }

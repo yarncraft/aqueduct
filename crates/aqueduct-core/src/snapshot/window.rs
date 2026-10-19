@@ -9,6 +9,11 @@ use std::collections::HashSet;
 
 /// Identifies one chunk. Watermarks carry it, so a replayed watermark of an older chunk is
 /// recognised and ignored.
+///
+/// **Ids must never repeat across restarts.** After a crash the stream replays watermarks from
+/// before it; if a new chunk reused an old id, a replayed `High(n)` would close the new window
+/// early. Allocate them from something persisted, such as the snapshot id plus a counter that
+/// resumes from the checkpoint, and never restart at 0.
 pub type ChunkId = u64;
 
 /// A watermark as it appears in the change stream.
@@ -31,9 +36,16 @@ pub struct ChunkRow<R> {
 pub enum Outcome<R> {
     /// Nothing to emit: a low watermark opened the window, or the watermark was stale.
     None,
-    /// The high watermark closed the window. Emit these rows, in order, then go on with the
-    /// stream. Empty when a `TRUNCATE` or live changes covered the whole chunk.
-    Emit(Vec<ChunkRow<R>>),
+    /// The high watermark closed the window. Emit `rows` in order, then go on with the stream.
+    /// `rows` is empty when a `TRUNCATE` or live changes covered the whole chunk.
+    ///
+    /// `last_key` is the key of the last row the chunk query read, whether or not it survived:
+    /// the cursor for the next chunk and for `SnapState.after`. `None` only for an empty chunk,
+    /// which means the table is done.
+    Emit {
+        rows: Vec<ChunkRow<R>>,
+        last_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,13 +78,15 @@ impl std::error::Error for WindowError {}
 
 struct InFlight<R> {
     id: ChunkId,
+    table: String,
     low_seen: bool,
     chunk: Option<Vec<ChunkRow<R>>>,
     touched: HashSet<String>,
     truncated: bool,
 }
 
-/// At most one chunk is in flight, so memory is bounded by the chunk size.
+/// At most one chunk of one table is in flight. Memory is the chunk plus the keys of the live
+/// writes to that table inside the window.
 pub struct Window<R> {
     cur: Option<InFlight<R>>,
 }
@@ -93,13 +107,15 @@ impl<R> Window<R> {
         self.cur.as_ref().map(|c| c.id)
     }
 
-    /// Start a chunk: its low watermark has been written and is awaited on the stream.
-    pub fn expect(&mut self, id: ChunkId) -> Result<(), WindowError> {
+    /// Start a chunk of `table`: its low watermark has been written and is awaited on the
+    /// stream. Live events of other tables never touch the chunk.
+    pub fn expect(&mut self, id: ChunkId, table: &str) -> Result<(), WindowError> {
         if let Some(c) = &self.cur {
             return Err(WindowError::Busy(c.id));
         }
         self.cur = Some(InFlight {
             id,
+            table: table.to_owned(),
             low_seen: false,
             chunk: None,
             touched: HashSet::new(),
@@ -120,20 +136,19 @@ impl<R> Window<R> {
         Ok(())
     }
 
-    /// A live insert, update or delete passed on the stream. Give every key it names: the
-    /// new key, and the old key too when an update changed the primary key. Outside the
-    /// window it is ignored.
-    pub fn live_key(&mut self, key: &str) {
-        if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen) {
-            if !c.touched.contains(key) {
-                c.touched.insert(key.to_owned());
-            }
+    /// A live insert, update or delete of `table` passed on the stream. Give every key it
+    /// names: the new key, and the old key too when an update changed the primary key. Ignored
+    /// outside the window and for any table but the chunk's.
+    pub fn live_key(&mut self, table: &str, key: &str) {
+        if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen && c.table == table) {
+            c.touched.insert(key.to_owned());
         }
     }
 
-    /// A live `TRUNCATE` of the snapshotted table passed on the stream. It voids the chunk.
-    pub fn live_truncate(&mut self) {
-        if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen) {
+    /// A live `TRUNCATE` of `table` passed on the stream. It voids the chunk if it is the
+    /// chunk's table.
+    pub fn live_truncate(&mut self, table: &str) {
+        if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen && c.table == table) {
             c.truncated = true;
         }
     }
@@ -165,14 +180,15 @@ impl<R> Window<R> {
                 else {
                     return Err(WindowError::ChunkMissing(id));
                 };
-                if truncated {
-                    return Ok(Outcome::Emit(Vec::new()));
-                }
-                let rows = rows
-                    .into_iter()
-                    .filter(|r| !touched.contains(&r.key))
-                    .collect();
-                Ok(Outcome::Emit(rows))
+                let last_key = rows.last().map(|r| r.key.clone());
+                let rows = if truncated {
+                    Vec::new()
+                } else {
+                    rows.into_iter()
+                        .filter(|r| !touched.contains(&r.key))
+                        .collect()
+                };
+                Ok(Outcome::Emit { rows, last_key })
             }
             _ => Ok(Outcome::None),
         }

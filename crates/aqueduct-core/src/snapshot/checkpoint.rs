@@ -50,8 +50,10 @@ impl Checkpoint {
         }
     }
 
-    /// Accepts the composite JSON and every plain format (decimal LSN, K text, resume token).
-    /// A `{` can only start the JSON form: no plain format begins with one.
+    /// Accepts the composite JSON and every plain format (decimal LSN, K text, MongoDB resume
+    /// token). A MongoDB position is itself a JSON object (`{"_data":"..."}`), so only an object
+    /// with a `snap` key is the composite form: any other well-formed JSON is returned as plain
+    /// text, byte for byte. Malformed text that starts with `{` is an error.
     pub fn decode(text: &str) -> Result<Self, String> {
         let text = text.trim();
         if text.is_empty() {
@@ -60,8 +62,13 @@ impl Checkpoint {
         if !text.starts_with('{') {
             return Ok(Self::plain(text));
         }
+        let v: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("bad checkpoint: {e}"))?;
+        if v.get("snap").is_none() {
+            return Ok(Self::plain(text));
+        }
         let c: Composite =
-            serde_json::from_str(text).map_err(|e| format!("bad snapshot checkpoint: {e}"))?;
+            serde_json::from_value(v).map_err(|e| format!("bad snapshot checkpoint: {e}"))?;
         if c.snap.table >= c.snap.tables.len() {
             return Err(format!(
                 "snapshot checkpoint names table {} of {}",
@@ -137,13 +144,20 @@ mod tests {
     }
 
     #[test]
+    fn a_json_position_without_snap_is_plain() {
+        for p in ["{}", r#"{"pos":"1"}"#, r#"{"_data":"82"}"#] {
+            assert_eq!(Checkpoint::decode(p), Ok(Checkpoint::plain(p)));
+        }
+    }
+
+    #[test]
     fn rejects_garbage() {
         for bad in [
             "",
             "   ",
             "{",
-            "{}",
-            r#"{"pos":"1"}"#,
+            r#"{"pos":"1","snap":null}"#,
+            r#"{"pos":"1","snap":{}}"#,
             r#"{"pos":1,"snap":{"id":"s","tables":["t"],"table":0,"after":null}}"#,
             r#"{"pos":"1","snap":{"id":"s","tables":["t"],"table":1,"after":null}}"#,
             r#"{"pos":"1","snap":{"id":"s","tables":[],"table":0,"after":null}}"#,
