@@ -320,19 +320,35 @@ impl RelationCache {
 
     /// Replica-identity key values of `tuple` joined with the unit separator (0x1f), or `None` when the table
     /// has no key columns or uses `REPLICA IDENTITY FULL` (where every column is flagged, so the key would
-    /// be the whole row and move on every update), or when a key column was not sent (unchanged TOAST).
+    /// be the whole row and move on every update), or when a key column was not sent (unchanged TOAST) and the update carries no old value for it.
     /// `None` means "fall back to the table key", not "no primary key". Used to partition by primary key.
     pub fn key(&self, id: u32, tuple: &Tuple) -> Result<Option<String>, DecodeError> {
+        self.key_with_old(id, tuple, None)
+    }
+
+    /// Like [`key`](Self::key), but a key column the new tuple did not send (unchanged TOAST) is taken from
+    /// the `old` key/old-row tuple of an update when that has it. Postgres sends the old key whenever an
+    /// identity column is stored externally, so the row keeps the key its insert had.
+    pub fn key_with_old(
+        &self,
+        id: u32,
+        tuple: &Tuple,
+        old: Option<&Tuple>,
+    ) -> Result<Option<String>, DecodeError> {
         let rel = self.get(id)?;
         if rel.identity_full() {
             return Ok(None);
         }
         let mut out = String::new();
         let mut any = false;
-        for (col, datum) in rel.columns.iter().zip(tuple) {
+        for (i, (col, datum)) in rel.columns.iter().zip(tuple).enumerate() {
             if !col.key {
                 continue;
             }
+            let datum = match (datum, old.and_then(|o| o.get(i))) {
+                (Datum::Unchanged, Some(o)) => o,
+                _ => datum,
+            };
             if any {
                 out.push('\u{1f}');
             }
@@ -345,7 +361,7 @@ impl RelationCache {
                     }
                 }
                 Datum::Null => {}
-                // An unsent TOASTed key column would give a different key than the insert had.
+                // Unsent and no old value: a different key than the insert had, so use the table key.
                 Datum::Unchanged => return Ok(None),
             }
         }
@@ -527,6 +543,43 @@ mod tests {
         let new = decode_tuple(&[Some("5"), Some("b")]);
         assert_eq!(cache.key(42, &old).unwrap(), None);
         assert_eq!(cache.key(42, &new).unwrap(), None);
+    }
+
+    #[test]
+    fn unchanged_toast_key_is_taken_from_the_old_tuple_of_an_update() {
+        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let new = vec![Datum::Unchanged, Datum::Text("b".into())];
+        let old = vec![Datum::Text("5".into()), Datum::Null];
+        let insert_key = cache
+            .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+            .unwrap();
+        assert_eq!(
+            cache.key_with_old(42, &new, Some(&old)).unwrap(),
+            insert_key
+        );
+        assert_eq!(cache.key_with_old(42, &new, None).unwrap(), None);
+    }
+
+    #[test]
+    fn nothing_identity_without_key_columns_has_no_key() {
+        let Message::Relation(mut rel) = decode(&relation_bytes_with(b'n')).unwrap() else {
+            panic!()
+        };
+        for c in &mut rel.columns {
+            c.key = false;
+        }
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        assert_eq!(
+            cache
+                .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

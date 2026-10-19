@@ -242,7 +242,7 @@ impl PostgresSource {
                     {
                         tracing::info!(
                             table = %format!("{}.{}", rel.schema, rel.name),
-                            "REPLICA IDENTITY FULL: partition_by = key falls back to the table key for this table"
+                            "REPLICA IDENTITY FULL: with partition_by = key this table uses the table key (per-table order only)"
                         );
                     }
                     cache.insert(rel)
@@ -257,12 +257,14 @@ impl PostgresSource {
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
+                    let key = cache
+                        .key_with_old(relation, &new, old.as_ref())
+                        .map_err(dec)?;
                     let before = old
                         .map(|t| cache.row(relation, &t))
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    let key = cache.key(relation, &new).map_err(dec)?;
                     self.queue(lsn, xid, ts, name, Op::Update, before, after, key);
                 }
                 Message::Delete { relation, old } => {
