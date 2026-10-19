@@ -57,6 +57,8 @@ alongside the regular `docker-compose.yml` (port 8080). Tables are capped at abo
 
 Full deployment guide (Postgres setup, Docker/Kubernetes, every config key, operations, troubleshooting): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
+Upgrading? Read [`CHANGELOG.md`](CHANGELOG.md) first: the next release changes the TLS and admin-token defaults.
+
 TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`). See
 `config/aqueduct.example.toml`. Mount your own file over it.
 
