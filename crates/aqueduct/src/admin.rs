@@ -636,9 +636,7 @@ Authorization: Bearer {token}
     }
 
     // Contract the dashboard's fetch-based SSE client parses: Bearer-authenticated stream, a
-    // 200 text/event-stream head, then `data: <json>
-
-` frames (one full snapshot each).
+    // 200 text/event-stream head, then `data: <json>` frames (one full snapshot each).
     #[tokio::test]
     async fn stream_with_bearer_yields_json_data_frames() {
         let addr = start(Some("k")).await;
