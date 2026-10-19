@@ -280,4 +280,6 @@ SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator   
 podman-compose -f docker-compose.sim.yml -p aqsim down      # add -v to wipe data
 ```
 
-All services use `restart: unless-stopped`. It publishes only port 8088, so it does not clash with the main compose file (8080).
+All services use `restart: unless-stopped`. It publishes only ports 8088 and 8089, so it does not clash with the main compose file (8080).
+
+The `aqueduct-kafka` service (port 8089, `sim/aqueduct.kafka.toml`) runs the Kafka source over `cdc.public.*` and writes `mirror.{schema}.{table}`; compare offsets of `cdc.public.<t>` and `mirror.public.<t>` to check nothing is lost or duplicated, including across `podman restart aqsim_aqueduct-kafka_1`.

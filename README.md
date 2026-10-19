@@ -45,7 +45,11 @@ SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator
 podman-compose -f docker-compose.sim.yml -p aqsim down
 ```
 
-Set `AQUEDUCT_ADMIN_TOKEN` to use a different admin token. The simulation publishes only port 8088, so it can run
+A second Aqueduct (`aqueduct-kafka`, cockpit on <http://localhost:8089/?token=dev-token-change-me>) runs the Kafka source:
+it reads the `cdc.public.*` topics written by the Postgres pipeline and republishes them as `mirror.public.*`. The two
+topic sets should always have equal offsets, which makes a quick end-to-end check.
+
+Set `AQUEDUCT_ADMIN_TOKEN` to use a different admin token. The simulation publishes only ports 8088 and 8089, so it can run
 alongside the regular `docker-compose.yml` (port 8080). Tables are capped at about 2000 recent rows and Kafka retention at
 256 MiB / 24 h, so it can run indefinitely. See `docs/DEPLOYMENT.md` for details.
 
