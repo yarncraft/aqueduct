@@ -1,6 +1,6 @@
 # ADR 0002: Routing and transforms
 
-- Status: proposed (revised after Megatron's review of a22306f)
+- Status: proposed (revised after Megatron's reviews of a22306f and 40ce8ef)
 - Issue: #48
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author). Implementer: Wheeljack, after #45
 - Date: 2026-10-19
@@ -86,18 +86,25 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
   `before`). `<path>` is a column name, dotted for nested MongoDB documents (`after.address.city`).
 - **Operators:** `==` `!=` `<` `<=` `>` `>=`, `in [..]`, `is null`, `is not null`, `and`, `or`, `not`,
   and parentheses. Literals: strings, numbers, `true`/`false`, `null`.
-- A missing field is `null`. Comparisons with `null` are false, except `is null` (SQL `WHERE` semantics).
+- **Three-valued logic, as in SQL `WHERE`.** A missing field is `null`. A comparison with `null` is
+  **unknown**, and only `is null` / `is not null` test for it. Unknown propagates: `not unknown` is unknown,
+  `false and unknown` is false, `true or unknown` is true, and anything else involving unknown stays unknown.
+  An event whose `where` ends **unknown is filtered**, so it fails closed. Example: `not (row.region == 'eu')`
+  with a missing or TOAST-omitted `region` is unknown, and the row is dropped, not passed. Write
+  `row.region is null or not (row.region == 'eu')` to keep such rows.
 - **Comparisons are typed by the literal, and a type mismatch is an error, never `false`.** The decoder writes
   only int2/4/8, float4/8 and bool as JSON numbers or booleans (`decoder.rs::push_text`). `numeric`, `uuid`,
   dates, timestamps and the rest arrive as JSON strings. So:
   - A **number literal** compares numerically against a JSON number **or a string that parses as a
     decimal** (`numeric` text). The comparison is exact decimal on the normalised digits, not `f64`. Any other
-    value is a type error.
+    value is a type error, including numeric `NaN` and `±Infinity` (as text or as float).
   - A **string literal** allows only `==`, `!=` and `in`. Ordering a string (`<` on a timestamp) is rejected
     at **startup**, because Postgres timestamp text depends on the session `TimeZone` and does not sort reliably.
   - A **bool literal** matches a JSON bool only.
-  - A type error **propagates through `not`, `and` and `or`**. It is never coerced to true or false, so
+  - A type error **propagates through `not`, `and` and `or`** and wins over true, false and unknown, with no
+    short-circuit: `false and <error>` is still an error. It is never coerced to true or false, so
     `not (...)` cannot let a mis-typed row through. The event then follows the error policy (§5a).
+  - Numeric `NaN` and `±Infinity` are type errors against a number literal, never unknown.
 - **No** functions, arithmetic, regex or scripting in v1. The parser is hand-written and adds no new
   dependency. It is limited to 4 KiB of input and nesting depth 32, so a hostile or accidental config cannot
   overflow the stack at startup. Expressions are compiled at startup, so a syntax error fails config validation.
@@ -129,8 +136,9 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
     another internal topic, or a bare topic of its own choosing.
   - Each substituted value is **one segment**, `[A-Za-z0-9_-]{1,64}`. A `.` inside a value is not allowed, so
     `eu` is fine and `x.payments` is not.
-  - **No static topic** anywhere in the config (route `topic`, `sink.topic`, other fallbacks) may match the
-    template's glob. So `orders.{row.region}` cannot be pointed at another route's `orders.eu`.
+  - **No static topic** anywhere in the config (route `topic`, `sink.topic`, other fallbacks,
+    `sink.dead_letter_topic`) may match the template's glob. No static topic, including the dead-letter
+    topic, may start with `_`. So `orders.{row.region}` cannot be pointed at another route's `orders.eu`.
   - An optional `topic_values = ["eu", "us"]` allow-list.
   - **`topic_fallback` is required** on every template that reads a row field. A null or missing field, a
     value that breaks the rules, a value not in `topic_values`, or the cap below sends the event to the
@@ -162,7 +170,10 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
   - **A configured field that never appears** (a typo like `card_last_4`) cannot be caught at startup,
     because columns are only known when rows arrive. The plan counts, per route and field, how many rows of a
     matched table were seen without that column. After 1000 such rows it logs a warn-once and raises
-    `aqueduct_route_field_unseen{route, field}`, which the cockpit shows as a warning.
+    `aqueduct_route_field_unseen{route, field}`, which the cockpit shows as a warning. This covers **every
+    field path the route references**: field ops, every path in `where` (`row.stauts` would otherwise just
+    read null and filter everything), topic templates, `key` and the outbox columns. For a nested path the
+    check is on the full path.
 - **No row data may bypass the field operations.** Steps 2–3 read the original row, so validation
   **rejects** a route where any `exclude`d, `mask`ed or `hash`ed column (or, with `include`, any column that
   is not included) appears in `key`, in a topic template, in `topic_values`, or in the outbox `aggregate_id`
@@ -182,21 +193,6 @@ outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", paylo
   - **Decoder follow-up:** under `REPLICA IDENTITY FULL` the old tuple is logged in full, so the decoder can
     fill `Unchanged` columns of `after` from `before`. That makes FULL a real workaround, for live events too.
     It needs a separate issue and a test (it reuses #50's TOAST fixture).
-
-#### 5a. Error policy: never silent, never a stall from one row
-
-A **row-level evaluation error** has two sources: a type error in `where`, or an outbox row missing its
-`aggregate_id` / `payload`. Neither drops the event nor guesses an outcome.
-
-- When `sink.dead_letter_topic` is set, the event goes there. The value is the envelope **with the route's
-  field operations applied**, so the DLQ never holds data the route would have masked. The key is
-  `schema.table`, and an `aqueduct-error` header holds the reason (the expression and the type, no values).
-  The event is counted under `errors`, and the batch acks normally.
-- Without a dead-letter topic, the pipeline fails with the route, the table and the reason. Validation
-  **warns at startup** when any route uses `where` or outbox without `sink.dead_letter_topic`, so this
-  choice is visible up front. `unchanged = "dead_letter"` without a dead-letter topic is a validation error.
-
-Dynamic topics never reach this path (§5 "Content routing" always has a fallback).
 - **Tombstones (envelope format):** `tombstones = true` emits a null-value record with the same key after
   every delete. Config validation **rejects** it unless the route's key is per row (`key = [...]` or
   `partition_by = "key"`): a tombstone keyed `schema.table` would erase the whole table from a compacted
@@ -205,6 +201,26 @@ Dynamic topics never reach this path (§5 "Content routing" always has a fallbac
   in Debezium. topic = template over the outbox columns, key = `aggregate_id`, value = the `payload`
   column (`json`/`jsonb` passes through raw; text is sent as is), headers `id` and `type` plus `op` and
   `lsn`. Mutually exclusive with `format`, the field keys and `key`.
+
+#### 5a. Error policy: never silent, never a stall from one row
+
+A **row-level evaluation error** has two sources: a type error in `where`, or an outbox row missing its
+`aggregate_id` / `payload`. Neither drops the event nor guesses an outcome.
+
+- The event goes to `sink.dead_letter_topic`. The value is the envelope **with the route's
+  field operations applied**, so the DLQ never holds data the route would have masked. The key is
+  `schema.table`, and an `aqueduct-error` header holds the reason (the expression and the type, no values).
+  The event is counted under `errors`, and the batch acks normally.
+- **`sink.dead_letter_topic` is required** (a validation error, not a warning) as soon as any route uses
+  `where`, outbox or `unchanged = "dead_letter"`. Type errors are per row, not per column type: a `text` or
+  `jsonb` column holding `'abc'`, numeric `NaN`, or any MongoDB field (schemaless). If such a row failed the
+  pipeline, it would pin the Postgres slot until the primary's disk fills, or let the oplog roll past the
+  Mongo resume token. So no row-level error can stop the pipeline.
+- An error in route R sends the event to the DLQ. It does **not** fall through to the next matching route,
+  which could be less restrictive.
+
+Dynamic topics never reach this path (§5 "Content routing" always has a fallback). An unknown `where`
+(three-valued logic, §3) is not an error: the event is `filtered`.
 
 ### 6. Ordering
 
@@ -231,7 +247,8 @@ next to it. Tombstones follow their delete on the same partition.
 - Negative: transforms are Kafka-specific (consistent with "Kafka is the only sink"). The fixed order
   can't express exotic chains. Content routing is deliberately constrained (static prefix, one segment,
   required fallback, broker-counted cap). Ordering comparisons on timestamps are not supported in v1.
-  A misspelled field name is only caught at runtime, by the unseen-field warning.
+  A misspelled field name is only caught at runtime, by the unseen-field warning. Any route with `where` or
+  outbox needs a dead-letter topic.
 - Breaking: none. Existing routes behave exactly as today. New keys are additive, and `format = "row"`,
   outbox and tombstones change the value only on routes that opt in.
 
@@ -240,10 +257,11 @@ next to it. Tombstones follow their delete on the same partition.
 1. **Plan + config:** `RoutePlan` compiled from `[[sink.routes]]`, with all validation: mutually exclusive
    keys, tombstones need a per-row key, the hash key from env or file only, no masked/hashed/excluded column
    in key/topic/outbox, explicit `key` with field ops under `partition_by = "key"`, the template rules, the
-   rename collision check, and the dead-letter checks. Wired into `send_batch` with the no-transform fast
+   rename collision check, and the dead-letter checks (`dead_letter_topic` required with `where`, outbox or
+   `unchanged = "dead_letter"`; not matching any template glob; no leading `_`). Wired into `send_batch` with the no-transform fast
    path. Includes the `--sink render` bench mode and a baseline.
-2. **Expression engine:** field paths, lazy borrowed row view, a typed evaluator (decimal-string numerics,
-   errors propagate), the parser with its depth and size limits, template rendering. Table-driven unit
+2. **Expression engine:** field paths, lazy borrowed row view, a typed three-valued evaluator
+   (decimal-string numerics, `NaN`/`±Infinity` as errors, null as unknown, errors win), the parser with its depth and size limits, template rendering. Table-driven unit
    tests, plus a parser fuzz test that includes deep nesting.
 3. **Filter + error policy:** `ops` and `where`, `sink.dead_letter_topic`, `RouteStats` and admin/Prometheus
    exposure.
@@ -251,7 +269,8 @@ next to it. Tombstones follow their delete on the same partition.
    required `topic_fallback`, the broker-counted `max_dynamic_topics`, inspector topic discovery.
 5. **Per-route key** (coordinate with #45).
 6. **Fields:** include/exclude, mask, HMAC hash (canonical input, `hash_key_id` header), rename, and the
-   unseen-field warning and metric.
+   unseen-field warning and metric over every field path the route references (`where`, templates, `key`,
+   outbox columns, field ops).
 7. **Shapes:** `format = "row"` with `deletes` and `unchanged`, envelope `tombstones`, raw display in the
    inspector.
 8. **Outbox router.**
