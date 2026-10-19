@@ -104,6 +104,8 @@ impl KafkaSource {
     }
 
     fn position(&self) -> Position {
+        // invariant: a BTreeMap<String, i64> always serialises to JSON.
+        #[allow(clippy::expect_used)]
         Position::Text(serde_json::to_string(&self.offsets).expect("offset map serialises"))
     }
 

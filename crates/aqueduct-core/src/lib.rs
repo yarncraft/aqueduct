@@ -4,6 +4,7 @@
 //! replication). The pipeline hands each event to a [`Sink`] and, only after
 //! the sink succeeds, acknowledges the event's [`Position`] back to the source
 //! (at-least-once delivery).
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod event;
 mod metrics;

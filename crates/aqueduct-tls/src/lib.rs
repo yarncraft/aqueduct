@@ -1,5 +1,6 @@
 //! Shared rustls client configuration (ring provider, no OpenSSL) for every
 //! outbound connection Aqueduct makes.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::sync::Arc;
 

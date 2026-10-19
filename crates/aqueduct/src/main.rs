@@ -18,7 +18,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("info".parse().unwrap()),
+                .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
         )
         .json()
         .init();
@@ -51,9 +51,13 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let listener = TcpListener::bind(&cfg.health_addr)
-        .await
-        .expect("bind health_addr");
+    let listener = match TcpListener::bind(&cfg.health_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, addr = %cfg.health_addr, "failed to bind health_addr");
+            std::process::exit(1);
+        }
+    };
     let metrics = Arc::new(aqueduct_core::Metrics::new());
     let (mut sink, inspector) = match sink::build(&cfg.sink).await {
         Ok(s) => s,

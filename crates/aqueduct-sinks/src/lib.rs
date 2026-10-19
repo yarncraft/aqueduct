@@ -1,5 +1,6 @@
 //! The Kafka [`Sink`](aqueduct_core::Sink) (the only sink) and the Kafka-backed
 //! event inspector. Events are encoded as one JSON object per record.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod inspect;
 mod kafka;
