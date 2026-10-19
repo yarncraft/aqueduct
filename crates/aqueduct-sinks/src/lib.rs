@@ -4,6 +4,7 @@
 
 mod inspect;
 mod kafka;
+pub mod route;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{

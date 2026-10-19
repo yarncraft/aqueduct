@@ -1,7 +1,8 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{ChangeEvent, Error, Op, Position, Result, Source};
+use aqueduct_core::{ChangeEvent, Error, Metrics, Op, Position, Result, Source};
 use async_trait::async_trait;
 use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
@@ -98,7 +99,14 @@ pub struct PostgresSource {
     checkpointed: u64,
     /// When the last heartbeat was attempted.
     last_heartbeat: Instant,
+    /// Where heartbeats and slot lag are reported, if the host wants them.
+    metrics: Option<Arc<Metrics>>,
+    /// When the slot lag was last read.
+    last_slot_stats: Option<Instant>,
 }
+
+/// How often the slot lag is read from `pg_replication_slots`.
+const SLOT_STATS_EVERY: Duration = Duration::from_secs(5);
 
 impl PostgresSource {
     pub fn new(cfg: PostgresSourceConfig) -> Self {
@@ -113,6 +121,59 @@ impl PostgresSource {
             full_identity_logged: HashSet::new(),
             checkpointed: 0,
             last_heartbeat: Instant::now(),
+            metrics: None,
+            last_slot_stats: None,
+        }
+    }
+
+    /// Report heartbeats and slot lag to `metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn skip_heartbeat(&self, reason: String) {
+        tracing::warn!("{reason}; skipping this heartbeat");
+        if let Some(m) = &self.metrics {
+            m.record_heartbeat_skip(reason);
+        }
+    }
+
+    /// Reads the slot's `confirmed_flush_lsn` and its distance from the WAL head, at most once
+    /// per [`SLOT_STATS_EVERY`]. Telemetry only: a failure clears the values and never stops
+    /// the stream.
+    async fn refresh_slot_stats(&mut self) {
+        let Some(metrics) = self.metrics.clone() else {
+            return;
+        };
+        if self
+            .last_slot_stats
+            .is_some_and(|t| t.elapsed() < SLOT_STATS_EVERY)
+        {
+            return;
+        }
+        self.last_slot_stats = Some(Instant::now());
+        let row = match self.client() {
+            Ok(c) => {
+                c.query_opt(
+                    "SELECT confirmed_flush_lsn::text,                      pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()                      ELSE pg_current_wal_lsn() END, confirmed_flush_lsn)::int8                      FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&self.cfg.slot],
+                )
+                .await
+            }
+            Err(_) => return,
+        };
+        match row {
+            Ok(Some(row)) => {
+                let flush: Option<String> = row.get(0);
+                let lag: Option<i64> = row.get(1);
+                metrics.set_slot(lag.map(|n| n.max(0) as u64), flush);
+            }
+            Ok(None) => metrics.set_slot(None, None),
+            Err(e) => {
+                tracing::debug!(error = %e, "slot lag query failed");
+                metrics.set_slot(None, None);
+            }
         }
     }
 
@@ -210,6 +271,35 @@ impl PostgresSource {
         }
     }
 
+    /// Queues one `Truncate` event per table. A multi-table `TRUNCATE` is a single WAL message, so
+    /// its tables share one LSN: the LSN check runs once for the message, not per table, or only the
+    /// first table would be emitted.
+    fn queue_truncate(
+        &mut self,
+        lsn: u64,
+        xid: u32,
+        commit_ts_micros: i64,
+        tables: Vec<(String, String)>,
+    ) {
+        if lsn <= self.emitted {
+            return;
+        }
+        self.emitted = lsn;
+        for (schema, table) in tables {
+            self.buffer.push_back(ChangeEvent {
+                position: Position::Lsn(lsn),
+                xid,
+                commit_ts_micros,
+                schema,
+                table,
+                op: Op::Truncate,
+                before: None,
+                after: None,
+                key: None,
+            });
+        }
+    }
+
     /// Starts a heartbeat if one is due: runs the optional action query, then reads the server's
     /// WAL flush position. This must happen **before** the peek, so every transaction committed
     /// at or below the returned LSN is visible to that peek.
@@ -229,14 +319,14 @@ impl PostgresSource {
                 Err(e) => Err(e),
             };
             if let Err(e) = ran {
-                tracing::warn!(error = %e, "heartbeat action query failed; skipping this heartbeat");
+                self.skip_heartbeat(format!("heartbeat action query failed: {e}"));
                 return Ok(None);
             }
         }
         match self.wal_position().await {
             Ok(wal) => Ok(wal),
             Err(e) => {
-                tracing::warn!(error = %e, "heartbeat WAL position query failed; skipping this heartbeat");
+                self.skip_heartbeat(format!("heartbeat WAL position query failed: {e}"));
                 Ok(None)
             }
         }
@@ -268,11 +358,15 @@ impl PostgresSource {
         for t in targets {
             self.advance(t).await?;
         }
+        if let Some(m) = &self.metrics {
+            m.record_heartbeat();
+        }
         Ok(())
     }
 
     async fn poll(&mut self) -> Result<()> {
         let heartbeat_wal = self.heartbeat_begin().await?;
+        self.refresh_slot_stats().await;
         let rows = self
             .client()?
             .query(
@@ -359,11 +453,12 @@ impl PostgresSource {
                     self.queue(lsn, xid, ts, name, Op::Delete, before, None, key);
                 }
                 Message::Truncate { relations } => {
+                    let mut names = Vec::with_capacity(relations.len());
                     for id in relations {
                         let r = cache.get(id).map_err(dec)?;
-                        let name = (r.schema.clone(), r.name.clone());
-                        self.queue(lsn, xid, ts, name, Op::Truncate, None, None, None);
+                        names.push((r.schema.clone(), r.name.clone()));
                     }
+                    self.queue_truncate(lsn, xid, ts, names);
                 }
                 Message::Commit { end_lsn, .. } => {
                     if end_lsn > self.last_end {
@@ -387,6 +482,9 @@ impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
         let client = self.connect().await?;
         self.client = Some(client);
+        if let Some(m) = &self.metrics {
+            m.heartbeat_configured(self.cfg.heartbeat_interval);
+        }
 
         let slot = self.cfg.slot.clone();
         let mut recreated = false;
@@ -526,6 +624,40 @@ mod tests {
         assert_eq!(l, 0x16_B374_D848);
         assert_eq!(Position::Lsn(l).to_string(), "16/B374D848");
         assert!(parse_lsn("garbage").is_err());
+    }
+
+    #[test]
+    fn multi_table_truncate_emits_one_event_per_table() {
+        let mut src = PostgresSource::new(PostgresSourceConfig::new("postgres://x", "s", "p"));
+        let tables = vec![
+            ("public".to_string(), "a".to_string()),
+            ("public".to_string(), "b".to_string()),
+            ("app".to_string(), "c".to_string()),
+        ];
+        src.queue_truncate(100, 7, 0, tables.clone());
+        let got: Vec<_> = src
+            .buffer
+            .iter()
+            .map(|e| {
+                (
+                    e.schema.as_str(),
+                    e.table.as_str(),
+                    e.op,
+                    e.position.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("public", "a", Op::Truncate, Position::Lsn(100)),
+                ("public", "b", Op::Truncate, Position::Lsn(100)),
+                ("app", "c", Op::Truncate, Position::Lsn(100)),
+            ]
+        );
+        // The next peek re-sends the same message: it must not be queued twice.
+        src.queue_truncate(100, 7, 0, tables);
+        assert_eq!(src.buffer.len(), 3);
     }
 
     #[derive(Debug)]

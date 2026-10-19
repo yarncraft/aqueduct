@@ -285,6 +285,37 @@ fn prometheus(s: &Snapshot) -> String {
         );
         let _ = writeln!(o, "aqueduct_lag_seconds {}", lag.max(0) as f64 / 1000.0);
     }
+    if let Some(lag) = s.slot_lag_bytes {
+        metric(
+            &mut o,
+            "aqueduct_slot_lag_bytes",
+            "gauge",
+            "WAL between the server head and the slot's confirmed_flush_lsn.",
+        );
+        let _ = writeln!(o, "aqueduct_slot_lag_bytes {lag}");
+    }
+    if let Some(hb) = &s.heartbeat {
+        metric(
+            &mut o,
+            "aqueduct_heartbeat_skipped_total",
+            "counter",
+            "Idle heartbeats skipped because a query failed.",
+        );
+        let _ = writeln!(o, "aqueduct_heartbeat_skipped_total {}", hb.skipped_total);
+        if let Some(ms) = hb.last_ms {
+            metric(
+                &mut o,
+                "aqueduct_heartbeat_last_timestamp_seconds",
+                "gauge",
+                "When the last idle heartbeat completed (Unix time).",
+            );
+            let _ = writeln!(
+                o,
+                "aqueduct_heartbeat_last_timestamp_seconds {}",
+                ms as f64 / 1000.0
+            );
+        }
+    }
     if let Some(ms) = s.last_event_unix_ms {
         metric(
             &mut o,

@@ -48,8 +48,15 @@ pub async fn build(cfg: &KafkaConfig) -> Result<(KafkaSink, KafkaInspector)> {
         Some(s) => s.parse().map_err(Error::Config)?,
         None => PartitionBy::default(),
     };
-    let sink = KafkaSink::connect(cfg.brokers.clone(), router, cfg.partitions, &security)
-        .await?
-        .with_partition_by(by);
+    cfg.check_replication_factor().map_err(Error::Config)?;
+    let sink = KafkaSink::connect(
+        cfg.brokers.clone(),
+        router,
+        cfg.partitions,
+        cfg.replication_factor,
+        &security,
+    )
+    .await?
+    .with_partition_by(by);
     Ok((sink, inspector))
 }

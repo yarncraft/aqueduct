@@ -20,6 +20,7 @@ publication = "aqueduct"
 brokers = ["kafka:9092"]
 topic = "cdc.{schema}.{table}"   # fallback: one topic per table
 partitions = 1
+# replication_factor = 3          # for topics Aqueduct creates; default 3, or 1 on a smaller cluster
 
 # First match wins; add routes to send tables elsewhere.
 # [[sink.routes]]
