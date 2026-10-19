@@ -88,6 +88,10 @@ pub struct PostgresConfig {
     /// Optional SQL run before each heartbeat, e.g. an upsert into a small published table.
     #[serde(default)]
     pub heartbeat_action_query: Option<String>,
+    /// Do not record or check which cluster and database a checkpoint belongs to. Only for servers
+    /// that refuse `pg_control_system()`. Default: check, and fail at startup if it cannot be read.
+    #[serde(default)]
+    pub checkpoint_skip_system_check: bool,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -110,6 +114,7 @@ impl PostgresConfig {
             .heartbeat_action_query
             .clone()
             .filter(|q| !q.trim().is_empty());
+        c.skip_origin_check = self.checkpoint_skip_system_check;
         Ok(c)
     }
 }
@@ -551,6 +556,7 @@ heartbeat_action_query = 'SELECT 1'")
             allow_slot_recreate: false,
             heartbeat_interval_secs: 10,
             heartbeat_action_query: None,
+            checkpoint_skip_system_check: false,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());

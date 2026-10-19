@@ -45,13 +45,83 @@ impl Key {
     }
 }
 
-/// Parses a text checkpoint; anything that is not a [`Key`] belongs to another source type.
-fn key_from_checkpoint(t: &str) -> Result<Key> {
-    Key::parse(t).ok_or_else(|| {
+/// The database a checkpoint was written against: the cluster's `system_identifier` (set by
+/// `initdb`, so it is the same on physical replicas and on restores of that cluster) and the
+/// database OID within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Origin {
+    system: u64,
+    database: u32,
+}
+
+/// What a text checkpoint records about its origin. Checkpoints written before #63 have neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Stamp {
+    system: Option<u64>,
+    database: Option<u32>,
+}
+
+/// Checkpoint text: the [`Key`], then `;name=value` fields (`sys`, `db`) when the origin is known.
+fn encode_checkpoint(key: Key, origin: Option<Origin>) -> String {
+    match origin {
+        Some(o) => format!("{};sys={};db={}", key.encode(), o.system, o.database),
+        None => key.encode(),
+    }
+}
+
+/// Parses checkpoint text. An unknown or repeated field makes the whole checkpoint invalid, so a
+/// format this version does not understand is refused rather than half-read.
+fn parse_checkpoint(t: &str) -> Option<(Key, Stamp)> {
+    let mut parts = t.split(';');
+    let key = Key::parse(parts.next()?)?;
+    let mut stamp = Stamp::default();
+    for field in parts {
+        let (name, value) = field.split_once('=')?;
+        match name {
+            "sys" if stamp.system.is_none() => stamp.system = Some(value.parse().ok()?),
+            "db" if stamp.database.is_none() => stamp.database = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some((key, stamp))
+}
+
+/// Parses a text checkpoint; anything that is not a Postgres checkpoint belongs to another source
+/// type (or to a newer Aqueduct version).
+fn key_from_checkpoint(t: &str) -> Result<(Key, Stamp)> {
+    parse_checkpoint(t).ok_or_else(|| {
         Error::Checkpoint(format!(
             "checkpoint {t:?} is not a Postgres checkpoint; it belongs to another source type"
         ))
     })
+}
+
+/// Refuses a checkpoint written against another cluster (a different `initdb`: a re-pointed URL
+/// or a rebuilt primary) or another database of the same cluster. A restore, PITR or failover of
+/// the same cluster keeps its `system_identifier`, so it is **not** caught here; the
+/// checkpoint-ahead-of-WAL check in `start` is the only guard for those.
+fn check_origin(saved: Stamp, server: Origin) -> Result<()> {
+    if let Some(sys) = saved.system {
+        if sys != server.system {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against Postgres cluster {sys}, but this server is cluster {}. \
+                 The URL points at a different or rebuilt cluster. Point it back, or remove the \
+                 checkpoint to start over",
+                server.system
+            )));
+        }
+    }
+    if let Some(db) = saved.database {
+        if db != server.database {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against database OID {db}, but this connection is to \
+                 database OID {} on the same cluster. Point the URL back at that database, or \
+                 remove the checkpoint to start over",
+                server.database
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Assigns [`Key`]s to the changes of the transaction being decoded.
@@ -117,6 +187,9 @@ pub struct PostgresSourceConfig {
     /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
     /// servers where WAL position alone does not move the slot.
     pub heartbeat_action_query: Option<String>,
+    /// Skip recording and checking which cluster and database a checkpoint belongs to. Only for
+    /// servers that refuse `pg_control_system()`; without it such a server fails at startup.
+    pub skip_origin_check: bool,
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -139,6 +212,7 @@ impl PostgresSourceConfig {
             ssl_root_cert: None,
             heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
             heartbeat_action_query: None,
+            skip_origin_check: false,
         }
     }
 
@@ -181,6 +255,9 @@ pub struct PostgresSource {
     metrics: Option<Arc<Metrics>>,
     /// When the slot lag was last read.
     last_slot_stats: Option<Instant>,
+    /// The connected cluster and database, stamped on every checkpoint. `None` with
+    /// `skip_origin_check`.
+    origin: Option<Origin>,
 }
 
 /// How often the slot lag is read from `pg_replication_slots`.
@@ -201,7 +278,36 @@ impl PostgresSource {
             last_heartbeat: Instant::now(),
             metrics: None,
             last_slot_stats: None,
+            origin: None,
         }
+    }
+
+    /// The connected cluster's `system_identifier` and the current database's OID.
+    async fn read_origin(&self) -> Result<Origin> {
+        let row = self
+            .client()?
+            .query_one(
+                "SELECT s.system_identifier::text, d.oid::int8 \
+                 FROM pg_control_system() s, pg_database d WHERE d.datname = current_database()",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                Error::Source(format!(
+                    "{}. Aqueduct reads pg_control_system() to tell which cluster a checkpoint \
+                     belongs to; grant it, or set postgres.checkpoint_skip_system_check = true",
+                    src_err(e)
+                ))
+            })?;
+        let system: String = row.get(0);
+        let database: i64 = row.get(1);
+        Ok(Origin {
+            system: system
+                .parse()
+                .map_err(|_| Error::Source(format!("invalid system_identifier {system:?}")))?,
+            database: u32::try_from(database)
+                .map_err(|_| Error::Source(format!("invalid database OID {database}")))?,
+        })
     }
 
     /// Report heartbeats and slot lag to `metrics`.
@@ -345,7 +451,7 @@ impl PostgresSource {
                 before,
                 after,
                 key: row_key,
-                checkpoint: Some(Position::Text(key.encode())),
+                checkpoint: Some(Position::Text(encode_checkpoint(key, self.origin))),
             });
         }
     }
@@ -532,6 +638,29 @@ impl Source for PostgresSource {
             m.heartbeat_configured(self.cfg.heartbeat_interval);
         }
 
+        // Which cluster and database this is, checked against the checkpoint before the slot is
+        // looked up or created, so a checkpoint is never applied to (and no slot is created on)
+        // the wrong database. `allow_slot_recreate` does not bypass this.
+        if self.cfg.skip_origin_check {
+            tracing::warn!(
+                "checkpoint_skip_system_check is set: a checkpoint from another cluster or \
+                 database is not detected"
+            );
+        } else {
+            let origin = self.read_origin().await?;
+            self.origin = Some(origin);
+            if let Some(Position::Text(t)) = &start {
+                let (_, stamp) = key_from_checkpoint(t)?;
+                check_origin(stamp, origin)?;
+                if stamp.system.is_none() {
+                    tracing::info!(
+                        "checkpoint has no cluster identity (written before this check existed); \
+                         it is recorded with the next checkpoint"
+                    );
+                }
+            }
+        }
+
         let slot = self.cfg.slot.clone();
         let mut recreated = false;
         let existing = self
@@ -597,7 +726,7 @@ impl Source for PostgresSource {
                     );
                 }
                 Position::Text(t) => {
-                    let k = key_from_checkpoint(&t)?;
+                    let (k, _) = key_from_checkpoint(&t)?;
                     // Same cross-cluster guard as for a plain LSN, on the commit LSN.
                     if let Some(wal) = self.wal_position().await? {
                         if k.commit > wal {
@@ -637,7 +766,7 @@ impl Source for PostgresSource {
         // cannot be placed in the commit order, so acking one would be a guess.
         match position {
             Position::Text(t) => {
-                let k = Key::parse(&t)
+                let (k, _) = parse_checkpoint(&t)
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
                 self.advance_acked(k).await
@@ -1007,13 +1136,83 @@ mod key_tests {
     /// as "no checkpoint". The current parser likewise refuses text that is not a key.
     #[test]
     fn foreign_text_checkpoint_is_refused() {
-        assert_eq!(key_from_checkpoint("10@99#3").unwrap().commit, 10);
+        assert_eq!(key_from_checkpoint("10@99#3").unwrap().0.commit, 10);
         for foreign in ["{\"_data\":\"82\"}", "16/B374D848", "10@99"] {
             assert!(
                 matches!(key_from_checkpoint(foreign), Err(Error::Checkpoint(_))),
                 "{foreign:?}"
             );
         }
+    }
+
+    const HERE: Origin = Origin {
+        system: 7_312_345_678_901_234_567,
+        database: 16_384,
+    };
+
+    #[test]
+    fn checkpoint_carries_its_origin() {
+        let k = Key {
+            commit: 10,
+            change: 99,
+            ord: 3,
+        };
+        let text = encode_checkpoint(k, Some(HERE));
+        assert_eq!(text, "10@99#3;sys=7312345678901234567;db=16384");
+        let (key, stamp) = parse_checkpoint(&text).unwrap();
+        assert_eq!(key, k);
+        assert_eq!(stamp.system, Some(HERE.system));
+        assert_eq!(stamp.database, Some(HERE.database));
+        // Without an origin (skip_origin_check) the text is the bare key, as before #63.
+        assert_eq!(encode_checkpoint(k, None), "10@99#3");
+        assert_eq!(parse_checkpoint("10@99#3"), Some((k, Stamp::default())));
+    }
+
+    #[test]
+    fn unknown_or_malformed_checkpoint_fields_are_refused() {
+        for bad in [
+            "10@99#3;",
+            "10@99#3;sys",
+            "10@99#3;sys=x",
+            "10@99#3;db=-1",
+            "10@99#3;sys=1;sys=1",
+            "10@99#3;tli=2",
+            "10@99#3;sys=1;db=2;x=3",
+        ] {
+            assert!(
+                matches!(key_from_checkpoint(bad), Err(Error::Checkpoint(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_from_another_cluster_or_database_is_refused() {
+        let same = Stamp {
+            system: Some(HERE.system),
+            database: Some(HERE.database),
+        };
+        assert!(check_origin(same, HERE).is_ok());
+        // Legacy checkpoints carry no origin and are accepted (backfilled on the next save).
+        assert!(check_origin(Stamp::default(), HERE).is_ok());
+
+        let other_cluster = Stamp {
+            system: Some(HERE.system + 1),
+            ..same
+        };
+        let err = check_origin(other_cluster, HERE).unwrap_err().to_string();
+        assert!(err.contains("different or rebuilt cluster"), "{err}");
+        assert!(
+            !err.contains("backup"),
+            "must not promise to catch restores: {err}"
+        );
+
+        let other_db = Stamp {
+            database: Some(HERE.database + 1),
+            ..same
+        };
+        let err = check_origin(other_db, HERE).unwrap_err().to_string();
+        assert!(err.contains("same cluster"), "{err}");
     }
 
     /// In-progress transaction streaming (`streaming on`, proto >= 2) must stay off: changes of a

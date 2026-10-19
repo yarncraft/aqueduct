@@ -132,6 +132,7 @@ topic = "cdc.{schema}.{table}"
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
+| `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
@@ -270,6 +271,22 @@ acknowledged; the jump to the server's WAL position then rarely fires. Both path
 WAL position query fails, the source logs a warning and skips that heartbeat instead of stopping. A standby cannot run
 an `UPDATE` action query, so leave it unset there. A checkpoint ahead of the server's WAL position (a state volume
 copied from another cluster) is rejected at startup.
+
+### Checkpoint origin check
+
+Every Postgres checkpoint records the cluster's `system_identifier` and the database OID
+(`<commit>@<change>#<ord>;sys=<id>;db=<oid>`). At startup, before the slot is looked up or created, Aqueduct reads
+both from the server (`pg_control_system()`, which a plain `LOGIN REPLICATION` role could call in our tests on PG 14, 16 and 17) and refuses
+a checkpoint written against another cluster or another database. `allow_slot_recreate` does not bypass this.
+
+- **Caught:** the URL now points at a different cluster (another `initdb`, including a primary rebuilt from scratch),
+  or at another database of the same cluster.
+- **Not caught:** a restore, PITR or snapshot restore of the **same** cluster, and a failover to one of its replicas.
+  These keep the `system_identifier`. A failover is fine; for a restore, only the "checkpoint ahead of the WAL"
+  check above applies, and only when the restore went back before the checkpoint's position.
+- A checkpoint written by an older version has no origin. It is accepted, and the next checkpoint records it.
+- If the role cannot call `pg_control_system()` (some managed services), startup fails with a message naming
+  `checkpoint_skip_system_check`. Set it to `true` to run without this check.
 
 ```sql
 CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
