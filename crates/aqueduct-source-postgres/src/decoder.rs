@@ -440,7 +440,7 @@ mod tests {
     fn negative_relation_column_count_is_an_error() {
         let mut b = vec![b'R'];
         b.extend(42u32.to_be_bytes());
-        b.extend(b"public users ");
+        b.extend(b"public\0users\0");
         b.push(b'd');
         b.extend((-2i16).to_be_bytes());
         assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-2)));
