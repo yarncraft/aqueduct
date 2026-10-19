@@ -118,7 +118,7 @@ topic = "cdc.{schema}.{table}"
 | `health_addr` | `0.0.0.0:8080` | Listen address of the cockpit, API and `/healthz` |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically. Keep on the state volume |
 | `admin_insecure_no_auth` | `false` | Allow a non-loopback `health_addr` without `admin_token`. Without this, startup refuses that combination; with it, a warning is logged. Loopback binds never need a token |
-| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/api/*` requires it (`Authorization: Bearer ...` or `?token=`). Env: `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/api/*` requires it (`Authorization: Bearer ...` only; `?token=` is rejected). Env: `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Cockpit event inspector, reading recent events back from Kafka. Needs `admin_token`; `false` turns it off |
 
 ### `[postgres]`
@@ -228,7 +228,7 @@ topic = "audit"
 
 ## 4. Admin cockpit
 
-Open `http://host:8080/` (or `/?token=<admin_token>` when a token is set). It shows throughput, totals, lag,
+Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, per-operation and per-table breakdowns and an event inspector.
 Routes: `/` and `/admin.css` (page), `/healthz`, `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka).
 

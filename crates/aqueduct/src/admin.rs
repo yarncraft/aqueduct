@@ -9,7 +9,8 @@
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
 //!
 //! If `admin_token` is configured, `/metrics` and `/api/*` require it as
-//! `Authorization: Bearer <token>` or `?token=<token>`. The event inspector (which exposes row
+//! `Authorization: Bearer <token>`. A `?token=` query parameter is never accepted: URLs leak
+//! through proxy logs, browser history and Referer. The event inspector (which exposes row
 //! data) reads from the Kafka topics the sink writes to and is only enabled when a token is configured.
 //!
 //! Defensive limits: request read timeout, a cap on concurrent connections and on SSE streams,
@@ -131,12 +132,7 @@ impl Admin {
     fn authorized(&self, req: &Request) -> bool {
         match &self.token {
             None => true,
-            Some(t) => {
-                // Evaluate both so timing does not reveal which source matched.
-                let a = req.bearer.as_deref().is_some_and(|b| ct_eq(b, t));
-                let b = req.query_token.as_deref().is_some_and(|q| ct_eq(q, t));
-                a | b
-            }
+            Some(t) => req.bearer.as_deref().is_some_and(|b| ct_eq(b, t)),
         }
     }
 }
@@ -153,7 +149,6 @@ fn ct_eq(a: &str, b: &str) -> bool {
 struct Request {
     path: String,
     bearer: Option<String>,
-    query_token: Option<String>,
     query: String,
 }
 
@@ -165,10 +160,6 @@ fn parse(raw: &str) -> Option<Request> {
     }
     let target = first.next()?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let query_token = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("token="))
-        .map(str::to_string);
     let bearer = lines.find_map(|l| {
         let (k, v) = l.split_once(':')?;
         k.eq_ignore_ascii_case("authorization")
@@ -178,7 +169,6 @@ fn parse(raw: &str) -> Option<Request> {
     Some(Request {
         path: path.to_string(),
         bearer,
-        query_token,
         query: query.to_string(),
     })
 }
@@ -517,8 +507,8 @@ mod tests {
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
         assert_eq!(
-            (r.path.as_str(), r.query_token.as_deref()),
-            ("/api/stream", Some("abc"))
+            (r.path.as_str(), r.bearer.as_deref()),
+            ("/api/stream", None)
         );
         let r = parse("GET /api/metrics HTTP/1.1\r\nAuthorization: Bearer s3\r\n\r\n").unwrap();
         assert_eq!(r.bearer.as_deref(), Some("s3"));
@@ -531,8 +521,10 @@ mod tests {
         let open = Admin::new(m.clone(), None, None);
         let locked = Admin::new(m, Some("k".into()), None);
         let anon = parse("GET /api/metrics HTTP/1.1\r\n\r\n").unwrap();
-        let ok = parse("GET /api/metrics?token=k HTTP/1.1\r\n\r\n").unwrap();
-        let bad = parse("GET /api/metrics?token=kk HTTP/1.1\r\n\r\n").unwrap();
+        let ok = parse("GET /api/metrics HTTP/1.1\r\nAuthorization: Bearer k\r\n\r\n").unwrap();
+        let bad = parse("GET /api/metrics HTTP/1.1\r\nAuthorization: Bearer kk\r\n\r\n").unwrap();
+        let query = parse("GET /api/metrics?token=k HTTP/1.1\r\n\r\n").unwrap();
+        assert!(!locked.authorized(&query));
         assert!(open.authorized(&anon));
         assert!(!locked.authorized(&anon));
         assert!(!locked.authorized(&bad));
@@ -568,6 +560,25 @@ mod tests {
         out
     }
 
+    async fn get_bearer(addr: std::net::SocketAddr, path: &str, token: &str) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            format!(
+                "GET {path} HTTP/1.1
+host: x
+Authorization: Bearer {token}
+
+"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
     async fn start(token: Option<&str>) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -589,10 +600,10 @@ mod tests {
         assert!(get(addr, "/readyz").await.starts_with("HTTP/1.1 503"));
         assert!(get(addr, "/api/metrics").await.starts_with("HTTP/1.1 401"));
         assert!(get(addr, "/metrics").await.starts_with("HTTP/1.1 401"));
-        let ok = get(addr, "/api/metrics?token=k").await;
+        let ok = get_bearer(addr, "/api/metrics", "k").await;
         assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("\"events_total\":0"));
         assert!(ok.contains("\"inspector\":false"));
-        let prom = get(addr, "/metrics?token=k").await;
+        let prom = get_bearer(addr, "/metrics", "k").await;
         assert!(prom.contains("aqueduct_events_total{op=\"insert\"} 0"));
         assert!(get(addr, "/api/events").await.starts_with("HTTP/1.1 401"));
     }
@@ -600,7 +611,27 @@ mod tests {
     #[tokio::test]
     async fn inspector_is_disabled_without_kafka_inspector() {
         let addr = start(Some("k")).await;
-        let r = get(addr, "/api/events?token=k").await;
+        let r = get_bearer(addr, "/api/events", "k").await;
         assert!(r.starts_with("HTTP/1.1 403"));
+    }
+
+    // #11: the token must never be accepted from the URL (proxy logs, history, Referer).
+    #[tokio::test]
+    async fn query_string_token_is_rejected() {
+        let addr = start(Some("k")).await;
+        for path in [
+            "/api/metrics?token=k",
+            "/metrics?token=k",
+            "/api/stream?token=k",
+            "/api/events?token=k",
+        ] {
+            assert!(
+                get(addr, path).await.starts_with("HTTP/1.1 401"),
+                "{path} accepted ?token="
+            );
+        }
+        assert!(get_bearer(addr, "/api/metrics", "k")
+            .await
+            .starts_with("HTTP/1.1 200"));
     }
 }

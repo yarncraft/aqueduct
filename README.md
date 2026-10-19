@@ -36,7 +36,7 @@ You only need Docker or Podman; nothing else is installed on the host.
 podman-compose -f docker-compose.sim.yml -p aqsim up -d --build     # or: docker compose -f docker-compose.sim.yml -p aqsim up -d --build
 
 # open the cockpit
-#   http://localhost:8088/?token=dev-token-change-me
+#   http://localhost:8088/#token=dev-token-change-me
 
 # change the load (transactions per second, default 15; each is ~2-3 events)
 SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator
@@ -45,7 +45,7 @@ SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator
 podman-compose -f docker-compose.sim.yml -p aqsim down
 ```
 
-A second Aqueduct (`aqueduct-kafka`, cockpit on <http://localhost:8089/?token=dev-token-change-me>) runs the Kafka source:
+A second Aqueduct (`aqueduct-kafka`, cockpit on <http://localhost:8089/#token=dev-token-change-me>) runs the Kafka source:
 it reads the `cdc.public.*` topics written by the Postgres pipeline and republishes them as `mirror.public.*`. The two
 topic sets should always have equal offsets, which makes a quick end-to-end check.
 
@@ -131,8 +131,8 @@ before/after diff and Copy JSON).
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 
-With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` or `?token=<token>`; open the
-dashboard as `http://host:8080/?token=<token>`. The page itself is public and **events contain row data**,
+With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` (a `?token=` query parameter is rejected; URLs leak into logs, history and Referer); open the
+dashboard once as `http://host:8080/#token=<token>` (the fragment is never sent to the server). The page itself is public and **events contain row data**,
 so always set a token and keep the port off untrusted networks.
 
 ## Operations
