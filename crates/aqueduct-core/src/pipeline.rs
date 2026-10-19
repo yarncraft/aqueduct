@@ -149,6 +149,10 @@ async fn drive(
             }
         }
         // One checkpoint write and one ack for the whole batch, after the sink succeeded.
+        // A heartbeat position may end up here, but a source that advances its slot on idle
+        // heartbeats (Postgres) keeps that position on the server, not in this file. On restart
+        // the slot's own position wins over an older checkpoint, so nothing is lost; at worst
+        // the stream re-reads from the last delivered event, which at-least-once allows.
         store.save(&last).await?;
         source.ack(last).await?;
     }

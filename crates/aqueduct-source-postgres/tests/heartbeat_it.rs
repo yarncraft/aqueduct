@@ -36,6 +36,7 @@ impl Fixture {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        sweep_leftovers(&db).await;
         let id = format!("{}_{tag}_{}", std::process::id(), nanos % 1_000_000_000);
         let f = Fixture {
             db,
@@ -61,14 +62,24 @@ impl Fixture {
         self.source_with(heartbeat, None)
     }
 
+    fn source_off(&self) -> PostgresSource {
+        let mut cfg = self.config(Duration::from_secs(1), None);
+        cfg.heartbeat_interval = None;
+        PostgresSource::new(cfg)
+    }
+
     fn source_with(&self, heartbeat: Duration, action: Option<String>) -> PostgresSource {
+        PostgresSource::new(self.config(heartbeat, action))
+    }
+
+    fn config(&self, heartbeat: Duration, action: Option<String>) -> PostgresSourceConfig {
         let url = format!("postgres://postgres:aq@{}/postgres", addr());
         let mut cfg = PostgresSourceConfig::new(url, self.slot.clone(), self.publication.clone());
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         cfg.heartbeat_interval = Some(heartbeat);
         cfg.heartbeat_action_query = action;
-        PostgresSource::new(cfg)
+        cfg
     }
 
     /// About 2 MiB of WAL in a table the publication does not cover.
@@ -90,10 +101,18 @@ impl Fixture {
     }
 
     /// Frees the slot so a long-lived server does not run out of `max_replication_slots`.
+    /// A failing test never gets here; the next run's [`sweep_leftovers`] covers that.
     async fn cleanup(self, source: PostgresSource) {
         drop(source);
         self.db
             .execute("SELECT pg_drop_replication_slot($1::text)", &[&self.slot])
+            .await
+            .unwrap();
+        self.db
+            .batch_execute(&format!(
+                "DROP PUBLICATION {}; DROP TABLE {}, {};",
+                self.publication, self.unpub, self.publ
+            ))
             .await
             .unwrap();
     }
@@ -131,6 +150,46 @@ impl Fixture {
                 panic!("unpublished writes must not produce events, got {ev:?}");
             }
         }
+    }
+}
+
+/// Best-effort removal of what earlier runs left behind when a test failed before `cleanup`
+/// (a long-lived CI server would otherwise run out of `max_replication_slots`). Objects of
+/// this process are skipped because the other tests are still using them; names carry the pid.
+async fn sweep_leftovers(db: &Client) {
+    let mine = format!("_{}_", std::process::id());
+    let names = |sql: &'static str| async move {
+        db.query(sql, &[])
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let others = |all: Vec<String>| {
+        all.into_iter()
+            .filter(|n| !n.contains(&mine))
+            .collect::<Vec<_>>()
+    };
+    // Errors are ignored: a slot that is still active in a concurrent run cannot be dropped.
+    for slot in others(
+        names(r"SELECT slot_name::text FROM pg_replication_slots WHERE slot_name LIKE 'aq\_hb\_%'")
+            .await,
+    ) {
+        let _ = db
+            .execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+            .await;
+    }
+    for p in others(
+        names(r"SELECT pubname::text FROM pg_publication WHERE pubname LIKE 'aq\_hb\_pub\_%'")
+            .await,
+    ) {
+        let _ = db.batch_execute(&format!("DROP PUBLICATION {p}")).await;
+    }
+    for t in others(names(r"SELECT tablename::text FROM pg_tables WHERE tablename LIKE 'hb\_pub\_%' OR tablename LIKE 'hb\_unpub\_%'").await) {
+        let _ = db.batch_execute(&format!("DROP TABLE {t}")).await;
     }
 }
 
@@ -181,6 +240,8 @@ async fn heartbeat_never_confirms_past_an_unacked_event() {
         .expect("the published insert must arrive");
     assert_eq!(ev.op, Op::Insert);
 
+    // `ev.position` is the change's own LSN, below its transaction's commit-end LSN. While the
+    // event is unacked the slot must not move past the start of that transaction at all.
     // Several heartbeat intervals pass with more unpublished writes and no ack.
     f.write_unpublished().await;
     let until = Instant::now() + Duration::from_secs(4);
@@ -238,5 +299,66 @@ async fn action_query_runs_before_each_heartbeat() {
         .expect("the action query's published write must arrive");
     assert_eq!(ev.table, f.publ);
     assert!(ev.after.as_ref().unwrap().get().contains("beat"));
+    f.cleanup(s).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn unacked_event_is_redelivered_after_a_restart() {
+    let f = Fixture::new("restart").await;
+    let mut s = f.source(Duration::from_secs(1));
+    s.start(None).await.unwrap();
+
+    f.insert_published("survives").await;
+    let ev = drive(&mut s, Duration::from_secs(10))
+        .await
+        .expect("the published insert must arrive");
+
+    // Heartbeats and unpublished writes pass without an ack, then the process "crashes".
+    f.write_unpublished().await;
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        assert!(drive(&mut s, Duration::from_millis(500)).await.is_none());
+    }
+    drop(s);
+
+    let mut again = f.source(Duration::from_secs(1));
+    again.start(None).await.unwrap();
+    let redelivered = drive(&mut again, Duration::from_secs(10))
+        .await
+        .expect("the unacked event must come back after a restart");
+    assert_eq!(redelivered.position, ev.position);
+    assert_eq!(redelivered.table, f.publ);
+    assert!(redelivered
+        .after
+        .as_ref()
+        .unwrap()
+        .get()
+        .contains("survives"));
+    f.cleanup(again).await;
+}
+
+/// Negative control for the tests above: with heartbeats off, nothing moves the slot past
+/// writes the publication does not cover, so those tests really exercise the heartbeat.
+/// (Only the source advances the slot here; `peek` never does, on any server version.)
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn slot_stays_behind_without_a_heartbeat() {
+    let f = Fixture::new("off").await;
+    let mut s = f.source_off();
+    s.start(None).await.unwrap();
+    let baseline = f.confirmed().await;
+
+    f.write_unpublished().await;
+    let until = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < until {
+        assert!(drive(&mut s, Duration::from_millis(500)).await.is_none());
+    }
+    assert_eq!(
+        f.confirmed().await,
+        baseline,
+        "the slot moved without a heartbeat"
+    );
+    assert!(f.wal().await > baseline);
     f.cleanup(s).await;
 }
