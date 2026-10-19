@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:pk with partition_by = key"]
+        SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:identity with partition_by = key"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz"]
@@ -160,7 +160,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 
 ### Kafka sink
 
-Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created) and `partition_by`. Records: JSON value, headers `op` and `lsn`, key `schema.table`; partition = FNV-1a hash of the key, so a table's changes stay ordered. With `partition_by = "key"` the key is `schema.table:<primary key>`, spreading a table over partitions while each row's changes stay ordered (tables without a key fall back to `schema.table`). Acked by the broker before checkpointing.
+Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created) and `partition_by`. Records: JSON value, headers `op` and `lsn`, key `schema.table`; partition = FNV-1a hash of the key, so a table's changes stay ordered. With `partition_by = "key"` the key is `schema.table:<replica-identity columns>` (MongoDB: the `documentKey`), spreading a table over partitions. Per-row order then holds only while the identity columns never change: not with `REPLICA IDENTITY FULL` (every column is identity, so any update changes the key), and not across an update of a key column. `TRUNCATE` and tables without an identity use `schema.table`, so a truncate is not ordered against row events in this mode. Acked by the broker before checkpointing.
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.

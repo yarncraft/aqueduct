@@ -48,7 +48,7 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;   -- full "before" image
 -- default identity (primary key) gives only the key columns in "before"
 ```
 
-Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key.
+Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key. If you use `partition_by = "key"` on the sink, prefer a key: `FULL` makes every column part of the Kafka key and loses per-row ordering (see [Kafka sink](#kafka-sink)).
 
 The publication must exist before Aqueduct starts. The slot is created automatically.
 
@@ -184,7 +184,7 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `brokers` | required | Bootstrap list, for example `["kafka-1:9093", "kafka-2:9093"]` |
 | `topic` | unset | Fallback topic for events no route matches. May use `{schema}` and `{table}` |
 | `partitions` | `1` | Partition count used when Aqueduct has to create a topic |
-| `partition_by` | `table` | `table`: record key `schema.table`, total order per table. `key`: record key `schema.table:<primary key>`, a table spreads over partitions and order is kept per row; tables without a key fall back to `table` |
+| `partition_by` | `table` | `table`: record key `schema.table`, total order per table. `key`: record key `schema.table:<replica-identity columns>` (MongoDB: `documentKey`), a table spreads over partitions. See the ordering caveats below |
 | `tls` | `false` | Encrypt with TLS and verify the broker certificate and hostname (rustls). Set it for any non-local cluster |
 | `tls_ca_file` | unset | PEM CA bundle for brokers with a private CA |
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
@@ -192,8 +192,13 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins |
 
-Records: key `schema.table` (or `schema.table:<primary key>` with `partition_by = "key"`), value the JSON event, headers `op` and `lsn`, timestamp = commit time. The partition is a
-stable FNV-1a hash of the key, so one table's changes (or, with `key`, one row's changes) stay ordered. A produce is acknowledged by the broker before the
+Records: key `schema.table` (or `schema.table:<replica-identity columns>` with `partition_by = "key"`), value the JSON event, headers `op` and `lsn`, timestamp = commit time. The partition is a
+stable FNV-1a hash of the key. With the default `table`, all of a table's changes stay ordered. With `key`, a row's changes
+stay ordered **only while its identity columns never change**: use a primary key or `REPLICA IDENTITY USING INDEX` on
+immutable columns. Under `REPLICA IDENTITY FULL` every column is part of the key, so any update can move the row to
+another partition and per-row order is lost; an update of a key column does the same with any identity. `TRUNCATE` (and
+any table without an identity) is keyed `schema.table`, so it is not ordered against that table's row events; do not
+use it as a barrier in `key` mode. A produce is acknowledged by the broker before the
 checkpoint moves. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
 fails the pipeline instead of being silently dropped. Topics are created on first use, so pre-create them (with the
 replication factor and retention you want) in production.
