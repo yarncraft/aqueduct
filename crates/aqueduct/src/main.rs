@@ -76,7 +76,9 @@ async fn main() {
 
     let mut source: Box<dyn aqueduct_core::Source> = match source_cfg {
         config::SourceConfig::Postgres(p) => match p.source_config() {
-            Ok(c) => Box::new(aqueduct_source_postgres::PostgresSource::new(c)),
+            Ok(c) => Box::new(
+                aqueduct_source_postgres::PostgresSource::new(c).with_metrics(metrics.clone()),
+            ),
             Err(e) => {
                 tracing::error!(error = %e, "invalid postgres config");
                 std::process::exit(1);
