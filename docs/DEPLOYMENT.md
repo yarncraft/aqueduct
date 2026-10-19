@@ -286,7 +286,20 @@ heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
 
 The table is in the publication, so its changes are delivered as normal events (topic `cdc.public.aqueduct_heartbeat`
 by default, one per interval); route or ignore that topic downstream. Monitor the effect with
-`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots`.
+`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots`, or read it from Aqueduct:
+
+| Field on `/api/metrics` and `/api/stream` | Meaning |
+|-------|---------|
+| `slot_lag_bytes` | WAL between the server head and the slot's `confirmed_flush_lsn`, read every 5 s. `null` when unknown (no slot yet, query failed, or a MongoDB source). |
+| `confirmed_flush_lsn` | The slot's confirmed position as text, `null` when unknown. |
+| `heartbeat.interval_ms` | The heartbeat interval, `null` when `heartbeat_interval_secs = 0`. |
+| `heartbeat.last_ms` | Unix ms of the last completed heartbeat, `null` before the first. |
+| `heartbeat.skipped_total` | Heartbeats skipped because the action query or the WAL position query failed. |
+| `heartbeat.last_skip_reason` | Why the latest one was skipped, `null` until one is. |
+
+The `heartbeat` object is absent for sources without heartbeats (MongoDB). Heartbeats are not events: they are not counted in `events_total`
+and never reach the sink. `/metrics` has `aqueduct_slot_lag_bytes`, `aqueduct_heartbeat_skipped_total` and
+`aqueduct_heartbeat_last_timestamp_seconds`; each is left out while its value is unknown.
 
 ## 6. Troubleshooting
 
