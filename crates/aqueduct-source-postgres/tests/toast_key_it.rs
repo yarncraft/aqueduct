@@ -68,6 +68,19 @@ async fn unsent_toast_key_column_keeps_the_insert_key() {
     )
     .await
     .unwrap();
+    // Precondition: the key really is stored out of line. If it were inline, Postgres would send
+    // it in the new tuple and the key assertions below would pass without the old-key path.
+    let toasted: bool = db
+        .query_one(
+            &format!(
+                "SELECT pg_relation_size(reltoastrelid) > 0 FROM pg_class WHERE oid = '{table}'::regclass"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(toasted, "the 2400-byte key was not TOASTed, so this test proves nothing");
     // Leaves the key column alone, so the new tuple carries it as "unchanged TOAST".
     db.execute(&format!("UPDATE {table} SET v = 'two'"), &[])
         .await
@@ -77,6 +90,12 @@ async fn unsent_toast_key_column_keeps_the_insert_key() {
     assert_eq!(insert.op, Op::Insert);
     let update = next_event(&mut s).await;
     assert_eq!(update.op, Op::Update);
+
+    // The server sent the old key tuple; without it the key below could only come from the insert.
+    assert!(
+        update.before.is_some(),
+        "the server did not send the old key tuple for the update"
+    );
 
     let insert_key = insert.key.clone().expect("the insert has a key");
     assert!(
