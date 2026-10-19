@@ -135,19 +135,6 @@ impl Fixture {
         parse_lsn(&row.get::<_, String>(0)).unwrap()
     }
 
-    /// LSN of the last row the slot would decode right now, without consuming anything.
-    async fn last_decoded_lsn(&self) -> u64 {
-        let row = self
-            .db
-            .query_one(
-                "SELECT max(lsn)::text FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, NULL, 'proto_version', '1', 'publication_names', $2::text)",
-                &[&self.slot, &self.publication],
-            )
-            .await
-            .unwrap();
-        parse_lsn(&row.get::<_, String>(0)).unwrap()
-    }
-
     async fn wal(&self) -> u64 {
         let row = self
             .db
@@ -392,24 +379,32 @@ async fn slot_stays_behind_without_a_heartbeat() {
 #[ignore = "needs a Postgres server, see the module docs"]
 async fn capped_replay_window_does_not_skip_later_rows() {
     let f = Fixture::new("capped").await;
-    // Creates the slot; the events below are never delivered by this source.
-    let mut first = f.source_capped(4);
+    // The first source (default batch size) delivers the old events and never acks them: the
+    // slot stays behind.
+    let mut first = f.source(Duration::from_secs(1));
     first.start(None).await.unwrap();
-    drop(first);
-
-    for i in 0..9 {
+    for i in 0..10 {
         f.insert_published(&format!("old{i}")).await;
     }
-    let before_last = f.wal().await;
-    f.insert_published("old9").await;
-    // Everything up to here counts as delivered and checkpointed. A checkpoint is the position of
-    // a delivered change, so use the last row decoded so far (the commit) and not the WAL end,
-    // which is where the next transaction's first record starts.
-    let checkpoint = f.last_decoded_lsn().await;
+    let mut last_old = None;
+    for _ in 0..10 {
+        last_old = Some(
+            drive(&mut first, Duration::from_secs(10))
+                .await
+                .expect("an old event never arrived"),
+        );
+    }
+    // Pretend the checkpoint for the last old event was saved just before a crash.
+    let checkpoint = lsn(&last_old.unwrap());
+    drop(first);
+    let behind = f.confirmed().await;
+    assert!(behind < checkpoint, "the slot must still be behind the checkpoint");
+
+    // `X` sits in the committed WAL behind the replay window.
     f.insert_published("after-window").await;
 
-    // Restart with the checkpoint ahead of the slot, nothing acked. With 3 rows per
-    // transaction and `batch_size = 4`, one peek covers about two transactions.
+    // Restart with the checkpoint ahead of the slot. With 3 rows per transaction and
+    // `batch_size = 4`, one peek covers about one transaction, so the window spans many peeks.
     let mut s = f.source_capped(4);
     s.start(Some(Position::Lsn(checkpoint))).await.unwrap();
 
@@ -432,10 +427,9 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     // The slot kept moving through the replay window although nothing was acked, but not past
     // the unacked event.
     assert!(
-        f.confirmed().await > before_last,
+        f.confirmed().await > checkpoint,
         "the slot did not move through the replay window"
     );
-    f.drive_until_confirmed(&mut s, checkpoint + 1).await;
     assert!(f.confirmed().await <= lsn(&ev));
 
     // After the ack the slot moves past the delivered row and catches up to the end of the WAL.
