@@ -481,6 +481,30 @@ pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
 mod tests {
     use super::*;
 
+    /// Every element the dashboard script looks up by id must exist in the HTML,
+    /// otherwise the script throws on load and every handler after it is dead.
+    #[test]
+    fn dashboard_script_ids_exist_in_html() {
+        let ids = |prefix: &str, suffix: &str| -> Vec<&str> {
+            DASHBOARD
+                .split(prefix)
+                .skip(1)
+                .filter_map(|r| r.split(suffix).next())
+                .collect()
+        };
+        let defined = ids("id=\"", "\"");
+        let mut missing: Vec<&str> = ids("$('", "')")
+            .into_iter()
+            .chain(ids("getElementById('", "')"))
+            .filter(|id| !defined.contains(id))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(missing.is_empty(), "ids used by script but absent from admin.html: {missing:?}");
+        assert_eq!(DASHBOARD.matches("class=\"rateop").count(), 4, "one checkbox per op");
+    }
+
+
     #[test]
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
