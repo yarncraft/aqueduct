@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn negative_value_length_is_an_error() {
-        for kind in [b't', b'b'] {
+        for kind in *b"tb" {
             let mut b = vec![b'I'];
             b.extend(42u32.to_be_bytes());
             b.push(b'N');
