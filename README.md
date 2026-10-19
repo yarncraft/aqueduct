@@ -215,6 +215,7 @@ before/after diff and Copy JSON).
 | `GET /readyz` | `200` while the pipeline is streaming, else `503` (readiness probe) |
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
+| `GET /api/trend` | Day-long trend, one point per minute (1440 max): `rate` (events/s), `lag_ms` (worst in the minute) and `sink_ms` (mean) arrays, oldest first, `null` where a minute has no data. Kept in memory, so it restarts empty. Drives the KPI sparklines |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 

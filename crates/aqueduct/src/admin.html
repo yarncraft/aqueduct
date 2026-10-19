@@ -33,6 +33,8 @@
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Throughput</div>
       <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="rate">0</span><span class="ml-1 text-xs text-ink-300">evt/s</span></div>
       <div class="mt-1 font-mono text-[11px] text-ink-300">now <span id="rate-now" class="text-ink-200">0</span> · peak (15 s avg) <span id="peak" class="text-ink-200">0</span> /s</div>
+      <svg id="spark-rate" viewBox="0 0 200 28" preserveAspectRatio="none" class="mt-2 block w-full" style="height:28px"></svg>
+      <div id="spark-rate-cap" class="mt-1 font-mono text-[11px] text-ink-300">24 h · no data yet</div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Events delivered</div>
@@ -43,11 +45,15 @@
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">End-to-end lag</div>
       <div id="lag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
+      <svg id="spark-lag" viewBox="0 0 200 28" preserveAspectRatio="none" class="mt-2 block w-full" style="height:28px"></svg>
+      <div id="spark-lag-cap" class="mt-1 font-mono text-[11px] text-ink-300">24 h · no data yet</div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
       <div id="sinkavg" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div id="sinkdet" class="mt-1 font-mono text-[11px] text-ink-300">mean per event</div>
+      <svg id="spark-sink" viewBox="0 0 200 28" preserveAspectRatio="none" class="mt-2 block w-full" style="height:28px"></svg>
+      <div id="spark-sink-cap" class="mt-1 font-mono text-[11px] text-ink-300">24 h · no data yet</div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
@@ -390,6 +396,37 @@ $('evpause').addEventListener('click', () => {
   if (!paused) pollEvents();
 });
 $('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
+// Day-long sparklines under the KPI tiles: one server-side point per minute, refreshed once a minute.
+function spark(key, v, color, f) {
+  const el = $('spark-' + key), max = Math.max(0, ...v.filter(x => x != null));
+  const n = Math.max(v.length, 2), x = i => 200 * i / (n - 1), y = a => 27 - 26 * (max ? a / max : 0);
+  let g = '', run = [];
+  const flush = () => {
+    if (run.length > 1) {
+      const pts = run.map(([i, a]) => x(i).toFixed(1) + ',' + y(a).toFixed(1)).join(' ');
+      g += `<polygon points="${x(run[0][0]).toFixed(1)},28 ${pts} ${x(run[run.length - 1][0]).toFixed(1)},28" fill="${color}" fill-opacity="0.12"/>`;
+      g += `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.25" vector-effect="non-scaling-stroke"/>`;
+    }
+    run = [];
+  };
+  v.forEach((a, i) => { if (a == null) flush(); else run.push([i, a]); });
+  flush();
+  el.innerHTML = g;
+  const h = Math.round(v.length / 60 * 10) / 10;
+  $('spark-' + key + '-cap').textContent = v.length > 1 ? `last ${h} h · max ${f(max)}` : '24 h · no data yet';
+}
+async function pollTrend() {
+  try {
+    const r = await fetch('/api/trend', authInit());
+    if (!r.ok) return;
+    const t = await r.json();
+    spark('rate', t.rate, '#4c90f0', v => fmt(Math.round(v * 10) / 10) + ' /s');
+    spark('lag', t.lag_ms, '#ec9a3c', ms);
+    spark('sink', t.sink_ms, '#ad7bee', ms);
+  } catch (_) { /* best-effort: keep the previous sparklines */ }
+}
+setInterval(pollTrend, 60000);
+pollTrend();
 const pollTimer = setInterval(pollEvents, 3000);
 pollEvents();
 
