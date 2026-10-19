@@ -99,30 +99,45 @@ Megatron's review found, and I reproduced on PG16 (thread, 2026-10-19), that **c
 across transactions**. Transactions are decoded in commit order, so a transaction that started earlier but
 commits later has changes with LSNs **below** changes already delivered. Main has two losses from this: `queue`
 drops those changes as `<= emitted`, and `ack_target` pops a later-committing transaction whose last change LSN
-is below the acked change LSN, advancing the slot past it before it was delivered. The P0 fix on main (Ironhide)
-and this ADR use one model:
+is below the acked change LSN, advancing the slot past it before it was delivered. Megatron then found a third:
+**`change_lsn` is not unique inside a transaction.** COPY is decoded from `heap_multi_insert`, and every tuple
+of one WAL record (up to 1000) carries that record's LSN. A multi-table `TRUNCATE` is one message that becomes
+one event per table. `lsn > emitted` keeps the first and drops the rest. The P0 fix (#94, Ironhide) and this ADR
+use one model:
 
-- **Key K = `(commit_lsn, change_lsn)`.** `commit_lsn` is `Begin.final_lsn`, which equals the Commit message's
-  `commit_lsn` and is known at BEGIN, before any change. The stream is strictly increasing in K. Transactions
-  arrive in commit order, and changes within one transaction are monotonic. Both transports report the same K
-  for the same change.
+- **Key K = `(commit_lsn, change_lsn, ord)`.** `commit_lsn` is `Begin.final_lsn`, which equals the Commit
+  message's `commit_lsn` and is known at BEGIN, before any change. `ord` is the event's index among the events
+  with the same `change_lsn` in that transaction, counted per **event**, not per message: each COPY tuple and
+  each table of a TRUNCATE gets the next `ord`, starting at 0. Decoding the same WAL record again yields the
+  same events in the same order, so `ord` is stable across re-peeks, restarts and both transports. Transactions
+  arrive in commit order and change LSNs are non-decreasing inside one, so the stream is **strictly increasing**
+  in K, compared lexicographically, and every event has a unique K. Both transports report the same K for the
+  same change.
+- **Batches can split anywhere.** Because K is unique per event, a batch boundary inside a same-LSN group (a
+  1000-row COPY record against `MAX_BATCH` = 1000) is safe. No carry rule is needed for correctness.
 - **Checkpoint = K.** The P0 fix pulls ADR 0001 S1's `ChangeEvent.checkpoint` forward, and Postgres sets it to
-  `Position::Text("<commit>@<change>")`. The pipeline saves and acks that value. The wire `lsn` stays the change
+  `Position::Text("<commit>@<change>#<ord>")`. The pipeline saves and acks that value. The wire `lsn` stays the change
   LSN, and DEPLOYMENT.md says it is not monotonic across transactions.
-- **Dedupe:** the K high-water mark replaces `emitted`. Skip a transaction with `commit_lsn < mark.commit`. For
-  `commit_lsn == mark.commit`, skip changes with `change_lsn <= mark.change`. Deliver everything with
-  `commit_lsn > mark.commit`. The decision is taken at BEGIN. An old plain-LSN checkpoint has no commit part:
+- **Dedupe:** the K high-water mark replaces `emitted`, and it applies on the live path (re-peeks) as well as
+  after a restart. Skip a transaction with `commit_lsn < mark.commit` (decided at BEGIN). For
+  `commit_lsn == mark.commit`, skip events with `(change_lsn, ord) <= (mark.change, mark.ord)`. Deliver
+  everything with `commit_lsn > mark.commit`. An old plain-LSN checkpoint has no commit part:
   that first start skips nothing and replays from the slot (duplicates only, logged once).
-- **Feedback** (`write` = `flush` = `apply`): `tx_ends` holds `(commit_lsn, last_change, end)` in commit order.
-  `ack(k)` pops while `commit_lsn < k.commit`, or while `commit_lsn == k.commit && last_change <= k.change`, and
-  reports the last popped `end`. Change LSNs are never compared across transactions. Mid-transaction acks still
+- **Feedback** (`write` = `flush` = `apply`): `tx_ends` holds `(commit_lsn, (last_change, last_ord), end)` in
+  commit order. `ack(k)` pops while `commit_lsn < k.commit`, or while `commit_lsn == k.commit &&
+  (last_change, last_ord) <= (k.change, k.ord)`, and reports the last popped `end`. An empty transaction is
+  `(commit_lsn, (0, 0), end)`. Change LSNs are never compared across transactions.
+- **The ack boundary is exact.** A later transaction's `commit_lsn` can **equal** an earlier one's commit end
+  (in the trace, Tb's `final_lsn` 0/1567FD8 = Ta's end). Postgres skips a transaction only when its commit LSN is
+  **below** the slot's confirmed position, so confirming exactly Ta's end keeps Tb. A unit test pins that
+  equality, so nobody later "optimises" the target past it. Mid-transaction acks still
   don't move the slot.
 
 ### 5. Idle progress, start position and replay
 
 - **Keepalives become ordered heartbeats.** A keepalive `k` carries the walsender's sent position. When the
   source pops one from the channel between transactions, it emits an **`Op::Heartbeat` event with checkpoint
-  K = `(walEnd, 0)`**, at most once per `heartbeat_interval`. It means "every transaction with
+  K = `(walEnd, 0, 0)`**, at most once per `heartbeat_interval`. It means "every transaction with
   `commit_lsn < walEnd` is delivered". The event goes through the pipeline behind every real event, so once it is
   saved and acked that is true, and `ack` may confirm to `walEnd`. A transaction that began before `walEnd` and
   commits after it has `commit_lsn > walEnd`, so a restart from that checkpoint does not skip it (Megatron's
@@ -230,12 +245,13 @@ not v1: it would duplicate the supervisor and hide failures from `/healthz`.
    on-request status updates, the byte-bounded channel, and the `watch` for flush. AC: unit tests over a scripted
    byte stream (keepalive with a reply request, a full channel still sends status updates, an oversize message, an over-cap frame). A **fuzz target** over `XLogData` and keepalive parsing.
 3. **T3. `transport = "stream"` in `PostgresSource`:** config and validation, the per-connection relation cache,
-   K-based dedupe and feedback (§4), and keepalive heartbeats with K = `(walEnd, 0)`. It reuses the
+   K-based dedupe and feedback (§4), and keepalive heartbeats with K = `(walEnd, 0, 0)`. It reuses the
    P0 fix's K code rather than duplicating it, so it lands after that fix. AC: the whole Postgres
    integration suite (including #47's `heartbeat_it` and Megatron's capped-peek restart test) runs in both modes.
    An **equivalence test** shows the same workload yields the same events with the same K in both modes,
    and the workload **includes overlapping transactions** (an early-starting, late-committing transaction across
-   a batch boundary and across a keepalive heartbeat, then a restart). A **slow-sink test** blocks the sink for 20 s with `wal_sender_timeout = 5s` and the connection
+   a batch boundary and across a keepalive heartbeat, then a restart), a multi-row **COPY** cut by a batch
+   boundary, and a multi-table **TRUNCATE**. A **slow-sink test** blocks the sink for 20 s with `wal_sender_timeout = 5s` and the connection
    survives. A 1M-row transaction keeps RSS under a bound with every row delivered.
 4. **T4. Bench:** `aqueduct-bench` Postgres source with `--transport`, with the §8 numbers posted.
 5. **T5. Docs:** DEPLOYMENT.md (`transport`, `max_wal_senders`, `pg_hba`, poolers, `stream_buffer_bytes`),
