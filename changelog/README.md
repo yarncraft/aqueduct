@@ -21,7 +21,8 @@ Create `changelog/unreleased/<section>/<issue>-<slug>.md` in the same PR as the 
 
   Wrap at about 120 columns. Indent continuation lines, nested bullets and code blocks by two spaces.
 
-To fix an entry, edit its file. Don't add a second one.
+To fix an entry, edit its file. Don't add a second one. The script refuses to run if a fragment sits outside the four
+section folders, so a misfiled entry can't be skipped and deleted at release.
 
 ## Previewing and releasing
 
