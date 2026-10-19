@@ -500,8 +500,15 @@ mod tests {
             .collect();
         missing.sort_unstable();
         missing.dedup();
-        assert!(missing.is_empty(), "ids used by script but absent from admin.html: {missing:?}");
-        assert_eq!(DASHBOARD.matches("class=\"rateop").count(), 4, "one checkbox per op");
+        assert!(
+            missing.is_empty(),
+            "ids used by script but absent from admin.html: {missing:?}"
+        );
+        assert_eq!(
+            DASHBOARD.matches("class=\"rateop").count(),
+            4,
+            "one checkbox per op"
+        );
     }
 
 
