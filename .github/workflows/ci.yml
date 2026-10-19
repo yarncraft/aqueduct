@@ -121,7 +121,7 @@ jobs:
           AQUEDUCT_TEST_PG_TLS: localhost:5433
           AQUEDUCT_TEST_PG_PLAIN: localhost:5434
         run: |
-          cargo test --locked -p aqueduct-source-kafka -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
+          cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
           cargo test --locked -p aqueduct-sinks --test kafka_it
       - name: Container logs on failure
         if: failure()

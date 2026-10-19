@@ -140,22 +140,7 @@ Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_h
 ### `[source]` (alternative sources)
 
 `[postgres]` is shorthand for `[source] type = "postgres"` with the same keys. Set exactly one of the two.
-`type` can also be `kafka` or `mongodb` (both below).
-
-#### Kafka source
-
-Reads topics through the pipeline, e.g. to re-key or fan out events. Offsets are kept in Aqueduct's own
-checkpoint (no consumer group, nothing committed to the broker) and saved only after the sink has the events.
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `brokers`, `topics` | required | Topic names may use `*` wildcards. Partitions are discovered at start; restart to pick up new ones. |
-| `start_at` | `earliest` | Where partitions without a checkpoint begin: `earliest` or `latest`. |
-| `format` | `auto` | `auto`: Aqueduct event JSON passes through, other values are wrapped. `raw`: always wrap as `schema=kafka`, `table=<topic>`, `op=insert`, `after=<value>`. |
-| `tls`, `tls_ca_file`, `sasl_*` | as for the sink | SASL secrets: `AQUEDUCT_KAFKA_SOURCE_SASL_USERNAME` / `_PASSWORD`. |
-
-Do not point the source and sink at the same topics: the pipeline would feed itself. A checkpoint ahead of the
-log (topic recreated) stops startup; one behind retention logs a warning and restarts at the earliest offset.
+`type` can also be `mongodb` (below). There is no Kafka source; Kafka is sink-only.
 
 #### MongoDB source
 
@@ -286,6 +271,4 @@ SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator   
 podman-compose -f docker-compose.sim.yml -p aqsim down      # add -v to wipe data
 ```
 
-All services use `restart: unless-stopped`. It publishes only ports 8088 and 8089, so it does not clash with the main compose file (8080).
-
-The `aqueduct-kafka` service (port 8089, `sim/aqueduct.kafka.toml`) runs the Kafka source over `cdc.public.*` and writes `mirror.{schema}.{table}`; compare offsets of `cdc.public.<t>` and `mirror.public.<t>` to check nothing is lost or duplicated, including across `podman restart aqsim_aqueduct-kafka_1`.
+All services use `restart: unless-stopped`. It publishes only port 8088, so it does not clash with the main compose file (8080).
