@@ -29,6 +29,10 @@ pub struct MongoSource {
 /// Long enough to be cheap, far inside any realistic oplog window.
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
+/// Server-side wait of each getMore. Bounds how often an idle stream reaches the heartbeat
+/// check and how long shutdown waits on `next()`, instead of relying on the server default.
+const MAX_AWAIT: Duration = Duration::from_secs(1);
+
 impl MongoSource {
     pub fn new(cfg: MongoConfig) -> Self {
         Self {
@@ -55,11 +59,17 @@ impl MongoSource {
             return Ok(None);
         };
         let text = token_text(&token)?;
+        Ok(self.heartbeat_at(text))
+    }
+
+    /// A heartbeat at `text`, unless that is already the last position handed out.
+    fn heartbeat_at(&mut self, text: String) -> Option<ChangeEvent> {
+        self.last_heartbeat = Instant::now();
         if self.last_token.as_deref() == Some(text.as_str()) {
-            return Ok(None);
+            return None;
         }
         self.last_token = Some(text.clone());
-        Ok(Some(ChangeEvent::heartbeat(Position::Text(text), 0)))
+        Some(ChangeEvent::heartbeat(Position::Text(text), 0))
     }
 }
 
@@ -78,6 +88,14 @@ fn parse_token(text: &str) -> Result<ResumeToken> {
 fn token_text(token: &ResumeToken) -> Result<String> {
     let bson = mongodb::bson::to_bson(token).map_err(src_err)?;
     Ok(bson.into_relaxed_extjson().to_string())
+}
+
+/// A change doc's own resume token in the same text form as event positions.
+fn doc_token_text(doc: &Document) -> Result<String> {
+    let ev = Bson::Document(doc.clone()).into_relaxed_extjson();
+    ev.get("_id")
+        .map(Value::to_string)
+        .ok_or_else(|| Error::Source("change event without resume token".into()))
 }
 
 /// `clusterTime` (a BSON timestamp, seconds in the high word) to microseconds.
@@ -131,6 +149,7 @@ impl Source for MongoSource {
         let mut watch = db
             .watch()
             .pipeline(pipeline)
+            .max_await_time(MAX_AWAIT)
             .full_document(FullDocumentType::UpdateLookup);
         if self.cfg.pre_images {
             watch = watch.full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable);
@@ -161,6 +180,15 @@ impl Source for MongoSource {
                             self.last_token = Some(t.clone());
                         }
                         return Ok(Some(ev));
+                    }
+                    // Unmapped doc (drop, rename, index DDL, ...). A steady run of these never
+                    // reaches the empty-batch branch, so heartbeat at the doc's own token: it
+                    // is already consumed, unlike the driver's token, which may sit past
+                    // buffered docs.
+                    if self.last_heartbeat.elapsed() >= self.heartbeat_every {
+                        if let Some(hb) = self.heartbeat_at(doc_token_text(&doc)?) {
+                            return Ok(Some(hb));
+                        }
                     }
                 }
                 None => {
@@ -212,6 +240,15 @@ mod tests {
         assert_eq!(e.position, Position::Text(r#"{"_data":"8265A1"}"#.into()));
         assert!(e.after.unwrap().get().contains("\"n\":\"a\""));
         assert_eq!(e.key.as_deref(), Some(r#"{"_id":1}"#));
+    }
+
+    #[test]
+    fn skipped_doc_token_is_its_own_id() {
+        let d = doc! {"_id": {"_data": "8265A2"}, "operationType": "drop",
+        "ns": {"db": "app", "coll": "u"}};
+        assert!(to_change_event(&d).unwrap().is_none());
+        assert_eq!(doc_token_text(&d).unwrap(), r#"{"_data":"8265A2"}"#);
+        assert!(doc_token_text(&doc! {"operationType": "drop"}).is_err());
     }
 
     #[tokio::test]
