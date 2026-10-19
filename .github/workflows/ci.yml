@@ -34,7 +34,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
   integration:
     needs: rust
-    # Runs the tests that need a live Kafka broker and a MongoDB replica set.
+    # Runs the tests that need a live Kafka broker, a MongoDB replica set and Postgres (TLS and plaintext).
     # Containers are started with `docker run` because service containers cannot
     # pass `--replSet` to mongod.
     runs-on: ubuntu-latest
@@ -74,6 +74,39 @@ jobs:
             sleep 2
           done
           echo "replica set never became primary"; exit 1
+      - name: Start Postgres with and without TLS
+        run: |
+          set -euo pipefail
+          d=$RUNNER_TEMP/pgtls; mkdir -p "$d"; cd "$d"
+          # Throwaway CA, a second unrelated CA, and a server cert whose SAN is localhost only.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=aq-test-ca -keyout ca.key -out ca.pem
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=aq-other-ca -keyout other.key -out other.pem
+          openssl req -newkey rsa:2048 -nodes -subj /CN=localhost -keyout server.key -out server.csr
+          printf 'subjectAltName=DNS:localhost
+' > san.ext
+          openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt
+          # postgres refuses a key it does not own, and the image runs as uid 999.
+          sudo chown 999:999 server.key server.crt; sudo chmod 600 server.key
+          common="-e POSTGRES_PASSWORD=aq postgres:16 -c wal_level=logical -c max_replication_slots=20"
+          docker run -d --name pg-tls -p 5433:5432 -v "$d":/certs:ro $common             -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+          docker run -d --name pg-plain -p 5434:5432 $common
+          for c in pg-tls pg-plain; do
+            ok=0
+            for i in $(seq 1 30); do
+              if docker exec $c pg_isready -U postgres; then ok=1; break; fi
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { echo "$c never became ready"; exit 1; }
+            # pg_isready can pass during init, before the final restart: retry the DDL.
+            ok=0
+            for i in $(seq 1 15); do
+              if docker exec $c psql -U postgres -c 'CREATE PUBLICATION aq_pub FOR ALL TABLES'; then ok=1; break; fi
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { echo "$c: could not create publication"; exit 1; }
+          done
+          echo "AQUEDUCT_TEST_PG_CA=$d/ca.pem" >> "$GITHUB_ENV"
+          echo "AQUEDUCT_TEST_PG_WRONG_CA=$d/other.pem" >> "$GITHUB_ENV"
       - name: Wait for Kafka
         run: |
           for i in $(seq 1 30); do
@@ -86,11 +119,15 @@ jobs:
           AQUEDUCT_TEST_KAFKA: localhost:9092
           AQUEDUCT_KAFKA_BROKERS: localhost:9092
           MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+          AQUEDUCT_TEST_PG_TLS: localhost:5433
+          AQUEDUCT_TEST_PG_PLAIN: localhost:5434
         run: |
-          cargo test --locked -p aqueduct-source-kafka -p aqueduct-source-mongodb -- --ignored
+          cargo test --locked -p aqueduct-source-kafka -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
           cargo test --locked -p aqueduct-sinks --test kafka_it
       - name: Container logs on failure
         if: failure()
         run: |
           docker logs kafka | tail -50
           docker logs mongo | tail -50
+          docker logs pg-tls | tail -50
+          docker logs pg-plain | tail -50
