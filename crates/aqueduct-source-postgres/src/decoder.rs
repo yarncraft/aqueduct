@@ -97,23 +97,26 @@ impl<'a> Reader<'a> {
         self.0 = tail;
         Ok(head)
     }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        self.take(N)?.try_into().map_err(|_| DecodeError::Eof)
+    }
     fn u8(&mut self) -> Result<u8, DecodeError> {
-        Ok(self.take(1)?[0])
+        Ok(u8::from_be_bytes(self.array()?))
     }
     fn i16(&mut self) -> Result<i16, DecodeError> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_be_bytes(self.array()?))
     }
     fn i32(&mut self) -> Result<i32, DecodeError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, DecodeError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.array()?))
     }
     fn i64(&mut self) -> Result<i64, DecodeError> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_be_bytes(self.array()?))
     }
     fn u64(&mut self) -> Result<u64, DecodeError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.array()?))
     }
     fn cstr(&mut self) -> Result<String, DecodeError> {
         let end = self
@@ -517,5 +520,32 @@ mod tests {
         assert_eq!(out, r#""a\"b\\c\nd\u0001é""#);
         let v: String = serde_json::from_str(&out).unwrap();
         assert_eq!(v, "a\"b\\c\nd\u{1}é");
+    }
+
+    #[test]
+    fn truncated_messages_error_instead_of_panicking() {
+        let mut begin = vec![b'B'];
+        begin.extend(100u64.to_be_bytes());
+        begin.extend(0i64.to_be_bytes());
+        begin.extend(7u32.to_be_bytes());
+        let mut ins = vec![b'I'];
+        ins.extend(42u32.to_be_bytes());
+        ins.push(b'N');
+        ins.extend(tuple_bytes(&[Some("5"), None]));
+        let mut upd = vec![b'U'];
+        upd.extend(42u32.to_be_bytes());
+        upd.push(b'K');
+        upd.extend(tuple_bytes(&[Some("1"), None]));
+        upd.push(b'N');
+        upd.extend(tuple_bytes(&[Some("1"), Some("bob")]));
+        let mut del = vec![b'D'];
+        del.extend(42u32.to_be_bytes());
+        del.push(b'K');
+        del.extend(tuple_bytes(&[Some("1"), None]));
+        for full in [begin, relation_bytes(), ins, upd, del] {
+            for cut in 0..full.len() {
+                assert!(decode(&full[..cut]).is_err(), "cut at {cut}");
+            }
+        }
     }
 }

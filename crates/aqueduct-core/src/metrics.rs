@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::{ChangeEvent, Op};
+
+/// Metrics are best-effort telemetry: a panic elsewhere that poisoned a lock must not
+/// cascade into the pipeline, so recover the guard instead of unwrapping.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Pipeline lifecycle, shown on the admin cockpit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -131,7 +137,7 @@ impl Metrics {
             Op::Heartbeat => return,
         }
         .fetch_add(1, Relaxed);
-        *self.last_position.lock().unwrap() = Some(ev.position.to_string());
+        *lock(&self.last_position) = Some(ev.position.to_string());
         self.last_commit_ts_micros
             .store(ev.commit_ts_micros, Relaxed);
         self.last_event_unix_ms.store(now_ms(), Relaxed);
@@ -140,7 +146,7 @@ impl Metrics {
         self.sink_us_last.store(us, Relaxed);
         self.sink_us_max.fetch_max(us, Relaxed);
         {
-            let mut t = self.tables.lock().unwrap();
+            let mut t = lock(&self.tables);
             *t.entry(format!("{}.{}", ev.schema, ev.table)).or_default() += 1;
         }
         {
@@ -153,14 +159,14 @@ impl Metrics {
                 // keeps the match exhaustive.
                 Op::Heartbeat => return,
             };
-            let mut t = self.table_ops.lock().unwrap();
+            let mut t = lock(&self.table_ops);
             t.entry(format!("{}.{}", ev.schema, ev.table)).or_default()[slot] += 1;
         }
     }
 
     pub fn record_error(&self, msg: impl Into<String>) {
         self.errors.fetch_add(1, Relaxed);
-        *self.last_error.lock().unwrap() = Some(msg.into());
+        *lock(&self.last_error) = Some(msg.into());
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -177,7 +183,7 @@ impl Metrics {
             deletes: self.deletes.load(Relaxed),
             truncates: self.truncates.load(Relaxed),
             errors: self.errors.load(Relaxed),
-            last_lsn: self.last_position.lock().unwrap().clone(),
+            last_lsn: lock(&self.last_position).clone(),
             lag_ms: (events > 0 && ts > 0).then(|| now_ms() as i64 - ts / 1000),
             last_event_unix_ms: (last_ms > 0).then_some(last_ms),
             sink_avg_ms: if events > 0 {
@@ -187,9 +193,9 @@ impl Metrics {
             },
             sink_last_ms: self.sink_us_last.load(Relaxed) as f64 / 1000.0,
             sink_max_ms: self.sink_us_max.load(Relaxed) as f64 / 1000.0,
-            tables: self.tables.lock().unwrap().clone(),
-            table_ops: self.table_ops.lock().unwrap().clone(),
-            last_error: self.last_error.lock().unwrap().clone(),
+            tables: lock(&self.tables).clone(),
+            table_ops: lock(&self.table_ops).clone(),
+            last_error: lock(&self.last_error).clone(),
         }
     }
 }
