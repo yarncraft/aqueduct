@@ -8,8 +8,8 @@
 //!     --test replication_it -- --ignored
 //! ```
 //!
-//! Without `AQUEDUCT_TEST_PG_TRUST` the test returns early: the shared CI server uses password
-//! authentication, which this slice does not support.
+//! `AQUEDUCT_TEST_PG_TRUST` must be set: the test fails when it is not, so a run that skips
+//! the server cannot report green. The integration jobs start a trust-auth `pg-trust` container.
 
 use std::time::Duration;
 
@@ -20,11 +20,9 @@ use tokio_postgres::NoTls;
 #[tokio::test]
 #[ignore = "needs a trust-auth Postgres server, see the module docs"]
 async fn streamed_insert_matches_the_peeked_change() {
-    let Ok(addr) = std::env::var("AQUEDUCT_TEST_PG_TRUST") else {
-        eprintln!("AQUEDUCT_TEST_PG_TRUST not set; skipping");
-        return;
-    };
-    let url = format!("postgres://postgres@{addr}/postgres");
+    let addr = std::env::var("AQUEDUCT_TEST_PG_TRUST")
+        .expect("AQUEDUCT_TEST_PG_TRUST must name a trust-auth Postgres, see the module docs");
+    let url = format!("postgres://postgres@{addr}/postgres?sslmode=disable");
     let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(conn);
 

@@ -93,7 +93,9 @@ jobs:
           common="-e POSTGRES_PASSWORD=aq postgres:16 -c wal_level=logical -c max_replication_slots=20"
           docker run -d --name pg-tls -p 5433:5432 -v "$d":/certs:ro $common -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
           docker run -d --name pg-plain -p 5434:5432 $common
-          for c in pg-tls pg-plain; do
+          # Trust authentication, for the replication client, which has no password auth yet.
+          docker run -d --name pg-trust -p 5435:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=10
+          for c in pg-tls pg-plain pg-trust; do
             ok=0
             for i in $(seq 1 30); do
               if docker exec $c pg_isready -U postgres; then ok=1; break; fi
@@ -124,6 +126,7 @@ jobs:
           MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
           AQUEDUCT_TEST_PG_TLS: localhost:5433
           AQUEDUCT_TEST_PG_PLAIN: localhost:5434
+          AQUEDUCT_TEST_PG_TRUST: localhost:5435
         run: |
           cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
           cargo test --locked -p aqueduct-sinks --test kafka_it
@@ -134,3 +137,4 @@ jobs:
           docker logs mongo | tail -50
           docker logs pg-tls | tail -50
           docker logs pg-plain | tail -50
+          docker logs pg-trust | tail -50

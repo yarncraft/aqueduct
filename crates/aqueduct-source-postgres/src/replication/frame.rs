@@ -12,6 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// Largest accepted message body: Postgres' `MaxAllocSize`. Anything larger is a protocol error.
 pub const MAX_FRAME: usize = 0x3fff_ffff;
 
+/// Largest accepted body for every message except `CopyData`: startup replies, `DataRow` from
+/// `IDENTIFY_SYSTEM` and `ErrorResponse` are tiny, and this limit applies before authentication.
+pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
+
 /// Seconds between the Unix epoch and the Postgres epoch (2000-01-01).
 const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 
@@ -62,10 +66,20 @@ pub async fn read_backend<R: AsyncRead + Unpin>(r: &mut R) -> Result<Backend> {
         .await
         .map_err(|e| proto(format!("reading length of {:?}: {e}", tag as char)))?;
     let body_len = body_len(tag, len)?;
-    let mut body = vec![0u8; body_len];
-    r.read_exact(&mut body)
+    // Grow the buffer only with bytes that arrive: a header that announces a huge body and then
+    // stalls or closes costs nothing.
+    let mut body = Vec::new();
+    let got = r
+        .take(body_len as u64)
+        .read_to_end(&mut body)
         .await
         .map_err(|e| proto(format!("reading body of {:?}: {e}", tag as char)))?;
+    if got != body_len {
+        return Err(proto(format!(
+            "connection closed in the body of {:?}: got {got} of {body_len} bytes",
+            tag as char
+        )));
+    }
     parse_backend(tag, &body)
 }
 
@@ -80,9 +94,14 @@ pub fn body_len(tag: u8, len: i32) -> Result<usize> {
                 tag as char
             ))
         })?;
-    if body > MAX_FRAME {
+    let cap = if tag == b'd' {
+        MAX_FRAME
+    } else {
+        MAX_CONTROL_FRAME
+    };
+    if body > cap {
         return Err(proto(format!(
-            "message {:?} announces {body} bytes, over the {MAX_FRAME} byte limit",
+            "message {:?} announces {body} bytes, over the {cap} byte limit",
             tag as char
         )));
     }
@@ -200,6 +219,15 @@ pub fn parse_copy_data(payload: &[u8]) -> Result<Replication> {
 /// Microseconds since 2000-01-01 for a Unix time in microseconds.
 pub fn pg_micros(unix_micros: i64) -> i64 {
     unix_micros - PG_EPOCH_OFFSET_SECS * 1_000_000
+}
+
+/// Rejects a NUL in an operator-supplied name: it would cut a query short or add startup
+/// parameters.
+pub fn reject_nul(what: &str, value: &str) -> Result<()> {
+    if value.contains(' ') {
+        return Err(Error::Config(format!("{what} contains a NUL byte")));
+    }
+    Ok(())
 }
 
 // ---- frontend messages ----------------------------------------------------------------------
@@ -380,6 +408,34 @@ mod tests {
         let mut r = &bytes[..];
         let err = read_backend(&mut r).await.unwrap_err().to_string();
         assert!(err.contains("over the"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn announced_size_is_not_allocated_up_front() {
+        // MAX_FRAME is announced, 10 bytes arrive, then EOF. The read must fail on the short body
+        // and the buffer must hold only what arrived.
+        let mut bytes = vec![b'd'];
+        bytes.extend(((MAX_FRAME as i32) + 4).to_be_bytes());
+        bytes.extend([7u8; 10]);
+        let mut r = &bytes[..];
+        let err = read_backend(&mut r).await.unwrap_err().to_string();
+        assert!(err.contains("got 10 of"), "{err}");
+    }
+
+    #[test]
+    fn only_copy_data_may_be_large() {
+        let over = (MAX_CONTROL_FRAME + 5) as i32;
+        assert!(body_len(b'E', over).is_err());
+        assert!(body_len(b'D', over).is_err());
+        assert!(body_len(b'R', over).is_err());
+        assert!(body_len(b'd', over).is_ok());
+        assert!(body_len(b'E', (MAX_CONTROL_FRAME + 4) as i32).is_ok());
+    }
+
+    #[test]
+    fn nul_bytes_are_refused() {
+        assert!(reject_nul("slot", "a b").is_err());
+        assert!(reject_nul("slot", "ab").is_ok());
     }
 
     #[test]

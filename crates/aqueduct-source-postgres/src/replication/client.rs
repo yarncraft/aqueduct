@@ -5,7 +5,7 @@ use tokio_postgres::config::Host;
 
 use super::frame::{
     self, copy_data, lsn_text, pg_micros, query, quote_ident, quote_literal, read_backend,
-    startup_message, status_update, terminate, Backend, Replication,
+    reject_nul, startup_message, status_update, terminate, Backend, Replication,
 };
 use crate::source::parse_lsn;
 
@@ -23,20 +23,32 @@ pub struct SystemInfo {
     pub database: Option<String>,
 }
 
-/// One logical replication session over a plaintext TCP connection with trust authentication.
-pub struct ReplicationClient {
-    io: BufReader<TcpStream>,
-    streaming: bool,
+/// Where to connect, validated. Fails closed while the client cannot do TLS: any `sslmode`
+/// other than `disable` and any non-loopback host is refused before a socket is opened.
+#[derive(Debug, PartialEq, Eq)]
+struct Target {
+    host: String,
+    port: u16,
+    user: String,
+    database: String,
 }
 
-impl ReplicationClient {
-    /// Connects and completes startup. `url` is the same URL as the SQL connection; it must name
-    /// exactly one TCP host. The server must accept the user without a password (`trust`):
-    /// password authentication and TLS are not part of this slice and are refused with an error.
-    pub async fn connect(url: &str) -> Result<Self> {
-        let cfg: tokio_postgres::Config = url
-            .parse()
-            .map_err(|e| Error::Config(format!("invalid postgres url: {e}")))?;
+impl Target {
+    fn parse(url: &str) -> Result<Self> {
+        let parsed = crate::tls::parse(url)?;
+        let mode = parsed.url_mode.unwrap_or_default();
+        if mode != crate::SslMode::Disable {
+            return Err(Error::Config(format!(
+                "streaming replication cannot use TLS yet, so it refuses sslmode={mode:?};                  only sslmode=disable on a loopback host is accepted"
+            )));
+        }
+        let cfg = parsed.config;
+        if !crate::tls::is_local(&cfg) {
+            return Err(Error::Config(
+                "streaming replication cannot use TLS yet, so it refuses a non-loopback host"
+                    .into(),
+            ));
+        }
         let host = match cfg.get_hosts() {
             [Host::Tcp(h)] => h.clone(),
             [] => return Err(Error::Config("postgres url has no host".into())),
@@ -58,9 +70,33 @@ impl ReplicationClient {
         };
         let user = cfg
             .get_user()
-            .ok_or_else(|| Error::Config("postgres url has no user".into()))?;
-        let database = cfg.get_dbname().unwrap_or(user);
+            .ok_or_else(|| Error::Config("postgres url has no user".into()))?
+            .to_string();
+        let database = cfg.get_dbname().unwrap_or(&user).to_string();
+        reject_nul("user", &user)?;
+        reject_nul("database", &database)?;
+        Ok(Target {
+            host,
+            port,
+            user,
+            database,
+        })
+    }
+}
 
+/// One logical replication session over a plaintext TCP connection with trust authentication.
+pub struct ReplicationClient {
+    io: BufReader<TcpStream>,
+    streaming: bool,
+}
+
+impl ReplicationClient {
+    /// Connects and completes startup. `url` is the same URL as the SQL connection; it must name
+    /// exactly one TCP host. The server must accept the user without a password (`trust`):
+    /// password authentication and TLS are not part of this slice and are refused with an error.
+    pub async fn connect(url: &str) -> Result<Self> {
+        let target = Target::parse(url)?;
+        let (host, port) = (&target.host, target.port);
         let tcp = TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| err(format!("connecting to {host}:{port}: {e}")))?;
@@ -69,7 +105,8 @@ impl ReplicationClient {
             io: BufReader::new(tcp),
             streaming: false,
         };
-        c.send(&startup_message(user, database)).await?;
+        c.send(&startup_message(&target.user, &target.database))
+            .await?;
         loop {
             match c.read().await? {
                 Backend::Auth(0) => {}
@@ -159,6 +196,8 @@ impl ReplicationClient {
         if self.streaming {
             return Err(err("replication already started"));
         }
+        reject_nul("slot name", slot)?;
+        reject_nul("publication name", publication)?;
         let sql = format!(
             "START_REPLICATION SLOT {} LOGICAL {} (proto_version '1', publication_names {})",
             quote_ident(slot),
@@ -217,5 +256,51 @@ impl ReplicationClient {
     /// Sends `Terminate` and drops the connection. Best effort.
     pub async fn close(mut self) {
         let _ = self.send(&terminate()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_loopback_is_the_only_target() {
+        let t = Target::parse("postgres://u@localhost:5436/d?sslmode=disable").unwrap();
+        assert_eq!(
+            (t.host.as_str(), t.port, t.database.as_str()),
+            ("localhost", 5436, "d")
+        );
+        assert!(Target::parse("postgres://u@127.0.0.1/d?sslmode=disable").is_ok());
+    }
+
+    #[test]
+    fn any_tls_mode_is_refused_until_tls_exists() {
+        // No sslmode means verify-full, which this client cannot honour.
+        for url in [
+            "postgres://u@localhost/d",
+            "postgres://u@localhost/d?sslmode=prefer",
+            "postgres://u@localhost/d?sslmode=require",
+            "postgres://u@localhost/d?sslmode=verify-ca",
+            "postgres://u@localhost/d?sslmode=verify-full",
+        ] {
+            let e = Target::parse(url).unwrap_err().to_string();
+            assert!(e.contains("cannot use TLS yet"), "{url}: {e}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_hosts_are_refused_even_with_sslmode_disable() {
+        for url in [
+            "postgres://u@db.example.com/d?sslmode=disable",
+            "postgres://u@10.0.0.5/d?sslmode=disable",
+            "postgres://u@localhost,db.example.com/d?sslmode=disable",
+        ] {
+            assert!(Target::parse(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn nul_in_user_or_database_is_refused() {
+        assert!(Target::parse("postgres://u@localhost/d%00x?sslmode=disable").is_err());
     }
 }
