@@ -31,6 +31,8 @@ The compose file starts Postgres 16 with `wal_level=logical`, creates a `users` 
 endlessly inserts, updates and deletes rows in an industrial asset-management schema (`organizations`, `sites`, `assets`, `asset_readings`, `work_orders`, `maintenance_events`), so the cockpit always has live traffic.
 You only need Docker or Podman; nothing else is installed on the host.
 
+**Upgrading from the old users/orders/payments sim:** run `down -v` once first. Postgres only runs `sim/init.sql` on an empty volume, so an old volume keeps the old schema, and the simulator then fails every transaction silently (the cockpit just looks idle).
+
 ```sh
 # choose an admin token (required, no default), then start (builds the Aqueduct image on first run)
 export AQUEDUCT_ADMIN_TOKEN=$(openssl rand -hex 32)
