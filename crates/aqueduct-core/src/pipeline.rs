@@ -3,7 +3,7 @@ use tokio::sync::watch;
 
 use std::time::{Duration, Instant};
 
-use crate::{ChangeEvent, Metrics, Position, State};
+use crate::{ChangeEvent, Metrics, Op, Position, State};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -126,21 +126,28 @@ async fn drive(
                 None => break,
             }
         }
-        let began = Instant::now();
-        let delivered = tokio::time::timeout(SINK_TIMEOUT, async {
-            sink.send_batch(&batch).await?;
-            sink.flush().await
-        })
-        .await
-        .map_err(|_| Error::Sink(format!("sink timed out after {}s", SINK_TIMEOUT.as_secs())))?;
-        delivered?;
-        // The batch is delivered as a unit; report its average per-event sink time.
-        let per_event = began.elapsed() / batch.len() as u32;
-        for event in &batch {
-            metrics.record_event(event, per_event);
+        // Heartbeats only move the checkpoint: the last event's position is saved below,
+        // but sinks and metrics never see them.
+        let last = batch[batch.len() - 1].position.clone();
+        batch.retain(|e| e.op != Op::Heartbeat);
+        if !batch.is_empty() {
+            let began = Instant::now();
+            let delivered = tokio::time::timeout(SINK_TIMEOUT, async {
+                sink.send_batch(&batch).await?;
+                sink.flush().await
+            })
+            .await
+            .map_err(|_| {
+                Error::Sink(format!("sink timed out after {}s", SINK_TIMEOUT.as_secs()))
+            })?;
+            delivered?;
+            // The batch is delivered as a unit; report its average per-event sink time.
+            let per_event = began.elapsed() / batch.len() as u32;
+            for event in &batch {
+                metrics.record_event(event, per_event);
+            }
         }
         // One checkpoint write and one ack for the whole batch, after the sink succeeded.
-        let last = batch[batch.len() - 1].position.clone();
         store.save(&last).await?;
         source.ack(last).await?;
     }
@@ -150,7 +157,6 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Op;
     use std::collections::VecDeque;
 
     struct VecSource(VecDeque<ChangeEvent>, Vec<Position>);
@@ -228,5 +234,33 @@ mod tests {
         assert_eq!(sink.1, 1);
         assert_eq!(src.1, vec![Position::Lsn(3)]);
         assert_eq!(store.0, Some(Position::Lsn(3)));
+    }
+
+    #[tokio::test]
+    async fn heartbeats_move_the_checkpoint_but_never_reach_the_sink() {
+        let hb = |n| ChangeEvent::heartbeat(Position::Lsn(n), 0);
+        // Mixed batch: heartbeat in the middle and at the end.
+        let mut src = VecSource(VecDeque::from([ev(1), hb(2), ev(3), hb(4)]), vec![]);
+        let mut sink = VecSink(vec![], 0);
+        let mut store = MemStore(None);
+        let metrics = Metrics::new();
+        let (_tx, rx) = watch::channel(false);
+        run_pipeline_with_metrics(&mut src, &mut sink, &mut store, rx, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(sink.0, vec![Position::Lsn(1), Position::Lsn(3)]);
+        assert_eq!(metrics.events_total(), 2);
+        assert_eq!(store.0, Some(Position::Lsn(4)));
+        assert_eq!(src.1, vec![Position::Lsn(4)]);
+
+        // Heartbeat-only batch: no sink call at all, checkpoint still moves.
+        let mut src = VecSource(VecDeque::from([hb(9)]), vec![]);
+        let mut sink = VecSink(vec![], 0);
+        let (_tx, rx) = watch::channel(false);
+        run_pipeline(&mut src, &mut sink, &mut store, rx)
+            .await
+            .unwrap();
+        assert_eq!(sink.1, 0);
+        assert_eq!(store.0, Some(Position::Lsn(9)));
     }
 }

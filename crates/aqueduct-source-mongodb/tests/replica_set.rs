@@ -67,3 +67,38 @@ async fn insert_update_delete_then_resume() {
 
     client.database(&db_name).drop().await.unwrap();
 }
+
+/// Writes to a collection the source filters out; the source must still hand the pipeline a
+/// heartbeat so the checkpoint follows the stream. Not run here (needs a replica set).
+#[tokio::test]
+#[ignore]
+async fn filtered_writes_produce_a_heartbeat() {
+    let db_name = format!("aq_hb_{}", std::process::id());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let db = client.database(&db_name);
+    db.collection::<Document>("watched")
+        .insert_one(doc! {"_id": 0})
+        .await
+        .unwrap();
+
+    let mut c = cfg(&db_name);
+    c.collections = vec!["watched".into()];
+    let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
+    src.start(None).await.unwrap();
+    let other = db.collection::<Document>("other");
+    other.insert_one(doc! {"_id": 1}).await.unwrap();
+
+    // The first heartbeat may predate the insert above, so it proves only the path.
+    let first = next(&mut src).await;
+    assert_eq!(first.op, Op::Heartbeat);
+    assert!(matches!(first.position, aqueduct_core::Position::Text(_)));
+
+    // Only filtered writes happen from here, so a second heartbeat with a different token
+    // shows the token advances past events the source never emits.
+    other.insert_one(doc! {"_id": 2}).await.unwrap();
+    let second = next(&mut src).await;
+    assert_eq!(second.op, Op::Heartbeat);
+    assert_ne!(first.position.to_string(), second.position.to_string());
+
+    db.drop().await.unwrap();
+}

@@ -118,12 +118,17 @@ impl Metrics {
 
     /// Record one event that the sink accepted, taking `sink_time` to deliver.
     pub fn record_event(&self, ev: &ChangeEvent, sink_time: Duration) {
+        if ev.op == Op::Heartbeat {
+            return;
+        }
         self.events.fetch_add(1, Relaxed);
         match ev.op {
             Op::Insert => &self.inserts,
             Op::Update => &self.updates,
             Op::Delete => &self.deletes,
             Op::Truncate => &self.truncates,
+            // Unreachable: heartbeats return at the top; the arm keeps the match exhaustive.
+            Op::Heartbeat => return,
         }
         .fetch_add(1, Relaxed);
         *self.last_position.lock().unwrap() = Some(ev.position.to_string());
@@ -144,6 +149,9 @@ impl Metrics {
                 Op::Update => 1,
                 Op::Delete => 2,
                 Op::Truncate => 3,
+                // Unreachable: heartbeats return at the top of `record_event`; the arm only
+                // keeps the match exhaustive.
+                Op::Heartbeat => return,
             };
             let mut t = self.table_ops.lock().unwrap();
             t.entry(format!("{}.{}", ev.schema, ev.table)).or_default()[slot] += 1;
