@@ -28,7 +28,7 @@ pub struct PostgresSourceConfig {
     /// If the slot is missing but a checkpoint exists, changes made while the slot was gone are
     /// lost. By default that is a startup error; set this to accept it and start a fresh slot.
     pub allow_slot_recreate: bool,
-    /// TLS policy; overrides `sslmode` in the URL when set. Default: URL, else `prefer`.
+    /// TLS policy; overrides `sslmode` in the URL when set. Default: URL, else `verify-full`.
     pub ssl_mode: Option<SslMode>,
     /// PEM CA bundle to verify the server against; overrides `sslrootcert` in the URL.
     pub ssl_root_cert: Option<String>,
@@ -128,17 +128,7 @@ impl PostgresSource {
             .await
             .map_err(src_err)?
             .get(0);
-        match (encrypted, local) {
-            (true, _) => {
-                if matches!(mode, SslMode::Prefer | SslMode::Require) && root.is_none() {
-                    tracing::warn!("postgres connection is encrypted but the server certificate is NOT verified; set sslmode=verify-full and a CA (postgres.ssl_root_cert)");
-                }
-            }
-            (false, true) => tracing::info!("postgres connection is plaintext (local host)"),
-            (false, false) => tracing::warn!(
-                "postgres connection is PLAINTEXT to a non-loopback host: credentials and row data cross the network unencrypted; set postgres.ssl_mode = \"verify-full\""
-            ),
-        }
+        tls::check_negotiated(mode, encrypted, local, root.is_some())?;
         Ok(client)
     }
 

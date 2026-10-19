@@ -20,7 +20,7 @@ Limits to know about:
 
 - Only changes made after the slot is created are captured. There is **no initial table snapshot**.
 - One Aqueduct instance per slot. Run a second instance with a different `slot` name, never two on one slot.
-- Postgres connections are currently unencrypted (no TLS). Keep Aqueduct and Postgres on a private network.
+- Postgres connections use TLS with certificate and hostname verification (`ssl_mode = "verify-full"`) by default. Plaintext to a non-loopback host is refused at startup unless you set `ssl_mode = "disable"` explicitly.
 - DDL is not streamed. Add a new table to the publication, and expect `before` images only if the table's `REPLICA IDENTITY` allows it.
 
 ## 1. Prepare Postgres
@@ -127,13 +127,13 @@ topic = "cdc.{schema}.{table}"
 | `url` | required | `postgres://user:pass@host:5432/db`. A normal connection: **do not** add `replication=database`. Env: `AQUEDUCT_PG_URL` |
 | `slot` | `aqueduct` | Logical slot name, created if missing. Use a distinct name per instance |
 | `publication` | `aqueduct` | Existing publication to stream |
-| `ssl_mode` | from URL, else `prefer` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. **Use `verify-full` in production** |
+| `ssl_mode` | from URL, else `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. Weaker modes must be set explicitly; `verify-full` is the default and the production setting |
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
 checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) whether the session is really
-encrypted and logs a warning if the connection is plaintext to a non-loopback host, or encrypted but unverified.
+encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning); an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
 
 ### `[source]` (alternative sources)

@@ -146,7 +146,7 @@ pub struct PostgresConfig {
     #[serde(default)]
     pub allow_slot_recreate: bool,
     /// `disable | prefer | require | verify-ca | verify-full`. Overrides `sslmode`
-    /// in the URL; default is the URL's, else `prefer`.
+    /// in the URL; default is the URL's, else `verify-full`.
     #[serde(default)]
     pub ssl_mode: Option<String>,
     /// PEM CA bundle used to verify the server (overrides `sslrootcert` in the URL).
