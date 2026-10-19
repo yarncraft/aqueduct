@@ -15,7 +15,27 @@ use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
+
+/// Drops a slot. Dropping a source does not close its connection at once, so the slot can still
+/// be active (55006) for a moment; retry instead of failing the test.
+async fn drop_slot(db: &tokio_postgres::Client, slot: &str) {
+    let mut tries = 0;
+    loop {
+        match db
+            .execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+            .await
+        {
+            Ok(_) => return,
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("dropping slot {slot}: {e}"),
+        }
+    }
+}
 
 fn addr() -> String {
     std::env::var("AQUEDUCT_TEST_PG_PLAIN")
@@ -91,9 +111,7 @@ async fn overlapping_transactions_lose_no_rows() {
     let got: BTreeSet<i64> = got.into_iter().collect();
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table};"
     ))
@@ -179,9 +197,7 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     let seen: BTreeSet<i64> = seen.into_iter().collect();
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table};"
     ))
@@ -269,9 +285,7 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
     let seen: BTreeSet<i64> = seen.into_iter().collect();
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table};"
     ))
@@ -350,9 +364,7 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     }
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {t}, {u};"
     ))
@@ -386,9 +398,7 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
         1,
         "invalid fixture: a multi-table TRUNCATE must be a single message"
     );
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&raw_slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &raw_slot).await;
     assert_eq!(
         inserted,
         BTreeSet::from([1, 2, 3]),
@@ -455,9 +465,7 @@ async fn restart_after_acking_part_of_a_copy_loses_no_rows() {
     }
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!("DROP PUBLICATION {publication}; DROP TABLE {t};"))
         .await
         .unwrap();
@@ -557,9 +565,7 @@ async fn plain_lsn_checkpoint_restart_loses_no_rows_and_acks_advance_the_slot() 
     let after = confirmed().await;
 
     drop(s);
-    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
-        .await
-        .unwrap();
+    drop_slot(&db, &slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table};"
     ))
