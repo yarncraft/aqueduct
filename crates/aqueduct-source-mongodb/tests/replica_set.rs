@@ -102,3 +102,34 @@ async fn filtered_writes_produce_a_heartbeat() {
 
     db.drop().await.unwrap();
 }
+
+/// A steady run of unmapped events (`drop` of a watched collection) never produces an empty
+/// batch, yet the source must still heartbeat, at the skipped doc's own token. Not run here
+/// (needs a replica set).
+#[tokio::test]
+#[ignore]
+async fn skipped_ddl_still_produces_a_heartbeat() {
+    let db_name = format!("aq_ddl_{}", std::process::id());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let db = client.database(&db_name);
+    let watched = db.collection::<Document>("watched");
+    watched.insert_one(doc! {"_id": 0}).await.unwrap();
+
+    let mut c = cfg(&db_name);
+    c.collections = vec!["watched".into()];
+    let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
+    src.start(None).await.unwrap();
+
+    let churn = tokio::spawn(async move {
+        for _ in 0..40 {
+            let _ = watched.drop().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let hb = next(&mut src).await;
+    assert_eq!(hb.op, Op::Heartbeat);
+    assert!(matches!(hb.position, aqueduct_core::Position::Text(_)));
+
+    churn.abort();
+    db.drop().await.unwrap();
+}
