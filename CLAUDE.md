@@ -59,7 +59,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 
 ## Conventions
 
-- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes.
+- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Breaking changes also get an entry under `## Unreleased` in `CHANGELOG.md` with the upgrade step.
 - Kafka is the only sink by design; do not add others. The inspector reads from Kafka, never from an in-process buffer.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
