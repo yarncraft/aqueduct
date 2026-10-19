@@ -125,6 +125,7 @@ mod tests {
             before: None,
             after: RawValue::from_string(r#"{"id":1}"#.into()).ok(),
             key: Some("1".into()),
+            checkpoint: None,
         }
     }
 
