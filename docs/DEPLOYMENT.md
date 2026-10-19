@@ -48,7 +48,7 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;   -- full "before" image
 -- default identity (primary key) gives only the key columns in "before"
 ```
 
-Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key. If you use `partition_by = "key"` on the sink, prefer a key: `FULL` makes every column part of the Kafka key and loses per-row ordering (see [Kafka sink](#kafka-sink)). Running `ALTER TABLE ... REPLICA IDENTITY` on a table that is already streaming re-keys all its rows at once, so consumers can see one reorder window at that moment.
+Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key. If you use `partition_by = "key"` on the sink, prefer a key: `FULL` tables are keyed `schema.table`, so they get per-table order but no spread across partitions (see [Kafka sink](#kafka-sink)). Running `ALTER TABLE ... REPLICA IDENTITY` on a table that is already streaming re-keys all its rows at once, so consumers can see one reorder window at that moment.
 
 The publication must exist before Aqueduct starts. The slot is created automatically.
 
