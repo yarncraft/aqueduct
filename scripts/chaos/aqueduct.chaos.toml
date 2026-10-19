@@ -7,6 +7,8 @@ checkpoint_path = "/var/lib/aqueduct/checkpoint"
 url = "postgres://aqueduct:aqueduct@postgres:5432/app"
 slot = "aqueduct"
 publication = "aqueduct"
+# Plaintext on the private compose network only; the default is verify-full and refuses plaintext to a non-loopback host.
+ssl_mode = "disable"
 
 [sink]
 type = "file"

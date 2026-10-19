@@ -13,14 +13,14 @@ use tokio_postgres::Config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SslMode {
     Disable,
-    /// Use TLS if the server offers it, else plaintext (libpq default). No verification.
-    #[default]
+    /// Use TLS if the server offers it, else plaintext. No verification. Must be chosen explicitly.
     Prefer,
     /// TLS required, certificate not verified (verified against `ssl_root_cert` if one is set).
     Require,
     /// TLS required, certificate chain verified, hostname not checked.
     VerifyCa,
-    /// TLS required, certificate chain and hostname verified.
+    /// TLS required, certificate chain and hostname verified. The default: weaker modes need explicit config.
+    #[default]
     VerifyFull,
 }
 
@@ -130,9 +130,42 @@ pub(crate) fn is_local(config: &Config) -> bool {
     })
 }
 
+/// Policy on what the server actually negotiated. Fails closed: plaintext to a
+/// non-loopback host is an error unless `ssl_mode = "disable"` was chosen explicitly.
+pub(crate) fn check_negotiated(
+    mode: SslMode,
+    encrypted: bool,
+    local: bool,
+    has_root_cert: bool,
+) -> Result<()> {
+    match (encrypted, local) {
+        (true, _) => {
+            if matches!(mode, SslMode::Prefer | SslMode::Require) && !has_root_cert {
+                tracing::warn!("postgres connection is encrypted but the server certificate is NOT verified; set sslmode=verify-full and a CA (postgres.ssl_root_cert)");
+            }
+        }
+        (false, true) => tracing::info!("postgres connection is plaintext (local host)"),
+        (false, false) if mode == SslMode::Disable => tracing::warn!(
+            "postgres connection is PLAINTEXT to a non-loopback host (ssl_mode = \"disable\"): credentials and row data cross the network unencrypted"
+        ),
+        (false, false) => {
+            return Err(Error::Config(
+                "postgres connection is PLAINTEXT to a non-loopback host: refusing to run; use TLS (postgres.ssl_mode = \"verify-full\") or set ssl_mode = \"disable\" explicitly to accept plaintext".into(),
+            ))
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #12: secure by default. Weaker modes must be an explicit choice.
+    #[test]
+    fn default_ssl_mode_is_verify_full() {
+        assert_eq!(SslMode::default(), SslMode::VerifyFull);
+    }
 
     #[test]
     fn strips_libpq_only_params_from_url() {
@@ -171,6 +204,33 @@ mod tests {
         assert!(!is_local(
             &parse("postgres://u@10.0.0.5/app").unwrap().config
         ));
+    }
+
+    #[test]
+    fn bare_url_leaves_mode_to_default() {
+        assert_eq!(parse("postgres://u@db/app").unwrap().url_mode, None);
+    }
+
+    #[test]
+    fn plaintext_to_remote_fails_unless_disable() {
+        for mode in [
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            assert!(
+                check_negotiated(mode, false, false, true).is_err(),
+                "{mode:?}"
+            );
+        }
+        assert!(check_negotiated(SslMode::Disable, false, false, false).is_ok());
+    }
+
+    #[test]
+    fn plaintext_to_loopback_and_tls_pass() {
+        assert!(check_negotiated(SslMode::Prefer, false, true, false).is_ok());
+        assert!(check_negotiated(SslMode::VerifyFull, true, false, false).is_ok());
     }
 
     #[test]

@@ -22,7 +22,8 @@ services:
       kafka:
         condition: service_started
     environment:
-      AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app
+      # Demo Postgres has no TLS; plaintext must be opted into explicitly (default is verify-full).
+      AQUEDUCT_PG_URL: postgres://aqueduct:aqueduct@postgres:5432/app?sslmode=disable
       # Dev default; set a real secret in production. Without a token the event inspector is off.
       AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:-dev-token-change-me}
     volumes:

@@ -7,6 +7,9 @@ checkpoint_path = "/var/lib/aqueduct/checkpoint"
 url = "postgres://aqueduct:aqueduct@postgres:5432/app"
 slot = "aqueduct"
 publication = "aqueduct"
+# TLS defaults to verify-full (cert chain + hostname). Point ssl_root_cert at your CA if it is private.
+# ssl_root_cert = "/etc/aqueduct/pg-ca.pem"
+# Only for a trusted private network without TLS (compose demo): ssl_mode = "disable"
 
 # Kafka is the only sink.
 [sink]
