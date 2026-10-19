@@ -422,7 +422,9 @@ mod tests {
 
     #[test]
     fn with_causes_appends_chain_and_skips_duplicates() {
-        let chain = Layer("outer", Some(Box::new(Layer("middle", Some(Box::new(Layer("root", None)))))));
+        let root = Layer("root", None);
+        let middle = Layer("middle", Some(Box::new(root)));
+        let chain = Layer("outer", Some(Box::new(middle)));
         let msg = with_causes("handshake".into(), Some(&chain));
         assert_eq!(msg, "handshake: outer: middle: root");
         // A cause whose text is already in the message is not repeated.
