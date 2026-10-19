@@ -32,3 +32,61 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+  integration:
+    # Runs the tests that need a live Kafka broker and a MongoDB replica set.
+    # Containers are started with `docker run` because service containers cannot
+    # pass `--replSet` to mongod.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Kafka (KRaft, single node)
+        run: |
+          docker run -d --name kafka -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            apache/kafka:3.8.0
+      - name: Start MongoDB (single-node replica set)
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' && break
+            sleep 2
+          done
+          docker exec mongo mongosh --quiet --eval \
+            "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})"
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' | grep -q PRIMARY && exit 0
+            sleep 2
+          done
+          echo "replica set never became primary"; exit 1
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 30); do
+            docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list && exit 0
+            sleep 2
+          done
+          echo "kafka never became ready"; exit 1
+      - name: Integration tests
+        env:
+          AQUEDUCT_TEST_KAFKA: localhost:9092
+          AQUEDUCT_KAFKA_BROKERS: localhost:9092
+          MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+        run: |
+          cargo test --locked -p aqueduct-source-kafka -p aqueduct-source-mongodb -- --ignored
+          cargo test --locked -p aqueduct-sinks --test kafka_it
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker logs kafka | tail -50
+          docker logs mongo | tail -50
