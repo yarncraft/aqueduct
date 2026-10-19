@@ -260,7 +260,7 @@ routes to, using its own connection (created on first use). A closed tab costs n
 ## Always-on simulation
 
 `docker-compose.sim.yml` runs Postgres, Kafka, Aqueduct and a workload generator (`sim/simulate.sh`) that
-keeps inserting, updating and deleting rows in `users`, `orders` and `payments` forever (tables are capped
+keeps inserting, updating and deleting rows in the industrial schema (`organizations`, `sites`, `assets`, `asset_readings`, `work_orders`, `maintenance_events`) forever (tables are capped
 at roughly 2000 recent rows; Kafka retention is capped at 256 MiB / 24 h).
 
 ```sh

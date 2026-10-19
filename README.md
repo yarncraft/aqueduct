@@ -28,7 +28,7 @@ The compose file starts Postgres 16 with `wal_level=logical`, creates a `users` 
 ## Run the simulation
 
 `docker-compose.sim.yml` starts a self-contained demo: Postgres, Kafka, Aqueduct and a `simulator` container that
-endlessly inserts, updates and deletes rows in `users`, `orders` and `payments`, so the cockpit always has live traffic.
+endlessly inserts, updates and deletes rows in an industrial asset-management schema (`organizations`, `sites`, `assets`, `asset_readings`, `work_orders`, `maintenance_events`), so the cockpit always has live traffic.
 You only need Docker or Podman; nothing else is installed on the host.
 
 ```sh
