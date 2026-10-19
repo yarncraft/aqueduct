@@ -81,8 +81,13 @@ cluster time inside the opaque resume token, and the read is limited by `minSnap
 - New `Op::Read`, serialised `"read"` in JSON and in the Kafka `op` header (consistent with
   `insert`/`update`/`delete`). `before = null`, `after` = the full row, `xid = 0`,
   `commit_ts_micros` = the chunk read time.
-- `position` = the high-watermark LSN (or token), so the wire `lsn` stays a real stream position and is
-  monotonic with the live events around it.
+- `position` = the high-watermark LSN (or token), so the wire `lsn` stays a real stream position. Like every
+  Postgres `lsn`, it is not monotonic across transactions (ADR 0003 §4).
+- **Postgres checkpoint key:** a `read` row gets K = `(hw_commit, hw_lsn, ord)` (ADR 0003 §4), where `hw_commit` is
+  the `final_lsn` of the high watermark's transaction (`pg_logical_emit_message(true, ..)` is transactional),
+  `hw_lsn` is the message's LSN, and `ord` is the row's index among the rows emitted at that watermark. So
+  `read` rows sort after every live event of the window and before the next transaction, and every row has its
+  own K.
 - **Row encoding must be the decoder's.** The chunk `SELECT` casts each published column to `::text` and
   feeds it through the same `push_text(type_oid, ..)` as pgoutput tuples, so a `read` row and an
   `insert` of the same row are byte-identical. Column set = the publication's column list
@@ -103,10 +108,13 @@ second file that can disagree after a crash.
   `last.checkpoint.unwrap_or(last.position)`. Nothing else in core changes, and the wire format is untouched.
 - While a snapshot is active, every event the source emits (live and `read`) carries
   `checkpoint = Position::Text(json)`, with the shape
-  `{"pos": <lsn | token>, "snap": {"id", "tables": [...], "table": i, "after": [pk values] | null}}`, where
-  `after` is the last PK of the last **fully emitted** chunk. When the snapshot completes, the source emits
-  a heartbeat with the plain position, so the checkpoint returns to today's format.
-- `start()` accepts the old plain formats and the new JSON. `ack()` parses `pos` out of it.
+  `{"pos": <K | token>, "snap": {"id", "tables": [...], "table": i, "after": [pk values] | null}}`, where
+  `pos` is the Postgres K text `"<commit>@<change>#<ord>"` (ADR 0003 §4) or the MongoDB resume token, and
+  `after` is the last PK of the last **fully emitted** chunk. When the snapshot completes, the source emits a
+  heartbeat with the plain K (Postgres) or token (MongoDB), so the checkpoint returns to the non-snapshot
+  format.
+- `start()` accepts the plain-LSN format (duplicates-only replay, ADR 0003 §4), the K text and the snapshot
+  JSON. `ack()` parses `pos` out of it.
 
 Crash cases (Ratchet's kill points):
 
