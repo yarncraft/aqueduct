@@ -161,6 +161,12 @@ pub(crate) fn check_negotiated(
 mod tests {
     use super::*;
 
+    // #12: secure by default. Weaker modes must be an explicit choice.
+    #[test]
+    fn default_ssl_mode_is_verify_full() {
+        assert_eq!(SslMode::default(), SslMode::VerifyFull);
+    }
+
     #[test]
     fn strips_libpq_only_params_from_url() {
         let p = parse(
@@ -201,8 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn default_is_verify_full() {
-        assert_eq!(SslMode::default(), SslMode::VerifyFull);
+    fn bare_url_leaves_mode_to_default() {
         assert_eq!(parse("postgres://u@db/app").unwrap().url_mode, None);
     }
 
