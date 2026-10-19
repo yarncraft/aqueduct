@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Optional: runs the `rust` job of scripts/ci-local.sh on each branch tip being pushed.
+# Enable with:  git config core.hooksPath .githooks
+# Set LOCAL_CI_JOBS (e.g. rust,docker,audit,integration) to run more; skip once with SKIP_LOCAL_CI=1.
+[ -n "${SKIP_LOCAL_CI:-}" ] && exit 0
+zero=0000000000000000000000000000000000000000
+while read -r _ local_sha _ _; do
+  [ "$local_sha" = "$zero" ] && continue
+  "$(git rev-parse --show-toplevel)/scripts/ci-local.sh" --jobs "${LOCAL_CI_JOBS:-rust}" "$local_sha" || exit 1
+done
+exit 0
