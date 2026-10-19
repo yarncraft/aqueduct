@@ -126,6 +126,10 @@ pub struct KafkaConfig {
     /// Partitions to create topics with if they do not exist.
     #[serde(default = "default_partitions")]
     pub partitions: i32,
+    /// Replicas for topics created if they do not exist. Unset: 3, or 1 (with a warning) on a
+    /// cluster with fewer than 3 brokers.
+    #[serde(default)]
+    pub replication_factor: Option<i16>,
     /// `table` (default): key `schema.table`, per-table ordering. `key`: key also includes the
     /// primary-key values, spreading a table over partitions with per-row ordering.
     #[serde(default)]
@@ -312,6 +316,22 @@ topic = \"t\"
 "
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn replication_factor_is_optional_and_configurable() {
+        assert_eq!(admin_cfg("").sink.replication_factor, None);
+        let c: Config = toml::from_str(
+            "[postgres]
+url = \"postgres://u@db/app\"
+[sink]
+brokers = [\"b:9093\"]
+topic = \"t\"
+replication_factor = 2
+",
+        )
+        .unwrap();
+        assert_eq!(c.sink.replication_factor, Some(2));
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
+use rskafka::client::error::{Error as ClientError, ProtocolError};
 use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
 use rskafka::record::Record;
@@ -185,6 +186,9 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     true
 }
 
+/// Replicas for auto-created topics when `replication_factor` is not configured.
+pub const DEFAULT_REPLICATION_FACTOR: i16 = 3;
+
 /// Produces each event as a JSON record to a Kafka topic chosen by a
 /// [`TopicRouter`]. The record key is `schema.table`; the partition is chosen
 /// by hashing the key, so changes to one table keep their order. Topics are
@@ -195,6 +199,7 @@ pub struct KafkaSink {
     client: Client,
     router: TopicRouter,
     new_topic_partitions: i32,
+    replication_factor: Option<i16>,
     partition_by: PartitionBy,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
 }
@@ -205,11 +210,13 @@ fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
 
 impl KafkaSink {
     /// Connect to the brokers. Topics missing at first use are created with
-    /// `new_topic_partitions` partitions.
+    /// `new_topic_partitions` partitions and `replication_factor` replicas (`None`: try
+    /// [`DEFAULT_REPLICATION_FACTOR`], and use 1 with a warning if the cluster is too small).
     pub async fn connect(
         brokers: Vec<String>,
         router: TopicRouter,
         new_topic_partitions: i32,
+        replication_factor: Option<i16>,
         security: &KafkaSecurity,
     ) -> Result<Self> {
         let client = security
@@ -221,6 +228,7 @@ impl KafkaSink {
             client,
             router,
             new_topic_partitions: new_topic_partitions.max(1),
+            replication_factor: replication_factor.map(|r| r.max(1)),
             partition_by: PartitionBy::default(),
             topics: HashMap::new(),
         };
@@ -258,9 +266,25 @@ impl KafkaSink {
             .controller_client()
             .map_err(|e| err("controller", &e))?;
         // Ignore "already exists" races; the re-list below is authoritative.
-        let _ = ctrl
-            .create_topic(topic, self.new_topic_partitions, 1, 5_000)
-            .await;
+        let create = |rf: i16| ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000);
+        match self.replication_factor {
+            Some(rf) => {
+                let _ = create(rf).await;
+            }
+            None => {
+                if let Err(ClientError::ServerError {
+                    protocol_error: ProtocolError::InvalidReplicationFactor,
+                    ..
+                }) = create(DEFAULT_REPLICATION_FACTOR).await
+                {
+                    tracing::warn!(
+                        topic,
+                        "cluster has fewer than {DEFAULT_REPLICATION_FACTOR} brokers; creating topic with replication factor 1, set `replication_factor` to choose"
+                    );
+                    let _ = create(1).await;
+                }
+            }
+        }
         let listed = self
             .client
             .list_topics()

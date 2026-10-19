@@ -185,9 +185,15 @@ async fn main() {
             let parts: i32 = arg("--partitions").map_or(3, |v| v.parse().unwrap());
             let topic = format!("aqueduct-bench-{}", std::process::id());
             let router = TopicRouter::new(vec![], Some(topic)).unwrap();
-            let inner = KafkaSink::connect(vec![brokers], router, parts, &KafkaSecurity::default())
-                .await
-                .unwrap();
+            let inner = KafkaSink::connect(
+                vec![brokers],
+                router,
+                parts,
+                None,
+                &KafkaSecurity::default(),
+            )
+            .await
+            .unwrap();
             let mut sink = Counting {
                 sizes,
                 inner: Some(inner),
