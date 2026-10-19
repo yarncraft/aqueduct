@@ -1,6 +1,6 @@
 # ADR 0002: Routing and transforms
 
-- Status: proposed
+- Status: proposed (revised after Megatron's review of a22306f)
 - Issue: #48
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author). Implementer: Wheeljack, after #45
 - Date: 2026-10-19
@@ -66,11 +66,11 @@ match = "public.orders"
 ops = ["insert", "update", "delete"]
 where = "row.status == 'paid' or op == 'delete'"
 topic = "orders.{row.region}"
-topic_fallback = "orders.unknown"
+topic_fallback = "orders.unknown"     # required for templates that read a row field
 key = ["id"]
 exclude = ["internal_note"]
 mask = ["card_last4"]                 # -> "***"
-hash = ["email"]                      # HMAC-SHA256 hex, key from sink.hash_key
+hash = ["email"]                      # HMAC-SHA256 hex, key from AQUEDUCT_HASH_KEY
 rename = { cust_id = "customer_id" }
 format = "row"                        # value = the row, not the envelope
 deletes = "tombstone"                 # row format: tombstone | drop | row (before + "__deleted": true)
@@ -193,8 +193,8 @@ A **row-level evaluation error** has two sources: a type error in `where`, or an
   `schema.table`, and an `aqueduct-error` header holds the reason (the expression and the type, no values).
   The event is counted under `errors`, and the batch acks normally.
 - Without a dead-letter topic, the pipeline fails with the route, the table and the reason. Validation
-  **warns at startup** when any route uses `where`, outbox or `unchanged = "dead_letter"` without
-  `sink.dead_letter_topic`, so this choice is visible up front.
+  **warns at startup** when any route uses `where` or outbox without `sink.dead_letter_topic`, so this
+  choice is visible up front. `unchanged = "dead_letter"` without a dead-letter topic is a validation error.
 
 Dynamic topics never reach this path (§5 "Content routing" always has a fallback).
 - **Tombstones (envelope format):** `tombstones = true` emits a null-value record with the same key after
@@ -229,26 +229,37 @@ next to it. Tombstones follow their delete on the same partition.
 - Positive: no change to core or the at-least-once loop. Zero cost when unused. One place (the plan) to
   test, as a pure function. The per-route `key` makes #45-style ordering problems fixable in config.
 - Negative: transforms are Kafka-specific (consistent with "Kafka is the only sink"). The fixed order
-  can't express exotic chains. Content routing adds a topic-explosion risk, capped by `max_dynamic_topics`.
+  can't express exotic chains. Content routing is deliberately constrained (static prefix, one segment,
+  required fallback, broker-counted cap). Ordering comparisons on timestamps are not supported in v1.
+  A misspelled field name is only caught at runtime, by the unseen-field warning.
 - Breaking: none. Existing routes behave exactly as today. New keys are additive, and `format = "row"`,
   outbox and tombstones change the value only on routes that opt in.
 
 ## Implementation issues (after approval)
 
-1. **Plan + config:** `RoutePlan` compiled from `[[sink.routes]]`, validation (mutually exclusive keys,
-   tombstones need a per-row key, `hash_key` when hashing), wired into `send_batch` with the no-transform
-   fast path. Includes the `--sink render` bench mode and a baseline.
-2. **Expression engine:** field paths, lazy borrowed row view, predicate parser and evaluator, template
-   rendering. Table-driven unit tests and a parser fuzz test.
-3. **Filter:** `ops` and `where`, plus `RouteStats` and admin/Prometheus exposure.
-4. **Content routing:** templated topics, `topic_fallback`, topic-name validation, `max_dynamic_topics`,
-   inspector topic discovery.
+1. **Plan + config:** `RoutePlan` compiled from `[[sink.routes]]`, with all validation: mutually exclusive
+   keys, tombstones need a per-row key, the hash key from env or file only, no masked/hashed/excluded column
+   in key/topic/outbox, explicit `key` with field ops under `partition_by = "key"`, the template rules, the
+   rename collision check, and the dead-letter checks. Wired into `send_batch` with the no-transform fast
+   path. Includes the `--sink render` bench mode and a baseline.
+2. **Expression engine:** field paths, lazy borrowed row view, a typed evaluator (decimal-string numerics,
+   errors propagate), the parser with its depth and size limits, template rendering. Table-driven unit
+   tests, plus a parser fuzz test that includes deep nesting.
+3. **Filter + error policy:** `ops` and `where`, `sink.dead_letter_topic`, `RouteStats` and admin/Prometheus
+   exposure.
+4. **Content routing:** templated topics with the prefix/segment/collision rules, `topic_values`, the
+   required `topic_fallback`, the broker-counted `max_dynamic_topics`, inspector topic discovery.
 5. **Per-route key** (coordinate with #45).
-6. **Fields:** include/exclude, mask, HMAC hash, rename.
-7. **Shapes:** `format = "row"` with `deletes`, envelope `tombstones`, raw display in the inspector.
+6. **Fields:** include/exclude, mask, HMAC hash (canonical input, `hash_key_id` header), rename, and the
+   unseen-field warning and metric.
+7. **Shapes:** `format = "row"` with `deletes` and `unchanged`, envelope `tombstones`, raw display in the
+   inspector.
 8. **Outbox router.**
-9. **Docs:** DEPLOYMENT.md route reference, README example, CHANGELOG (additive).
-10. **Cockpit:** per-route counts (Bumblebee).
+9. **Docs:** DEPLOYMENT.md route reference (including the rows-leaving-the-filter, TOAST and mask-type
+   caveats), README example, CHANGELOG (additive).
+10. **Cockpit:** per-route counts, filtered/fallback/error counts, unseen-field warnings (Bumblebee).
+11. **Follow-ups, not v1:** `on_leave` for rows leaving a filter; the decoder filling `Unchanged` TOAST
+    columns from `before` under FULL; fan-out (`continue = true`).
 
 Priority: 1 → 2 → 3, 4, 5 (the most-asked: filter, content routing, keys), then 6 (PII), 7, 8. Each one
 ships with unit tests, docs, and the bench number from issue 1's harness.
@@ -258,5 +269,6 @@ ships with unit tests, docs, and the bench number from issue 1's harness.
 1. Fixed transform order instead of an ordered chain? Recommendation: fixed.
 2. First match wins, with no fan-out of one event to several routes in v1? Recommendation: yes. Fan-out can
    come later as `continue = true` on a route.
-3. Is `max_dynamic_topics = 100` the right default, and should exceeding it fail the pipeline (my
-   recommendation) or send to the fallback?
+3. ~~Should exceeding `max_dynamic_topics` fail?~~ Resolved in review: it goes to the fallback, the cap is
+   counted from the broker, and the fallback is required (Megatron: failing turns one row into a stall that
+   fills the primary's disk).
