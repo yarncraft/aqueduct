@@ -20,6 +20,8 @@ pub enum DecodeError {
     UnknownRelation(u32),
     #[error("column value is not valid JSON")]
     Json,
+    #[error("negative length or count {0}")]
+    NegativeLength(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +111,16 @@ impl<'a> Reader<'a> {
     fn i32(&mut self) -> Result<i32, DecodeError> {
         Ok(i32::from_be_bytes(self.array()?))
     }
+    /// A non-negative i16 count. A negative one is a malformed message, not an empty value.
+    fn count16(&mut self) -> Result<usize, DecodeError> {
+        let n = self.i16()?;
+        usize::try_from(n).map_err(|_| DecodeError::NegativeLength(i32::from(n)))
+    }
+    /// A non-negative i32 length or count.
+    fn count32(&mut self) -> Result<usize, DecodeError> {
+        let n = self.i32()?;
+        usize::try_from(n).map_err(|_| DecodeError::NegativeLength(n))
+    }
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.array()?))
     }
@@ -129,14 +141,14 @@ impl<'a> Reader<'a> {
         Ok(s.to_owned())
     }
     fn tuple(&mut self) -> Result<Tuple, DecodeError> {
-        let n = self.i16()?.max(0) as usize;
+        let n = self.count16()?;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(match self.u8()? {
                 b'n' => Datum::Null,
                 b'u' => Datum::Unchanged,
                 kind @ (b't' | b'b') => {
-                    let len = self.i32()?.max(0) as usize;
+                    let len = self.count32()?;
                     let bytes = self.take(len)?;
                     if kind == b't' {
                         Datum::Text(
@@ -177,7 +189,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             let schema = r.cstr()?;
             let name = r.cstr()?;
             let _replica_identity = r.u8()?;
-            let n = r.i16()?.max(0) as usize;
+            let n = r.count16()?;
             let mut columns = Vec::with_capacity(n);
             for _ in 0..n {
                 let flags = r.u8()?;
@@ -229,7 +241,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             }
         }
         b'T' => {
-            let n = r.i32()?.max(0) as usize;
+            let n = r.count32()?;
             let _options = r.u8()?;
             let mut relations = Vec::with_capacity(n);
             for _ in 0..n {
@@ -400,6 +412,46 @@ mod tests {
             v.extend((-1i32).to_be_bytes());
         }
         v
+    }
+
+    #[test]
+    fn negative_tuple_column_count_is_an_error() {
+        let mut b = vec![b'I'];
+        b.extend(42u32.to_be_bytes());
+        b.push(b'N');
+        b.extend((-1i16).to_be_bytes());
+        assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-1)));
+    }
+
+    #[test]
+    fn negative_value_length_is_an_error() {
+        for kind in [b't', b'b'] {
+            let mut b = vec![b'I'];
+            b.extend(42u32.to_be_bytes());
+            b.push(b'N');
+            b.extend(1i16.to_be_bytes());
+            b.push(kind);
+            b.extend((-5i32).to_be_bytes());
+            assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-5)));
+        }
+    }
+
+    #[test]
+    fn negative_relation_column_count_is_an_error() {
+        let mut b = vec![b'R'];
+        b.extend(42u32.to_be_bytes());
+        b.extend(b"public users ");
+        b.push(b'd');
+        b.extend((-2i16).to_be_bytes());
+        assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-2)));
+    }
+
+    #[test]
+    fn negative_truncate_relation_count_is_an_error() {
+        let mut b = vec![b'T'];
+        b.extend(i32::MIN.to_be_bytes());
+        b.push(0);
+        assert_eq!(decode(&b), Err(DecodeError::NegativeLength(i32::MIN)));
     }
 
     #[test]
