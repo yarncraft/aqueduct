@@ -641,11 +641,9 @@ Authorization: Bearer {token}
     async fn stream_with_bearer_yields_json_data_frames() {
         let addr = start(Some("k")).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(
-            b"GET /api/stream HTTP/1.1\r\nhost: x\r\nAuthorization: Bearer k\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        c.write_all(b"GET /api/stream HTTP/1.1\r\nhost: x\r\nAuthorization: Bearer k\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let got = tokio::time::timeout(Duration::from_secs(5), async {
@@ -663,7 +661,12 @@ Authorization: Bearer {token}
         .expect("no SSE frame within 5s");
         assert!(got.starts_with("HTTP/1.1 200") && got.contains("text/event-stream"));
         let frame = got.split("\r\n\r\n").nth(1).unwrap();
-        let data = frame.lines().next().unwrap().strip_prefix("data: ").unwrap();
+        let data = frame
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("data: ")
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(data).unwrap();
         assert!(v.get("events_per_sec").is_some());
         // Unauthenticated stream is refused.
