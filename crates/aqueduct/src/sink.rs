@@ -48,11 +48,7 @@ pub async fn build(cfg: &KafkaConfig) -> Result<(KafkaSink, KafkaInspector)> {
         Some(s) => s.parse().map_err(Error::Config)?,
         None => PartitionBy::default(),
     };
-    if cfg.replication_factor.is_some_and(|r| r < 1) {
-        return Err(Error::Config(
-            "sink.replication_factor must be at least 1".into(),
-        ));
-    }
+    cfg.check_replication_factor().map_err(Error::Config)?;
     let sink = KafkaSink::connect(
         cfg.brokers.clone(),
         router,

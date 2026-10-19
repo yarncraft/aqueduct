@@ -153,6 +153,18 @@ pub struct KafkaConfig {
     pub sasl_password: Option<Secret>,
 }
 
+impl KafkaConfig {
+    /// An explicit `replication_factor` must be at least 1.
+    pub fn check_replication_factor(&self) -> Result<(), String> {
+        match self.replication_factor {
+            Some(r) if r < 1 => Err(format!(
+                "sink.replication_factor must be at least 1, got {r}"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct KafkaRouteConfig {
     /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
@@ -332,6 +344,12 @@ replication_factor = 2
         )
         .unwrap();
         assert_eq!(c.sink.replication_factor, Some(2));
+        assert!(c.sink.check_replication_factor().is_ok());
+        for bad in [0, -1] {
+            let mut c = c.clone();
+            c.sink.replication_factor = Some(bad);
+            assert!(c.sink.check_replication_factor().is_err(), "{bad}");
+        }
     }
 
     #[test]

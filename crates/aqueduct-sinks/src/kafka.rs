@@ -433,6 +433,8 @@ impl Sink for KafkaSink {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn replication_factor_fallback_only_when_unset() {
         let bad = ProtocolError::InvalidReplicationFactor;
@@ -444,8 +446,6 @@ mod tests {
             assert_eq!(after_create(cfg, Some(&exists)), AfterCreate::Done);
         }
     }
-
-    use super::*;
 
     fn route(p: &str, t: &str) -> KafkaRoute {
         KafkaRoute {
