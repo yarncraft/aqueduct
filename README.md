@@ -135,6 +135,8 @@ With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` (a `?toke
 dashboard once as `http://host:8080/#token=<token>` (the fragment is never sent to the server; the page moves it into session storage and strips it from the URL; a `?token=` in the page URL is ignored). The page itself is public and **events contain row data**,
 so always set a token and keep the port off untrusted networks.
 
+The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
+
 ## Operations
 
 - Persist `/var/lib/aqueduct` on a volume (the image pre-creates it writable for the non-root user).

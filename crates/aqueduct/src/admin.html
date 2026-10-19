@@ -32,7 +32,7 @@
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Throughput</div>
       <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="rate">0</span><span class="ml-1 text-xs text-ink-300">evt/s</span></div>
-      <div class="mt-1 font-mono text-[11px] text-ink-300">peak <span id="peak" class="text-ink-200">0</span> /s</div>
+      <div class="mt-1 font-mono text-[11px] text-ink-300">now <span id="rate-now" class="text-ink-200">0</span> · peak (15 s avg) <span id="peak" class="text-ink-200">0</span> /s</div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Events delivered</div>
@@ -182,6 +182,16 @@ const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Rates, the chart and recent sink latency are trailing averages over this many 1 s snapshots;
+// counters, lag and max latency stay exact (lag is an alarm signal, a mean would hide a stall).
+const SMOOTH_WINDOW = 15;
+const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+const smooth = (h, w = SMOOTH_WINDOW) => h.map((_, i) => avg(h.slice(Math.max(0, i - w + 1), i + 1)));
+// Sink latency samples, one per snapshot in which events were delivered (sink_last_ms only
+// changes then). Cleared on reconnect so values from before an outage are not blended in.
+let sinkSamples = [], lastTotal = null;
+const resetSmoothing = () => { sinkSamples = []; lastTotal = null; };
+
 const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red', stopped: 'bg-ink-300' };
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
@@ -192,11 +202,11 @@ function rateSeries(d) {
   const ops = [...document.querySelectorAll('.rateop')].filter(c => c.checked).map(c => +c.value);
   const per = d.history_ops || {};
   const names = tb ? [tb] : Object.keys(per);
-  if (!tb && ops.length === 4) return d.history;
-  return d.history.map((_, i) => names.reduce((a, t) => {
+  if (!tb && ops.length === 4) return smooth(d.history);
+  return smooth(d.history.map((_, i) => names.reduce((a, t) => {
     const row = (per[t] || [])[i - (d.history.length - (per[t] || []).length)];
     return a + (row ? ops.reduce((b, o) => b + row[o], 0) : 0);
-  }, 0));
+  }, 0)));
 }
 function syncRateTables(d) {
   const sel = $('ratetable'), cur = sel.value, names = Object.keys(d.history_ops || {}).sort();
@@ -232,13 +242,20 @@ function render(d) {
   $('uptime').textContent = dur(d.uptime_secs);
 
   $('inspector').hidden = !d.inspector;
-  $('rate').textContent = fmt(d.events_per_sec);
-  $('peak').textContent = fmt(Math.max(0, ...d.history));
+  const sm = smooth(d.history);
+  $('rate').textContent = fmt(Math.round(sm.length ? sm[sm.length - 1] : d.events_per_sec));
+  $('rate-now').textContent = fmt(d.events_per_sec);
+  $('peak').textContent = fmt(Math.round(Math.max(0, ...sm)));
   $('total').textContent = fmt(d.events_total);
   $('lsn').textContent = d.last_lsn || '–';
+  if (lastTotal !== null && d.events_total > lastTotal) {
+    sinkSamples.push(d.sink_last_ms);
+    if (sinkSamples.length > SMOOTH_WINDOW) sinkSamples.shift();
+  }
+  lastTotal = d.events_total;
   $('lag').textContent = d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
   $('sinkavg').textContent = d.events_total ? ms(d.sink_avg_ms) : '–';
-  $('sinkdet').textContent = d.events_total ? `last ${ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'mean per event';
+  $('sinkdet').textContent = d.events_total ? `${sinkSamples.length ? 'recent ' + ms(avg(sinkSamples)) : 'last ' + ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'mean per event';
   $('errors').textContent = fmt(d.errors);
   $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
   $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
@@ -406,6 +423,7 @@ async function streamLoop() {
     } catch (_) { /* fall through to reconnect */ }
     clearTimeout(stall);
     ctl.abort();
+    resetSmoothing();
     setConn(false, 'reconnecting');
     await new Promise(res => setTimeout(res, delay));
     delay = Math.min(delay * 2, 15000);
