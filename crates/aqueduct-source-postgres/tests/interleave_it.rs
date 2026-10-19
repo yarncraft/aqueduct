@@ -286,10 +286,7 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
 /// record carries that record's LSN, and a multi-table `TRUNCATE` is one message for all its
 /// tables. A position-only dedupe keeps one event per position and drops the rest.
 const COPY_3_ROWS: &str =
-    r#"COPY {t} (k, v) FROM PROGRAM 'printf "1	a
-2	b
-3	c
-"'"#;
+    r#"COPY {t} (k, v) FROM PROGRAM 'printf "1\ta\n2\tb\n3\tc\n"'"#;
 
 #[tokio::test]
 #[ignore = "needs a Postgres server, see the module docs"]
