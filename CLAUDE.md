@@ -73,3 +73,16 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
 - Git push to the Buzz relay needs a working `git-credential-nostr`; if it prints no credential, the push cannot succeed from that session.
+
+## Issue and PR titles
+
+Titles must make sense to someone who has not read the plan. Reviewers send back a PR whose title breaks these rules.
+
+- Format: `<Area>: <what changes, in plain words>`. Put the result first. A plan code, if any, goes last in parentheses.
+- Areas: `Postgres source`, `MongoDB source`, `Kafka sink`, `Routing`, `Snapshots`, `Cockpit`, `Pipeline`, `CI`, `Docs`.
+- Don't lead with plan codes (R1, S4, T3) or use internal symbols (K, `ord`, `RoutePlan`) as the title. No people's names.
+- Bugs describe what the user sees ("rows lost when transactions overlap"), not the mechanism.
+- PR titles end with `(#issue)`.
+- Examples: `Routing: set the Kafka message key per route (R5)`, `Postgres source: decode logical replication messages, needed for snapshot watermarks (S3)`.
+
+Commit messages and branch names are not affected.
