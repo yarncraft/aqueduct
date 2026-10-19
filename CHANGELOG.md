@@ -33,4 +33,10 @@ Notable changes to Aqueduct. Newest first.
 
   `curl`: `curl -H "Authorization: Bearer $AQUEDUCT_ADMIN_TOKEN" http://host:8080/metrics`.
 
+### Changed
+
+- **Postgres source errors now include the cause** (#18). A failed connect previously showed only
+  `error performing TLS handshake`; it now reads e.g. `...: invalid peer certificate: UnknownIssuer`. This text appears in
+  logs and the cockpit's `last_error`. Server-side errors add only the SQLSTATE and message, never `DETAIL`/`HINT`.
+
 Details: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (config reference and the "Securing connections" checklist).
