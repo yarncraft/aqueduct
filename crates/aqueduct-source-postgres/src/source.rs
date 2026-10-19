@@ -437,7 +437,7 @@ impl Source for PostgresSource {
                     if let Some(wal) = self.wal_position().await? {
                         if l > wal {
                             return Err(Error::Checkpoint(format!(
-                                "checkpoint LSN {} is ahead of this server's WAL position {};                                  it belongs to another cluster. Remove the checkpoint to start over",
+                                "checkpoint LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
                                 Position::Lsn(l),
                                 Position::Lsn(wal)
                             )));
