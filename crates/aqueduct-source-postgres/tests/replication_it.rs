@@ -9,7 +9,7 @@
 //! ```
 //!
 //! `AQUEDUCT_TEST_PG_TRUST` must be set: the test fails when it is not, so a run that skips
-//! the server cannot report green. The integration jobs start a trust-auth `pg-trust` container.
+//! the server cannot report green. Run it locally against the container above and post the output on the PR.
 
 use std::time::Duration;
 

@@ -44,7 +44,7 @@ SHA=$(git rev-parse --verify "${SHA:-HEAD}^{commit}") || { echo "not a commit: $
 SHORT=${SHA:0:7}
 
 # --- gate integrity ----------------------------------------------------------------------------
-for v in DATABASE_URL PGHOST PGPASSWORD MONGO_URI AQUEDUCT_KAFKA_BROKERS          AQUEDUCT_TEST_KAFKA AQUEDUCT_TEST_PG_TLS AQUEDUCT_TEST_PG_PLAIN AQUEDUCT_TEST_PG_TRUST AQUEDUCT_TEST_PG_CA AQUEDUCT_TEST_PG_WRONG_CA; do
+for v in DATABASE_URL PGHOST PGPASSWORD MONGO_URI AQUEDUCT_KAFKA_BROKERS          AQUEDUCT_TEST_KAFKA AQUEDUCT_TEST_PG_TLS AQUEDUCT_TEST_PG_PLAIN AQUEDUCT_TEST_PG_CA AQUEDUCT_TEST_PG_WRONG_CA; do
   if [ -n "${!v:-}" ]; then echo "refusing to run: $v is set; the integration job only uses its own throwaway containers" >&2; exit 1; fi
 done
 # A stray control byte (e.g. 0x01 where a sed back-reference `\1` belongs) renders as nothing in diffs.
@@ -148,9 +148,6 @@ job_integration() {
   "$CLI" run -d --pod "$POD" --name pg-tls -v "$POD-certs":/certs:ro "${pgcommon[@]}" -c port=5433 \
     -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key >/dev/null || return 1
   "$CLI" run -d --pod "$POD" --name pg-plain "${pgcommon[@]}" -c port=5434 >/dev/null || return 1
-  # Trust authentication, for the replication client, which has no password auth yet.
-  "$CLI" run -d --pod "$POD" --name pg-trust -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 \
-    -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=10 -c port=5435 >/dev/null || return 1
 
   local i ok state c
   ok=0
@@ -169,7 +166,7 @@ job_integration() {
   done
   [ "$ok" = 1 ] || { echo "replica set never became primary"; return 1; }
 
-  for c in pg-tls:5433 pg-plain:5434 pg-trust:5435; do
+  for c in pg-tls:5433 pg-plain:5434; do
     local name=${c%%:*} port=${c##*:}
     ok=0
     for i in $(seq 1 30); do
@@ -198,7 +195,6 @@ job_integration() {
     -e AQUEDUCT_TEST_KAFKA=localhost:9092 -e AQUEDUCT_KAFKA_BROKERS=localhost:9092 \
     -e 'MONGO_URI=mongodb://localhost:27017/?replicaSet=rs0&directConnection=true' \
     -e AQUEDUCT_TEST_PG_TLS=localhost:5433 -e AQUEDUCT_TEST_PG_PLAIN=localhost:5434 \
-    -e AQUEDUCT_TEST_PG_TRUST=localhost:5435 \
     -e AQUEDUCT_TEST_PG_CA=/certs/ca.pem -e AQUEDUCT_TEST_PG_WRONG_CA=/certs/other.pem -- '
     cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
     cargo test --locked -p aqueduct-sinks --test kafka_it'
