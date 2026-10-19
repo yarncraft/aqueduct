@@ -634,4 +634,46 @@ Authorization: Bearer {token}
             .await
             .starts_with("HTTP/1.1 200"));
     }
+
+    // Contract the dashboard's fetch-based SSE client parses: Bearer-authenticated stream, a
+    // 200 text/event-stream head, then `data: <json>
+
+` frames (one full snapshot each).
+    #[tokio::test]
+    async fn stream_with_bearer_yields_json_data_frames() {
+        let addr = start(Some("k")).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /api/stream HTTP/1.1
+host: x
+Authorization: Bearer k
+
+")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = c.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "stream closed before first frame");
+                buf.extend_from_slice(&chunk[..n]);
+                if String::from_utf8_lossy(&buf).contains("
+
+") && buf.windows(6).any(|w| w == b"data: ") {
+                    return String::from_utf8_lossy(&buf).into_owned();
+                }
+            }
+        })
+        .await
+        .expect("no SSE frame within 5s");
+        assert!(got.starts_with("HTTP/1.1 200") && got.contains("text/event-stream"));
+        let frame = got.split("
+
+").nth(1).unwrap();
+        let data = frame.lines().next().unwrap().strip_prefix("data: ").unwrap();
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert!(v.get("events_per_sec").is_some());
+        // Unauthenticated stream is refused.
+        assert!(get(addr, "/api/stream").await.starts_with("HTTP/1.1 401"));
+    }
 }
