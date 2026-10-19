@@ -127,6 +127,7 @@ impl Metrics {
             Op::Update => &self.updates,
             Op::Delete => &self.deletes,
             Op::Truncate => &self.truncates,
+            // Unreachable: heartbeats return at the top; the arm keeps the match exhaustive.
             Op::Heartbeat => return,
         }
         .fetch_add(1, Relaxed);
@@ -148,6 +149,8 @@ impl Metrics {
                 Op::Update => 1,
                 Op::Delete => 2,
                 Op::Truncate => 3,
+                // Unreachable: heartbeats return at the top of `record_event`; the arm only
+                // keeps the match exhaustive.
                 Op::Heartbeat => return,
             };
             let mut t = self.table_ops.lock().unwrap();
