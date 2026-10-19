@@ -40,6 +40,17 @@ async fn main() {
     tracing::info!(source = source_cfg.type_name(), "aqueduct starting");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    match cfg.check_admin_exposure() {
+        Ok(true) => tracing::warn!(
+            addr = %cfg.health_addr,
+            "admin_insecure_no_auth is set: the admin API and cockpit are UNAUTHENTICATED on a non-loopback address"
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    }
     let listener = TcpListener::bind(&cfg.health_addr)
         .await
         .expect("bind health_addr");

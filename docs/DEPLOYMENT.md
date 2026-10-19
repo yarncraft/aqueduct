@@ -117,7 +117,8 @@ topic = "cdc.{schema}.{table}"
 |-----|---------|-------------|
 | `health_addr` | `0.0.0.0:8080` | Listen address of the cockpit, API and `/healthz` |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically. Keep on the state volume |
-| `admin_token` | unset | If set, `/api/*` requires it (`Authorization: Bearer ...` or `?token=`). Env: `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_insecure_no_auth` | `false` | Allow a non-loopback `health_addr` without `admin_token`. Without this, startup refuses that combination; with it, a warning is logged. Loopback binds never need a token |
+| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/api/*` requires it (`Authorization: Bearer ...` or `?token=`). Env: `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Cockpit event inspector, reading recent events back from Kafka. Needs `admin_token`; `false` turns it off |
 
 ### `[postgres]`
