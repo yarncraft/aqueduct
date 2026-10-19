@@ -64,11 +64,12 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 |-----|---------|---------|
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
+| `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default. Plaintext to a non-loopback host aborts startup unless `ssl_mode = "disable"` is set explicitly |
 | `source.type` | `postgres` | `postgres`, `kafka` or `mongodb`. Without a `[source]` table, `[postgres]` is used |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN, offsets or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_insecure_no_auth` | `false` | Opt out of the token requirement on a non-loopback `health_addr` (logs a warning) |
-| `admin_token` | unset | Protects `/api/*` when set. Override with `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_token` | unset | Protects `/api/*`. **Required** when `health_addr` is not loopback (startup refuses otherwise; an empty value counts as unset). Override with `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Event inspector in the cockpit; reads recent events back from Kafka. Also needs `admin_token` |
 
 ### Kafka sink
@@ -127,13 +128,17 @@ before/after diff and Copy JSON).
 |-------|---------|
 | `GET /` , `GET /admin.css` | Dashboard (embedded HTML + Tailwind CSS) |
 | `GET /healthz` | `200 ok`, used by the image `HEALTHCHECK` (`aqueduct --healthcheck`) |
+| `GET /readyz` | `200` while the pipeline is streaming, else `503` (readiness probe) |
+| `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 
-With `admin_token` set, `/api/*` needs `Authorization: Bearer <token>` (a `?token=` query parameter is rejected; URLs leak into logs, history and Referer); open the
-dashboard once as `http://host:8080/#token=<token>` (the fragment is never sent to the server; the page moves it into session storage and strips it from the URL; a `?token=` in the page URL is ignored). The page itself is public and **events contain row data**,
-so always set a token and keep the port off untrusted networks.
+Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start without `admin_token`, unless
+`admin_insecure_no_auth = true` (logged as a warning). With a token, `/metrics` and `/api/*` need `Authorization: Bearer <token>`
+(a `?token=` query parameter is rejected; URLs leak into logs, history and Referer). Open the dashboard once as
+`http://host:8080/#token=<token>` (the fragment is never sent to the server; the page moves it into session storage and strips it from the URL; a `?token=` in the page URL is ignored). The page itself is public and
+**events contain row data**, so keep the port off untrusted networks.
 
 ## Operations
 

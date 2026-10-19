@@ -118,7 +118,7 @@ topic = "cdc.{schema}.{table}"
 | `health_addr` | `0.0.0.0:8080` | Listen address of the cockpit, API and `/healthz` |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically. Keep on the state volume |
 | `admin_insecure_no_auth` | `false` | Allow a non-loopback `health_addr` without `admin_token`. Without this, startup refuses that combination; with it, a warning is logged. Loopback binds never need a token |
-| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/api/*` requires it (`Authorization: Bearer ...` only; `?token=` is rejected). Env: `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/metrics` and `/api/*` require it (`Authorization: Bearer ...` only; `?token=` is rejected). Env: `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Cockpit event inspector, reading recent events back from Kafka. Needs `admin_token`; `false` turns it off |
 
 ### `[postgres]`
@@ -230,9 +230,9 @@ topic = "audit"
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, per-operation and per-table breakdowns and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz`, `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka).
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka).
 
-The inspector shows row data. Set `admin_token`, publish the port only on a trusted network or behind a reverse proxy
+The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
 
 The inspector adds no work to the pipeline: nothing is buffered in memory. Each refresh (every 3 s while a tab is open,
@@ -269,6 +269,7 @@ routes to, using its own connection (created on first use). A closed tab costs n
 
 1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
+3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one); never set `admin_insecure_no_auth` in production.
 4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
 
 ## Always-on simulation
