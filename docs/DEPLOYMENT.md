@@ -279,8 +279,9 @@ keeps inserting, updating and deleting rows in `users`, `orders` and `payments` 
 at roughly 2000 recent rows; Kafka retention is capped at 256 MiB / 24 h).
 
 ```sh
+export AQUEDUCT_ADMIN_TOKEN=$(openssl rand -hex 32)   # required, no default
 podman-compose -f docker-compose.sim.yml -p aqsim up -d --build   # or: docker compose -f ... -p aqsim up -d --build
-# UI: http://localhost:8088   admin token: dev-token-change-me (override with AQUEDUCT_ADMIN_TOKEN)
+# UI: http://localhost:8088/#token=$AQUEDUCT_ADMIN_TOKEN
 SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator   # change load (tx/s)
 podman-compose -f docker-compose.sim.yml -p aqsim down      # add -v to wipe data
 ```
