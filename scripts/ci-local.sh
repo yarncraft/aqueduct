@@ -48,7 +48,9 @@ for v in DATABASE_URL PGHOST PGPASSWORD MONGO_URI AQUEDUCT_KAFKA_BROKERS        
   if [ -n "${!v:-}" ]; then echo "refusing to run: $v is set; the integration job only uses its own throwaway containers" >&2; exit 1; fi
 done
 # A stray control byte (e.g. 0x01 where a sed back-reference `\1` belongs) renders as nothing in diffs.
-if grep -nP '[\x00-\x08\x0e-\x1f]' "$0" >&2; then echo "refusing to run: $0 contains control characters" >&2; exit 1; fi
+# Fail closed: only grep exit 1 (no match) passes; a match or a grep error stops the run.
+LC_ALL=C grep -naq $'[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]' "$0"; rc=$?
+[ $rc -eq 1 ] || { echo "refusing to run: $0 contains control characters (or the check failed, grep exit $rc)" >&2; exit 1; }
 git fetch -q origin main 2>/dev/null || echo "warning: could not fetch origin/main; gate checks use the local ref" >&2
 BASE=origin/main
 if git rev-parse --verify -q "$BASE" >/dev/null; then
