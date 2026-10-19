@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aqueduct-tls", "crates/aqueduct-core", "crates/aqueduct", "crates/aqueduct-source-postgres", "crates/aqueduct-sinks", "crates/aqueduct-source-kafka", "crates/aqueduct-source-mongodb"]
+members = ["crates/aqueduct-tls", "crates/aqueduct-core", "crates/aqueduct", "crates/aqueduct-source-postgres", "crates/aqueduct-sinks", "crates/aqueduct-source-kafka", "crates/aqueduct-source-mongodb", "crates/aqueduct-bench"]
 
 [workspace.package]
 version = "0.1.0"
