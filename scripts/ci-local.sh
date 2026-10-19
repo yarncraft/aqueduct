@@ -47,6 +47,8 @@ SHORT=${SHA:0:7}
 for v in DATABASE_URL PGHOST PGPASSWORD MONGO_URI AQUEDUCT_KAFKA_BROKERS          AQUEDUCT_TEST_KAFKA AQUEDUCT_TEST_PG_TLS AQUEDUCT_TEST_PG_PLAIN AQUEDUCT_TEST_PG_CA AQUEDUCT_TEST_PG_WRONG_CA; do
   if [ -n "${!v:-}" ]; then echo "refusing to run: $v is set; the integration job only uses its own throwaway containers" >&2; exit 1; fi
 done
+# A stray control byte (e.g. 0x01 where a sed back-reference `\1` belongs) renders as nothing in diffs.
+if grep -nP '[\x00-\x08\x0e-\x1f]' "$0" >&2; then echo "refusing to run: $0 contains control characters" >&2; exit 1; fi
 git fetch -q origin main 2>/dev/null || echo "warning: could not fetch origin/main; gate checks use the local ref" >&2
 BASE=origin/main
 if git rev-parse --verify -q "$BASE" >/dev/null; then
@@ -206,7 +208,7 @@ job_integration() {
 # The `--ignored` tests silently not running would make a green result meaningless.
 check_integration_ran() {
   local n
-  n=$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*//p' "$LOGS/integration.log" | awk '{t+=$1} END{print t+0}')
+  n=$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$LOGS/integration.log" | awk '{t+=$1} END{print t+0}')
   echo "integration tests passed: $n" >> "$LOGS/integration.log"
   [ "$n" -gt 0 ]
 }
