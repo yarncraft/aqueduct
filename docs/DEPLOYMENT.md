@@ -186,7 +186,7 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `brokers` | required | Bootstrap list, for example `["kafka-1:9093", "kafka-2:9093"]` |
 | `topic` | unset | Fallback topic for events no route matches. May use `{schema}` and `{table}` |
 | `partitions` | `1` | Partition count used when Aqueduct has to create a topic |
-| `replication_factor` | `3`, or `1` if the cluster has fewer than 3 brokers (logged as a warning) | Replicas used when Aqueduct has to create a topic. Existing topics are not changed. Set it explicitly in production |
+| `replication_factor` | `3`, or `1` if the cluster has fewer than 3 brokers (logged as a warning) | Replicas used when Aqueduct has to create a topic. Existing topics are not changed. Must be at least 1. An explicit value the broker rejects (more replicas than brokers) is a startup error; only the unset default falls back. Set it explicitly in production |
 | `partition_by` | `table` | `table`: record key `schema.table`, total order per table. `key`: record key `schema.table:<replica-identity columns>` (MongoDB: `documentKey`), a table spreads over partitions. See the ordering caveats below |
 | `tls` | `false` | Encrypt with TLS and verify the broker certificate and hostname (rustls). Set it for any non-local cluster |
 | `tls_ca_file` | unset | PEM CA bundle for brokers with a private CA |
