@@ -30,9 +30,12 @@ cargo test --workspace            # always run the whole workspace, not one crat
 docker compose up --build         # or: podman-compose up -d --build
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, tests and a docker build.
+**There is no CI**, local or remote. Before you post a SHA for review, run these yourself (in podman on the Windows machine) and paste the commands and their `test result` lines on the PR:
 
-**Local CI** (`scripts/ci-local.sh [--post] [--jobs rust,docker,audit,integration] [SHA]`) runs the same jobs as `ci.yml` in podman on an exact commit, exported with `git archive` so uncommitted changes are never tested. The integration job starts Kafka, MongoDB and both Postgres variants in one pod. `--post` publishes a `local-ci/<job>` commit status using the token from `git credential fill`; without it nothing leaves the machine. Keep the script in step with `ci.yml`. `git config core.hooksPath .githooks` enables an optional `pre-push` hook that runs the `rust` job (`LOCAL_CI_JOBS` for more, `SKIP_LOCAL_CI=1` to skip once).
+- Every PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`.
+- PRs that touch a source, the Kafka sink or the pipeline: the integration suite too, `cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored` and `cargo test --locked -p aqueduct-sinks --test kafka_it`, against local Kafka, MongoDB and Postgres containers (`AQUEDUCT_TEST_KAFKA`, `AQUEDUCT_KAFKA_BROKERS`, `AQUEDUCT_TEST_PG_*`). The passed count must be non-zero; a test that skips itself when its variable is unset does not count.
+- PRs that change `Cargo.lock`: `cargo audit`.
+- PRs that change the `Dockerfile` or the image: `podman build .`.
 
 On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\cargo`, Podman in `S:\podman\bin`.
 

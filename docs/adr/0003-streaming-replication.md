@@ -206,7 +206,7 @@ gain is less server-side spill. It is a possible follow-up.
 
 ### 8. Measuring before flipping the default
 
-`aqueduct-bench` gets a Postgres source mode with `--transport poll|stream` against the CI Postgres. The default
+`aqueduct-bench` gets a Postgres source mode with `--transport poll|stream` against a local Postgres. The default
 flips only when, on the same machine:
 
 - stream throughput is at least poll throughput;
@@ -240,7 +240,7 @@ not v1: it would duplicate the supervisor and hide failures from `/healthz`.
    certificate being refused under `verify-full`. Also: cleartext **and md5** refused over plaintext to
    non-loopback; no `-PLUS` downgrade under `verify-full`; a bad SCRAM server signature rejected; an over-cap
    length header rejected before allocation. A **fuzz target** over the backend message and `CopyBoth` frame
-   parser runs briefly in CI and shows errors, never a panic or an unbounded allocation.
+   parser runs briefly locally (command and output posted on the PR) and shows errors, never a panic or an unbounded allocation.
 2. **T2. Replication task:** `IDENTIFY_SYSTEM`, `START_REPLICATION`, `XLogData` and keepalive parsing, timer and
    on-request status updates, the byte-bounded channel, and the `watch` for flush. AC: unit tests over a scripted
    byte stream (keepalive with a reply request, a full channel still sends status updates, an oversize message, an over-cap frame). A **fuzz target** over `XLogData` and keepalive parsing.
