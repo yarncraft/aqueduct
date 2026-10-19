@@ -139,7 +139,7 @@ Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_h
 ### `[source]` (alternative sources)
 
 `[postgres]` is shorthand for `[source] type = "postgres"` with the same keys. Set exactly one of the two.
-`type` can also be `kafka` (below) or `mongodb` (see the README).
+`type` can also be `kafka` or `mongodb` (both below).
 
 #### Kafka source
 
@@ -155,6 +155,33 @@ checkpoint (no consumer group, nothing committed to the broker) and saved only a
 
 Do not point the source and sink at the same topics: the pipeline would feed itself. A checkpoint ahead of the
 log (topic recreated) stops startup; one behind retention logs a warning and restarts at the earliest offset.
+
+#### MongoDB source
+
+Reads a change stream, so MongoDB must run as a **replica set** (a single node started with `--replSet` and
+`rs.initiate()` is enough; standalone servers have no change streams). Atlas works as is.
+
+```toml
+[source]
+type = "mongodb"
+uri = "mongodb://aqueduct:SECRET@mongo.internal:27017/?replicaSet=rs0&tls=true"
+database = "app"
+collections = ["users", "orders"]   # empty = the whole database
+pre_images = true
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `uri` | required | `mongodb://` or `mongodb+srv://`. Credentials and `tls=true` go in the URI. |
+| `database` | required | Database to watch. It becomes `schema`; the collection becomes `table`. |
+| `collections` | all | Collections to include. |
+| `pre_images` | `true` | Ask for `fullDocumentBeforeChange`. It only has an effect on collections with pre-images enabled (`collMod` with `changeStreamPreAndPostImages: {enabled: true}`, MongoDB 6.0+); otherwise `before` stays empty for updates. |
+
+- The role needs the `find` and `changeStream` actions on the watched database (the built-in `read` role covers both).
+- The position is the change-stream resume token, saved in Aqueduct's checkpoint only after the sink has the event. A restart resumes just after the last checkpointed event. Nothing is stored on the server.
+- The resume token must still be in the oplog. If Aqueduct is down longer than the oplog window, the stream cannot resume and startup fails; size the oplog for your longest expected outage.
+- Updates use `updateLookup`, so `after` is the document as it is when read: it can be newer than the change, or only the `_id` if the document was deleted meanwhile. Deletes carry the pre-image when available, otherwise just the `_id`.
+- There is no initial snapshot, same as the other sources.
 
 ### `[sink]`
 
