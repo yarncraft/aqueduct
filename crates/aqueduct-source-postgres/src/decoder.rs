@@ -121,6 +121,11 @@ impl<'a> Reader<'a> {
         let n = self.i32()?;
         usize::try_from(n).map_err(|_| DecodeError::NegativeLength(n))
     }
+    /// Preallocation bound for a declared element count: every element takes at least one byte,
+    /// so a count above the bytes left is malformed and must not drive a huge allocation.
+    fn cap(&self, n: usize) -> usize {
+        n.min(self.0.len())
+    }
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.array()?))
     }
@@ -142,7 +147,7 @@ impl<'a> Reader<'a> {
     }
     fn tuple(&mut self) -> Result<Tuple, DecodeError> {
         let n = self.count16()?;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(self.cap(n));
         for _ in 0..n {
             out.push(match self.u8()? {
                 b'n' => Datum::Null,
@@ -190,7 +195,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             let name = r.cstr()?;
             let _replica_identity = r.u8()?;
             let n = r.count16()?;
-            let mut columns = Vec::with_capacity(n);
+            let mut columns = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 let flags = r.u8()?;
                 let name = r.cstr()?;
@@ -243,7 +248,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
         b'T' => {
             let n = r.count32()?;
             let _options = r.u8()?;
-            let mut relations = Vec::with_capacity(n);
+            let mut relations = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 relations.push(r.u32()?);
             }
@@ -444,6 +449,14 @@ mod tests {
         b.push(b'd');
         b.extend((-2i16).to_be_bytes());
         assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-2)));
+    }
+
+    #[test]
+    fn huge_truncate_relation_count_is_eof_not_an_allocation() {
+        let mut b = vec![b'T'];
+        b.extend(i32::MAX.to_be_bytes());
+        b.push(0);
+        assert_eq!(decode(&b), Err(DecodeError::Eof));
     }
 
     #[test]
