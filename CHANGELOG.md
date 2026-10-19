@@ -71,7 +71,12 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
-- **Cockpit replication-health tiles** (#54, UI half). Slot lag, last-heartbeat age and skipped heartbeats, read from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. Each tile shows `–` until the server reports the field, so this ships independently of the backend half.
+- **Cockpit replication-health tiles** (#54, UI half). Slot lag, last-heartbeat age and skipped heartbeats, read from
+  `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. A tile
+  shows `–` while the server does not report its field.
+- **Slot lag and heartbeat state in the metrics** (#54, backend). `/api/metrics` and `/api/stream` gain `slot_lag_bytes`,
+  `confirmed_flush_lsn` and a `heartbeat` object; `/metrics` gains `aqueduct_slot_lag_bytes`,
+  `aqueduct_heartbeat_skipped_total` and `aqueduct_heartbeat_last_timestamp_seconds`. See DEPLOYMENT.md, Idle heartbeat.
 - **Postgres idle heartbeat** (#47). Writes to tables outside the publication no longer pin WAL: every `heartbeat_interval_secs`
   (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is
   not yet checkpointed. Optional `heartbeat_action_query` for servers that need a write to move the slot. No action needed
