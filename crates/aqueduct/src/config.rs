@@ -169,10 +169,59 @@ fn default_checkpoint_path() -> String {
     "/var/lib/aqueduct/checkpoint".into()
 }
 
+/// Shortest admin token accepted. `openssl rand -hex 32` gives 64.
+const MIN_ADMIN_TOKEN_LEN: usize = 16;
+
+/// Placeholders that were published in this repo (the compose default until #19, docs samples).
+const KNOWN_WEAK_ADMIN_TOKENS: &[&str] = &["dev-token-change-me", "change-me"];
+
 impl Config {
+    /// Reject an admin token that is obviously not a secret. An empty value still means "unset".
+    /// A literal `${` is an unexpanded compose or shell placeholder, which would make the
+    /// published placeholder text the token.
+    pub fn check_admin_token(&self) -> Result<(), String> {
+        let Some(t) = self.admin_token.as_deref().filter(|t| !t.is_empty()) else {
+            return Ok(());
+        };
+        if t.trim().is_empty() {
+            return Err(
+                "admin_token is only whitespace; set a real secret (e.g. `openssl rand -hex 32`)"
+                    .into(),
+            );
+        }
+        if t != t.trim() {
+            return Err(
+                "admin_token has leading or trailing whitespace (a secrets file ending in a newline?); it could never match a Bearer header, so strip it"
+                    .into(),
+            );
+        }
+        if t.contains("${") {
+            return Err(
+                "admin_token contains `${`: an unexpanded variable placeholder, not a secret; check how AQUEDUCT_ADMIN_TOKEN is passed"
+                    .into(),
+            );
+        }
+        if KNOWN_WEAK_ADMIN_TOKENS
+            .iter()
+            .any(|w| t.eq_ignore_ascii_case(w))
+        {
+            return Err(
+                "admin_token is a well-known placeholder (it was a published default); set a random secret (e.g. `openssl rand -hex 32`)"
+                    .into(),
+            );
+        }
+        if t.chars().count() < MIN_ADMIN_TOKEN_LEN {
+            return Err(format!(
+                "admin_token is shorter than {MIN_ADMIN_TOKEN_LEN} characters; use a random secret (e.g. `openssl rand -hex 32`)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse to expose the admin API without a token on a non-loopback bind, unless
     /// `admin_insecure_no_auth = true`. Returns whether the opt-out is in effect (caller logs it).
     pub fn check_admin_exposure(&self) -> Result<bool, String> {
+        self.check_admin_token()?;
         let has_token = self.admin_token.as_deref().is_some_and(|t| !t.is_empty());
         if has_token || is_loopback_addr(&self.health_addr) {
             return Ok(false);
@@ -277,7 +326,7 @@ topic = \"t\"
     fn admin_exposure_token_or_explicit_opt_out() {
         let c = admin_cfg(
             "health_addr = \"0.0.0.0:8080\"
-admin_token = \"k\"",
+admin_token = \"0123456789abcdef\"",
         );
         assert_eq!(c.check_admin_exposure(), Ok(false));
         let c = admin_cfg(
@@ -285,6 +334,44 @@ admin_token = \"k\"",
 admin_insecure_no_auth = true",
         );
         assert_eq!(c.check_admin_exposure(), Ok(true));
+    }
+
+    #[test]
+    fn weak_admin_tokens_are_rejected_on_any_bind() {
+        for bind in ["127.0.0.1:8080", "0.0.0.0:8080"] {
+            for t in [
+                "k",
+                "change-me",
+                "0123456789abcde",  // 15 chars
+                "                ", // whitespace only, long enough
+                " ",
+                "dev-token-change-me",
+                "Dev-Token-Change-Me",
+                "0123456789abcdef
+", // secrets file with a trailing newline
+                " 0123456789abcdef",
+                "${AQUEDUCT_ADMIN_TOKEN:?set AQUEDUCT_ADMIN_TOKEN to a secret value}",
+                "prefix-${X}-0123456789",
+            ] {
+                let c = admin_cfg(&format!(
+                    "health_addr = \"{bind}\"
+admin_token = {t:?}"
+                ));
+                assert!(c.check_admin_exposure().is_err(), "{bind} {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn strong_admin_token_and_unset_token_pass_the_token_check() {
+        let c = admin_cfg("admin_token = \"0123456789abcdef\"");
+        assert_eq!(c.check_admin_token(), Ok(()));
+        // Empty stays "unset": loopback without a token is still fine.
+        let c = admin_cfg(
+            "health_addr = \"127.0.0.1:8080\"
+admin_token = \"\"",
+        );
+        assert_eq!(c.check_admin_exposure(), Ok(false));
     }
 
     #[test]

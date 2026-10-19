@@ -1,6 +1,6 @@
 health_addr = "0.0.0.0:8080"
 checkpoint_path = "/var/lib/aqueduct/checkpoint"
-# admin_token = "change-me"   # REQUIRED while health_addr is non-loopback (startup refuses otherwise)
+# admin_token = "<random, 16+ chars>"   # `openssl rand -hex 32`. REQUIRED while health_addr is non-loopback (startup refuses otherwise)
 # admin_insecure_no_auth = false  # explicit, loudly-logged opt-out of the above; do not use in production
 # inspector = true            # event inspector reads recent events back from Kafka; needs admin_token
 
