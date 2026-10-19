@@ -129,7 +129,6 @@ async fn drive(
         // Heartbeats only move the checkpoint: the last event's position is saved below,
         // but sinks and metrics never see them.
         // invariant: `first` was pushed above, so the batch is never empty here.
-        #[allow(clippy::indexing_slicing)]
         let last = batch[batch.len() - 1].position.clone();
         batch.retain(|e| e.op != Op::Heartbeat);
         if !batch.is_empty() {

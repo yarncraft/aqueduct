@@ -528,7 +528,21 @@ mod tests {
         begin.extend(100u64.to_be_bytes());
         begin.extend(0i64.to_be_bytes());
         begin.extend(7u32.to_be_bytes());
-        for full in [begin, relation_bytes()] {
+        let mut ins = vec![b'I'];
+        ins.extend(42u32.to_be_bytes());
+        ins.push(b'N');
+        ins.extend(tuple_bytes(&[Some("5"), None]));
+        let mut upd = vec![b'U'];
+        upd.extend(42u32.to_be_bytes());
+        upd.push(b'K');
+        upd.extend(tuple_bytes(&[Some("1"), None]));
+        upd.push(b'N');
+        upd.extend(tuple_bytes(&[Some("1"), Some("bob")]));
+        let mut del = vec![b'D'];
+        del.extend(42u32.to_be_bytes());
+        del.push(b'K');
+        del.extend(tuple_bytes(&[Some("1"), None]));
+        for full in [begin, relation_bytes(), ins, upd, del] {
             for cut in 0..full.len() {
                 assert!(decode(&full[..cut]).is_err(), "cut at {cut}");
             }
