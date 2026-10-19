@@ -122,19 +122,20 @@ async fn skipped_ddl_still_produces_a_heartbeat() {
     let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
     src.start(None).await.unwrap();
 
-    // Recreate the collection each round so every drop writes an oplog entry. `create` events
-    // need `showExpandedEvents`, which the source does not set, so only unmapped `drop` events
-    // arrive, and getMores keep returning data for longer than the 1s heartbeat interval.
+    // Drop, then recreate, each round: `watched` exists at start, so the first drop is real and
+    // so is every later one. `create` events need `showExpandedEvents`, which the source does
+    // not set, so only unmapped `drop` events arrive, and getMores keep returning data for
+    // longer than the 1s heartbeat interval.
     let churn_db = db.clone();
     let churn = tokio::spawn(async move {
         let end = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < end {
-            churn_db.create_collection("watched").await.unwrap();
             churn_db
                 .collection::<Document>("watched")
                 .drop()
                 .await
                 .unwrap();
+            churn_db.create_collection("watched").await.unwrap();
         }
     });
     // Smoke test only: it cannot show which branch emitted the heartbeat. The unit test
@@ -143,6 +144,7 @@ async fn skipped_ddl_still_produces_a_heartbeat() {
     assert_eq!(hb.op, Op::Heartbeat);
     assert!(matches!(hb.position, aqueduct_core::Position::Text(_)));
 
-    churn.abort();
+    // Bounded by the 5s loop; a panic in the churn task fails the test.
+    churn.await.unwrap();
     db.drop().await.unwrap();
 }
