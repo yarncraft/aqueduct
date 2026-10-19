@@ -511,7 +511,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
