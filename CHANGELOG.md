@@ -59,6 +59,10 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Route plan inside the Kafka sink** (#79). Routing now compiles once into a `RoutePlan` with a pure `render` step; output
+  (topic, key, value, headers) is byte-identical to before, which a golden test pins. `[[sink.routes]]` accepts an optional
+  unique `name` that labels the route in the per-route counters (`matched`, `produced`; exposed in a later change).
+  `aqueduct-bench --sink render` measures the render cost without a broker.
 - **Postgres idle heartbeat** (#47). Writes to tables outside the publication no longer pin WAL: every `heartbeat_interval_secs`
   (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is
   not yet checkpointed. Optional `heartbeat_action_query` for servers that need a write to move the slot. No action needed

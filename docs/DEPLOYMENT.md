@@ -192,7 +192,7 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match` |
 
 Records: key `schema.table` (or `schema.table:<replica-identity columns>` with `partition_by = "key"`), value the JSON event, headers `op` and `lsn`, timestamp = commit time. The partition is a
 stable FNV-1a hash of the key. With the default `table`, all of a table's changes stay ordered. With `key`, a row's changes

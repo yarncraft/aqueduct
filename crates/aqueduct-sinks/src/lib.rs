@@ -4,12 +4,11 @@
 
 mod inspect;
 mod kafka;
+pub mod route;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
-pub use kafka::{
-    glob_match, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism,
-    TopicRouter,
-};
+pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
+pub use route::{KafkaRoute, OutRecord, RouteCount, RoutePlan, RouteStats};
 
 use aqueduct_core::{ChangeEvent, Error, Result};
 

@@ -2,7 +2,7 @@
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
-use aqueduct_sinks::{KafkaSecurity, KafkaSink, TopicRouter};
+use aqueduct_sinks::{KafkaSecurity, KafkaSink, RoutePlan};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use serde_json::value::to_raw_value;
@@ -30,7 +30,7 @@ async fn produces_all_events_in_per_table_order() {
     let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
     let topic = format!("aqueduct-it-{}", std::process::id());
 
-    let router = TopicRouter::new(vec![], Some(topic.clone())).unwrap();
+    let router = RoutePlan::new(vec![], Some(topic.clone())).unwrap();
     let mut sink = KafkaSink::connect(brokers.clone(), router, 3, &KafkaSecurity::default())
         .await
         .unwrap();

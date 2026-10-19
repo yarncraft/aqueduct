@@ -7,6 +7,8 @@ use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandl
 use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
 use rskafka::record::Record;
 
+use crate::route::{OutRecord, RoutePlan};
+
 /// SASL mechanism for broker authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslMechanism {
@@ -109,62 +111,6 @@ impl std::str::FromStr for PartitionBy {
     }
 }
 
-/// Sends events whose `schema.table` matches `pattern` to `topic`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KafkaRoute {
-    /// `schema.table` with `*` wildcards, e.g. `public.*`, `*.audit_log`, `*`.
-    pub pattern: String,
-    /// Destination topic; `{schema}` and `{table}` are substituted.
-    pub topic: String,
-}
-
-/// Picks the topic for a table: first matching route wins, else `default`.
-#[derive(Debug, Clone)]
-pub struct TopicRouter {
-    routes: Vec<KafkaRoute>,
-    default: Option<String>,
-}
-
-impl TopicRouter {
-    pub fn new(routes: Vec<KafkaRoute>, default: Option<String>) -> Result<Self> {
-        if routes.is_empty() && default.is_none() {
-            return Err(Error::Config(
-                "kafka sink needs `topic` and/or at least one route".into(),
-            ));
-        }
-        Ok(Self { routes, default })
-    }
-
-    pub fn topic_for(&self, schema: &str, table: &str) -> Option<String> {
-        let name = format!("{schema}.{table}");
-        let template = self
-            .routes
-            .iter()
-            .find(|r| glob_match(&r.pattern, &name))
-            .map(|r| r.topic.as_str())
-            .or(self.default.as_deref())?;
-        Some(
-            template
-                .replace("{schema}", schema)
-                .replace("{table}", table),
-        )
-    }
-}
-
-impl TopicRouter {
-    /// Globs matching every topic this router can produce to: each route and the
-    /// default topic, with `{schema}`/`{table}` placeholders turned into `*`.
-    pub fn topic_globs(&self) -> Vec<String> {
-        let wild = |t: &str| t.replace("{schema}", "*").replace("{table}", "*");
-        self.routes
-            .iter()
-            .map(|r| r.topic.as_str())
-            .chain(self.default.as_deref())
-            .map(wild)
-            .collect()
-    }
-}
-
 /// `*` matches any run of characters (including none and dots); everything else is literal.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
@@ -186,16 +132,15 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Produces each event as a JSON record to a Kafka topic chosen by a
-/// [`TopicRouter`]. The record key is `schema.table`; the partition is chosen
+/// [`RoutePlan`]. The record key is `schema.table`; the partition is chosen
 /// by hashing the key, so changes to one table keep their order. Topics are
 /// opened (and created if missing) on first use. `send` returns once the
 /// broker has acknowledged the record, so the pipeline only checkpoints
 /// durably produced events.
 pub struct KafkaSink {
     client: Client,
-    router: TopicRouter,
+    plan: RoutePlan,
     new_topic_partitions: i32,
-    partition_by: PartitionBy,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
 }
 
@@ -208,7 +153,7 @@ impl KafkaSink {
     /// `new_topic_partitions` partitions.
     pub async fn connect(
         brokers: Vec<String>,
-        router: TopicRouter,
+        plan: RoutePlan,
         new_topic_partitions: i32,
         security: &KafkaSecurity,
     ) -> Result<Self> {
@@ -219,14 +164,18 @@ impl KafkaSink {
             .map_err(|e| err("connect", &e))?;
         let mut sink = Self {
             client,
-            router,
+            plan,
             new_topic_partitions: new_topic_partitions.max(1),
-            partition_by: PartitionBy::default(),
             topics: HashMap::new(),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
         // default like `cdc.{table}` only resolves per event, so it opens on first use).
-        if let Some(t) = sink.router.default.clone().filter(|t| !t.contains('{')) {
+        if let Some(t) = sink
+            .plan
+            .default_topic()
+            .map(str::to_string)
+            .filter(|t| !t.contains('{'))
+        {
             sink.open_topic(&t).await?;
         }
         Ok(sink)
@@ -234,7 +183,7 @@ impl KafkaSink {
 
     /// Choose how records are keyed and partitioned (default: by table).
     pub fn with_partition_by(mut self, by: PartitionBy) -> Self {
-        self.partition_by = by;
+        self.plan.set_partition_by(by);
         self
     }
 
@@ -304,31 +253,25 @@ fn partition_index(key: &str, n: usize) -> usize {
 }
 
 /// Record key: `schema.table`, plus `:` and the primary-key values when partitioning by key.
-fn record_key(event: &ChangeEvent, by: PartitionBy) -> String {
+pub(crate) fn record_key(event: &ChangeEvent, by: PartitionBy) -> String {
     match (by, &event.key) {
         (PartitionBy::Key, Some(k)) => format!("{}.{}:{k}", event.schema, event.table),
         _ => format!("{}.{}", event.schema, event.table),
     }
 }
 
-fn record(event: &ChangeEvent, key: String) -> Result<Record> {
+fn record(out: OutRecord) -> Record {
     let mut headers = BTreeMap::new();
-    headers.insert(
-        "op".to_string(),
-        format!("{:?}", event.op).to_lowercase().into_bytes(),
-    );
-    headers.insert(
-        "lsn".to_string(),
-        event.position.to_checkpoint().into_bytes(),
-    );
-    let timestamp = chrono::DateTime::from_timestamp_micros(event.commit_ts_micros)
+    headers.insert("op".to_string(), out.op.into_bytes());
+    headers.insert("lsn".to_string(), out.lsn.into_bytes());
+    let timestamp = chrono::DateTime::from_timestamp_micros(out.commit_ts_micros)
         .unwrap_or_else(chrono::Utc::now);
-    Ok(Record {
-        key: Some(key.into_bytes()),
-        value: Some(crate::encode(event)?.into_bytes()),
+    Record {
+        key: Some(out.key.into_bytes()),
+        value: Some(out.value.into_bytes()),
         headers,
         timestamp,
-    })
+    }
 }
 
 /// The events that become Kafka records: heartbeats carry no row and produce nothing.
@@ -347,23 +290,18 @@ impl Sink for KafkaSink {
     /// broker has acknowledged all of them.
     async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
         let mut groups: HashMap<(String, usize), Vec<Record>> = HashMap::new();
+        let mut rendered = Vec::new();
         for event in deliverable(events) {
-            let topic = self
-                .router
-                .topic_for(&event.schema, &event.table)
-                .ok_or_else(|| {
-                    Error::Sink(format!(
-                        "no kafka route or default topic for {}.{}",
-                        event.schema, event.table
-                    ))
-                })?;
-            self.open_topic(&topic).await?;
-            let key = record_key(event, self.partition_by);
-            let part = partition_index(&key, self.topics[&topic].len());
-            groups
-                .entry((topic, part))
-                .or_default()
-                .push(record(event, key)?);
+            rendered.clear();
+            self.plan.render_into(event, &mut rendered)?;
+            for out in rendered.drain(..) {
+                self.open_topic(&out.topic).await?;
+                let part = partition_index(&out.key, self.topics[&out.topic].len());
+                groups
+                    .entry((out.topic.clone(), part))
+                    .or_default()
+                    .push(record(out));
+            }
         }
         let sends = groups.into_iter().map(|((topic, part), records)| {
             let client = self.topics[&topic][part].clone();
@@ -383,13 +321,6 @@ impl Sink for KafkaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn route(p: &str, t: &str) -> KafkaRoute {
-        KafkaRoute {
-            pattern: p.into(),
-            topic: t.into(),
-        }
-    }
 
     #[test]
     fn sasl_debug_redacts_password() {
@@ -454,7 +385,8 @@ mod tests {
     #[test]
     fn record_has_key_headers_and_json_value() {
         let e = crate::sample();
-        let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
+        let plan = RoutePlan::new(vec![], Some("t".into())).unwrap();
+        let r = record(plan.render(&e).unwrap().remove(0));
         assert_eq!(r.key.as_deref(), Some(&b"public.users"[..]));
         assert_eq!(r.headers["op"], b"insert");
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
@@ -486,39 +418,5 @@ mod tests {
         assert!(glob_match("a*b*c", "aXXbYYc"));
         assert!(!glob_match("a*b*c", "aXXcYYb"));
         assert!(!glob_match("ab*ba", "aba"));
-    }
-
-    #[test]
-    fn first_match_wins_then_default_with_placeholders() {
-        let r = TopicRouter::new(
-            vec![
-                route("public.orders", "orders-events"),
-                route("public.*", "pub.{table}"),
-                route("*.audit_*", "audit"),
-            ],
-            Some("cdc.{schema}.{table}".into()),
-        )
-        .unwrap();
-        assert_eq!(r.topic_for("public", "orders").unwrap(), "orders-events");
-        assert_eq!(r.topic_for("public", "users").unwrap(), "pub.users");
-        assert_eq!(r.topic_for("hr", "audit_log").unwrap(), "audit");
-        assert_eq!(r.topic_for("hr", "staff").unwrap(), "cdc.hr.staff");
-    }
-
-    #[test]
-    fn topic_globs_cover_routes_and_default() {
-        let r = TopicRouter::new(
-            vec![route("public.orders", "orders-events")],
-            Some("cdc.{schema}.{table}".into()),
-        )
-        .unwrap();
-        assert_eq!(r.topic_globs(), vec!["orders-events", "cdc.*.*"]);
-    }
-
-    #[test]
-    fn unrouted_event_without_default_has_no_topic() {
-        let r = TopicRouter::new(vec![route("public.*", "p")], None).unwrap();
-        assert_eq!(r.topic_for("sales", "x"), None);
-        assert!(TopicRouter::new(vec![], None).is_err());
     }
 }

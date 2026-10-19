@@ -151,6 +151,9 @@ pub struct KafkaConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KafkaRouteConfig {
+    /// Label for this route in per-route stats; defaults to `match`. Unique.
+    #[serde(default)]
+    pub name: Option<String>,
     /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
     #[serde(rename = "match")]
     pub pattern: String,

@@ -5,8 +5,11 @@
 //! MB/s = bytes of encoded JSON per event * events / time.
 //!
 //!   cargo run --release -p aqueduct-bench -- [--events N] [--payload BYTES]
-//!       [--sink null|kafka] [--profile simple|industrial] [--dir PATH]
+//!       [--sink null|render|kafka] [--profile simple|industrial] [--dir PATH]
 //!       [--brokers HOST:PORT] [--partitions N]
+//!
+//! `--sink render` runs the route plan (topic, key, JSON value, headers) on every event without a
+//! broker: the cost of everything the Kafka sink does before the network.
 //!
 //! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), then sends,
 //! flushes, checkpoints and acks once per batch, so the source hands out its events through
@@ -21,10 +24,31 @@ use aqueduct_core::{
     run_pipeline_with_metrics, ChangeEvent, CheckpointStore, Error, Metrics, Op, Position, Result,
     Sink, Source,
 };
-use aqueduct_sinks::{KafkaSecurity, KafkaSink, TopicRouter};
+use aqueduct_sinks::{KafkaSecurity, KafkaSink, OutRecord, RoutePlan};
 use async_trait::async_trait;
 use serde_json::value::to_raw_value;
 use tokio::sync::watch;
+
+/// Renders every event through the route plan and drops the records.
+struct RenderSink {
+    plan: RoutePlan,
+    out: Vec<OutRecord>,
+    bytes: u64,
+}
+
+#[async_trait]
+impl Sink for RenderSink {
+    async fn send(&mut self, event: &ChangeEvent) -> Result<()> {
+        self.out.clear();
+        self.plan.render_into(event, &mut self.out)?;
+        self.bytes += self
+            .out
+            .iter()
+            .map(|r| r.value.len() as u64 + 1)
+            .sum::<u64>();
+        Ok(())
+    }
+}
 
 struct SynthSource {
     next: u64,
@@ -184,13 +208,25 @@ async fn main() {
             let brokers = arg("--brokers").unwrap_or_else(|| "localhost:9092".into());
             let parts: i32 = arg("--partitions").map_or(3, |v| v.parse().unwrap());
             let topic = format!("aqueduct-bench-{}", std::process::id());
-            let router = TopicRouter::new(vec![], Some(topic)).unwrap();
+            let router = RoutePlan::new(vec![], Some(topic)).unwrap();
             let inner = KafkaSink::connect(vec![brokers], router, parts, &KafkaSecurity::default())
                 .await
                 .unwrap();
             let mut sink = Counting {
                 sizes,
                 inner: Some(inner),
+                bytes: 0,
+            };
+            run_pipeline_with_metrics(&mut src, &mut sink, &mut store, rx, &metrics)
+                .await
+                .unwrap();
+            sink.bytes
+        }
+        "render" => {
+            let topic = format!("aqueduct-bench-{}", std::process::id());
+            let mut sink = RenderSink {
+                plan: RoutePlan::new(vec![], Some(topic)).unwrap(),
+                out: Vec::new(),
                 bytes: 0,
             };
             run_pipeline_with_metrics(&mut src, &mut sink, &mut store, rx, &metrics)
