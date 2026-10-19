@@ -62,6 +62,12 @@ impl Fixture {
         self.source_with(heartbeat, None)
     }
 
+    fn source_capped(&self, batch_size: i32) -> PostgresSource {
+        let mut cfg = self.config(Duration::from_secs(1), None);
+        cfg.batch_size = batch_size;
+        PostgresSource::new(cfg)
+    }
+
     fn source_off(&self) -> PostgresSource {
         let mut cfg = self.config(Duration::from_secs(1), None);
         cfg.heartbeat_interval = None;
@@ -123,6 +129,19 @@ impl Fixture {
             .query_one(
                 "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
                 &[&self.slot],
+            )
+            .await
+            .unwrap();
+        parse_lsn(&row.get::<_, String>(0)).unwrap()
+    }
+
+    /// LSN of the last row the slot would decode right now, without consuming anything.
+    async fn last_decoded_lsn(&self) -> u64 {
+        let row = self
+            .db
+            .query_one(
+                "SELECT max(lsn)::text FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, NULL, 'proto_version', '1', 'publication_names', $2::text)",
+                &[&self.slot, &self.publication],
             )
             .await
             .unwrap();
@@ -360,5 +379,69 @@ async fn slot_stays_behind_without_a_heartbeat() {
         "the slot moved without a heartbeat"
     );
     assert!(f.wal().await > baseline);
+    f.cleanup(s).await;
+}
+
+/// A capped peek ends at a commit boundary that can lie well below the WAL position the
+/// heartbeat captured. After a crash between `store.save` and `ack` the checkpoint is ahead of
+/// the slot, so every peek of the replay window returns only already-delivered rows. The
+/// heartbeat must walk the slot through that window one capped peek at a time (step 1) and must
+/// not jump to the captured WAL position (step 2) while the peek is capped: that would skip the
+/// published row committed behind the window.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn capped_replay_window_does_not_skip_later_rows() {
+    let f = Fixture::new("capped").await;
+    // Creates the slot; the events below are never delivered by this source.
+    let mut first = f.source_capped(4);
+    first.start(None).await.unwrap();
+    drop(first);
+
+    for i in 0..9 {
+        f.insert_published(&format!("old{i}")).await;
+    }
+    let before_last = f.wal().await;
+    f.insert_published("old9").await;
+    // Everything up to here counts as delivered and checkpointed. A checkpoint is the position of
+    // a delivered change, so use the last row decoded so far (the commit) and not the WAL end,
+    // which is where the next transaction's first record starts.
+    let checkpoint = f.last_decoded_lsn().await;
+    f.insert_published("after-window").await;
+
+    // Restart with the checkpoint ahead of the slot, nothing acked. With 3 rows per
+    // transaction and `batch_size = 4`, one peek covers about two transactions.
+    let mut s = f.source_capped(4);
+    s.start(Some(Position::Lsn(checkpoint))).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ev = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the row behind the replay window never arrived"
+        );
+        if let Some(ev) = drive(&mut s, Duration::from_millis(500)).await {
+            break ev;
+        }
+    };
+    assert!(
+        lsn(&ev) > checkpoint,
+        "an event at or below the checkpoint was redelivered: {ev:?}"
+    );
+    assert!(ev.after.as_ref().unwrap().get().contains("after-window"));
+
+    // The slot kept moving through the replay window although nothing was acked, but not past
+    // the unacked event.
+    assert!(
+        f.confirmed().await > before_last,
+        "the slot did not move through the replay window"
+    );
+    f.drive_until_confirmed(&mut s, checkpoint + 1).await;
+    assert!(f.confirmed().await <= lsn(&ev));
+
+    // After the ack the slot moves past the delivered row and catches up to the end of the WAL.
+    s.ack(ev.position.clone()).await.unwrap();
+    f.drive_until_confirmed(&mut s, lsn(&ev) + 1).await;
+    let target = f.wal().await;
+    f.drive_until_confirmed(&mut s, target).await;
     f.cleanup(s).await;
 }

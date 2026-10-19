@@ -227,7 +227,7 @@ impl PostgresSource {
         let row = self
             .client()?
             .query_one(
-                "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()                  ELSE pg_current_wal_flush_lsn() END)::text",
+                "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_flush_lsn() END)::text",
                 &[],
             )
             .await
@@ -238,10 +238,10 @@ impl PostgresSource {
 
     /// Finishes a heartbeat after the peek was processed. Advances the slot only when nothing
     /// is queued or awaiting a checkpoint; see [`heartbeat_targets`].
-    async fn heartbeat_end(&mut self, wal: u64) -> Result<()> {
+    async fn heartbeat_end(&mut self, wal: u64, drained: bool) -> Result<()> {
         let targets = heartbeat_targets(
             &mut self.tx_ends,
-            self.buffer.is_empty(),
+            drained && self.buffer.is_empty(),
             self.checkpointed,
             wal,
         );
@@ -263,6 +263,11 @@ impl PostgresSource {
             )
             .await
             .map_err(src_err)?;
+        // `upto_nchanges` ends a capped peek at the first commit past the limit, possibly well
+        // below `heartbeat_wal`. Only a peek that returned fewer rows than the cap saw everything.
+        // A peek that reached the end can still return `batch_size` rows or more (it stops at a
+        // commit boundary); that only delays the jump to `wal` by one interval, never skips data.
+        let drained = i64::try_from(rows.len()).is_ok_and(|n| n < i64::from(self.cfg.batch_size));
 
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
@@ -351,7 +356,7 @@ impl PostgresSource {
             }
         }
         if let Some(wal) = heartbeat_wal {
-            self.heartbeat_end(wal).await?;
+            self.heartbeat_end(wal, drained).await?;
         }
         Ok(())
     }
@@ -541,14 +546,16 @@ fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
 ///    that covers empty transactions (Postgres < 15 sends them for unpublished tables) and
 ///    replays of transactions already delivered before a restart. The slot may move to the
 ///    last such commit end.
-/// 2. Only if nothing is queued and no transaction is still waiting for its checkpoint may the
-///    slot move to `wal`. The caller captured `wal` before the peek, so every transaction
-///    committed at or below it was part of that peek and is already acknowledged.
+/// 2. Only if the peek was drained (returned fewer rows than `batch_size`), nothing is queued and
+///    no transaction is still waiting for its checkpoint may the slot move to `wal`. The caller
+///    captured `wal` before the peek, so a drained peek contained every transaction committed at
+///    or below it, all already acknowledged. A capped peek can end below `wal`, so it only gets
+///    step 1.
 ///
 /// An unacknowledged event therefore always holds the slot back (at-least-once).
 fn heartbeat_targets(
     tx_ends: &mut VecDeque<(u64, u64)>,
-    buffer_empty: bool,
+    idle: bool,
     checkpointed: u64,
     wal: u64,
 ) -> Vec<u64> {
@@ -556,7 +563,7 @@ fn heartbeat_targets(
     if let Some(t) = ack_target(tx_ends, checkpointed) {
         targets.push(t);
     }
-    if buffer_empty && tx_ends.is_empty() {
+    if idle && tx_ends.is_empty() {
         targets.push(wal);
     }
     targets
@@ -570,6 +577,16 @@ mod heartbeat_tests {
     fn idle_advances_to_wal() {
         let mut q = VecDeque::new();
         assert_eq!(heartbeat_targets(&mut q, true, 0, 500), vec![500]);
+    }
+
+    #[test]
+    fn capped_peek_only_gets_the_checkpointed_target() {
+        // Not idle (capped peek): the slot may reach the last checkpointed commit end, never `wal`.
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(heartbeat_targets(&mut q, false, 100, 500), vec![120]);
+        assert_eq!(q.len(), 1);
+        let mut q = VecDeque::from([(0, 120), (0, 140)]);
+        assert_eq!(heartbeat_targets(&mut q, false, 0, 500), vec![140]);
     }
 
     #[test]
