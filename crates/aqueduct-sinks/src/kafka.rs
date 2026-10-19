@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
+use rskafka::client::error::{Error as ClientError, ProtocolError};
 use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder, Credentials, SaslConfig};
 use rskafka::record::Record;
@@ -185,6 +186,35 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     true
 }
 
+/// Replicas for auto-created topics when `replication_factor` is not configured.
+pub const DEFAULT_REPLICATION_FACTOR: i16 = 3;
+
+/// What to do after the first attempt to create a missing topic.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterCreate {
+    Done,
+    FallBack,
+    Reject,
+}
+
+/// `configured` is the operator's `replication_factor`; `error` is the broker's protocol error,
+/// if any. Other failures (including `TopicAlreadyExists` races) are left to the re-list, which is
+/// authoritative. Only an unset factor falls back; an explicit one the broker rejects is an error.
+fn after_create(configured: Option<i16>, error: Option<&ProtocolError>) -> AfterCreate {
+    match (error, configured) {
+        (Some(ProtocolError::InvalidReplicationFactor), None) => AfterCreate::FallBack,
+        (Some(ProtocolError::InvalidReplicationFactor), Some(_)) => AfterCreate::Reject,
+        _ => AfterCreate::Done,
+    }
+}
+
+fn protocol_error(outcome: &std::result::Result<(), ClientError>) -> Option<&ProtocolError> {
+    match outcome {
+        Err(ClientError::ServerError { protocol_error, .. }) => Some(protocol_error),
+        _ => None,
+    }
+}
+
 /// Produces each event as a JSON record to a Kafka topic chosen by a
 /// [`TopicRouter`]. The record key is `schema.table`; the partition is chosen
 /// by hashing the key, so changes to one table keep their order. Topics are
@@ -195,6 +225,7 @@ pub struct KafkaSink {
     client: Client,
     router: TopicRouter,
     new_topic_partitions: i32,
+    replication_factor: Option<i16>,
     partition_by: PartitionBy,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
 }
@@ -205,11 +236,13 @@ fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
 
 impl KafkaSink {
     /// Connect to the brokers. Topics missing at first use are created with
-    /// `new_topic_partitions` partitions.
+    /// `new_topic_partitions` partitions and `replication_factor` replicas (`None`: try
+    /// [`DEFAULT_REPLICATION_FACTOR`], and use 1 with a warning if the cluster is too small).
     pub async fn connect(
         brokers: Vec<String>,
         router: TopicRouter,
         new_topic_partitions: i32,
+        replication_factor: Option<i16>,
         security: &KafkaSecurity,
     ) -> Result<Self> {
         let client = security
@@ -221,6 +254,7 @@ impl KafkaSink {
             client,
             router,
             new_topic_partitions: new_topic_partitions.max(1),
+            replication_factor,
             partition_by: PartitionBy::default(),
             topics: HashMap::new(),
         };
@@ -258,9 +292,26 @@ impl KafkaSink {
             .controller_client()
             .map_err(|e| err("controller", &e))?;
         // Ignore "already exists" races; the re-list below is authoritative.
-        let _ = ctrl
-            .create_topic(topic, self.new_topic_partitions, 1, 5_000)
-            .await;
+        let create = |rf: i16| ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000);
+        let first = self
+            .replication_factor
+            .unwrap_or(DEFAULT_REPLICATION_FACTOR);
+        let outcome = create(first).await;
+        match after_create(self.replication_factor, protocol_error(&outcome)) {
+            AfterCreate::Done => {}
+            AfterCreate::FallBack => {
+                tracing::warn!(
+                    topic,
+                    "cluster has fewer than {DEFAULT_REPLICATION_FACTOR} brokers; creating topic with replication factor 1, set `replication_factor` to choose"
+                );
+                let _ = create(1).await;
+            }
+            AfterCreate::Reject => {
+                return Err(Error::Sink(format!(
+                    "kafka broker rejected replication_factor = {first} for topic {topic} (fewer than {first} brokers?)"
+                )));
+            }
+        }
         let listed = self
             .client
             .list_topics()
@@ -383,6 +434,18 @@ impl Sink for KafkaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_factor_fallback_only_when_unset() {
+        let bad = ProtocolError::InvalidReplicationFactor;
+        let exists = ProtocolError::TopicAlreadyExists;
+        assert_eq!(after_create(None, Some(&bad)), AfterCreate::FallBack);
+        assert_eq!(after_create(Some(3), Some(&bad)), AfterCreate::Reject);
+        for cfg in [None, Some(1), Some(3)] {
+            assert_eq!(after_create(cfg, None), AfterCreate::Done);
+            assert_eq!(after_create(cfg, Some(&exists)), AfterCreate::Done);
+        }
+    }
 
     fn route(p: &str, t: &str) -> KafkaRoute {
         KafkaRoute {

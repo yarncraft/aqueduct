@@ -31,7 +31,7 @@ async fn produces_all_events_in_per_table_order() {
     let topic = format!("aqueduct-it-{}", std::process::id());
 
     let router = TopicRouter::new(vec![], Some(topic.clone())).unwrap();
-    let mut sink = KafkaSink::connect(brokers.clone(), router, 3, &KafkaSecurity::default())
+    let mut sink = KafkaSink::connect(brokers.clone(), router, 3, None, &KafkaSecurity::default())
         .await
         .unwrap();
     let tables = ["users", "orders", "items"];
