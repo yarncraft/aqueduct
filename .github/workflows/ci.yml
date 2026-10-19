@@ -82,13 +82,12 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=aq-test-ca -keyout ca.key -out ca.pem
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=aq-other-ca -keyout other.key -out other.pem
           openssl req -newkey rsa:2048 -nodes -subj /CN=localhost -keyout server.key -out server.csr
-          printf 'subjectAltName=DNS:localhost
-' > san.ext
+          printf 'subjectAltName=DNS:localhost\n' > san.ext
           openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt
           # postgres refuses a key it does not own, and the image runs as uid 999.
           sudo chown 999:999 server.key server.crt; sudo chmod 600 server.key
           common="-e POSTGRES_PASSWORD=aq postgres:16 -c wal_level=logical -c max_replication_slots=20"
-          docker run -d --name pg-tls -p 5433:5432 -v "$d":/certs:ro $common             -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+          docker run -d --name pg-tls -p 5433:5432 -v "$d":/certs:ro $common -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
           docker run -d --name pg-plain -p 5434:5432 $common
           for c in pg-tls pg-plain; do
             ok=0
