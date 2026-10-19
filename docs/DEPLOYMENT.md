@@ -241,7 +241,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match` |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:

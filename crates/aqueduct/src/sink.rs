@@ -1,21 +1,22 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
-    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SourceInfo,
-    TopicRouter,
+    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, RoutePlan,
+    SourceInfo,
 };
 
 use crate::config::KafkaConfig;
 
-fn router(cfg: &KafkaConfig) -> Result<TopicRouter> {
+fn plan(cfg: &KafkaConfig) -> Result<RoutePlan> {
     let routes = cfg
         .routes
         .iter()
         .map(|r| KafkaRoute {
+            name: r.name.clone(),
             pattern: r.pattern.clone(),
             topic: r.topic.clone(),
         })
         .collect();
-    TopicRouter::new(routes, cfg.topic.clone())
+    RoutePlan::new(routes, cfg.topic.clone())
 }
 
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
@@ -42,9 +43,9 @@ fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
 /// Build the Kafka sink and the inspector that reads the same topics back
 /// (with the same TLS/SASL settings).
 pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, KafkaInspector)> {
-    let router = router(cfg)?;
+    let plan = plan(cfg)?;
     let security = security(cfg)?;
-    let inspector = KafkaInspector::new(cfg.brokers.clone(), &router, security.clone());
+    let inspector = KafkaInspector::new(cfg.brokers.clone(), &plan, security.clone());
     let by: PartitionBy = match &cfg.partition_by {
         Some(s) => s.parse().map_err(Error::Config)?,
         None => PartitionBy::default(),
@@ -52,7 +53,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     cfg.check_replication_factor().map_err(Error::Config)?;
     let sink = KafkaSink::connect(
         cfg.brokers.clone(),
-        router,
+        plan,
         cfg.partitions,
         cfg.replication_factor,
         &security,
