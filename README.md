@@ -10,6 +10,93 @@ Mongo resume token) is checkpointed and acknowledged only after the sink succeed
 - **Admin cockpit**: live throughput, lag, latency, per-table stats and an event inspector
 - Distroless, non-root image; state in one volume
 
+## Architecture
+
+One process runs one pipeline: a **source**, the **Kafka sink**, a **checkpoint file** and the **admin server**,
+all inside one container.
+
+```mermaid
+flowchart LR
+    subgraph db["Source database"]
+        PG[("Postgres<br/>logical slot + publication")]
+        MG[("MongoDB<br/>change stream")]
+    end
+
+    subgraph aq["Aqueduct container (distroless, uid 65532)"]
+        SRC["Source<br/>pgoutput decoder / change-stream mapper"]
+        PIPE["run_pipeline<br/>batches of up to 1000 events"]
+        SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:identity with partition_by = key"]
+        CK[("checkpoint file<br/>/var/lib/aqueduct")]
+        MET["Metrics"]
+        ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz"]
+        INS["Event inspector"]
+    end
+
+    K[("Kafka topics")]
+    U(["Browser / Prometheus / probes"])
+
+    PG -- "peek changes" --> SRC
+    MG -- "watch" --> SRC
+    SRC --> PIPE --> SINK --> K
+    PIPE -- "save position" --> CK
+    PIPE -. "ack(position)" .-> SRC
+    SRC -. "slot advance (Postgres)" .-> PG
+    PIPE --> MET --> ADM
+    K -- "read back recent events" --> INS --> ADM
+    U -- "Bearer for /api/* and /metrics<br/>/, /healthz, /readyz are open" --> ADM
+```
+
+### Delivery: at-least-once
+
+The checkpoint is written and the source acknowledged only after Kafka has acknowledged the whole batch. A crash
+before that point replays the batch, so consumers must tolerate duplicates.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Source
+    participant P as run_pipeline
+    participant K as Kafka sink
+    participant C as Checkpoint file
+    Note over P,C: startup: load checkpoint, source.start(position)
+    loop until shutdown
+        P->>S: next() + try_next() (up to 1000 events)
+        S-->>P: batch of ChangeEvents
+        P->>K: send_batch(batch) + flush() (60 s timeout)
+        K-->>P: broker ack
+        P->>C: save(last position) (tmp file, fsync, rename)
+        P->>S: ack(last position)
+        Note over S: Postgres: slot advances only to a commit-end LSN
+    end
+```
+
+Heartbeat events (MongoDB, idle or filtered streams) never reach the sink. They only move the checkpoint.
+
+### Crates
+
+```mermaid
+flowchart BT
+    core["aqueduct-core<br/>events, traits, pipeline, metrics"]
+    tls["aqueduct-tls<br/>rustls config"]
+    pg["aqueduct-source-postgres"]
+    mg["aqueduct-source-mongodb"]
+    sinks["aqueduct-sinks<br/>Kafka sink + inspector"]
+    bin["aqueduct<br/>binary: config, checkpoint, admin"]
+    bench["aqueduct-bench"]
+
+    pg --> core
+    pg --> tls
+    mg --> core
+    sinks --> core
+    sinks --> tls
+    bin --> core
+    bin --> pg
+    bin --> mg
+    bin --> sinks
+    bench --> core
+    bench --> sinks
+```
+
 ## Quick start
 
 Docker or Podman (with `podman-compose`; use `podman build --format docker` if you want the image `HEALTHCHECK` kept):
@@ -75,7 +162,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 
 ### Kafka sink
 
-Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created). Records: JSON value, key `schema.table`, headers `op` and `lsn`; partition = hash(key), so a table's changes stay ordered. Acked by the broker before checkpointing.
+Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1, used when a topic has to be created) and `partition_by`. Records: JSON value, headers `op` and `lsn`, key `schema.table`; partition = FNV-1a hash of the key, so a table's changes stay ordered. With `partition_by = "key"` the key is `schema.table:<replica-identity columns>` (MongoDB: the `documentKey`), spreading a table over partitions. Per-row order then holds only while the identity columns never change: not with `REPLICA IDENTITY FULL` (every column is identity, so any update changes the key), and not across an update of a key column. `TRUNCATE` and tables without an identity use `schema.table`, so a truncate is not ordered against row events in this mode. Acked by the broker before checkpointing.
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
 (`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
@@ -151,7 +238,7 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 ```
 
 Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source), `aqueduct-source-mongodb` ·
-`aqueduct-sinks` (Kafka sink + inspector reader) · `aqueduct` (binary: config, checkpoint, admin server and UI) · `aqueduct-bench` (throughput benchmark).
+`aqueduct-sinks` (Kafka sink + inspector reader) · `aqueduct-tls` (shared rustls config) · `aqueduct` (binary: config, checkpoint, admin server and UI) · `aqueduct-bench` (throughput benchmark).
 See `CLAUDE.md` for contributor and agent notes.
 
 Benchmark (no Postgres needed): `cargo run --release -p aqueduct-bench -- --events 200000 --profile industrial` measures the pipeline with a null sink; add `--sink kafka --brokers localhost:9092` to include a real broker. The Kafka sink end-to-end test in `crates/aqueduct-sinks/tests/kafka_it.rs` runs when `AQUEDUCT_KAFKA_BROKERS` is set and is skipped otherwise.

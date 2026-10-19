@@ -15,7 +15,11 @@ a container (Docker or Podman). Keep every feature working inside the distroless
 | `aqueduct-source-postgres` | Pure pgoutput decoder (`decoder.rs`) and the polling `Source` (`source.rs`) |
 | `aqueduct-source-mongodb` | MongoDB change-stream source; resume token as the `Position` |
 | `aqueduct-sinks` | Kafka sink and the Kafka-backed event inspector reader (`rskafka`, pure Rust). Kafka is the only sink |
+| `aqueduct-tls` | Shared rustls client config (ring, no OpenSSL) used by the Postgres source and the Kafka sink |
 | `aqueduct` | Binary: TOML config, file checkpoint, admin HTTP server (`admin.rs`, `admin.html`, `admin.css`) |
+| `aqueduct-bench` | Throughput benchmark of the pipeline (null or Kafka sink) |
+
+The README `## Architecture` section has Mermaid diagrams of the components, the at-least-once loop and the crate graph.
 
 ## Commands
 
@@ -38,7 +42,10 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.
 - Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it.
-- Kafka: record key is `schema.table`, partition is a stable FNV-1a hash of the key (per-table ordering).
+- Kafka: record key is `schema.table` (default `partition_by = "table"`, per-table ordering) or `schema.table:<identity>`
+  (`partition_by = "key"`); partition is a stable FNV-1a hash of the key (`kafka.rs::record_key`). The identity part is the
+  replica-identity columns joined with `0x1f`, binary datums hex (`decoder.rs::key`), or the MongoDB `documentKey` JSON; it is not
+  the PK under `REPLICA IDENTITY FULL`, so `key` mode only orders per row while identity columns are immutable. Truncates use `schema.table`.
 - Rows are sensitive. The event inspector exposes row data over HTTP; keep it behind `admin_token`
   and never log tokens.
 - **Fail closed**: the admin server refuses a non-loopback `health_addr` without `admin_token` (`Config::check_admin_exposure`,
@@ -62,7 +69,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 
 ## Conventions
 
-- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Breaking changes also get an entry under `## Unreleased` in `CHANGELOG.md` with the upgrade step.
+- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Update the README architecture diagrams when you add or remove a crate, source, route or pipeline step. Breaking changes also get an entry under `## Unreleased` in `CHANGELOG.md` with the upgrade step.
 - Kafka is the only sink by design; do not add others. The inspector reads from Kafka, never from an in-process buffer.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
