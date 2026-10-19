@@ -2,7 +2,6 @@ use crate::config::MongoConfig;
 use crate::mapping::{map_event, Mapped};
 use aqueduct_core::{ChangeEvent, Error, Position, Result, Source};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use mongodb::bson::{doc, Bson, Document};
 use mongodb::change_stream::event::ResumeToken;
 use mongodb::change_stream::ChangeStream;
@@ -151,12 +150,12 @@ impl Source for MongoSource {
                 .stream
                 .as_mut()
                 .ok_or_else(|| Error::Source("source not started".into()))?;
-            let wait = self
-                .heartbeat_every
-                .saturating_sub(self.last_heartbeat.elapsed());
-            match tokio::time::timeout(wait, stream.next()).await {
-                Ok(Some(doc)) => {
-                    let doc = doc.map_err(src_err)?;
+            // `next_if_any` makes at most one getMore (the server holds it for maxAwaitTime)
+            // and returns `None` for an empty batch. Do NOT wrap `stream.next()` in a timeout
+            // here: dropping that future mid-poll leaves the driver's cursor state taken, and
+            // `resume_token()` then panics ("cursor state access while streaming").
+            match stream.next_if_any().await.map_err(src_err)? {
+                Some(doc) => {
                     if let Some(ev) = to_change_event(&doc)? {
                         if let Position::Text(t) = &ev.position {
                             self.last_token = Some(t.clone());
@@ -164,13 +163,18 @@ impl Source for MongoSource {
                         return Ok(Some(ev));
                     }
                 }
-                Ok(None) => return Ok(None),
-                Err(_) => {}
-            }
-            // Idle, or only skipped events arrived: let the checkpoint follow the stream.
-            if self.last_heartbeat.elapsed() >= self.heartbeat_every {
-                if let Some(hb) = self.heartbeat()? {
-                    return Ok(Some(hb));
+                None => {
+                    if !stream.is_alive() {
+                        return Ok(None);
+                    }
+                    // Empty batch: the token is the server's postBatchResumeToken, so the
+                    // checkpoint can follow an idle or fully filtered stream. Only here is it
+                    // safe, as the driver's token may point past undelivered events otherwise.
+                    if self.last_heartbeat.elapsed() >= self.heartbeat_every {
+                        if let Some(hb) = self.heartbeat()? {
+                            return Ok(Some(hb));
+                        }
+                    }
                 }
             }
         }
