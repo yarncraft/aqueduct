@@ -258,7 +258,7 @@ impl Config {
             return Ok(true);
         }
         Err(format!(
-            "health_addr {} is not loopback and no admin_token is set; set admin_token              (or AQUEDUCT_ADMIN_TOKEN), bind to 127.0.0.1, or set admin_insecure_no_auth = true",
+            "health_addr {} is not loopback and no admin_token is set; set admin_token (or AQUEDUCT_ADMIN_TOKEN), bind to 127.0.0.1, or set admin_insecure_no_auth = true",
             self.health_addr
         ))
     }
