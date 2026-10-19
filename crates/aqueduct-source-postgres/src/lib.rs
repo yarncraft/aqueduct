@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod decoder;
+pub mod replication;
 mod source;
 mod tls;
 
