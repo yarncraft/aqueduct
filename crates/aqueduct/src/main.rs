@@ -82,13 +82,6 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        config::SourceConfig::Kafka(k) => match k.source_config() {
-            Ok(c) => Box::new(aqueduct_source_kafka::KafkaSource::new(c)),
-            Err(e) => {
-                tracing::error!(error = %e, "invalid kafka source config");
-                std::process::exit(1);
-            }
-        },
         config::SourceConfig::Mongodb(m) => {
             if let Err(e) = m.validate() {
                 tracing::error!(error = %e, "invalid mongodb config");

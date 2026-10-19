@@ -1,11 +1,11 @@
 # Aqueduct
 
 Change-data-capture (CDC) written in Rust and built to run **only in a container**. Aqueduct reads
-changes from a source (**Postgres** logical replication via `pgoutput`, **Kafka** topics, or **MongoDB**
+changes from a source (**Postgres** logical replication via `pgoutput`, or **MongoDB**
 change streams) and streams them to a sink with at-least-once delivery: the source position (Postgres LSN,
-Kafka offsets, Mongo resume token) is checkpointed and acknowledged only after the sink succeeds.
+Mongo resume token) is checkpointed and acknowledged only after the sink succeeds.
 
-- Sources: **Postgres** (default), **Kafka**, **MongoDB**, chosen with `[source] type`; a top-level `[postgres]` table still works
+- Sources: **Postgres** (default), **MongoDB**, chosen with `[source] type`; a top-level `[postgres]` table still works
 - Sink: **Kafka** (the only sink), with per-table topic routing
 - **Admin cockpit**: live throughput, lag, latency, per-table stats and an event inspector
 - Distroless, non-root image; state in one volume
@@ -46,11 +46,7 @@ SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator
 podman-compose -f docker-compose.sim.yml -p aqsim down
 ```
 
-A second Aqueduct (`aqueduct-kafka`, cockpit on <http://localhost:8089/#token=$AQUEDUCT_ADMIN_TOKEN>) runs the Kafka source:
-it reads the `cdc.public.*` topics written by the Postgres pipeline and republishes them as `mirror.public.*`. The two
-topic sets should always have equal offsets, which makes a quick end-to-end check.
-
-`AQUEDUCT_ADMIN_TOKEN` must be set (compose refuses to start without it). The simulation publishes only ports 8088 and 8089, so it can run
+`AQUEDUCT_ADMIN_TOKEN` must be set (compose refuses to start without it). The simulation publishes only port 8088, so it can run
 alongside the regular `docker-compose.yml` (port 8080). Tables are capped at about 2000 recent rows and Kafka retention at
 256 MiB / 24 h, so it can run indefinitely. See `docs/DEPLOYMENT.md` for details.
 
@@ -68,8 +64,8 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
 | `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default, so a server without TLS fails startup, even on localhost. For a non-TLS dev Postgres set `ssl_mode = "disable"` explicitly |
-| `source.type` | `postgres` | `postgres`, `kafka` or `mongodb`. Without a `[source]` table, `[postgres]` is used |
-| `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN, offsets or resume token), written atomically |
+| `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `CHANGELOG.md`.) Without a `[source]` table, `[postgres]` is used |
+| `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_insecure_no_auth` | `false` | Opt out of the token requirement on a non-loopback `health_addr` (logs a warning) |
 | `admin_token` | unset | Protects `/metrics` and `/api/*` (Bearer header only). **Required** when `health_addr` is not loopback (startup refuses otherwise; an empty value counts as unset). Override with `AQUEDUCT_ADMIN_TOKEN` |
@@ -98,10 +94,6 @@ topic = "orders-events"
 match = "*.audit_*"                   # any schema, tables starting with audit_
 topic = "audit"
 ```
-
-### Kafka source
-
-`[source] type = "kafka"` with `brokers`, `topics` (`*` wildcard), optional `start_at` (`earliest` default, or `latest`), `format` (`auto` or `raw`), `tls`, `tls_ca_file` and SASL keys. The position is the per-partition offsets, kept in Aqueduct's checkpoint (no consumer group). Details in `docs/DEPLOYMENT.md`; integration test: `crates/aqueduct-source-kafka/tests/broker.rs`.
 
 ### MongoDB source
 
@@ -154,7 +146,7 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source), `aqueduct-source-kafka`, `aqueduct-source-mongodb` ·
+Layout: `aqueduct-core` (types, traits, pipeline, metrics) · `aqueduct-source-postgres` (pgoutput decoder + source), `aqueduct-source-mongodb` ·
 `aqueduct-sinks` (Kafka sink + inspector reader) · `aqueduct` (binary: config, checkpoint, admin server and UI) · `aqueduct-bench` (throughput benchmark).
 See `CLAUDE.md` for contributor and agent notes.
 

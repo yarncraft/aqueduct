@@ -56,25 +56,6 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
 
-  # Kafka-source pipeline: cdc.public.* -> Aqueduct (kafka source) -> mirror.public.*
-  aqueduct-kafka:
-    build: .
-    depends_on:
-      aqueduct:
-        condition: service_started
-    environment:
-      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:?set AQUEDUCT_ADMIN_TOKEN to a secret value (e.g. openssl rand -hex 32)}
-    volumes:
-      - ./sim/aqueduct.kafka.toml:/etc/aqueduct/aqueduct.toml:ro
-      - aqueduct-kafka-state:/var/lib/aqueduct
-    ports:
-      - "8089:8080"
-    restart: unless-stopped
-    stop_grace_period: 30s
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-
   simulator:
     image: postgres:16
     depends_on:
@@ -90,4 +71,3 @@ services:
 volumes:
   pgdata:
   aqueduct-state:
-  aqueduct-kafka-state:
