@@ -56,6 +56,25 @@
     </div>
   </section>
 
+  <!-- Replication health: slot lag and heartbeat (each shows an en dash until the server reports it) -->
+  <section class="grid grid-cols-2 gap-px overflow-hidden rounded-sm border border-ink-600 bg-ink-600 lg:grid-cols-3">
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Slot lag</div>
+      <div id="slotlag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+      <div class="mt-1 truncate font-mono text-[11px] text-ink-300">confirmed flush <span id="flushlsn" class="text-ink-200">–</span></div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Last heartbeat</div>
+      <div id="hbage" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+      <div id="hbsub" class="mt-1 font-mono text-[11px] text-ink-300">not reported</div>
+    </div>
+    <div class="bg-ink-800 p-4">
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Heartbeat skipped</div>
+      <div id="hbskip" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+      <div id="hbreason" class="mt-1 truncate font-mono text-[11px] text-ink-300">–</div>
+    </div>
+  </section>
+
   <!-- Chart + operations -->
   <section class="grid gap-4 lg:grid-cols-3">
     <div class="rounded-sm border border-ink-600 bg-ink-800 lg:col-span-2">
@@ -180,6 +199,7 @@ const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', trun
 const fmt = n => n.toLocaleString('en-US');
 const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
+const bytes = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KiB' : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MiB' : (n / 1073741824).toFixed(2) + ' GiB';
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 // Rates, the chart and recent sink latency are trailing averages over this many 1 s snapshots;
@@ -240,6 +260,37 @@ function chart(series) {
   $('chart').innerHTML = g;
 }
 
+// Slot lag is exact. Heartbeat age is measured between the last beat and this snapshot, so it keeps
+// counting even if the beat stopped. Fields the server does not send render as an en dash.
+const TILE = 'mt-2 font-mono text-3xl font-medium tabular-nums ';
+function renderHealth(d) {
+  $('slotlag').textContent = d.slot_lag_bytes == null ? '–' : bytes(d.slot_lag_bytes);
+  $('flushlsn').textContent = d.confirmed_flush_lsn || '–';
+  const h = d.heartbeat;
+  if (!h) {
+    $('hbage').textContent = $('hbskip').textContent = $('hbreason').textContent = '–';
+    $('hbage').className = $('hbskip').className = TILE + 'text-ink-100';
+    $('hbsub').textContent = 'not reported';
+    return;
+  }
+  const every = h.interval_ms == null ? null : h.interval_ms;
+  let age = null, tone = 'text-ink-100';
+  if (every == null) {
+    $('hbage').textContent = 'off';
+  } else if (h.last_ms == null) {
+    $('hbage').textContent = 'waiting';
+  } else {
+    age = Math.max(0, Date.now() - h.last_ms);
+    $('hbage').textContent = ms(age) + ' ago';
+    tone = age > 5 * every ? 'text-red' : age > 2 * every ? 'text-amber' : 'text-ink-100';
+  }
+  $('hbage').className = TILE + tone;
+  $('hbsub').textContent = every == null ? 'heartbeats disabled' : 'every ' + ms(every);
+  $('hbskip').textContent = h.skipped_total == null ? '–' : fmt(h.skipped_total);
+  $('hbskip').className = TILE + 'text-ink-100';
+  $('hbreason').textContent = h.last_skip_reason ? 'last: ' + h.last_skip_reason : 'none skipped';
+}
+
 function render(d) {
   $('state-text').textContent = d.state;
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
@@ -263,6 +314,7 @@ function render(d) {
   $('errors').textContent = fmt(d.errors);
   $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
   $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
+  renderHealth(d);
   lastData = d;
   syncRateTables(d);
   chart(rateSeries(d));
