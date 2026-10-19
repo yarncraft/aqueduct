@@ -172,7 +172,7 @@ fn default_checkpoint_path() -> String {
 /// Shortest admin token accepted. `openssl rand -hex 32` gives 64.
 const MIN_ADMIN_TOKEN_LEN: usize = 16;
 
-/// Placeholders that were published in this repo (the compose default until #19, docs samples).
+/// Placeholders that were published in this repo (the compose default until #30, docs samples).
 const KNOWN_WEAK_ADMIN_TOKENS: &[&str] = &["dev-token-change-me", "change-me"];
 
 impl Config {
@@ -338,26 +338,30 @@ admin_insecure_no_auth = true",
 
     #[test]
     fn weak_admin_tokens_are_rejected_on_any_bind() {
-        for bind in ["127.0.0.1:8080", "0.0.0.0:8080"] {
-            for t in [
-                "k",
-                "change-me",
-                "0123456789abcde",  // 15 chars
-                "                ", // whitespace only, long enough
-                " ",
-                "dev-token-change-me",
-                "Dev-Token-Change-Me",
-                "0123456789abcdef
-", // secrets file with a trailing newline
-                " 0123456789abcdef",
+        // (token, substring that identifies the rule that must fire)
+        let cases: [(&str, &str); 11] = [
+            ("k", "shorter than"),
+            ("change-me", "well-known placeholder"),
+            ("0123456789abcde", "shorter than"),     // 15 chars
+            ("                ", "only whitespace"), // long enough, still whitespace
+            (" ", "only whitespace"),
+            ("dev-token-change-me", "well-known placeholder"),
+            ("Dev-Token-Change-Me", "well-known placeholder"),
+            ("0123456789abcdef\n", "leading or trailing whitespace"), // secrets file ending in a newline
+            (" 0123456789abcdef", "leading or trailing whitespace"),
+            (
                 "${AQUEDUCT_ADMIN_TOKEN:?set AQUEDUCT_ADMIN_TOKEN to a secret value}",
-                "prefix-${X}-0123456789",
-            ] {
-                let c = admin_cfg(&format!(
-                    "health_addr = \"{bind}\"
-admin_token = {t:?}"
-                ));
-                assert!(c.check_admin_exposure().is_err(), "{bind} {t:?}");
+                "unexpanded variable placeholder",
+            ),
+            ("prefix-${X}-0123456789", "unexpanded variable placeholder"),
+        ];
+        for bind in ["127.0.0.1:8080", "0.0.0.0:8080"] {
+            for (t, rule) in cases {
+                let c = admin_cfg(&format!("health_addr = \"{bind}\"\nadmin_token = {t:?}"));
+                let err = c
+                    .check_admin_exposure()
+                    .expect_err(&format!("{bind} {t:?} should be rejected"));
+                assert!(err.contains(rule), "{bind} {t:?}: {err}");
             }
         }
     }
@@ -367,10 +371,7 @@ admin_token = {t:?}"
         let c = admin_cfg("admin_token = \"0123456789abcdef\"");
         assert_eq!(c.check_admin_token(), Ok(()));
         // Empty stays "unset": loopback without a token is still fine.
-        let c = admin_cfg(
-            "health_addr = \"127.0.0.1:8080\"
-admin_token = \"\"",
-        );
+        let c = admin_cfg("health_addr = \"127.0.0.1:8080\"\nadmin_token = \"\"");
         assert_eq!(c.check_admin_exposure(), Ok(false));
     }
 
