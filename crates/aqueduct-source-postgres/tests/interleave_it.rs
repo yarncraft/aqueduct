@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aqueduct_core::{ChangeEvent, Op, Source};
+use aqueduct_core::{ChangeEvent, Op, Position, Source};
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 use tokio_postgres::NoTls;
 
@@ -466,5 +466,113 @@ async fn restart_after_acking_part_of_a_copy_loses_no_rows() {
         seen,
         BTreeSet::from([1, 2, 3]),
         "rows sharing the acked position must be redelivered after the restart"
+    );
+}
+
+/// Upgrade path. A deployment from before the commit-order key restarts with a plain-LSN
+/// checkpoint. That start has no key to dedupe on, so it replays from the slot: duplicates are
+/// allowed, loss is not, and the first ack must still move the slot.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn plain_lsn_checkpoint_restart_loses_no_rows_and_acks_advance_the_slot() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let (t1, conn1) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn1);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let table = format!("upgrade_{id}");
+    let publication = format!("aq_up_pub_{id}");
+    let slot = format!("aq_up_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    let new_source = || {
+        let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.ssl_mode = Some(SslMode::Disable);
+        cfg.poll_interval = Duration::from_millis(100);
+        PostgresSource::new(cfg)
+    };
+    // The old binary delivered row 1 and checkpointed the WAL position after it; the process
+    // then stopped. The slot was never advanced.
+    let mut s = new_source();
+    s.start(None).await.unwrap();
+    drop(s);
+    db.execute(&format!("INSERT INTO {table} VALUES (1, 'old')"), &[])
+        .await
+        .unwrap();
+    let wal: String = db
+        .query_one("SELECT pg_current_wal_flush_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let old_checkpoint = Position::Lsn(aqueduct_source_postgres::parse_lsn(&wal).unwrap());
+    let confirmed = || async {
+        let lsn: String = db
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        aqueduct_source_postgres::parse_lsn(&lsn).unwrap()
+    };
+    let before = confirmed().await;
+
+    // New binary, old checkpoint; overlapping transactions arrive after the restart.
+    let mut s = new_source();
+    s.start(Some(old_checkpoint)).await.unwrap();
+    t1.batch_execute(&format!(
+        "BEGIN; INSERT INTO {table} VALUES (2, 't1-first')"
+    ))
+    .await
+    .unwrap();
+    db.execute(&format!("INSERT INTO {table} VALUES (3, 't2')"), &[])
+        .await
+        .unwrap();
+    t1.batch_execute(&format!(
+        "INSERT INTO {table} VALUES (4, 't1-second'); COMMIT;"
+    ))
+    .await
+    .unwrap();
+
+    let mut seen = BTreeSet::new();
+    let mut last = None;
+    while let Some(e) = next_event(&mut s).await {
+        seen.insert(key_of(&e));
+        last = e.checkpoint;
+    }
+    s.ack(last.expect("events arrived")).await.unwrap();
+    let after = confirmed().await;
+
+    drop(s);
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+        .await
+        .unwrap();
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        BTreeSet::from([1, 2, 3, 4]),
+        "a plain-LSN checkpoint may duplicate rows but must not lose any"
+    );
+    assert!(
+        after > before,
+        "the first ack after the restart must move the slot ({before} -> {after})"
     );
 }

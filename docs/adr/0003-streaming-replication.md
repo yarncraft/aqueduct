@@ -125,8 +125,9 @@ use one model:
   that first start skips nothing and replays from the slot (duplicates only, logged once).
 - **Feedback** (`write` = `flush` = `apply`): `tx_ends` holds `(commit_lsn, (last_change, last_ord), end)` in
   commit order. `ack(k)` pops while `commit_lsn < k.commit`, or while `commit_lsn == k.commit &&
-  (last_change, last_ord) <= (k.change, k.ord)`, and reports the last popped `end`. An empty transaction is
-  `(commit_lsn, (0, 0), end)`. Change LSNs are never compared across transactions.
+  (last_change, last_ord) <= (k.change, k.ord)`, and reports the last popped `end`. An empty transaction
+  (no published changes) is stored with the last key queued before it, so it counts as acknowledged exactly when everything
+  before it is. Change LSNs are never compared across transactions.
 - **The ack boundary is exact.** A later transaction's `commit_lsn` can **equal** an earlier one's commit end
   (in the trace, Tb's `final_lsn` 0/1567FD8 = Ta's end). Postgres skips a transaction only when its commit LSN is
   **below** the slot's confirmed position, so confirming exactly Ta's end keeps Tb. A unit test pins that

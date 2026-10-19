@@ -99,6 +99,23 @@ pub async fn run_pipeline_with_metrics(
     res
 }
 
+/// Debug check of the contract that lets a batch end anywhere: two events in a row with the same
+/// `position` could not be told apart by an ack of that position, so both must carry a unique
+/// resume key in `checkpoint`. Heartbeats only move the checkpoint and are exempt.
+fn check_resume_keys(prev: &mut Option<(Position, bool)>, ev: &ChangeEvent) {
+    if ev.op == Op::Heartbeat {
+        return;
+    }
+    let has_key = ev.checkpoint.is_some();
+    if let Some((pos, prev_key)) = prev {
+        debug_assert!(
+            *pos != ev.position || (*prev_key && has_key),
+            "events sharing position {pos} need a `checkpoint` each, or an ack could skip one"
+        );
+    }
+    *prev = Some((ev.position.clone(), has_key));
+}
+
 async fn drive(
     source: &mut dyn Source,
     sink: &mut dyn Sink,
@@ -110,6 +127,7 @@ async fn drive(
     source.start(start).await?;
     metrics.set_state(State::Streaming);
     let mut batch: Vec<ChangeEvent> = Vec::with_capacity(MAX_BATCH);
+    let mut prev: Option<(Position, bool)> = None;
     loop {
         batch.clear();
         let first = tokio::select! {
@@ -119,12 +137,14 @@ async fn drive(
                 None => break,
             },
         };
+        check_resume_keys(&mut prev, &first);
         batch.push(first);
         // A batch may end anywhere, even inside events that share a position: sources whose
         // positions are not unique put a unique resume key in `checkpoint`, and that is what is
         // saved and acked below.
         while batch.len() < MAX_BATCH {
             let Some(ev) = source.try_next() else { break };
+            check_resume_keys(&mut prev, &ev);
             batch.push(ev);
         }
         // Heartbeats only move the checkpoint: the last event's position is saved below,
@@ -296,5 +316,18 @@ mod tests {
         assert_eq!(sink.1, 2);
         assert_eq!(src.1, vec![key(MAX_BATCH - 1), key(n - 1)]);
         assert_eq!(store.0, Some(key(n - 1)));
+    }
+
+    /// A source whose positions repeat and that sets no `checkpoint` could ack past events it has
+    /// not delivered; the debug check turns that into a failing test.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "need a `checkpoint` each")]
+    async fn same_position_without_checkpoints_trips_the_debug_assert() {
+        let mut src = VecSource(VecDeque::from([ev(5), ev(5)]), vec![]);
+        let mut sink = VecSink(vec![], 0);
+        let mut store = MemStore(None);
+        let (_tx, rx) = watch::channel(false);
+        let _ = run_pipeline(&mut src, &mut sink, &mut store, rx).await;
     }
 }
