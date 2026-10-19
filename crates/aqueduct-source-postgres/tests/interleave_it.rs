@@ -69,9 +69,11 @@ async fn overlapping_transactions_lose_no_rows() {
     // T1 writes first but commits last; T2 starts, writes and commits in between:
     //   T1 insert (lowest WAL position), T2 insert + commit, T1 insert (highest) + commit.
     // The source decodes T2 first, then T1, so T1's first change is below T2's position.
-    t1.batch_execute(&format!("BEGIN; INSERT INTO {table} VALUES (1, 't1-first')"))
-        .await
-        .unwrap();
+    t1.batch_execute(&format!(
+        "BEGIN; INSERT INTO {table} VALUES (1, 't1-first')"
+    ))
+    .await
+    .unwrap();
     db.execute(&format!("INSERT INTO {table} VALUES (2, 't2')"), &[])
         .await
         .unwrap();
@@ -144,9 +146,11 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     let mut s = new_source();
     s.start(None).await.unwrap();
 
-    t1.batch_execute(&format!("BEGIN; INSERT INTO {table} VALUES (1, 't1-first')"))
-        .await
-        .unwrap();
+    t1.batch_execute(&format!(
+        "BEGIN; INSERT INTO {table} VALUES (1, 't1-first')"
+    ))
+    .await
+    .unwrap();
     db.execute(&format!("INSERT INTO {table} VALUES (2, 't2')"), &[])
         .await
         .unwrap();
@@ -160,12 +164,11 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
     // that ended there, then "crash".
     let first = next_event(&mut s).await.expect("the first committed row");
     let mut seen = vec![key_of(&first)];
-    let checkpoint = first.position;
-    assert!(
-        seen[0] == 2,
-        "commit order puts T2 first, got {seen:?}"
-    );
-    s.ack(checkpoint).await.unwrap();
+    let checkpoint = first
+        .checkpoint
+        .expect("postgres events carry a checkpoint");
+    assert!(seen[0] == 2, "commit order puts T2 first, got {seen:?}");
+    s.ack(checkpoint.clone()).await.unwrap();
     drop(s);
 
     let mut s = new_source();
@@ -248,14 +251,14 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
     for _ in 0..2 {
         let e = next_event(&mut s).await.expect("a Ta row");
         seen.push(key_of(&e));
-        last = Some(e.position);
+        last = e.checkpoint;
     }
     assert!(
         seen.iter().all(|k| *k == 2 || *k == 3),
         "commit order puts Ta first, got {seen:?}"
     );
     let checkpoint = last.unwrap();
-    s.ack(checkpoint).await.unwrap();
+    s.ack(checkpoint.clone()).await.unwrap();
     drop(s);
 
     let mut s = new_source();
@@ -285,8 +288,7 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
 /// Same-position variants. `COPY` is decoded from `heap_multi_insert`, so every row in one WAL
 /// record carries that record's LSN, and a multi-table `TRUNCATE` is one message for all its
 /// tables. A position-only dedupe keeps one event per position and drops the rest.
-const COPY_3_ROWS: &str =
-    r#"COPY {t} (k, v) FROM PROGRAM 'printf "1\ta\n2\tb\n3\tc\n"'"#;
+const COPY_3_ROWS: &str = r#"COPY {t} (k, v) FROM PROGRAM 'printf "1\ta\n2\tb\n3\tc\n"'"#;
 
 #[tokio::test]
 #[ignore = "needs a Postgres server, see the module docs"]
@@ -325,8 +327,12 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     )
     .await
     .unwrap();
-    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t)).await.unwrap();
-    db.batch_execute(&format!("TRUNCATE {t}, {u}")).await.unwrap();
+    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t))
+        .await
+        .unwrap();
+    db.batch_execute(&format!("TRUNCATE {t}, {u}"))
+        .await
+        .unwrap();
 
     let mut inserted = BTreeSet::new();
     let mut truncated = BTreeSet::new();
@@ -347,9 +353,11 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
         .await
         .unwrap();
-    db.batch_execute(&format!("DROP PUBLICATION {publication}; DROP TABLE {t}, {u};"))
-        .await
-        .unwrap();
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {t}, {u};"
+    ))
+    .await
+    .unwrap();
 
     // The fixture is only valid if the rows really share a position. Check it from a second
     // slot's raw peek: the source under test may already have dropped rows, so its own events
@@ -428,12 +436,16 @@ async fn restart_after_acking_part_of_a_copy_loses_no_rows() {
     let mut s = new_source();
     s.start(None).await.unwrap();
 
-    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t)).await.unwrap();
+    db.batch_execute(&COPY_3_ROWS.replace("{t}", &t))
+        .await
+        .unwrap();
 
     let first = next_event(&mut s).await.expect("the first COPY row");
     let mut seen = BTreeSet::from([key_of(&first)]);
-    let checkpoint = first.position;
-    s.ack(checkpoint).await.unwrap();
+    let checkpoint = first
+        .checkpoint
+        .expect("postgres events carry a checkpoint");
+    s.ack(checkpoint.clone()).await.unwrap();
     drop(s);
 
     let mut s = new_source();

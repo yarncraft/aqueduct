@@ -292,6 +292,7 @@ mod tests {
             before: None,
             after: None,
             key: None,
+            checkpoint: None,
         }
     }
 

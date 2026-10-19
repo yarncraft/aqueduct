@@ -110,35 +110,30 @@ async fn drive(
     source.start(start).await?;
     metrics.set_state(State::Streaming);
     let mut batch: Vec<ChangeEvent> = Vec::with_capacity(MAX_BATCH);
-    // An event read past a full batch that did not belong to it; it starts the next batch.
-    let mut carry: Option<ChangeEvent> = None;
     loop {
         batch.clear();
-        let first = match carry.take() {
-            Some(ev) => ev,
-            None => tokio::select! {
-                _ = shutdown.changed() => break,
-                ev = source.next() => match ev? {
-                    Some(ev) => ev,
-                    None => break,
-                },
+        let first = tokio::select! {
+            _ = shutdown.changed() => break,
+            ev = source.next() => match ev? {
+                Some(ev) => ev,
+                None => break,
             },
         };
         batch.push(first);
-        while let Some(ev) = source.try_next() {
-            // Past MAX_BATCH, only events at the last event's position may join: a batch must
-            // never end between events that share a position (a multi-table TRUNCATE), because
-            // the ack of that position would cover the events still waiting behind it.
-            if batch.len() >= MAX_BATCH && batch[batch.len() - 1].position != ev.position {
-                carry = Some(ev);
-                break;
-            }
+        // A batch may end anywhere, even inside events that share a position: sources whose
+        // positions are not unique put a unique resume key in `checkpoint`, and that is what is
+        // saved and acked below.
+        while batch.len() < MAX_BATCH {
+            let Some(ev) = source.try_next() else { break };
             batch.push(ev);
         }
         // Heartbeats only move the checkpoint: the last event's position is saved below,
         // but sinks and metrics never see them.
         // invariant: `first` was pushed above, so the batch is never empty here.
-        let last = batch[batch.len() - 1].position.clone();
+        let last = {
+            let e = &batch[batch.len() - 1];
+            e.checkpoint.clone().unwrap_or_else(|| e.position.clone())
+        };
         batch.retain(|e| e.op != Op::Heartbeat);
         if !batch.is_empty() {
             let began = Instant::now();
@@ -228,6 +223,7 @@ mod tests {
             before: None,
             after: None,
             key: None,
+            checkpoint: None,
         }
     }
 
@@ -248,30 +244,6 @@ mod tests {
         assert_eq!(sink.1, 1);
         assert_eq!(src.1, vec![Position::Lsn(3)]);
         assert_eq!(store.0, Some(Position::Lsn(3)));
-    }
-
-    #[tokio::test]
-    async fn a_batch_never_ends_inside_events_sharing_a_position() {
-        // 999 inserts, then a 3-table truncate at one LSN: the batch limit falls inside it.
-        let mut events: VecDeque<ChangeEvent> = (1..=999).map(ev).collect();
-        for t in ["a", "b", "c"] {
-            let mut e = ev(1000);
-            e.op = Op::Truncate;
-            e.table = t.into();
-            events.push_back(e);
-        }
-        events.push_back(ev(1001));
-        let mut src = VecSource(events, vec![]);
-        let mut sink = VecSink(vec![], 0);
-        let mut store = MemStore(None);
-        let (_tx, rx) = watch::channel(false);
-        run_pipeline(&mut src, &mut sink, &mut store, rx)
-            .await
-            .unwrap();
-        assert_eq!(sink.0.len(), 1003);
-        // The first ack covers the whole truncate (1002 events), the next only the last insert.
-        assert_eq!(src.1, vec![Position::Lsn(1000), Position::Lsn(1001)]);
-        assert_eq!(sink.1, 2);
     }
 
     #[tokio::test]
@@ -300,5 +272,29 @@ mod tests {
             .unwrap();
         assert_eq!(sink.1, 0);
         assert_eq!(store.0, Some(Position::Lsn(9)));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_not_position_is_saved_and_acked_across_a_batch_split() {
+        // One same-LSN group larger than MAX_BATCH: every event has the same `position`, only
+        // `checkpoint` tells them apart. A batch cut inside the group saves the cut event's key.
+        let n = MAX_BATCH + 500;
+        let key = |i: usize| Position::Text(format!("9@5#{i}"));
+        let group = (0..n).map(|i| {
+            let mut e = ev(5);
+            e.checkpoint = Some(key(i));
+            e
+        });
+        let mut src = VecSource(group.collect(), vec![]);
+        let mut sink = VecSink(vec![], 0);
+        let mut store = MemStore(None);
+        let (_tx, rx) = watch::channel(false);
+        run_pipeline(&mut src, &mut sink, &mut store, rx)
+            .await
+            .unwrap();
+        assert_eq!(sink.0.len(), n, "every event of the group reaches the sink");
+        assert_eq!(sink.1, 2);
+        assert_eq!(src.1, vec![key(MAX_BATCH - 1), key(n - 1)]);
+        assert_eq!(store.0, Some(key(n - 1)));
     }
 }
