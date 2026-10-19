@@ -196,17 +196,18 @@ const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
 let lastData = null;
-// Event-rate series for the selected table and ops (falls back to the global history).
+// One event-rate series per checked op for the selected table (all tables when none is picked).
 function rateSeries(d) {
   const tb = $('ratetable').value;
-  const ops = [...document.querySelectorAll('.rateop')].filter(c => c.checked).map(c => +c.value);
   const per = d.history_ops || {};
   const names = tb ? [tb] : Object.keys(per);
-  if (!tb && ops.length === 4) return smooth(d.history);
-  return smooth(d.history.map((_, i) => names.reduce((a, t) => {
-    const row = (per[t] || [])[i - (d.history.length - (per[t] || []).length)];
-    return a + (row ? ops.reduce((b, o) => b + row[o], 0) : 0);
-  }, 0)));
+  return [...document.querySelectorAll('.rateop')].filter(c => c.checked).map(c => {
+    const o = +c.value;
+    return { op: o, h: d.history.map((_, i) => names.reduce((a, t) => {
+      const row = (per[t] || [])[i - (d.history.length - (per[t] || []).length)];
+      return a + (row ? row[o] : 0);
+    }, 0)) };
+  });
 }
 function syncRateTables(d) {
   const sel = $('ratetable'), cur = sel.value, names = Object.keys(d.history_ops || {}).sort();
@@ -215,10 +216,12 @@ function syncRateTables(d) {
   sel.value = cur;
 }
 
-function chart(h) {
+const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee'];
+function chart(series) {
   const W = 800, H = 220, PL = 34, PR = 8, PT = 10, PB = 8;
-  const max = Math.max(5, ...h);
-  const n = Math.max(h.length, 2);
+  const len = Math.max(0, ...series.map(s => s.h.length));
+  const max = Math.max(5, ...series.flatMap(s => s.h));
+  const n = Math.max(len, 2);
   const x = i => PL + (W - PL - PR) * i / (n - 1);
   const y = v => H - PB - (H - PT - PB) * v / max;
   let g = '';
@@ -227,11 +230,12 @@ function chart(h) {
     g += `<line x1="${PL}" x2="${W - PR}" y1="${yy}" y2="${yy}" stroke="#2f343c" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
     g += `<text x="${PL - 6}" y="${yy + 3}" text-anchor="end" fill="#738091" font-size="10" font-family="ui-monospace,Consolas,monospace">${Math.round(max * (1 - i / 4))}</text>`;
   }
-  if (h.length > 1) {
-    // Stepline: hold each value until the next sample, then jump.
-    const pts = h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
-    g += `<polygon points="${x(0)},${H - PB} ${pts} ${x(h.length - 1)},${H - PB}" fill="#4c90f0" fill-opacity="0.12"/>`;
-    g += `<polyline points="${pts}" fill="none" stroke="#4c90f0" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  if (len > 1) {
+    // Stepline per op: hold each value until the next sample, then jump.
+    for (const { op, h } of series) {
+      const pts = h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+      g += `<polyline points="${pts}" fill="none" stroke="${OPLINE[op]}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+    }
   }
   $('chart').innerHTML = g;
 }
