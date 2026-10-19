@@ -360,8 +360,28 @@ impl Source for PostgresSource {
     }
 }
 
+/// tokio-postgres' `Display` prints only the kind ("error performing TLS handshake"); the cause
+/// (`UnknownIssuer`, "server does not support TLS", ...) is only reachable via `source()`.
+/// A server error contributes its SQLSTATE and message only: DETAIL/HINT can carry row values
+/// and would otherwise reach `last_error`, `/api/metrics` and the logs.
 fn src_err(e: tokio_postgres::Error) -> Error {
-    Error::Source(e.to_string())
+    if let Some(db) = e.as_db_error() {
+        return Error::Source(format!("{e}: {} {}", db.code().code(), db.message()));
+    }
+    Error::Source(with_causes(e.to_string(), std::error::Error::source(&e)))
+}
+
+/// Appends each cause in the `source()` chain to `msg`, skipping text already present.
+fn with_causes(mut msg: String, mut cause: Option<&(dyn std::error::Error + 'static)>) -> String {
+    while let Some(c) = cause {
+        let text = c.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        cause = c.source();
+    }
+    msg
 }
 
 /// Parse Postgres `X/Y` hex LSN text.
@@ -383,6 +403,35 @@ mod tests {
         assert_eq!(l, 0x16_B374_D848);
         assert_eq!(Position::Lsn(l).to_string(), "16/B374D848");
         assert!(parse_lsn("garbage").is_err());
+    }
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn with_causes_appends_chain_and_skips_duplicates() {
+        let root = Layer("root", None);
+        let middle = Layer("middle", Some(Box::new(root)));
+        let chain = Layer("outer", Some(Box::new(middle)));
+        let msg = with_causes("handshake".into(), Some(&chain));
+        assert_eq!(msg, "handshake: outer: middle: root");
+        // A cause whose text is already in the message is not repeated.
+        let dup = Layer("UnknownIssuer", None);
+        let msg = with_causes("handshake: UnknownIssuer".into(), Some(&dup));
+        assert_eq!(msg, "handshake: UnknownIssuer");
+        assert_eq!(with_causes("x".into(), None), "x");
     }
 }
 
