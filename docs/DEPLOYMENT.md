@@ -98,7 +98,7 @@ Environment overrides: `AQUEDUCT_PG_URL`, `AQUEDUCT_ADMIN_TOKEN`. See `config/aq
 ```toml
 health_addr = "0.0.0.0:8080"
 checkpoint_path = "/var/lib/aqueduct/checkpoint"
-admin_token = "change-me"
+admin_token = "<output of: openssl rand -hex 32>"
 inspector = true
 
 [postgres]
@@ -118,7 +118,7 @@ topic = "cdc.{schema}.{table}"
 | `health_addr` | `0.0.0.0:8080` | Listen address of the cockpit, API and `/healthz` |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged LSN, written atomically. Keep on the state volume |
 | `admin_insecure_no_auth` | `false` | Allow a non-loopback `health_addr` without `admin_token`. Without this, startup refuses that combination; with it, a warning is logged. Loopback binds never need a token |
-| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/metrics` and `/api/*` require it (`Authorization: Bearer ...` only; `?token=` is rejected). Env: `AQUEDUCT_ADMIN_TOKEN` |
+| `admin_token` | unset | Required unless `health_addr` is loopback. If set, `/metrics` and `/api/*` require it (`Authorization: Bearer ...` only; `?token=` is rejected). Must be at least 16 characters, not whitespace-only and not contain `${`; startup refuses it otherwise. Env: `AQUEDUCT_ADMIN_TOKEN` |
 | `inspector` | `true` | Cockpit event inspector, reading recent events back from Kafka. Needs `admin_token`; `false` turns it off |
 
 ### `[postgres]`
