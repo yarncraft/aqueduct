@@ -33,6 +33,10 @@ pub struct Config {
     /// `AQUEDUCT_ADMIN_TOKEN`.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Explicit opt-out: serve the cockpit and `/api/*` without a token on a non-loopback
+    /// `health_addr`. Off by default; startup refuses that combination otherwise.
+    #[serde(default)]
+    pub admin_insecure_no_auth: bool,
     /// Serve the cockpit's event inspector, which reads recent events back from
     /// Kafka. It exposes row data, so it also needs `admin_token`.
     #[serde(default = "default_true")]
@@ -226,6 +230,15 @@ fn default_slot() -> String {
 fn default_publication() -> String {
     "aqueduct".into()
 }
+/// True only when the host part is a literal loopback IP or `localhost`.
+fn is_loopback_addr(addr: &str) -> bool {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    addr.rsplit_once(':')
+        .is_some_and(|(h, _)| h.eq_ignore_ascii_case("localhost"))
+}
+
 fn default_health_addr() -> String {
     "0.0.0.0:8080".into()
 }
@@ -234,6 +247,22 @@ fn default_checkpoint_path() -> String {
 }
 
 impl Config {
+    /// Refuse to expose the admin API without a token on a non-loopback bind, unless
+    /// `admin_insecure_no_auth = true`. Returns whether the opt-out is in effect (caller logs it).
+    pub fn check_admin_exposure(&self) -> Result<bool, String> {
+        let has_token = self.admin_token.as_deref().is_some_and(|t| !t.is_empty());
+        if has_token || is_loopback_addr(&self.health_addr) {
+            return Ok(false);
+        }
+        if self.admin_insecure_no_auth {
+            return Ok(true);
+        }
+        Err(format!(
+            "health_addr {} is not loopback and no admin_token is set; set admin_token              (or AQUEDUCT_ADMIN_TOKEN), bind to 127.0.0.1, or set admin_insecure_no_auth = true",
+            self.health_addr
+        ))
+    }
+
     /// Load TOML from `AQUEDUCT_CONFIG` (default `/etc/aqueduct/aqueduct.toml`),
     /// then let `AQUEDUCT_PG_URL` override the Postgres URL.
     pub fn load() -> Result<Self, String> {
@@ -288,6 +317,60 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admin_cfg(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "{extra}
+[postgres]
+url = \"postgres://u@db/app\"
+[sink]
+brokers = [\"b:9093\"]
+topic = \"t\"
+"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn admin_exposure_loopback_without_token_ok() {
+        for a in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            let c = admin_cfg(&format!("health_addr = \"{a}\""));
+            assert_eq!(c.check_admin_exposure(), Ok(false), "{a}");
+        }
+    }
+
+    #[test]
+    fn admin_exposure_non_loopback_without_token_rejected() {
+        for a in [
+            "0.0.0.0:8080",
+            "10.0.0.5:8080",
+            "[::]:8080",
+            "example.com:8080",
+        ] {
+            let c = admin_cfg(&format!("health_addr = \"{a}\""));
+            assert!(c.check_admin_exposure().is_err(), "{a}");
+        }
+        // Default bind is 0.0.0.0, so a bare config must be rejected.
+        assert!(admin_cfg("").check_admin_exposure().is_err());
+        // An empty token is no token.
+        assert!(admin_cfg("admin_token = \"\"")
+            .check_admin_exposure()
+            .is_err());
+    }
+
+    #[test]
+    fn admin_exposure_token_or_explicit_opt_out() {
+        let c = admin_cfg(
+            "health_addr = \"0.0.0.0:8080\"
+admin_token = \"k\"",
+        );
+        assert_eq!(c.check_admin_exposure(), Ok(false));
+        let c = admin_cfg(
+            "health_addr = \"0.0.0.0:8080\"
+admin_insecure_no_auth = true",
+        );
+        assert_eq!(c.check_admin_exposure(), Ok(true));
+    }
 
     #[test]
     fn secrets_are_redacted_in_debug() {
