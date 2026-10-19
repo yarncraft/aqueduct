@@ -85,8 +85,10 @@ FROM pg_replication_slots WHERE slot_type = 'logical';
 | Sink latency (p95) | sustained above your SLO |
 | State volume free space | below 20% |
 
-When the Prometheus endpoint from `feat/hardening` is available, alert on the equivalents of the above; confirm the
-metric names against that release before wiring dashboards (this runbook deliberately does not guess them).
+`GET /metrics` serves the same signals in Prometheus format (Bearer token required when `admin_token` is set):
+`aqueduct_state{state=...}`, `aqueduct_errors_total`, `aqueduct_events_total{op=...}`, `aqueduct_table_events_total{table=...}`,
+`aqueduct_lag_seconds`, `aqueduct_last_event_timestamp_seconds`, `aqueduct_sink_latency_seconds` and `aqueduct_uptime_seconds`
+(see `prometheus()` in `crates/aqueduct/src/admin.rs`). Use `GET /readyz` (`503` unless streaming) as the readiness probe.
 
 ## 4. Disaster recovery
 
