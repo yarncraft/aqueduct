@@ -143,7 +143,7 @@ alongside the regular `docker-compose.yml` (port 8080). Tables are capped at abo
 
 Full deployment guide (Postgres setup, Docker/Kubernetes, every config key, operations, troubleshooting): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-Upgrading? Read [`CHANGELOG.md`](CHANGELOG.md) first: the next release changes the TLS and admin-token defaults.
+Upgrading? Read the breaking changes in [`changelog/unreleased/breaking/`](changelog/unreleased/breaking/) first (see [`CHANGELOG.md`](CHANGELOG.md)): the next release changes the TLS and admin-token defaults.
 
 TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`). See
 `config/aqueduct.example.toml`. Mount your own file over it.
@@ -154,7 +154,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
 | `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default, so a server without TLS fails startup, even on localhost. For a non-TLS dev Postgres set `ssl_mode = "disable"` explicitly |
 | `postgres.heartbeat_interval_secs` / `postgres.heartbeat_action_query` | `10` / unset | While idle, the slot is advanced to the server's WAL position this often (never past a checkpointed event), so writes to unpublished tables do not pin WAL. `0` disables it. The optional query (e.g. an upsert into a small published table) runs before each heartbeat; see DEPLOYMENT.md |
-| `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `CHANGELOG.md`.) Without a `[source]` table, `[postgres]` is used |
+| `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `changelog/unreleased/breaking/20-kafka-source-removed.md`.) Without a `[source]` table, `[postgres]` is used |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_insecure_no_auth` | `false` | Opt out of the token requirement on a non-loopback `health_addr` (logs a warning) |

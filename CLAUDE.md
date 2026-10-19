@@ -73,7 +73,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 
 ## Conventions
 
-- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Update the README architecture diagrams when you add or remove a crate, source, route or pipeline step. Breaking changes also get an entry under `## Unreleased` in `CHANGELOG.md` with the upgrade step.
+- Keep README.md and `docs/DEPLOYMENT.md` (config reference, operations) current in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Update the README architecture diagrams when you add or remove a crate, source, route or pipeline step. User-visible changes get a changelog fragment, `changelog/unreleased/<section>/<issue>-<slug>.md` (see `changelog/README.md`). Breaking changes always need one in `breaking/`, with the upgrade step. Never edit the Unreleased notes in `CHANGELOG.md` directly.
 - Kafka is the only sink by design; do not add others. The inspector reads from Kafka, never from an in-process buffer.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
@@ -99,6 +99,6 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope
 - Types: `feat` (new behaviour), `fix` (bug fix), `docs`, `test`, `refactor` (no behaviour change), `perf`, `build`, `ci`, `chore`.
 - Scopes match the title areas: `postgres`, `mongodb`, `kafka`, `routing`, `snapshots`, `cockpit`, `pipeline`, `ci`, `docs`. Leave the scope out if a change spans several areas.
 - Summary: imperative, lower case, no trailing period, plain words as in titles. For example, `fix(postgres): stop skipping rows on multi-table TRUNCATE`.
-- Breaking changes: add `!` after the scope (`feat(routing)!: ...`) and a `BREAKING CHANGE:` footer with the upgrade step, matching the `CHANGELOG.md` entry.
+- Breaking changes: add `!` after the scope (`feat(routing)!: ...`) and a `BREAKING CHANGE:` footer with the upgrade step, matching the changelog fragment.
 - The body explains why. Agent-authored commits end with the `Co-Authored-By` line.
 - When squash-merging, rewrite the PR title into this form and keep the PR number: `feat(routing): set the Kafka message key per route (#81) (#105)`.
