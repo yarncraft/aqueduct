@@ -210,6 +210,35 @@ impl PostgresSource {
         }
     }
 
+    /// Queues one `Truncate` event per table. A multi-table `TRUNCATE` is a single WAL message, so
+    /// its tables share one LSN: the LSN check runs once for the message, not per table, or only the
+    /// first table would be emitted.
+    fn queue_truncate(
+        &mut self,
+        lsn: u64,
+        xid: u32,
+        commit_ts_micros: i64,
+        tables: Vec<(String, String)>,
+    ) {
+        if lsn <= self.emitted {
+            return;
+        }
+        self.emitted = lsn;
+        for (schema, table) in tables {
+            self.buffer.push_back(ChangeEvent {
+                position: Position::Lsn(lsn),
+                xid,
+                commit_ts_micros,
+                schema,
+                table,
+                op: Op::Truncate,
+                before: None,
+                after: None,
+                key: None,
+            });
+        }
+    }
+
     /// Starts a heartbeat if one is due: runs the optional action query, then reads the server's
     /// WAL flush position. This must happen **before** the peek, so every transaction committed
     /// at or below the returned LSN is visible to that peek.
@@ -359,11 +388,12 @@ impl PostgresSource {
                     self.queue(lsn, xid, ts, name, Op::Delete, before, None, key);
                 }
                 Message::Truncate { relations } => {
+                    let mut names = Vec::with_capacity(relations.len());
                     for id in relations {
                         let r = cache.get(id).map_err(dec)?;
-                        let name = (r.schema.clone(), r.name.clone());
-                        self.queue(lsn, xid, ts, name, Op::Truncate, None, None, None);
+                        names.push((r.schema.clone(), r.name.clone()));
                     }
+                    self.queue_truncate(lsn, xid, ts, names);
                 }
                 Message::Commit { end_lsn, .. } => {
                     if end_lsn > self.last_end {
@@ -526,6 +556,40 @@ mod tests {
         assert_eq!(l, 0x16_B374_D848);
         assert_eq!(Position::Lsn(l).to_string(), "16/B374D848");
         assert!(parse_lsn("garbage").is_err());
+    }
+
+    #[test]
+    fn multi_table_truncate_emits_one_event_per_table() {
+        let mut src = PostgresSource::new(PostgresSourceConfig::new("postgres://x", "s", "p"));
+        let tables = vec![
+            ("public".to_string(), "a".to_string()),
+            ("public".to_string(), "b".to_string()),
+            ("app".to_string(), "c".to_string()),
+        ];
+        src.queue_truncate(100, 7, 0, tables.clone());
+        let got: Vec<_> = src
+            .buffer
+            .iter()
+            .map(|e| {
+                (
+                    e.schema.as_str(),
+                    e.table.as_str(),
+                    e.op,
+                    e.position.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("public", "a", Op::Truncate, Position::Lsn(100)),
+                ("public", "b", Op::Truncate, Position::Lsn(100)),
+                ("app", "c", Op::Truncate, Position::Lsn(100)),
+            ]
+        );
+        // The next peek re-sends the same message: it must not be queued twice.
+        src.queue_truncate(100, 7, 0, tables);
+        assert_eq!(src.buffer.len(), 3);
     }
 
     #[derive(Debug)]
