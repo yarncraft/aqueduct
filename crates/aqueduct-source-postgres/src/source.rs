@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Position, Result, Source};
 use async_trait::async_trait;
@@ -32,7 +32,16 @@ pub struct PostgresSourceConfig {
     pub ssl_mode: Option<SslMode>,
     /// PEM CA bundle to verify the server against; overrides `sslrootcert` in the URL.
     pub ssl_root_cert: Option<String>,
+    /// While idle, move the slot forward to the server's WAL position at most this often, so
+    /// changes to tables outside the publication do not pin WAL on the primary. `None` turns it off.
+    pub heartbeat_interval: Option<Duration>,
+    /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
+    /// servers where WAL position alone does not move the slot.
+    pub heartbeat_action_query: Option<String>,
 }
+
+/// Default for [`PostgresSourceConfig::heartbeat_interval`].
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 impl PostgresSourceConfig {
     pub fn new(
@@ -49,6 +58,8 @@ impl PostgresSourceConfig {
             allow_slot_recreate: false,
             ssl_mode: None,
             ssl_root_cert: None,
+            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
+            heartbeat_action_query: None,
         }
     }
 
@@ -83,6 +94,10 @@ pub struct PostgresSource {
     /// Relations already logged as `REPLICA IDENTITY FULL`; every poll re-sends the Relation messages,
     /// so this lives on the source, not in the per-poll relation cache.
     full_identity_logged: HashSet<(String, String)>,
+    /// Highest LSN known to be durably checkpointed: the start checkpoint, then every `ack`.
+    checkpointed: u64,
+    /// When the last heartbeat was attempted.
+    last_heartbeat: Instant,
 }
 
 impl PostgresSource {
@@ -96,6 +111,8 @@ impl PostgresSource {
             tx_ends: VecDeque::new(),
             last_end: 0,
             full_identity_logged: HashSet::new(),
+            checkpointed: 0,
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -193,7 +210,69 @@ impl PostgresSource {
         }
     }
 
+    /// Starts a heartbeat if one is due: runs the optional action query, then reads the server's
+    /// WAL flush position. This must happen **before** the peek, so every transaction committed
+    /// at or below the returned LSN is visible to that peek.
+    async fn heartbeat_begin(&mut self) -> Result<Option<u64>> {
+        let Some(every) = self.cfg.heartbeat_interval else {
+            return Ok(None);
+        };
+        if self.last_heartbeat.elapsed() < every {
+            return Ok(None);
+        }
+        self.last_heartbeat = Instant::now();
+        // A heartbeat only saves WAL; a failure (lock timeout, revoked grant) must not halt the
+        // stream, which would pin WAL harder than having no heartbeat. Skip this beat.
+        if let Some(q) = self.cfg.heartbeat_action_query.clone() {
+            let ran = match self.client() {
+                Ok(c) => c.batch_execute(&q).await.map_err(src_err),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = ran {
+                tracing::warn!(error = %e, "heartbeat action query failed; skipping this heartbeat");
+                return Ok(None);
+            }
+        }
+        match self.wal_position().await {
+            Ok(wal) => Ok(wal),
+            Err(e) => {
+                tracing::warn!(error = %e, "heartbeat WAL position query failed; skipping this heartbeat");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The server's WAL flush position (replay position on a standby).
+    async fn wal_position(&self) -> Result<Option<u64>> {
+        let row = self
+            .client()?
+            .query_one(
+                "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_flush_lsn() END)::text",
+                &[],
+            )
+            .await
+            .map_err(src_err)?;
+        let text: Option<String> = row.get(0);
+        text.as_deref().map(parse_lsn).transpose()
+    }
+
+    /// Finishes a heartbeat after the peek was processed. Advances the slot only when nothing
+    /// is queued or awaiting a checkpoint; see [`heartbeat_targets`].
+    async fn heartbeat_end(&mut self, wal: u64, drained: bool) -> Result<()> {
+        let targets = heartbeat_targets(
+            &mut self.tx_ends,
+            drained && self.buffer.is_empty(),
+            self.checkpointed,
+            wal,
+        );
+        for t in targets {
+            self.advance(t).await?;
+        }
+        Ok(())
+    }
+
     async fn poll(&mut self) -> Result<()> {
+        let heartbeat_wal = self.heartbeat_begin().await?;
         let rows = self
             .client()?
             .query(
@@ -204,6 +283,11 @@ impl PostgresSource {
             )
             .await
             .map_err(src_err)?;
+        // `upto_nchanges` ends a capped peek at the first commit past the limit, possibly well
+        // below `heartbeat_wal`. Only a peek that returned fewer rows than the cap saw everything.
+        // A peek that reached the end can still return `batch_size` rows or more (it stops at a
+        // commit boundary); that only delays the jump to `wal` by one interval, never skips data.
+        let drained = i64::try_from(rows.len()).is_ok_and(|n| n < i64::from(self.cfg.batch_size));
 
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
@@ -291,6 +375,9 @@ impl PostgresSource {
                 Message::Ignored => {}
             }
         }
+        if let Some(wal) = heartbeat_wal {
+            self.heartbeat_end(wal, drained).await?;
+        }
         Ok(())
     }
 }
@@ -343,7 +430,22 @@ impl Source for PostgresSource {
         // A recreated slot starts a new stream, so the old checkpoint no longer applies.
         if let (Some(pos), false) = (start, recreated) {
             match pos {
-                Position::Lsn(l) => self.emitted = l,
+                Position::Lsn(l) => {
+                    // A checkpoint ahead of this server's WAL comes from another cluster (restored
+                    // dump, copied state volume). Treating it as acknowledged would move the slot
+                    // past data that was never delivered, so refuse it.
+                    if let Some(wal) = self.wal_position().await? {
+                        if l > wal {
+                            return Err(Error::Checkpoint(format!(
+                                "checkpoint LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
+                                Position::Lsn(l),
+                                Position::Lsn(wal)
+                            )));
+                        }
+                    }
+                    self.emitted = l;
+                    self.checkpointed = l;
+                }
                 Position::Text(t) => {
                     return Err(Error::Checkpoint(format!(
                         "checkpoint {t:?} is not a Postgres LSN; it belongs to another source type"
@@ -372,7 +474,10 @@ impl Source for PostgresSource {
 
     async fn ack(&mut self, position: Position) -> Result<()> {
         match position {
-            Position::Lsn(l) => self.advance_acked(l).await,
+            Position::Lsn(l) => {
+                self.checkpointed = self.checkpointed.max(l);
+                self.advance_acked(l).await
+            }
             Position::Text(t) => Err(Error::Source(format!("cannot ack non-LSN position {t:?}"))),
         }
     }
@@ -465,6 +570,97 @@ fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
         tx_ends.pop_front();
     }
     target
+}
+
+/// LSNs the slot may be advanced to, in order, for a heartbeat at WAL position `wal`.
+///
+/// 1. Transactions whose changes are all at or below `checkpointed` count as acknowledged:
+///    that covers empty transactions (Postgres < 15 sends them for unpublished tables) and
+///    replays of transactions already delivered before a restart. The slot may move to the
+///    last such commit end.
+/// 2. Only if the peek was drained (returned fewer rows than `batch_size`), nothing is queued and
+///    no transaction is still waiting for its checkpoint may the slot move to `wal`. The caller
+///    captured `wal` before the peek, so a drained peek contained every transaction committed at
+///    or below it, all already acknowledged. A capped peek can end below `wal`, so it only gets
+///    step 1.
+///
+/// An unacknowledged event therefore always holds the slot back (at-least-once).
+fn heartbeat_targets(
+    tx_ends: &mut VecDeque<(u64, u64)>,
+    idle: bool,
+    checkpointed: u64,
+    wal: u64,
+) -> Vec<u64> {
+    let mut targets = Vec::new();
+    if let Some(t) = ack_target(tx_ends, checkpointed) {
+        targets.push(t);
+    }
+    if idle && tx_ends.is_empty() {
+        targets.push(wal);
+    }
+    targets
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn idle_advances_to_wal() {
+        let mut q = VecDeque::new();
+        assert_eq!(heartbeat_targets(&mut q, true, 0, 500), vec![500]);
+    }
+
+    #[test]
+    fn capped_peek_only_gets_the_checkpointed_target() {
+        // Not idle (capped peek): the slot may reach the last checkpointed commit end, never `wal`.
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(heartbeat_targets(&mut q, false, 100, 500), vec![120]);
+        assert_eq!(q.len(), 1);
+        let mut q = VecDeque::from([(0, 120), (0, 140)]);
+        assert_eq!(heartbeat_targets(&mut q, false, 0, 500), vec![140]);
+    }
+
+    #[test]
+    fn queued_events_hold_the_slot() {
+        let mut q = VecDeque::new();
+        assert!(heartbeat_targets(&mut q, false, 0, 500).is_empty());
+    }
+
+    #[test]
+    fn delivered_but_uncheckpointed_transaction_holds_the_slot() {
+        let mut q = VecDeque::from([(100, 120)]);
+        assert!(heartbeat_targets(&mut q, true, 99, 500).is_empty());
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn checkpointed_transactions_are_acknowledged_first() {
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(heartbeat_targets(&mut q, true, 200, 500), vec![220, 500]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn partially_checkpointed_queue_only_moves_to_the_acked_commit_end() {
+        let mut q = VecDeque::from([(100, 120), (200, 220)]);
+        assert_eq!(heartbeat_targets(&mut q, true, 150, 500), vec![120]);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn empty_transactions_do_not_pin_the_slot() {
+        // (0, end): a transaction without published changes (Postgres < 15).
+        let mut q = VecDeque::from([(0, 120), (0, 140)]);
+        assert_eq!(heartbeat_targets(&mut q, true, 0, 500), vec![140, 500]);
+    }
+
+    #[test]
+    fn empty_transaction_behind_unacked_data_stays_queued() {
+        let mut q = VecDeque::from([(100, 120), (0, 140)]);
+        assert!(heartbeat_targets(&mut q, true, 0, 500).is_empty());
+        assert_eq!(q.len(), 2);
+    }
 }
 
 #[cfg(test)]

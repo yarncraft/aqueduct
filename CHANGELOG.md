@@ -57,6 +57,13 @@ Notable changes to Aqueduct. Newest first.
   placeholders `dev-token-change-me` or `change-me` (case-insensitive). This applies on loopback binds too. An empty value still means "unset". To
   upgrade, replace short tokens such as `change-me` with a random one: `openssl rand -hex 32`.
 
+### Added
+
+- **Postgres idle heartbeat** (#47). Writes to tables outside the publication no longer pin WAL: every `heartbeat_interval_secs`
+  (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is
+  not yet checkpointed. Optional `heartbeat_action_query` for servers that need a write to move the slot. No action needed
+  on upgrade; see DEPLOYMENT.md for the heartbeat-table recipe.
+
 ### Changed
 
 - **Postgres source errors now include the cause** (#18). A failed connect previously showed only

@@ -10,6 +10,9 @@ slot = "aqueduct"
 publication = "aqueduct"
 # TLS defaults to verify-full (cert chain + hostname). Point ssl_root_cert at your CA if it is private.
 # ssl_root_cert = "/etc/aqueduct/pg-ca.pem"
+# While idle the slot is advanced every N seconds (0 = off) so unpublished writes do not pin WAL.
+# heartbeat_interval_secs = 10
+# heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
 # Only for a trusted private network without TLS (compose demo): ssl_mode = "disable"
 
 # Kafka is the only sink.
