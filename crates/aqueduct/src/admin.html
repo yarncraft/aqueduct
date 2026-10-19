@@ -260,7 +260,7 @@ function chart(series) {
   $('chart').innerHTML = g;
 }
 
-// Slot lag is exact. Heartbeat age is measured between the last beat and this snapshot, so it keeps
+// Slot lag is exact. Heartbeat age is the browser clock minus the server's last beat time, so it keeps
 // counting even if the beat stopped. Fields the server does not send render as an en dash.
 const TILE = 'mt-2 font-mono text-3xl font-medium tabular-nums ';
 function renderHealth(d) {
@@ -281,7 +281,7 @@ function renderHealth(d) {
     $('hbage').textContent = 'waiting';
   } else {
     age = Math.max(0, Date.now() - h.last_ms);
-    $('hbage').textContent = ms(age) + ' ago';
+    $('hbage').textContent = (age < 60000 ? ms(age) : dur(Math.floor(age / 1000))) + ' ago';
     tone = age > 5 * every ? 'text-red' : age > 2 * every ? 'text-amber' : 'text-ink-100';
   }
   $('hbage').className = TILE + tone;
