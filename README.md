@@ -25,6 +25,30 @@ Then open the cockpit at <http://localhost:8080/>.
 The compose file starts Postgres 16 with `wal_level=logical`, creates a `users` table and an
 `aqueduct` publication (`config/init.sql`), a single-node Kafka (KRaft), and runs Aqueduct against both.
 
+## Run the simulation
+
+`docker-compose.sim.yml` starts a self-contained demo: Postgres, Kafka, Aqueduct and a `simulator` container that
+endlessly inserts, updates and deletes rows in `users`, `orders` and `payments`, so the cockpit always has live traffic.
+You only need Docker or Podman; nothing else is installed on the host.
+
+```sh
+# start (builds the Aqueduct image on first run)
+podman-compose -f docker-compose.sim.yml -p aqsim up -d --build     # or: docker compose -f docker-compose.sim.yml -p aqsim up -d --build
+
+# open the cockpit
+#   http://localhost:8088/?token=dev-token-change-me
+
+# change the load (transactions per second, default 15; each is ~2-3 events)
+SIM_RATE=40 podman-compose -f docker-compose.sim.yml -p aqsim up -d simulator
+
+# stop (keeps data); add -v to also wipe the Postgres, Aqueduct checkpoint volumes
+podman-compose -f docker-compose.sim.yml -p aqsim down
+```
+
+Set `AQUEDUCT_ADMIN_TOKEN` to use a different admin token. The simulation publishes only port 8088, so it can run
+alongside the regular `docker-compose.yml` (port 8080). Tables are capped at about 2000 recent rows and Kafka retention at
+256 MiB / 24 h, so it can run indefinitely. See `docs/DEPLOYMENT.md` for details.
+
 ## Configuration
 
 Full deployment guide (Postgres setup, Docker/Kubernetes, every config key, operations, troubleshooting): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
