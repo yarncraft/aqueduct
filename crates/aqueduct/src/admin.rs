@@ -497,7 +497,7 @@ mod tests {
             .into_iter()
             .chain(ids("getElementById('", "')"))
             // Skip ids built at runtime (`$('op-' + k)`); only literal ids can be checked.
-            .filter(|id| !id.contains(['\'', ' ','(', ')']))
+            .filter(|id| !id.contains(['\'', ' ', '(', ')']))
             .filter(|id| !defined.contains(id))
             .collect();
         missing.sort_unstable();
