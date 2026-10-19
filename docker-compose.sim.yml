@@ -1,6 +1,6 @@
 # Self-contained, endlessly running demo: Postgres + Kafka + Aqueduct + a workload generator.
-#   podman-compose -f docker-compose.sim.yml -p aqsim up -d --build
-#   UI: http://localhost:8088   (admin token: dev-token-change-me, override with AQUEDUCT_ADMIN_TOKEN)
+#   AQUEDUCT_ADMIN_TOKEN=<secret> podman-compose -f docker-compose.sim.yml -p aqsim up -d --build
+#   UI: http://localhost:8088   (admin token: whatever you set in AQUEDUCT_ADMIN_TOKEN, required)
 # Tune load with SIM_RATE (transactions per second, default 15). Stop with `down`; add `-v` to wipe data.
 services:
   postgres:
@@ -44,7 +44,7 @@ services:
       kafka:
         condition: service_started
     environment:
-      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:-dev-token-change-me}
+      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:?set AQUEDUCT_ADMIN_TOKEN to a secret value (e.g. openssl rand -hex 32)}
     volumes:
       - ./sim/aqueduct.sim.toml:/etc/aqueduct/aqueduct.toml:ro
       - aqueduct-state:/var/lib/aqueduct
@@ -63,7 +63,7 @@ services:
       aqueduct:
         condition: service_started
     environment:
-      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:-dev-token-change-me}
+      AQUEDUCT_ADMIN_TOKEN: ${AQUEDUCT_ADMIN_TOKEN:?set AQUEDUCT_ADMIN_TOKEN to a secret value (e.g. openssl rand -hex 32)}
     volumes:
       - ./sim/aqueduct.kafka.toml:/etc/aqueduct/aqueduct.toml:ro
       - aqueduct-kafka-state:/var/lib/aqueduct
