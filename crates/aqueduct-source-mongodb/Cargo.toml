@@ -8,7 +8,7 @@ license.workspace = true
 aqueduct-core = { path = "../aqueduct-core" }
 async-trait.workspace = true
 futures-util = "0.3"
-mongodb = { version = "3", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "dns-resolver", "compat-3-0-0"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
