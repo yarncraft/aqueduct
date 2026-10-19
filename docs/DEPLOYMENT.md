@@ -130,6 +130,8 @@ topic = "cdc.{schema}.{table}"
 | `publication` | `aqueduct` | Existing publication to stream |
 | `ssl_mode` | from URL, else `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. Weaker modes must be set explicitly; `verify-full` is the default and the production setting |
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
+| `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
+| `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
@@ -236,6 +238,8 @@ routes to, using its own connection (created on first use). A closed tab costs n
 - **WAL retention.** An unacknowledged slot makes Postgres keep WAL. If Aqueduct is down for long, or the sink is stuck,
   disk usage grows. Monitor `pg_replication_slots` (`confirmed_flush_lsn`, `pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)`)
   and alert on `max_slot_wal_keep_size` pressure. Set `max_slot_wal_keep_size` on Postgres 13+ as a safety valve.
+- **Idle databases.** Writes to tables outside the publication also produce WAL. The slot is moved forward for them by the
+  [idle heartbeat](#idle-heartbeat), on by default.
 - **Decommissioning.** Drop the slot or it will keep WAL forever: `SELECT pg_drop_replication_slot('aqueduct');`
 - **Restarts and upgrades.** Stop the container, deploy the new image with the same volume, start. It resumes from the slot.
   Do not delete the state volume; losing the checkpoint only causes replay (the slot still decides what is pending).
@@ -243,6 +247,39 @@ routes to, using its own connection (created on first use). A closed tab costs n
   (or your orchestrator) brings it back and delivery resumes from the last acknowledged transaction.
 - **Changing the publication or sink.** Edit the config and restart. Changing `slot` starts a new stream from "now".
 - **Health.** `GET /healthz` returns `200 ok` while the process is up. Use the cockpit's state and error count (`/api/metrics`) for deeper checks.
+
+### Idle heartbeat
+
+A logical slot only moves when Aqueduct confirms a position. If the database is busy but nothing in the publication
+changes, nothing is confirmed, and Postgres keeps all that WAL. Every `heartbeat_interval_secs` (default 10) the source
+checks whether it is idle and, if so, confirms the server's current WAL position, so the slot follows the database.
+
+It is idle only when no event is queued and every delivered event is already checkpointed. An event that has been read
+but not yet checkpointed always holds the slot back, so delivery stays at-least-once: after a crash the slot is
+never past an event that was not delivered, and a restart replays at most the unacknowledged tail, as before.
+The heartbeat position is not written to the checkpoint file, which only holds the last delivered event; the
+slot itself carries the heartbeat position. Set `heartbeat_interval_secs = 0` to disable.
+
+WAL position alone is enough on a normal server. If your Postgres produces no WAL while idle, or the slot still lags
+(for example a low-traffic managed database), give the heartbeat something to write with `heartbeat_action_query`.
+Run it once before each heartbeat. A small published table works:
+
+```sql
+CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
+INSERT INTO aqueduct_heartbeat VALUES (1, now());
+ALTER PUBLICATION aqueduct ADD TABLE aqueduct_heartbeat;
+-- the Aqueduct role needs SELECT (already required) and UPDATE on it
+GRANT UPDATE ON aqueduct_heartbeat TO aqueduct;
+```
+
+```toml
+[postgres]
+heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
+```
+
+The table is in the publication, so its changes are delivered as normal events (topic `cdc.public.aqueduct_heartbeat`
+by default, one per interval); route or ignore that topic downstream. Monitor the effect with
+`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots`.
 
 ## 6. Troubleshooting
 

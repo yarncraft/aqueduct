@@ -9,5 +9,5 @@ pub mod decoder;
 mod source;
 mod tls;
 
-pub use source::{parse_lsn, PostgresSource, PostgresSourceConfig};
+pub use source::{parse_lsn, PostgresSource, PostgresSourceConfig, DEFAULT_HEARTBEAT_INTERVAL};
 pub use tls::SslMode;

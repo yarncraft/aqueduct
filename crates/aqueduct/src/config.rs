@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
 /// A credential that never shows up in `Debug` output (and so not in logs).
@@ -79,6 +81,17 @@ pub struct PostgresConfig {
     /// PEM CA bundle used to verify the server (overrides `sslrootcert` in the URL).
     #[serde(default)]
     pub ssl_root_cert: Option<String>,
+    /// While idle, advance the slot to the server's WAL position this often (seconds), so writes
+    /// to unpublished tables do not pin WAL. `0` turns it off. Default 10.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Optional SQL run before each heartbeat, e.g. an upsert into a small published table.
+    #[serde(default)]
+    pub heartbeat_action_query: Option<String>,
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    aqueduct_source_postgres::DEFAULT_HEARTBEAT_INTERVAL.as_secs()
 }
 
 impl PostgresConfig {
@@ -91,6 +104,12 @@ impl PostgresConfig {
         c.ssl_mode = self.ssl_mode.as_deref().map(str::parse).transpose()?;
         c.ssl_root_cert = self.ssl_root_cert.clone();
         c.allow_slot_recreate = self.allow_slot_recreate;
+        c.heartbeat_interval = (self.heartbeat_interval_secs > 0)
+            .then(|| Duration::from_secs(self.heartbeat_interval_secs));
+        c.heartbeat_action_query = self
+            .heartbeat_action_query
+            .clone()
+            .filter(|q| !q.trim().is_empty());
         Ok(c)
     }
 }
@@ -459,6 +478,31 @@ type='redis'
     }
 
     #[test]
+    fn heartbeat_defaults_and_overrides() {
+        let pg = |extra: &str| -> PostgresConfig {
+            toml::from_str(&format!(
+                "url = 'postgres://u@db/app'
+{extra}"
+            ))
+            .unwrap()
+        };
+        let c = pg("").source_config().unwrap();
+        assert_eq!(c.heartbeat_interval, Some(Duration::from_secs(10)));
+        assert_eq!(c.heartbeat_action_query, None);
+        let c = pg("heartbeat_interval_secs = 0").source_config().unwrap();
+        assert_eq!(c.heartbeat_interval, None);
+        let c = pg("heartbeat_interval_secs = 3
+heartbeat_action_query = 'SELECT 1'")
+        .source_config()
+        .unwrap();
+        assert_eq!(c.heartbeat_interval, Some(Duration::from_secs(3)));
+        assert_eq!(c.heartbeat_action_query.as_deref(), Some("SELECT 1"));
+        // A blank query is no query.
+        let c = pg("heartbeat_action_query = '  '").source_config().unwrap();
+        assert_eq!(c.heartbeat_action_query, None);
+    }
+
+    #[test]
     fn rejects_bad_ssl_mode() {
         let mut p = PostgresConfig {
             url: "postgres://u@db/app".into(),
@@ -467,6 +511,8 @@ type='redis'
             ssl_mode: Some("sometimes".into()),
             ssl_root_cert: None,
             allow_slot_recreate: false,
+            heartbeat_interval_secs: 10,
+            heartbeat_action_query: None,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());
