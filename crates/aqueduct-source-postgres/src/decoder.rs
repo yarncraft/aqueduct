@@ -38,6 +38,16 @@ pub struct Relation {
     pub schema: String,
     pub name: String,
     pub columns: Vec<Column>,
+    /// Replica identity byte from the Relation message: `d` default, `n` nothing, `f` full, `i` index.
+    pub identity: u8,
+}
+
+impl Relation {
+    /// `REPLICA IDENTITY FULL` makes pgoutput flag every column as identity, so the "key" would be the
+    /// whole row and change on every update.
+    pub fn identity_full(&self) -> bool {
+        self.identity == b'f'
+    }
 }
 
 /// One column of a tuple as sent on the wire.
@@ -193,7 +203,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             let id = r.u32()?;
             let schema = r.cstr()?;
             let name = r.cstr()?;
-            let _replica_identity = r.u8()?;
+            let identity = r.u8()?;
             let n = r.count16()?;
             let mut columns = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
@@ -212,6 +222,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
                 schema,
                 name,
                 columns,
+                identity,
             })
         }
         b'I' => {
@@ -308,9 +319,14 @@ impl RelationCache {
     }
 
     /// Replica-identity key values of `tuple` joined with the unit separator (0x1f), or `None` when the table
-    /// has no key columns. Used to partition by primary key.
+    /// has no key columns or uses `REPLICA IDENTITY FULL` (where every column is flagged, so the key would
+    /// be the whole row and move on every update), or when a key column was not sent (unchanged TOAST).
+    /// `None` means "fall back to the table key", not "no primary key". Used to partition by primary key.
     pub fn key(&self, id: u32, tuple: &Tuple) -> Result<Option<String>, DecodeError> {
         let rel = self.get(id)?;
+        if rel.identity_full() {
+            return Ok(None);
+        }
         let mut out = String::new();
         let mut any = false;
         for (col, datum) in rel.columns.iter().zip(tuple) {
@@ -328,7 +344,9 @@ impl RelationCache {
                         let _ = write!(out, "{x:02x}");
                     }
                 }
-                Datum::Null | Datum::Unchanged => {}
+                Datum::Null => {}
+                // An unsent TOASTed key column would give a different key than the insert had.
+                Datum::Unchanged => return Ok(None),
             }
         }
         Ok(any.then_some(out))
@@ -404,10 +422,14 @@ mod tests {
     }
 
     fn relation_bytes() -> Vec<u8> {
+        relation_bytes_with(b'd')
+    }
+
+    fn relation_bytes_with(identity: u8) -> Vec<u8> {
         let mut v = vec![b'R'];
         v.extend(42u32.to_be_bytes());
         v.extend(b"public\0users\0");
-        v.push(b'd');
+        v.push(identity);
         v.extend(2i16.to_be_bytes());
         for (flags, name, oid) in [(1u8, "id", 23u32), (0, "name", 25)] {
             v.push(flags);
@@ -465,6 +487,89 @@ mod tests {
         b.extend(i32::MIN.to_be_bytes());
         b.push(0);
         assert_eq!(decode(&b), Err(DecodeError::NegativeLength(i32::MIN)));
+    }
+
+    fn key_of(identity: u8, tuple: &[Option<&str>]) -> Option<String> {
+        let Message::Relation(rel) = decode(&relation_bytes_with(identity)).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        cache.key(42, &decode_tuple(tuple)).unwrap()
+    }
+
+    fn decode_tuple(cols: &[Option<&str>]) -> Tuple {
+        let mut ins = vec![b'I'];
+        ins.extend(42u32.to_be_bytes());
+        ins.push(b'N');
+        ins.extend(tuple_bytes(cols));
+        let Message::Insert { new, .. } = decode(&ins).unwrap() else {
+            panic!()
+        };
+        new
+    }
+
+    #[test]
+    fn full_identity_has_no_key_so_updates_keep_one_partition() {
+        // Under FULL pgoutput flags every column, so the old and new row would hash differently.
+        let flagged_all = {
+            let Message::Relation(mut rel) = decode(&relation_bytes_with(b'f')).unwrap() else {
+                panic!()
+            };
+            for c in &mut rel.columns {
+                c.key = true;
+            }
+            rel
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(flagged_all);
+        let old = decode_tuple(&[Some("5"), Some("a")]);
+        let new = decode_tuple(&[Some("5"), Some("b")]);
+        assert_eq!(cache.key(42, &old).unwrap(), None);
+        assert_eq!(cache.key(42, &new).unwrap(), None);
+    }
+
+    #[test]
+    fn unchanged_toast_key_column_falls_back_to_the_table_key() {
+        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let tuple = vec![Datum::Unchanged, Datum::Text("a".into())];
+        assert_eq!(cache.key(42, &tuple).unwrap(), None);
+    }
+
+    #[test]
+    fn index_identity_key_changes_when_the_key_column_changes() {
+        // Documented caveat: updating a key column moves the row; pinned, not fixed.
+        let a = key_of(b'i', &[Some("5"), Some("x")]);
+        let b = key_of(b'i', &[Some("6"), Some("x")]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn default_identity_without_a_primary_key_falls_back_to_the_table_key() {
+        let Message::Relation(mut rel) = decode(&relation_bytes_with(b'd')).unwrap() else {
+            panic!()
+        };
+        for c in &mut rel.columns {
+            c.key = false;
+        }
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        assert_eq!(
+            cache
+                .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn default_and_index_identity_keep_the_key() {
+        assert_eq!(key_of(b'd', &[Some("5"), Some("a")]), Some("5".to_string()));
+        assert_eq!(key_of(b'i', &[Some("5"), Some("a")]), Some("5".to_string()));
     }
 
     #[test]

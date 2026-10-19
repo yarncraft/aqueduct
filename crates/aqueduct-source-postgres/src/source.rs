@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Error, Op, Position, Result, Source};
@@ -80,6 +80,9 @@ pub struct PostgresSource {
     tx_ends: VecDeque<(u64, u64)>,
     /// Highest commit end LSN recorded in `tx_ends`.
     last_end: u64,
+    /// Relations already logged as `REPLICA IDENTITY FULL`; every poll re-sends the Relation messages,
+    /// so this lives on the source, not in the per-poll relation cache.
+    full_identity_logged: HashSet<(String, String)>,
 }
 
 impl PostgresSource {
@@ -92,6 +95,7 @@ impl PostgresSource {
             acked: 0,
             tx_ends: VecDeque::new(),
             last_end: 0,
+            full_identity_logged: HashSet::new(),
         }
     }
 
@@ -230,7 +234,19 @@ impl PostgresSource {
                     xid = x;
                     ts = commit_ts_micros;
                 }
-                Message::Relation(rel) => cache.insert(rel),
+                Message::Relation(rel) => {
+                    if rel.identity_full()
+                        && self
+                            .full_identity_logged
+                            .insert((rel.schema.clone(), rel.name.clone()))
+                    {
+                        tracing::info!(
+                            table = %format!("{}.{}", rel.schema, rel.name),
+                            "REPLICA IDENTITY FULL: partition_by = key falls back to the table key for this table"
+                        );
+                    }
+                    cache.insert(rel)
+                }
                 Message::Insert { relation, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());

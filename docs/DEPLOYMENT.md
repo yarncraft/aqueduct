@@ -195,8 +195,9 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 Records: key `schema.table` (or `schema.table:<replica-identity columns>` with `partition_by = "key"`), value the JSON event, headers `op` and `lsn`, timestamp = commit time. The partition is a
 stable FNV-1a hash of the key. With the default `table`, all of a table's changes stay ordered. With `key`, a row's changes
 stay ordered **only while its identity columns never change**: use a primary key or `REPLICA IDENTITY USING INDEX` on
-immutable columns. Under `REPLICA IDENTITY FULL` every column is part of the key, so any update can move the row to
-another partition and per-row order is lost; an update of a key column does the same with any identity. `TRUNCATE` (and
+immutable columns. Tables with `REPLICA IDENTITY FULL` (every column is part of the key, so any update would move the
+row) are keyed `schema.table` even in `key` mode, so they keep per-table order only; an update of a key column still
+moves the row with any other identity. `TRUNCATE` (and
 any table without an identity) is keyed `schema.table`, so it is not ordered against that table's row events; do not
 use it as a barrier in `key` mode. A produce is acknowledged by the broker before the
 checkpoint moves. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
