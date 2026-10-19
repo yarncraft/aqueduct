@@ -92,6 +92,19 @@ const PEEK_SQL: &str = "SELECT lsn::text, data \
      FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
      'proto_version', '1', 'publication_names', $3::text)";
 
+/// [`PEEK_SQL`] plus `messages`, so logical messages (snapshot watermarks) are sent. Postgres 14+.
+const PEEK_SQL_WITH_MESSAGES: &str = "SELECT lsn::text, data \
+     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
+     'proto_version', '1', 'publication_names', $3::text, 'messages', 'true')";
+
+fn peek_sql(logical_messages: bool) -> &'static str {
+    if logical_messages {
+        PEEK_SQL_WITH_MESSAGES
+    } else {
+        PEEK_SQL
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresSourceConfig {
     /// libpq-style connection string / URL.
@@ -117,6 +130,9 @@ pub struct PostgresSourceConfig {
     /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
     /// servers where WAL position alone does not move the slot.
     pub heartbeat_action_query: Option<String>,
+    /// Ask the slot for logical messages (`'messages', 'true'`), which snapshots use as watermarks.
+    /// Needs Postgres 14+. Off by default, so the peek is unchanged.
+    pub logical_messages: bool,
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -139,6 +155,7 @@ impl PostgresSourceConfig {
             ssl_root_cert: None,
             heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
             heartbeat_action_query: None,
+            logical_messages: false,
         }
     }
 
@@ -420,7 +437,7 @@ impl PostgresSource {
         let rows = self
             .client()?
             .query(
-                PEEK_SQL,
+                peek_sql(self.cfg.logical_messages),
                 &[&self.cfg.slot, &self.cfg.batch_size, &self.cfg.publication],
             )
             .await
@@ -513,7 +530,8 @@ impl PostgresSource {
                         self.tx_ends.push_back((end, end_lsn));
                     }
                 }
-                Message::Ignored => {}
+                // Nothing consumes watermarks yet; the snapshot engine will.
+                Message::Logical(_) | Message::Ignored => {}
             }
         }
         if let Some(wal) = heartbeat_wal {
@@ -686,6 +704,21 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_are_only_requested_when_asked_for() {
+        let cfg = PostgresSourceConfig::new("postgres://x", "s", "p");
+        assert!(!cfg.logical_messages);
+        assert_eq!(peek_sql(cfg.logical_messages), PEEK_SQL);
+        assert!(!PEEK_SQL.contains("messages"));
+        assert_eq!(
+            peek_sql(true),
+            PEEK_SQL.replace(
+                "'publication_names', $3::text)",
+                "'publication_names', $3::text, 'messages', 'true')"
+            )
+        );
+    }
 
     #[test]
     fn lsn_roundtrip() {
