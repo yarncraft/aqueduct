@@ -61,7 +61,7 @@ case "${1:-}" in
     render "## $version ($(date +%Y-%m-%d))" > "$section"
     # Read the section from a file: awk -v would rewrite backslashes in the text.
     awk -v m="$marker" -v f="$section" '
-      { print; l = $0; sub(/$/, "", l) }
+      { print; l = $0; sub(/\r$/, "", l) }
       l == m { print ""; while ((getline line < f) > 0) print line }
     ' CHANGELOG.md > "$out"
     mv "$out" CHANGELOG.md
