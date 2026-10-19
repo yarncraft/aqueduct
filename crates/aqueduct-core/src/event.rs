@@ -70,6 +70,7 @@ impl ChangeEvent {
             before: None,
             after: None,
             key: None,
+            checkpoint: None,
         }
     }
 }
@@ -99,4 +100,9 @@ pub struct ChangeEvent {
     /// and unchanged-TOAST key columns.
     #[serde(skip)]
     pub key: Option<String>,
+    /// What the pipeline saves and acks after delivering this event, when it differs from
+    /// `position`. A source whose `position` is not unique or not ordered across the stream
+    /// (Postgres: change LSNs are not commit-ordered) puts its resume key here. Not serialised.
+    #[serde(skip)]
+    pub checkpoint: Option<Position>,
 }

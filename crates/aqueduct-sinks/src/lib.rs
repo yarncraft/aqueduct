@@ -31,5 +31,6 @@ pub(crate) fn sample() -> ChangeEvent {
         before: None,
         after: serde_json::value::RawValue::from_string(r#"{"id":1,"name":"ada"}"#.into()).ok(),
         key: Some("1".into()),
+        checkpoint: None,
     }
 }

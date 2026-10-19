@@ -285,6 +285,7 @@ pub fn pool(n: usize) -> Vec<ChangeEvent> {
                 before: before.map(raw),
                 after: after.map(raw),
                 key: None,
+                checkpoint: None,
             }
         })
         .collect()

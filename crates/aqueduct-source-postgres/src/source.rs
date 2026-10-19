@@ -14,6 +14,84 @@ use crate::decoder::{decode, Message, RelationCache};
 
 type Row = Box<RawValue>;
 
+/// Resume key of one change: `(commit LSN, change LSN, ord)`.
+///
+/// Change LSNs alone are neither unique (a COPY's rows and a multi-table TRUNCATE share one WAL
+/// record, so one LSN) nor commit-ordered (transactions overlap). Transactions arrive in commit
+/// order and changes within one in WAL order, so the stream is strictly increasing in this key.
+/// `ord` is the index among the changes of one transaction that share a `change` LSN; decoding the
+/// same WAL record again gives the same order. `commit` is `Begin.final_lsn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Key {
+    pub commit: u64,
+    pub change: u64,
+    pub ord: u32,
+}
+
+impl Key {
+    /// Checkpoint encoding: `<commit>@<change>#<ord>`, decimal.
+    pub fn encode(&self) -> String {
+        format!("{}@{}#{}", self.commit, self.change, self.ord)
+    }
+
+    pub fn parse(s: &str) -> Option<Key> {
+        let (commit, rest) = s.split_once('@')?;
+        let (change, ord) = rest.split_once('#')?;
+        Some(Key {
+            commit: commit.parse().ok()?,
+            change: change.parse().ok()?,
+            ord: ord.parse().ok()?,
+        })
+    }
+}
+
+/// Parses a text checkpoint; anything that is not a [`Key`] belongs to another source type.
+fn key_from_checkpoint(t: &str) -> Result<Key> {
+    Key::parse(t).ok_or_else(|| {
+        Error::Checkpoint(format!(
+            "checkpoint {t:?} is not a Postgres checkpoint; it belongs to another source type"
+        ))
+    })
+}
+
+/// Assigns [`Key`]s to the changes of the transaction being decoded.
+#[derive(Default)]
+struct TxKeys {
+    commit: u64,
+    last: Option<Key>,
+}
+
+impl TxKeys {
+    fn begin(&mut self, commit: u64) {
+        *self = TxKeys { commit, last: None };
+    }
+
+    fn next(&mut self, change: u64) -> Key {
+        let ord = match self.last {
+            Some(k) if k.change == change => k.ord + 1,
+            _ => 0,
+        };
+        let key = Key {
+            commit: self.commit,
+            change,
+            ord,
+        };
+        self.last = Some(key);
+        key
+    }
+
+    /// Key of the transaction's last change; `None` for a transaction without published changes.
+    fn end_key(&self) -> Option<Key> {
+        self.last
+    }
+}
+
+/// The peek query. `proto_version` stays 1 and `streaming` is never set: a streamed in-progress
+/// transaction has no commit LSN until it commits, so no [`Key`] could be built for its changes.
+const PEEK_SQL: &str = "SELECT lsn::text, data \
+     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
+     'proto_version', '1', 'publication_names', $3::text)";
+
 #[derive(Debug, Clone)]
 pub struct PostgresSourceConfig {
     /// libpq-style connection string / URL.
@@ -82,21 +160,21 @@ pub struct PostgresSource {
     cfg: PostgresSourceConfig,
     client: Option<Client>,
     buffer: VecDeque<ChangeEvent>,
-    /// Highest change LSN already queued; later peeks skip rows at or below it.
-    emitted: u64,
+    /// Highest key already queued; later peeks skip changes at or below it.
+    emitted: Key,
     /// Highest LSN the slot has been advanced to.
     acked: u64,
-    /// Completed transactions as (last change LSN, commit end LSN). The slot can only
-    /// be advanced to a commit end LSN: advancing to a mid-transaction change LSN
+    /// Completed transactions as (key of the last change, commit end LSN), in commit order. The
+    /// slot can only be advanced to a commit end LSN: advancing to a mid-transaction change LSN
     /// leaves `confirmed_flush_lsn` unmoved and the whole transaction is replayed.
-    tx_ends: VecDeque<(u64, u64)>,
+    tx_ends: VecDeque<(Key, u64)>,
     /// Highest commit end LSN recorded in `tx_ends`.
     last_end: u64,
     /// Relations already logged as `REPLICA IDENTITY FULL`; every poll re-sends the Relation messages,
     /// so this lives on the source, not in the per-poll relation cache.
     full_identity_logged: HashSet<(String, String)>,
-    /// Highest LSN known to be durably checkpointed: the start checkpoint, then every `ack`.
-    checkpointed: u64,
+    /// Highest key known to be durably checkpointed: the start checkpoint, then every `ack`.
+    checkpointed: Key,
     /// When the last heartbeat was attempted.
     last_heartbeat: Instant,
     /// Where heartbeats and slot lag are reported, if the host wants them.
@@ -114,12 +192,12 @@ impl PostgresSource {
             cfg,
             client: None,
             buffer: VecDeque::new(),
-            emitted: 0,
+            emitted: Key::default(),
             acked: 0,
             tx_ends: VecDeque::new(),
             last_end: 0,
             full_identity_logged: HashSet::new(),
-            checkpointed: 0,
+            checkpointed: Key::default(),
             last_heartbeat: Instant::now(),
             metrics: None,
             last_slot_stats: None,
@@ -220,9 +298,9 @@ impl PostgresSource {
             .ok_or_else(|| Error::Source("source not started".into()))
     }
 
-    /// Advance the slot past every fully acknowledged transaction (all changes <= `lsn`).
-    async fn advance_acked(&mut self, lsn: u64) -> Result<()> {
-        if let Some(target) = ack_target(&mut self.tx_ends, lsn) {
+    /// Advance the slot past every fully acknowledged transaction (all changes <= `key`).
+    async fn advance_acked(&mut self, key: Key) -> Result<()> {
+        if let Some(target) = ack_target(&mut self.tx_ends, key) {
             self.advance(target).await?;
         }
         Ok(())
@@ -246,19 +324,19 @@ impl PostgresSource {
     #[allow(clippy::too_many_arguments)]
     fn queue(
         &mut self,
-        lsn: u64,
+        key: Key,
         xid: u32,
         commit_ts_micros: i64,
         (schema, table): (String, String),
         op: Op,
         before: Option<Row>,
         after: Option<Row>,
-        key: Option<String>,
+        row_key: Option<String>,
     ) {
-        if lsn > self.emitted {
-            self.emitted = lsn;
+        if key > self.emitted {
+            self.emitted = key;
             self.buffer.push_back(ChangeEvent {
-                position: Position::Lsn(lsn),
+                position: Position::Lsn(key.change),
                 xid,
                 commit_ts_micros,
                 schema,
@@ -266,36 +344,8 @@ impl PostgresSource {
                 op,
                 before,
                 after,
-                key,
-            });
-        }
-    }
-
-    /// Queues one `Truncate` event per table. A multi-table `TRUNCATE` is a single WAL message, so
-    /// its tables share one LSN: the LSN check runs once for the message, not per table, or only the
-    /// first table would be emitted.
-    fn queue_truncate(
-        &mut self,
-        lsn: u64,
-        xid: u32,
-        commit_ts_micros: i64,
-        tables: Vec<(String, String)>,
-    ) {
-        if lsn <= self.emitted {
-            return;
-        }
-        self.emitted = lsn;
-        for (schema, table) in tables {
-            self.buffer.push_back(ChangeEvent {
-                position: Position::Lsn(lsn),
-                xid,
-                commit_ts_micros,
-                schema,
-                table,
-                op: Op::Truncate,
-                before: None,
-                after: None,
-                key: None,
+                key: row_key,
+                checkpoint: Some(Position::Text(key.encode())),
             });
         }
     }
@@ -370,9 +420,7 @@ impl PostgresSource {
         let rows = self
             .client()?
             .query(
-                "SELECT lsn::text, data \
-                 FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
-                 'proto_version', '1', 'publication_names', $3::text)",
+                PEEK_SQL,
                 &[&self.cfg.slot, &self.cfg.batch_size, &self.cfg.publication],
             )
             .await
@@ -385,7 +433,7 @@ impl PostgresSource {
 
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
-        let mut tx_last = 0u64;
+        let mut keys = TxKeys::default();
         for row in rows {
             // Borrow from the result buffer instead of copying each change out of it.
             let lsn_text: &str = row.get(0);
@@ -393,24 +441,16 @@ impl PostgresSource {
             let lsn = parse_lsn(lsn_text)?;
             let msg = decode(data)
                 .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
-            if matches!(
-                msg,
-                Message::Insert { .. }
-                    | Message::Update { .. }
-                    | Message::Delete { .. }
-                    | Message::Truncate { .. }
-            ) {
-                tx_last = tx_last.max(lsn);
-            }
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
                 Message::Begin {
                     xid: x,
                     commit_ts_micros,
-                    ..
+                    final_lsn,
                 } => {
                     xid = x;
                     ts = commit_ts_micros;
+                    keys.begin(final_lsn);
                 }
                 Message::Relation(rel) => {
                     if rel.identity_full()
@@ -429,13 +469,14 @@ impl PostgresSource {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    let key = cache.key(relation, &new).map_err(dec)?;
-                    self.queue(lsn, xid, ts, name, Op::Insert, None, after, key);
+                    let row_key = cache.key(relation, &new).map_err(dec)?;
+                    let key = keys.next(lsn);
+                    self.queue(key, xid, ts, name, Op::Insert, None, after, row_key);
                 }
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
-                    let key = cache
+                    let row_key = cache
                         .key_with_old(relation, &new, old.as_ref())
                         .map_err(dec)?;
                     let before = old
@@ -443,29 +484,34 @@ impl PostgresSource {
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    self.queue(lsn, xid, ts, name, Op::Update, before, after, key);
+                    let key = keys.next(lsn);
+                    self.queue(key, xid, ts, name, Op::Update, before, after, row_key);
                 }
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
-                    let key = cache.key(relation, &old).map_err(dec)?;
-                    self.queue(lsn, xid, ts, name, Op::Delete, before, None, key);
+                    let row_key = cache.key(relation, &old).map_err(dec)?;
+                    let key = keys.next(lsn);
+                    self.queue(key, xid, ts, name, Op::Delete, before, None, row_key);
                 }
                 Message::Truncate { relations } => {
-                    let mut names = Vec::with_capacity(relations.len());
                     for id in relations {
                         let r = cache.get(id).map_err(dec)?;
-                        names.push((r.schema.clone(), r.name.clone()));
+                        let name = (r.schema.clone(), r.name.clone());
+                        let key = keys.next(lsn);
+                        self.queue(key, xid, ts, name, Op::Truncate, None, None, None);
                     }
-                    self.queue_truncate(lsn, xid, ts, names);
                 }
                 Message::Commit { end_lsn, .. } => {
                     if end_lsn > self.last_end {
                         self.last_end = end_lsn;
-                        self.tx_ends.push_back((tx_last, end_lsn));
+                        // An empty transaction (Postgres < 15 sends them for unpublished tables) has no key of
+                        // its own. It ends at the highest key queued so far, so it counts as
+                        // acknowledged exactly when everything before it is.
+                        let end = keys.end_key().unwrap_or(self.emitted);
+                        self.tx_ends.push_back((end, end_lsn));
                     }
-                    tx_last = 0;
                 }
                 Message::Ignored => {}
             }
@@ -529,6 +575,9 @@ impl Source for PostgresSource {
         if let (Some(pos), false) = (start, recreated) {
             match pos {
                 Position::Lsn(l) => {
+                    // A plain-LSN checkpoint (written before commit-order keys) cannot be mapped
+                    // to a key, so local dedupe is off for this start: the slot replays from its
+                    // `confirmed_flush_lsn`, giving duplicates but never loss.
                     // A checkpoint ahead of this server's WAL comes from another cluster (restored
                     // dump, copied state volume). Treating it as acknowledged would move the slot
                     // past data that was never delivered, so refuse it.
@@ -541,13 +590,26 @@ impl Source for PostgresSource {
                             )));
                         }
                     }
-                    self.emitted = l;
-                    self.checkpointed = l;
+                    tracing::warn!(
+                        checkpoint = %Position::Lsn(l),
+                        "plain-LSN checkpoint: replaying from the slot without local dedupe; \
+                         some changes may be delivered again"
+                    );
                 }
                 Position::Text(t) => {
-                    return Err(Error::Checkpoint(format!(
-                        "checkpoint {t:?} is not a Postgres LSN; it belongs to another source type"
-                    )))
+                    let k = key_from_checkpoint(&t)?;
+                    // Same cross-cluster guard as for a plain LSN, on the commit LSN.
+                    if let Some(wal) = self.wal_position().await? {
+                        if k.commit > wal {
+                            return Err(Error::Checkpoint(format!(
+                                "checkpoint commit LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
+                                Position::Lsn(k.commit),
+                                Position::Lsn(wal)
+                            )));
+                        }
+                    }
+                    self.emitted = k;
+                    self.checkpointed = k;
                 }
             }
         }
@@ -571,12 +633,19 @@ impl Source for PostgresSource {
     }
 
     async fn ack(&mut self, position: Position) -> Result<()> {
+        // Events carry their key in `checkpoint`, and the pipeline acks that. A bare change LSN
+        // cannot be placed in the commit order, so acking one would be a guess.
         match position {
-            Position::Lsn(l) => {
-                self.checkpointed = self.checkpointed.max(l);
-                self.advance_acked(l).await
+            Position::Text(t) => {
+                let k = Key::parse(&t)
+                    .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
+                self.checkpointed = self.checkpointed.max(k);
+                self.advance_acked(k).await
             }
-            Position::Text(t) => Err(Error::Source(format!("cannot ack non-LSN position {t:?}"))),
+            Position::Lsn(l) => Err(Error::Source(format!(
+                "cannot ack plain LSN {}; ack the event's checkpoint",
+                Position::Lsn(l)
+            ))),
         }
     }
 }
@@ -629,34 +698,40 @@ mod tests {
     #[test]
     fn multi_table_truncate_emits_one_event_per_table() {
         let mut src = PostgresSource::new(PostgresSourceConfig::new("postgres://x", "s", "p"));
-        let tables = vec![
-            ("public".to_string(), "a".to_string()),
-            ("public".to_string(), "b".to_string()),
-            ("app".to_string(), "c".to_string()),
-        ];
-        src.queue_truncate(100, 7, 0, tables.clone());
+        let mut keys = TxKeys::default();
+        let run = |src: &mut PostgresSource, keys: &mut TxKeys| {
+            keys.begin(500);
+            for (schema, table) in [("public", "a"), ("public", "b"), ("app", "c")] {
+                let key = keys.next(100);
+                src.queue(
+                    key,
+                    7,
+                    0,
+                    (schema.into(), table.into()),
+                    Op::Truncate,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+        run(&mut src, &mut keys);
         let got: Vec<_> = src
             .buffer
             .iter()
-            .map(|e| {
-                (
-                    e.schema.as_str(),
-                    e.table.as_str(),
-                    e.op,
-                    e.position.clone(),
-                )
-            })
+            .map(|e| (e.schema.as_str(), e.table.as_str(), e.position.clone()))
             .collect();
+        // One WAL message, one LSN, one event per table.
         assert_eq!(
             got,
             vec![
-                ("public", "a", Op::Truncate, Position::Lsn(100)),
-                ("public", "b", Op::Truncate, Position::Lsn(100)),
-                ("app", "c", Op::Truncate, Position::Lsn(100)),
+                ("public", "a", Position::Lsn(100)),
+                ("public", "b", Position::Lsn(100)),
+                ("app", "c", Position::Lsn(100)),
             ]
         );
         // The next peek re-sends the same message: it must not be queued twice.
-        src.queue_truncate(100, 7, 0, tables);
+        run(&mut src, &mut keys);
         assert_eq!(src.buffer.len(), 3);
     }
 
@@ -690,12 +765,15 @@ mod tests {
     }
 }
 
-/// Pops every transaction whose changes are all <= `lsn` and returns the commit end LSN
+/// Pops every transaction whose changes are all <= `key` and returns the commit end LSN
 /// of the last one: the only position the slot can safely be advanced to.
-fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
+///
+/// Keys are compared whole, so change LSNs of different transactions are never compared with
+/// each other: a transaction that committed later has a larger commit LSN and stays queued.
+fn ack_target(tx_ends: &mut VecDeque<(Key, u64)>, key: Key) -> Option<u64> {
     let mut target = None;
     while let Some(&(last, end)) = tx_ends.front() {
-        if last > lsn {
+        if last > key {
             break;
         }
         target = Some(end);
@@ -706,7 +784,7 @@ fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
 
 /// LSNs the slot may be advanced to, in order, for a heartbeat at WAL position `wal`.
 ///
-/// 1. Transactions whose changes are all at or below `checkpointed` count as acknowledged:
+/// 1. Transactions whose changes are all at or below the `checkpointed` key count as acknowledged:
 ///    that covers empty transactions (Postgres < 15 sends them for unpublished tables) and
 ///    replays of transactions already delivered before a restart. The slot may move to the
 ///    last such commit end.
@@ -718,9 +796,9 @@ fn ack_target(tx_ends: &mut VecDeque<(u64, u64)>, lsn: u64) -> Option<u64> {
 ///
 /// An unacknowledged event therefore always holds the slot back (at-least-once).
 fn heartbeat_targets(
-    tx_ends: &mut VecDeque<(u64, u64)>,
+    tx_ends: &mut VecDeque<(Key, u64)>,
     idle: bool,
-    checkpointed: u64,
+    checkpointed: Key,
     wal: u64,
 ) -> Vec<u64> {
     let mut targets = Vec::new();
@@ -737,60 +815,80 @@ fn heartbeat_targets(
 mod heartbeat_tests {
     use super::*;
 
+    fn k(commit: u64, change: u64) -> Key {
+        Key {
+            commit,
+            change,
+            ord: 0,
+        }
+    }
+
     #[test]
     fn idle_advances_to_wal() {
         let mut q = VecDeque::new();
-        assert_eq!(heartbeat_targets(&mut q, true, 0, 500), vec![500]);
+        assert_eq!(
+            heartbeat_targets(&mut q, true, Key::default(), 500),
+            vec![500]
+        );
     }
 
     #[test]
     fn capped_peek_only_gets_the_checkpointed_target() {
         // Not idle (capped peek): the slot may reach the last checkpointed commit end, never `wal`.
-        let mut q = VecDeque::from([(100, 120), (200, 220)]);
-        assert_eq!(heartbeat_targets(&mut q, false, 100, 500), vec![120]);
+        let mut q = VecDeque::from([(k(120, 100), 120), (k(220, 200), 220)]);
+        assert_eq!(
+            heartbeat_targets(&mut q, false, k(120, 100), 500),
+            vec![120]
+        );
         assert_eq!(q.len(), 1);
-        let mut q = VecDeque::from([(0, 120), (0, 140)]);
-        assert_eq!(heartbeat_targets(&mut q, false, 0, 500), vec![140]);
+        let mut q = VecDeque::from([(k(120, 0), 120), (k(140, 0), 140)]);
+        assert_eq!(heartbeat_targets(&mut q, false, k(140, 0), 500), vec![140]);
     }
 
     #[test]
     fn queued_events_hold_the_slot() {
         let mut q = VecDeque::new();
-        assert!(heartbeat_targets(&mut q, false, 0, 500).is_empty());
+        assert!(heartbeat_targets(&mut q, false, Key::default(), 500).is_empty());
     }
 
     #[test]
     fn delivered_but_uncheckpointed_transaction_holds_the_slot() {
-        let mut q = VecDeque::from([(100, 120)]);
-        assert!(heartbeat_targets(&mut q, true, 99, 500).is_empty());
+        let mut q = VecDeque::from([(k(120, 100), 120)]);
+        assert!(heartbeat_targets(&mut q, true, k(120, 99), 500).is_empty());
         assert_eq!(q.len(), 1);
     }
 
     #[test]
     fn checkpointed_transactions_are_acknowledged_first() {
-        let mut q = VecDeque::from([(100, 120), (200, 220)]);
-        assert_eq!(heartbeat_targets(&mut q, true, 200, 500), vec![220, 500]);
+        let mut q = VecDeque::from([(k(120, 100), 120), (k(220, 200), 220)]);
+        assert_eq!(
+            heartbeat_targets(&mut q, true, k(220, 200), 500),
+            vec![220, 500]
+        );
         assert!(q.is_empty());
     }
 
     #[test]
     fn partially_checkpointed_queue_only_moves_to_the_acked_commit_end() {
-        let mut q = VecDeque::from([(100, 120), (200, 220)]);
-        assert_eq!(heartbeat_targets(&mut q, true, 150, 500), vec![120]);
+        let mut q = VecDeque::from([(k(120, 100), 120), (k(220, 200), 220)]);
+        assert_eq!(heartbeat_targets(&mut q, true, k(120, 100), 500), vec![120]);
         assert_eq!(q.len(), 1);
     }
 
     #[test]
     fn empty_transactions_do_not_pin_the_slot() {
-        // (0, end): a transaction without published changes (Postgres < 15).
-        let mut q = VecDeque::from([(0, 120), (0, 140)]);
-        assert_eq!(heartbeat_targets(&mut q, true, 0, 500), vec![140, 500]);
+        // A transaction without published changes (Postgres < 15) ends at the key before it.
+        let mut q = VecDeque::from([(Key::default(), 120), (Key::default(), 140)]);
+        assert_eq!(
+            heartbeat_targets(&mut q, true, Key::default(), 500),
+            vec![140, 500]
+        );
     }
 
     #[test]
     fn empty_transaction_behind_unacked_data_stays_queued() {
-        let mut q = VecDeque::from([(100, 120), (0, 140)]);
-        assert!(heartbeat_targets(&mut q, true, 0, 500).is_empty());
+        let mut q = VecDeque::from([(k(120, 100), 120), (k(120, 100), 140)]);
+        assert!(heartbeat_targets(&mut q, true, Key::default(), 500).is_empty());
         assert_eq!(q.len(), 2);
     }
 }
@@ -799,20 +897,131 @@ mod heartbeat_tests {
 mod ack_tests {
     use super::*;
 
+    fn k(commit: u64, change: u64, ord: u32) -> Key {
+        Key {
+            commit,
+            change,
+            ord,
+        }
+    }
+
     #[test]
     fn ack_mid_transaction_does_not_advance() {
-        let mut q = VecDeque::from([(100, 120), (200, 220)]);
-        assert_eq!(ack_target(&mut q, 150), Some(120));
+        let mut q = VecDeque::from([(k(120, 100, 0), 120), (k(220, 200, 1), 220)]);
+        assert_eq!(ack_target(&mut q, k(120, 100, 0)), Some(120));
         // Acking inside the second transaction must not advance past its commit end.
-        assert_eq!(ack_target(&mut q, 199), None);
+        assert_eq!(ack_target(&mut q, k(220, 200, 0)), None);
         assert_eq!(q.len(), 1);
     }
 
     #[test]
     fn ack_last_change_advances_to_commit_end() {
-        let mut q = VecDeque::from([(100, 120), (200, 220)]);
-        assert_eq!(ack_target(&mut q, 200), Some(220));
+        let mut q = VecDeque::from([(k(120, 100, 0), 120), (k(220, 200, 0), 220)]);
+        assert_eq!(ack_target(&mut q, k(220, 200, 0)), Some(220));
         assert!(q.is_empty());
+    }
+
+    /// Ta commits first (end 0xFD8) with its last change at a high LSN. Tb's only change has a
+    /// lower change LSN and its commit LSN equals Ta's end. Acking all of Ta must target exactly
+    /// Ta's end and keep Tb queued: Postgres skips a transaction only if its commit LSN is below
+    /// the slot's start, so exactly 0xFD8 still replays Tb. Do not "optimise" this target upward.
+    #[test]
+    fn ack_boundary_is_exactly_the_commit_end_of_the_acked_transaction() {
+        let ta = k(0xFD8, 0xF80, 1);
+        let tb = k(0xFD8 + 0x10, 0xF00, 0);
+        let mut q = VecDeque::from([(ta, 0xFD8), (tb, 0xFE8)]);
+        assert_eq!(ack_target(&mut q, ta), Some(0xFD8));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, tb);
+    }
+
+    /// Changes sharing one change LSN are ordered by `ord`: acking row 0 of a COPY must not
+    /// complete the transaction while the later rows are undelivered.
+    #[test]
+    fn ack_inside_a_same_lsn_group_does_not_advance() {
+        let mut q = VecDeque::from([(k(300, 200, 2), 300)]);
+        assert_eq!(ack_target(&mut q, k(300, 200, 0)), None);
+        assert_eq!(ack_target(&mut q, k(300, 200, 1)), None);
+        assert_eq!(ack_target(&mut q, k(300, 200, 2)), Some(300));
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn key_roundtrips_and_orders_lexicographically() {
+        let a = Key {
+            commit: 10,
+            change: 99,
+            ord: 3,
+        };
+        assert_eq!(a.encode(), "10@99#3");
+        assert_eq!(Key::parse("10@99#3"), Some(a));
+        for bad in ["", "10", "10@99", "10@99#", "x@1#1", "1@y#1", "1@1#z"] {
+            assert_eq!(Key::parse(bad), None, "{bad:?}");
+        }
+        // Commit order dominates change LSN; ord breaks ties within one LSN.
+        let later_tx_lower_change = Key {
+            commit: 11,
+            change: 5,
+            ord: 0,
+        };
+        assert!(a < later_tx_lower_change);
+        assert!(Key { ord: 4, ..a } > a);
+    }
+
+    #[test]
+    fn same_lsn_changes_get_distinct_increasing_keys() {
+        let mut t = TxKeys::default();
+        t.begin(500);
+        let ks = [t.next(100), t.next(100), t.next(100), t.next(200)];
+        assert_eq!(
+            ks.map(|k| (k.change, k.ord)),
+            [(100, 0), (100, 1), (100, 2), (200, 0)]
+        );
+        assert!(ks.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(t.end_key(), Some(ks[3]));
+        // A new transaction restarts ord and takes its own commit LSN.
+        t.begin(600);
+        assert_eq!(
+            t.next(100),
+            Key {
+                commit: 600,
+                change: 100,
+                ord: 0
+            }
+        );
+    }
+
+    #[test]
+    fn empty_transaction_has_no_key() {
+        let mut t = TxKeys::default();
+        t.begin(500);
+        assert_eq!(t.end_key(), None);
+    }
+
+    /// Rollback guard. A binary that predates `Key` refuses every `Position::Text` checkpoint
+    /// (main's `start` arm), so downgrading after this change fails loudly instead of being read
+    /// as "no checkpoint". The current parser likewise refuses text that is not a key.
+    #[test]
+    fn foreign_text_checkpoint_is_refused() {
+        assert_eq!(key_from_checkpoint("10@99#3").unwrap().commit, 10);
+        for foreign in ["{\"_data\":\"82\"}", "16/B374D848", "10@99"] {
+            assert!(
+                matches!(key_from_checkpoint(foreign), Err(Error::Checkpoint(_))),
+                "{foreign:?}"
+            );
+        }
+    }
+
+    /// In-progress transaction streaming (`streaming on`, proto >= 2) must stay off: changes of a
+    /// streamed transaction have no commit LSN, so no key could be built for them.
+    #[test]
+    fn peek_never_enables_streaming() {
+        assert!(!PEEK_SQL.to_lowercase().contains("streaming"));
+        assert!(PEEK_SQL.contains("'proto_version', '1'"));
     }
 }
 
