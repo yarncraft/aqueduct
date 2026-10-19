@@ -74,3 +74,5 @@ Notable changes to Aqueduct. Newest first.
   you use `partition_by = "key"`.
 
 Details: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (config reference and the "Securing connections" checklist).
+
+<!-- ci docs-only probe, do not merge -->
