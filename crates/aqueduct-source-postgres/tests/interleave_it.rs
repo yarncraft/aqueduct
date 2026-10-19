@@ -98,3 +98,90 @@ async fn overlapping_transactions_lose_no_rows() {
          dedupe dropped it)"
     );
 }
+
+/// Crash variant: deliver and ack only the transaction that committed first, then restart from
+/// that checkpoint. The slot has moved past T2 only, so the server re-sends T1 (committed after
+/// T2). Together with what was delivered before the restart, all three rows must be seen: a
+/// restart must not drop T1's earlier change because its position is below the checkpoint.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let (t1, conn1) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn1);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let table = format!("interleave_r_{id}");
+    let publication = format!("aq_ilr_pub_{id}");
+    let slot = format!("aq_ilr_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    let new_source = || {
+        let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.ssl_mode = Some(SslMode::Disable);
+        cfg.poll_interval = Duration::from_millis(100);
+        PostgresSource::new(cfg)
+    };
+    let mut s = new_source();
+    s.start(None).await.unwrap();
+
+    t1.batch_execute(&format!("BEGIN; INSERT INTO {table} VALUES (1, 't1-first')"))
+        .await
+        .unwrap();
+    db.execute(&format!("INSERT INTO {table} VALUES (2, 't2')"), &[])
+        .await
+        .unwrap();
+    t1.batch_execute(&format!(
+        "INSERT INTO {table} VALUES (3, 't1-second'); COMMIT;"
+    ))
+    .await
+    .unwrap();
+
+    // Commit order: T2's row arrives first. Ack it alone, as the pipeline would after a batch
+    // that ended there, then "crash".
+    let first = next_event(&mut s).await.expect("the first committed row");
+    let mut seen = vec![first.after.clone().unwrap().get().to_owned()];
+    let checkpoint = first.position;
+    assert!(
+        seen[0].contains("t2"),
+        "commit order puts T2 first, got {seen:?}"
+    );
+    s.ack(checkpoint).await.unwrap();
+    drop(s);
+
+    let mut s = new_source();
+    s.start(Some(checkpoint)).await.unwrap();
+    while let Some(e) = next_event(&mut s).await {
+        seen.push(e.after.expect("insert has a row").get().to_owned());
+    }
+    seen.sort();
+    seen.dedup();
+
+    drop(s);
+    db.execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+        .await
+        .unwrap();
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen.len(),
+        3,
+        "after the restart all three rows must have been seen, got {seen:?}"
+    );
+}
