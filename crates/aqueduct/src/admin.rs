@@ -643,13 +643,15 @@ Authorization: Bearer {token}
     async fn stream_with_bearer_yields_json_data_frames() {
         let addr = start(Some("k")).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /api/stream HTTP/1.1
+        c.write_all(
+            b"GET /api/stream HTTP/1.1
 host: x
 Authorization: Bearer k
 
-")
-            .await
-            .unwrap();
+",
+        )
+        .await
+        .unwrap();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let got = tokio::time::timeout(Duration::from_secs(5), async {
@@ -657,10 +659,11 @@ Authorization: Bearer k
                 let n = c.read(&mut chunk).await.unwrap();
                 assert!(n > 0, "stream closed before first frame");
                 buf.extend_from_slice(&chunk[..n]);
-                if String::from_utf8_lossy(&buf).contains("
+                let text = String::from_utf8_lossy(&buf);
+                if text.contains("data: ") && text.ends_with("
 
-") && buf.windows(6).any(|w| w == b"data: ") {
-                    return String::from_utf8_lossy(&buf).into_owned();
+") {
+                    return text.into_owned();
                 }
             }
         })
