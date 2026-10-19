@@ -32,6 +32,8 @@ docker compose up --build         # or: podman-compose up -d --build
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, tests and a docker build.
 
+**Local CI** (`scripts/ci-local.sh [--post] [--jobs rust,docker,audit,integration] [SHA]`) runs the same jobs as `ci.yml` in podman on an exact commit, exported with `git archive` so uncommitted changes are never tested. The integration job starts Kafka, MongoDB and both Postgres variants in one pod. `--post` publishes a `local-ci/<job>` commit status using the token from `git credential fill`; without it nothing leaves the machine. Keep the script in step with `ci.yml`. `git config core.hooksPath .githooks` enables an optional `pre-push` hook that runs the `rust` job (`LOCAL_CI_JOBS` for more, `SKIP_LOCAL_CI=1` to skip once).
+
 On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\cargo`, Podman in `S:\podman\bin`.
 
 ## Invariants (do not break)
