@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::route::{OutRecord, RoutePlan};
@@ -248,6 +249,8 @@ pub struct KafkaSink {
     new_topic_partitions: i32,
     replication_factor: Option<i16>,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
+    /// Create-topic requests sent, for diagnostics and tests.
+    create_attempts: AtomicU64,
 }
 
 fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
@@ -276,6 +279,7 @@ impl KafkaSink {
             new_topic_partitions: new_topic_partitions.max(1),
             replication_factor,
             topics: HashMap::new(),
+            create_attempts: AtomicU64::new(0),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
         // default like `cdc.{table}` only resolves per event, so it opens on first use).
@@ -320,6 +324,11 @@ impl KafkaSink {
         Ok(sink)
     }
 
+    /// How many create-topic requests this sink has sent.
+    pub fn create_attempts(&self) -> u64 {
+        self.create_attempts.load(Ordering::Relaxed)
+    }
+
     /// The route plan, e.g. to share its counters and description with the admin server.
     pub fn plan(&self) -> &RoutePlan {
         &self.plan
@@ -356,7 +365,10 @@ impl KafkaSink {
             .client
             .controller_client()
             .map_err(|e| err("controller", &e))?;
-        let create = |rf: i16| ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000);
+        let create = |rf: i16| {
+            self.create_attempts.fetch_add(1, Ordering::Relaxed);
+            ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000)
+        };
         let failed = |outcome: &std::result::Result<(), ClientError>, e: &ClientError| OpenError {
             error: err(&format!("create topic {topic}"), e),
             refused: refusal(outcome),

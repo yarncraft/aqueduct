@@ -423,7 +423,9 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   would hit such a name to the fallback without trying to create it. If the broker still refuses the create with
   `InvalidTopicException`, `PolicyViolation`, `TopicAuthorizationFailed` or `ClusterAuthorizationFailed`, the record
   goes to the fallback and counts under `fallback`, and Aqueduct logs a warning once per route (with the template, not
-  the value). These refusals cannot change on a retry. Any other create error (broker down, timeout) fails the batch,
+  the value). These refusals cannot change on a retry, so Aqueduct remembers the refused name (up to 10 000 names,
+  oldest forgotten first): later rows with that value go to the fallback without asking the broker again. The memory
+  lasts until a restart, so restart Aqueduct after pre-creating such a topic or granting the ACL. Any other create error (broker down, timeout) fails the batch,
   which is retried, as for every other topic: delivery stays at-least-once. A failed or refused create holds no
   `max_dynamic_topics` slot.
 - **Without create rights**, pre-create the topics and set `max_dynamic_topics = 0` or `topic_values`, so Aqueduct

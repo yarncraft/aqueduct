@@ -1,6 +1,6 @@
 //! The compiled routing table and its pure `render` step.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -161,6 +161,8 @@ enum Admit {
     Collides,
     /// New, and `sink.max_dynamic_topics` is reached.
     Cap,
+    /// The broker refused to create it earlier in this run.
+    Refused,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +174,15 @@ struct TopicNames {
     existing: HashSet<String>,
     /// [`collision_key`] -> the spelling that holds it: every existing and counted topic.
     keys: HashMap<String, String>,
+    /// Names the broker refused to create for good, so later rows that render them go to the
+    /// fallback without another create attempt. Bounded by [`MAX_REFUSED_TOPICS`] (oldest dropped
+    /// first) and cleared by a restart, which picks up a pre-created topic or a new ACL.
+    refused: HashSet<String>,
+    refused_order: VecDeque<String>,
 }
+
+/// How many refused topic names the plan remembers.
+const MAX_REFUSED_TOPICS: usize = 10_000;
 
 /// The topics content routing created or found, counted against `sink.max_dynamic_topics`, and
 /// every topic name known to exist, to refuse a new name Kafka would reject. Shared by every
@@ -222,18 +232,21 @@ impl DynamicTopics {
 
     /// Whether a content-routed `topic` may be used; a new one is counted.
     fn admit(&self, topic: &str) -> Admit {
-        if self
-            .names
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .counted
-            .contains(topic)
         {
-            return Admit::Yes;
+            let r = self.names.read().unwrap_or_else(|e| e.into_inner());
+            if r.counted.contains(topic) {
+                return Admit::Yes;
+            }
+            if r.refused.contains(topic) {
+                return Admit::Refused;
+            }
         }
         let mut w = self.write();
         if w.counted.contains(topic) {
             return Admit::Yes;
+        }
+        if w.refused.contains(topic) {
+            return Admit::Refused;
         }
         let key = collision_key(topic);
         if w.keys.get(&key).is_some_and(|held| held != topic) {
@@ -264,6 +277,21 @@ impl DynamicTopics {
         let key = collision_key(topic);
         if w.keys.get(&key).is_some_and(|held| held == topic) {
             w.keys.remove(&key);
+        }
+    }
+
+    /// Releases a topic the broker refused for good and remembers the name for this run.
+    fn refuse(&self, topic: &str) {
+        self.release(topic);
+        let mut w = self.write();
+        if w.existing.contains(topic) || !w.refused.insert(topic.to_string()) {
+            return;
+        }
+        w.refused_order.push_back(topic.to_string());
+        if w.refused_order.len() > MAX_REFUSED_TOPICS {
+            if let Some(oldest) = w.refused_order.pop_front() {
+                w.refused.remove(&oldest);
+            }
         }
     }
 }
@@ -1248,6 +1276,9 @@ impl RoutePlan {
                         .to_string()
                 }
                 Admit::Cap => "sink.max_dynamic_topics is reached".to_string(),
+                Admit::Refused => {
+                    "the broker refused to create this topic earlier in this run".to_string()
+                }
             },
             Err(e) => e.to_string(),
         };
@@ -1271,7 +1302,7 @@ impl RoutePlan {
         let Some(c) = out.content.take() else {
             return;
         };
-        self.dynamic.release(&out.topic);
+        self.dynamic.refuse(&out.topic);
         self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
         self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
         if !self.stats.refused_logged[c.route].swap(true, Ordering::Relaxed) {
@@ -2722,6 +2753,43 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(rest.content, None);
+    }
+
+    #[test]
+    fn a_refused_name_goes_to_the_fallback_at_render_time_from_then_on() {
+        let p = content_plan(None, 100);
+        let eu = || row("orders", Op::Insert, r#"{"region":"eu"}"#);
+        let mut out = p.render(&eu(), NOW).unwrap().remove(0);
+        assert!(out.content.is_some());
+        p.topic_refused(&mut out, "TopicAuthorizationFailed");
+        // Every later `eu` row: the fallback, with no content marker, so the sink never tries
+        // to create the topic again.
+        for _ in 0..3 {
+            let r = p.render(&eu(), NOW).unwrap().remove(0);
+            assert_eq!(
+                (r.topic.as_str(), r.content.as_ref()),
+                ("orders.unknown", None)
+            );
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.fallback), (4, 0, 4));
+        assert_eq!(p.dynamic_topic_count(), 0);
+        // Other values are unaffected.
+        assert_eq!(
+            outcome(&p, &row("orders", Op::Insert, r#"{"region":"us"}"#)),
+            "orders.us"
+        );
+        // The memory is bounded: the oldest refused name is forgotten first.
+        let d = DynamicTopics::new();
+        for i in 0..=MAX_REFUSED_TOPICS {
+            d.refuse(&format!("orders.t{i}"));
+        }
+        assert_eq!(d.admit("orders.t0"), Admit::Yes, "the oldest was dropped");
+        assert_eq!(d.admit("orders.t1"), Admit::Refused);
+        assert_eq!(
+            d.admit(&format!("orders.t{MAX_REFUSED_TOPICS}")),
+            Admit::Refused
+        );
     }
 
     #[test]

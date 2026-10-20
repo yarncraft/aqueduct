@@ -349,7 +349,9 @@ Content routing (#82):
   every topic opened or admitted since. It sends a name that collides under another spelling to the fallback. If the
   broker still refuses a create for a reason a retry cannot change (`InvalidTopicException`, `PolicyViolation`,
   `TopicAuthorizationFailed`, `ClusterAuthorizationFailed`), `send_batch` re-routes that record to the fallback (counted
-  under `fallback`), frees the name and logs a warning once per route. Other create errors still fail the batch, so
+  under `fallback`), frees the name and logs a warning once per route. The refused name is remembered for the run
+  (at most 10 000 names, oldest dropped first), so later rows that render it go to the fallback at render time with no
+  broker call; a restart clears the memory and picks up a pre-created topic or a new ACL. Other create errors still fail the batch, so
   delivery stays at-least-once.
 - **The leading-`_` rule applies only when content routing is in use**, so "Breaking: none" holds. Once any route's
   topic reads a row field, no route `topic`, `sink.topic` or fallback may start with `_`. Without one, such topics are

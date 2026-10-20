@@ -114,7 +114,8 @@ Notable changes to Aqueduct. Newest first.
   - null or missing values;
   - values that are not one segment or not in `topic_values`;
   - names that differ from an existing topic only by `.` vs `_` (Kafka would refuse them);
-  - creates the broker refuses for good (invalid name, create policy, missing ACL);
+  - creates the broker refuses for good (invalid name, create policy, missing ACL); the name is remembered until a
+    restart, so later rows with that value cause no broker call;
   - new topics beyond the new `[sink] max_dynamic_topics` (default 100; `0` means existing topics only), which is
     counted from the broker at startup, so it holds across restarts.
 

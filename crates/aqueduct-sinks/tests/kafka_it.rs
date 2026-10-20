@@ -480,6 +480,19 @@ async fn content_topics_kafka_would_refuse_go_to_the_fallback() {
         1,
         "refused names hold no cap slot"
     );
+    // A later `us` row goes to the fallback at render time: no second create attempt.
+    let attempts = sink.create_attempts();
+    sink.send_batch(&[region(4, "us"), region(5, "us")])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(
+        sink.create_attempts(),
+        attempts,
+        "the refused name is remembered"
+    );
+    let c = stats.snapshot()[0].counts;
+    assert_eq!((c.matched, c.produced, c.fallback), (5, 1, 4));
     let ns = |recs: Vec<(
         String,
         std::collections::BTreeMap<String, Vec<u8>>,
@@ -492,7 +505,7 @@ async fn content_topics_kafka_would_refuse_go_to_the_fallback() {
         v.sort_unstable();
         v
     };
-    assert_eq!(ns(read_all(&client, &fallback).await), [1, 2]);
+    assert_eq!(ns(read_all(&client, &fallback).await), [1, 2, 4, 5]);
     assert_eq!(ns(read_all(&client, &format!("{prefix}.apac")).await), [3]);
     let names: Vec<String> = client
         .list_topics()
