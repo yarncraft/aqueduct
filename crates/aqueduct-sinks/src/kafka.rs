@@ -261,6 +261,29 @@ impl KafkaSink {
                 .await
                 .map_err(|e| Error::Sink(format!("sink.dead_letter_topic {t}: {e}")))?;
         }
+        // Content routing: the fallbacks take every event a row cannot route, so they must work
+        // from the start; and the topics the templates already created count against
+        // `max_dynamic_topics`, so the cap holds across restarts.
+        let fallbacks: Vec<String> = sink.plan.fallback_topics().map(str::to_string).collect();
+        for t in &fallbacks {
+            sink.open_topic(t)
+                .await
+                .map_err(|e| Error::Sink(format!("topic_fallback {t}: {e}")))?;
+        }
+        if !fallbacks.is_empty() {
+            let listed = sink
+                .client
+                .list_topics()
+                .await
+                .map_err(|e| err("list topics", &e))?;
+            let n = sink
+                .plan
+                .add_existing_topics(listed.iter().map(|t| t.name.as_str()));
+            tracing::info!(
+                topics = n,
+                "content-routed topics already on the broker (counted against sink.max_dynamic_topics)"
+            );
+        }
         Ok(sink)
     }
 

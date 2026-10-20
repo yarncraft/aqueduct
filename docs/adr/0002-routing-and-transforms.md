@@ -320,3 +320,26 @@ Per-route key (#83):
 - **Truncates** have no row and get the table-only key (`"key": null`), like dead-letter records.
 - **Validation:** a non-empty list of distinct top-level column names; a dotted path is rejected. The key columns
   are registered with the unseen-field counter as `row.<column>`, on routes with or without `where`.
+
+## As built (R4)
+
+Content routing (#82):
+
+- **Which templates are "dynamic".** The prefix rule, the segment rule, `topic_fallback` and `topic_values` apply to
+  templates that read a row field (`before.`, `after.`, `row.`). Templates with only `{schema}`, `{table}` and `{op}`
+  keep today's behaviour (no prefix rule, no fallback; `{schema}`/`{table}` values are not segment-checked), so existing
+  configs such as `{schema}.{table}` still start. `sink.topic` may not read a row field (it has no fallback).
+- **`topic_fallback` is a fixed topic name** (no placeholders), opened at startup like the dead-letter topic.
+  `topic_fallback` or `topic_values` on a template that reads no row field is a startup error.
+- **Every substituted row value** must pass the segment rule and the allow-list. A rendered topic that is still not a
+  valid Kafka name (longer than 249 bytes) also goes to the fallback.
+- **Collision rule.** Fixed topics are a static route `topic`, a static `sink.topic`, every `topic_fallback` and
+  `sink.dead_letter_topic`. None may match a content-routed template's glob, except that route's own fallback (the §2
+  example `orders.unknown` for `orders.{row.region}`). Overlaps between two templates are not checked.
+- **The cap** is one count across all content-routed templates. At connect the sink lists the broker's topics and
+  counts those matching a template glob, minus the fixed topics. Existing topics are always usable. A new topic is
+  counted when the plan first routes to it, before it is created. A failed create is counted until the next restart's
+  re-count.
+- **No static topic may start with `_`.** This applies to every route `topic`, `sink.topic`, fallback and the dead-letter
+  topic, whether or not content routing is used. Fixed text must be valid topic characters. Both are now startup
+  errors, listed as a breaking change in the CHANGELOG.

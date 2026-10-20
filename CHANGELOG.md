@@ -6,6 +6,11 @@ Notable changes to Aqueduct. Newest first.
 
 ### Breaking changes and upgrade notes
 
+- **Topic names are checked at startup, and none may start with `_`** (#82). Every route `topic`, `sink.topic` and
+  `topic_fallback` must be a valid Kafka topic name, or a template whose fixed text is, and must not start with `_`
+  (Kafka's internal topics, such as `__consumer_offsets`). Braces other than placeholders (`{schema}`, `{table}`,
+  `{op}`, `{row.<col>}`, ...) fail startup as an invalid template. Such configs used to start and then fail on the first
+  send. Upgrade: rename any topic that starts with `_` or holds other characters than `A-Z a-z 0-9 . _ -`.
 - **Events use Debezium's envelope, keys and time encodings** (Postgres and MongoDB). Every consumer must be updated:
   - Value: `{"before", "after", "source": {"version", "connector", "ts_ms", "ts_us", "snapshot", "db", "schema",
     "table", "txId", "lsn"}, "op", "ts_ms", "ts_us"}` (MongoDB: `db` and `collection` in `source`). The old top-level
@@ -106,6 +111,18 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Routing: choose the topic from the row's contents** (#82, ADR 0002). A route's `topic` can read row fields, such as
+  `orders.{row.region}`, and also takes `{op}`. Such a template must start with fixed text and needs a fixed
+  `topic_fallback`. An optional `topic_values` allow-list limits the values. No fixed topic in the config may match the
+  template read as a glob. Each value must be one segment (`[A-Za-z0-9_-]{1,64}`). These events go to the fallback,
+  counted under `fallback`, and never stall the pipeline:
+  - null or missing values;
+  - values that are not one segment or not in `topic_values`;
+  - new topics beyond the new `[sink] max_dynamic_topics` (default 100), which is counted from the broker at startup,
+    so it holds across restarts.
+
+  Fallbacks are opened at startup. The inspector reads the content-routed topics, and `GET /api/routes` shows
+  `topic_fallback` and `topic_values`.
 - **Routing: set the Kafka message key per route** (#83, ADR 0002). `key = ["col", ...]` on a `[[sink.routes]]`
   entry builds the record key from those columns of the row (`after`, else `before`, so deletes key by their
   before-image): `{"db", "schema", "table", "key": {"col": value, ...}}`, values copied as JSON, a missing column

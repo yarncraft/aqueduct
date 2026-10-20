@@ -179,6 +179,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         ops: Some(vec!["insert".into()]),
         filter: Some("row.n > 10".into()),
         key: None,
+        ..Default::default()
     };
     let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
     let stats = plan.stats();
@@ -323,5 +324,109 @@ async fn route_key_keeps_each_rows_changes_on_one_partition() {
     assert!(
         used.len() > 1,
         "rows spread over partitions despite partition_by = table"
+    );
+}
+
+#[tokio::test]
+async fn content_routing_cap_counts_broker_topics_across_restarts() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let prefix = unique("aqueduct-it-content");
+    let fallback = format!("{prefix}-fallback");
+    let plan = || {
+        let route = KafkaRoute {
+            pattern: "public.*".into(),
+            topic: format!("{prefix}.{{row.region}}"),
+            topic_fallback: Some(fallback.clone()),
+            ..Default::default()
+        };
+        let mut p = RoutePlan::new(vec![route], None).unwrap();
+        p.set_max_dynamic_topics(2);
+        p
+    };
+    let region = |n: u64, r: &str| {
+        let mut e = ev(n, "orders");
+        e.after = Some(to_raw_value(&serde_json::json!({ "n": n, "region": r })).unwrap());
+        e
+    };
+
+    // First run: two topics fit under the cap, the third region goes to the fallback.
+    let p1 = plan();
+    let stats1 = p1.stats();
+    let mut sink = KafkaSink::connect(brokers.clone(), p1, 1, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let batch = [
+        region(1, "eu"),
+        region(2, "us"),
+        region(3, "apac"),
+        region(4, "eu"),
+    ];
+    sink.send_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+    let c = stats1.snapshot()[0].counts;
+    assert_eq!((c.produced, c.fallback), (3, 1));
+
+    // Restart: a new sink on the same broker counts the two topics it finds, so a new region
+    // still goes to the fallback, while an existing one is used.
+    let p2 = plan();
+    let stats2 = p2.stats();
+    let mut sink = KafkaSink::connect(brokers.clone(), p2, 1, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.plan().dynamic_topic_count(),
+        2,
+        "counted from the broker"
+    );
+    sink.send_batch(&[region(5, "latam"), region(6, "us")])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    let c = stats2.snapshot()[0].counts;
+    assert_eq!((c.produced, c.fallback), (1, 1));
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let mut topics: Vec<String> = client
+        .list_topics()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .filter(|t| t.starts_with(&prefix))
+        .collect();
+    topics.sort();
+    assert_eq!(
+        topics,
+        [
+            format!("{prefix}-fallback"),
+            format!("{prefix}.eu"),
+            format!("{prefix}.us")
+        ]
+    );
+    let lsns = |recs: Vec<(
+        String,
+        std::collections::BTreeMap<String, Vec<u8>>,
+        serde_json::Value,
+    )>| {
+        let mut v: Vec<u64> = recs
+            .iter()
+            .map(|r| r.2["after"]["n"].as_u64().unwrap())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(lsns(read_all(&client, &fallback).await), [3, 5]);
+    assert_eq!(
+        lsns(read_all(&client, &format!("{prefix}.eu")).await),
+        [1, 4]
+    );
+    assert_eq!(
+        lsns(read_all(&client, &format!("{prefix}.us")).await),
+        [2, 6]
     );
 }
