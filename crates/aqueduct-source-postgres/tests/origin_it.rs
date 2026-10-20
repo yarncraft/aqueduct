@@ -250,8 +250,14 @@ async fn a_replication_role_without_superuser_runs_the_check() {
         .unwrap();
     let ev = next_event(&mut s).await.expect("the insert");
     let ckpt_text = text(&ev.checkpoint.expect("checkpoint")).to_string();
-    assert!(field(&ckpt_text, "sys").parse::<u64>().is_ok(), "{ckpt_text}");
-    assert!(field(&ckpt_text, "tli").parse::<u32>().is_ok(), "{ckpt_text}");
+    assert!(
+        field(&ckpt_text, "sys").parse::<u64>().is_ok(),
+        "{ckpt_text}"
+    );
+    assert!(
+        field(&ckpt_text, "tli").parse::<u32>().is_ok(),
+        "{ckpt_text}"
+    );
     drop(s);
 
     // The opt-out skips the cluster comparison but still records and compares the database.

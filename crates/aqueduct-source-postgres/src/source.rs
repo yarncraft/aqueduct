@@ -1358,12 +1358,18 @@ mod key_tests {
             timeline: Some(3),
             ..HERE
         };
-        let err = check_origin(old_timeline, on_three).unwrap_err().to_string();
+        let err = check_origin(old_timeline, on_three)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("timeline 2") && err.contains("restored, recovered to a point in time (PITR) or failed over"),
+            err.contains("timeline 2")
+                && err.contains("restored, recovered to a point in time (PITR) or failed over"),
             "{err}"
         );
-        assert!(err.contains("may never reach Kafka") && err.contains(";tli="), "{err}");
+        assert!(
+            err.contains("may never reach Kafka") && err.contains(";tli="),
+            "{err}"
+        );
         // A checkpoint without a timeline is accepted and gets one on the next save.
         let no_timeline = Stamp {
             timeline: None,
@@ -1382,7 +1388,10 @@ mod key_tests {
     fn stamping_a_new_origin_warns_with_what_it_records() {
         // Legacy checkpoint: both fields are new, and the warning names them.
         let msg = stamp_warning(Stamp::default(), HERE).expect("legacy stamp warns");
-        assert!(msg.contains("sys=7312345678901234567 db=16384 tli=1"), "{msg}");
+        assert!(
+            msg.contains("sys=7312345678901234567 db=16384 tli=1"),
+            "{msg}"
+        );
         assert!(msg.contains("checkpoint-ahead-of-WAL"), "{msg}");
         // Written with skip_system_check, now checked: only sys is new.
         let db_only = Stamp {
@@ -1404,17 +1413,30 @@ mod key_tests {
         };
         assert_eq!(stamp_warning(full, HERE), None);
         // Written before the timeline was recorded: only tli is new.
-        let msg = stamp_warning(Stamp { timeline: None, ..full }, HERE).expect("adding tli warns");
+        let msg = stamp_warning(
+            Stamp {
+                timeline: None,
+                ..full
+            },
+            HERE,
+        )
+        .expect("adding tli warns");
         assert!(msg.contains("tli=1") && !msg.contains("sys="), "{msg}");
     }
 
     #[test]
     fn checkpoint_ahead_of_wal_names_every_possible_cause() {
         let same = ahead_of_wal(0x20, 0x10, true).to_string();
-        assert!(same.contains("restored, recovered to a point in time (PITR) or failed over"), "{same}");
+        assert!(
+            same.contains("restored, recovered to a point in time (PITR) or failed over"),
+            "{same}"
+        );
         assert!(!same.contains("another cluster"), "{same}");
         let unknown = ahead_of_wal(0x20, 0x10, false).to_string();
-        assert!(unknown.contains("another cluster") && unknown.contains("failed over"), "{unknown}");
+        assert!(
+            unknown.contains("another cluster") && unknown.contains("failed over"),
+            "{unknown}"
+        );
     }
 
     #[test]
