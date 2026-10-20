@@ -45,13 +45,178 @@ impl Key {
     }
 }
 
-/// Parses a text checkpoint; anything that is not a [`Key`] belongs to another source type.
-fn key_from_checkpoint(t: &str) -> Result<Key> {
-    Key::parse(t).ok_or_else(|| {
+/// The database a checkpoint was written against: the cluster's `system_identifier` (set by
+/// `initdb`, so it is the same on physical replicas and on restores of that cluster), its
+/// timeline (a new one after every promotion and PITR) and the database OID within it. `system`
+/// and `timeline` are `None` with `skip_system_check`; the database is always known, because
+/// `current_database()` needs no privilege.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Origin {
+    system: Option<u64>,
+    timeline: Option<u32>,
+    database: u32,
+}
+
+/// What a text checkpoint records about its origin. Checkpoints written before #63 have none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Stamp {
+    system: Option<u64>,
+    timeline: Option<u32>,
+    database: Option<u32>,
+}
+
+/// Checkpoint text: the [`Key`], then the `;name=value` fields (`sys`, `db`, `tli`) of the origin
+/// that is known.
+fn encode_checkpoint(key: Key, origin: Option<Origin>) -> String {
+    let mut t = key.encode();
+    if let Some(o) = origin {
+        if let Some(sys) = o.system {
+            t.push_str(&format!(";sys={sys}"));
+        }
+        t.push_str(&format!(";db={}", o.database));
+        if let Some(tli) = o.timeline {
+            t.push_str(&format!(";tli={tli}"));
+        }
+    }
+    t
+}
+
+/// Parses checkpoint text. An unknown or repeated field makes the whole checkpoint invalid, so a
+/// format this version does not understand is refused rather than half-read.
+fn parse_checkpoint(t: &str) -> Option<(Key, Stamp)> {
+    let mut parts = t.split(';');
+    let key = Key::parse(parts.next()?)?;
+    let mut stamp = Stamp::default();
+    for field in parts {
+        let (name, value) = field.split_once('=')?;
+        match name {
+            "sys" if stamp.system.is_none() => stamp.system = Some(value.parse().ok()?),
+            "db" if stamp.database.is_none() => stamp.database = Some(value.parse().ok()?),
+            "tli" if stamp.timeline.is_none() => stamp.timeline = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some((key, stamp))
+}
+
+/// Parses a text checkpoint; anything that is not a Postgres checkpoint belongs to another source
+/// type (or to a newer Aqueduct version).
+fn key_from_checkpoint(t: &str) -> Result<(Key, Stamp)> {
+    parse_checkpoint(t).ok_or_else(|| {
         Error::Checkpoint(format!(
             "checkpoint {t:?} is not a Postgres checkpoint; it belongs to another source type"
         ))
     })
+}
+
+/// What to do after a restore, PITR or failover of the same cluster, which cannot be told apart.
+const RESYNC: &str = "The cluster was restored, recovered to a point in time (PITR) or failed \
+     over since the checkpoint was written, so changes between the server's WAL end and the \
+     checkpoint may never reach Kafka. Resync the consumers: remove the checkpoint and take a \
+     snapshot. If you have verified that nothing was lost, for example after a planned \
+     switchover with no lag, delete only the `;tli=` field from the checkpoint";
+
+/// Refuses a checkpoint written against another cluster (a different `initdb`: a re-pointed URL
+/// or a rebuilt primary), another timeline of the same cluster (a promotion or PITR since) or
+/// another database of the same cluster. A restore that stays on the same timeline is only
+/// caught by the checkpoint-ahead-of-WAL check in `start`.
+///
+/// With `skip_system_check` the server's cluster and timeline are unknown and only the database
+/// is compared.
+fn check_origin(saved: Stamp, server: Origin) -> Result<()> {
+    if let (Some(sys), Some(server_sys)) = (saved.system, server.system) {
+        if sys != server_sys {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against Postgres cluster {sys}, but this server is cluster {server_sys}. \
+                 The URL points at a different or rebuilt cluster (pg_upgrade to a new major \
+                 version also makes a new one). Point it back, or remove the checkpoint to start over"
+            )));
+        }
+        if let (Some(tli), Some(server_tli)) = (saved.timeline, server.timeline) {
+            if tli != server_tli {
+                return Err(Error::Checkpoint(format!(
+                    "checkpoint was written on timeline {tli} of this cluster, but the server is \
+                     on timeline {server_tli}. {RESYNC}"
+                )));
+            }
+        }
+    }
+    if let Some(db) = saved.database {
+        if db != server.database {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against database OID {db}, but this connection is to \
+                 database OID {} on the same cluster. Point the URL back at that database, or \
+                 remove the checkpoint to start over",
+                server.database
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A checkpoint ahead of the server's WAL. Treating it as acknowledged would move the slot past
+/// data that was never delivered, so it is refused. `same_cluster` is true when the checkpoint
+/// records this cluster's `system_identifier`: then only a restore, PITR or failover explains it.
+fn ahead_of_wal(lsn: u64, wal: u64, same_cluster: bool) -> Error {
+    let cause = if same_cluster {
+        RESYNC
+    } else {
+        "It belongs to another cluster, or this cluster was restored, recovered to a point in \
+         time or failed over since, and then changes after the server's WAL end may never reach \
+         Kafka. Remove the checkpoint to start over, and resync the consumers"
+    };
+    Error::Checkpoint(format!(
+        "checkpoint LSN {} is ahead of this server's WAL position {}. {cause}",
+        Position::Lsn(lsn),
+        Position::Lsn(wal)
+    ))
+}
+
+/// The WARN logged when a checkpoint lacks part of the origin and the next save will record this
+/// server's: nothing has verified that this is the server the checkpoint came from, so the first
+/// start after an upgrade is protected only by the checkpoint-ahead-of-WAL check. `None` when the
+/// checkpoint already records everything that is known.
+fn stamp_warning(saved: Stamp, server: Origin) -> Option<String> {
+    let new_sys = server.system.filter(|_| saved.system.is_none());
+    let new_db = saved.database.is_none();
+    let new_tli = server.timeline.filter(|_| saved.timeline.is_none());
+    if new_sys.is_none() && !new_db && new_tli.is_none() {
+        return None;
+    }
+    let mut fields = Vec::new();
+    if let Some(sys) = new_sys {
+        fields.push(format!("sys={sys}"));
+    }
+    if new_db {
+        fields.push(format!("db={}", server.database));
+    }
+    if let Some(tli) = new_tli {
+        fields.push(format!("tli={tli}"));
+    }
+    Some(format!(
+        "checkpoint does not record which cluster or database it belongs to (written before this \
+         check existed, or with checkpoint_skip_system_check); the next checkpoint records {} as \
+         its origin. Only the checkpoint-ahead-of-WAL check confirmed this is the right server; \
+         if the URL was changed, stop now and remove the checkpoint",
+        fields.join(" ")
+    ))
+}
+
+/// Refuses an existing slot of the configured name that does not belong to the connected
+/// database (a logical slot of another database, or a physical slot). Such a slot is someone
+/// else's: it is never used, dropped or recreated, whatever `allow_slot_recreate` says.
+fn check_slot_database(slot: &str, slot_db: Option<&str>, current: &str) -> Result<()> {
+    match slot_db {
+        Some(db) if db == current => Ok(()),
+        Some(db) => Err(Error::Source(format!(
+            "replication slot {slot:?} belongs to database {db:?}, not {current:?}. It was left \
+             untouched; use another slot name, or point the URL at {db:?}"
+        ))),
+        None => Err(Error::Source(format!(
+            "replication slot {slot:?} is a physical slot, not a logical slot of database \
+             {current:?}. It was left untouched; use another slot name"
+        ))),
+    }
 }
 
 /// Assigns [`Key`]s to the changes of the transaction being decoded.
@@ -130,6 +295,10 @@ pub struct PostgresSourceConfig {
     /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
     /// servers where WAL position alone does not move the slot.
     pub heartbeat_action_query: Option<String>,
+    /// Skip reading, recording and checking the cluster's `system_identifier` and timeline. Only for servers
+    /// that refuse `pg_control_system()`; without it such a server fails at startup. The database
+    /// check stays on.
+    pub skip_system_check: bool,
     /// Ask the slot for logical messages (`'messages', 'true'`), which snapshots use as watermarks.
     /// Needs Postgres 14+. Off by default, so the peek is unchanged.
     pub logical_messages: bool,
@@ -155,6 +324,7 @@ impl PostgresSourceConfig {
             ssl_root_cert: None,
             heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
             heartbeat_action_query: None,
+            skip_system_check: false,
             logical_messages: false,
         }
     }
@@ -198,6 +368,8 @@ pub struct PostgresSource {
     metrics: Option<Arc<Metrics>>,
     /// When the slot lag was last read.
     last_slot_stats: Option<Instant>,
+    /// The connected cluster and database, stamped on every checkpoint. `None` before `start`.
+    origin: Option<Origin>,
 }
 
 /// How often the slot lag is read from `pg_replication_slots`.
@@ -218,7 +390,59 @@ impl PostgresSource {
             last_heartbeat: Instant::now(),
             metrics: None,
             last_slot_stats: None,
+            origin: None,
         }
+    }
+
+    /// The current database's OID and, unless `skip_system_check`, the connected cluster's
+    /// `system_identifier`.
+    async fn read_origin(&self) -> Result<Origin> {
+        let database: i64 = self
+            .client()?
+            .query_one(
+                "SELECT oid::int8 FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        let database = u32::try_from(database)
+            .map_err(|_| Error::Source(format!("invalid database OID {database}")))?;
+        if self.cfg.skip_system_check {
+            return Ok(Origin {
+                system: None,
+                timeline: None,
+                database,
+            });
+        }
+        let row = self
+            .client()?
+            .query_one(
+                "SELECT s.system_identifier::text, c.timeline_id::int8 \
+                 FROM pg_control_system() s, pg_control_checkpoint() c",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                Error::Source(format!(
+                    "{}. Aqueduct reads pg_control_system() and pg_control_checkpoint() to tell \
+                     which cluster and timeline a checkpoint belongs to; grant them, or set \
+                     postgres.checkpoint_skip_system_check = true",
+                    src_err(e)
+                ))
+            })?;
+        let system: String = row.get(0);
+        let timeline: i64 = row.get(1);
+        let system = system
+            .parse()
+            .map_err(|_| Error::Source(format!("invalid system_identifier {system:?}")))?;
+        let timeline = u32::try_from(timeline)
+            .map_err(|_| Error::Source(format!("invalid timeline {timeline}")))?;
+        Ok(Origin {
+            system: Some(system),
+            timeline: Some(timeline),
+            database,
+        })
     }
 
     /// Report heartbeats and slot lag to `metrics`.
@@ -362,7 +586,7 @@ impl PostgresSource {
                 before,
                 after,
                 key: row_key,
-                checkpoint: Some(Position::Text(key.encode())),
+                checkpoint: Some(Position::Text(encode_checkpoint(key, self.origin))),
             });
         }
     }
@@ -550,18 +774,48 @@ impl Source for PostgresSource {
             m.heartbeat_configured(self.cfg.heartbeat_interval);
         }
 
+        // Which cluster and database this is, checked against the checkpoint before the slot is
+        // looked up or created, so a checkpoint is never applied to (and no slot is created on)
+        // the wrong database. `allow_slot_recreate` does not bypass this. `skip_system_check`
+        // only drops the cluster part; the database is always compared.
+        if self.cfg.skip_system_check {
+            tracing::warn!(
+                "checkpoint_skip_system_check is set: a checkpoint from another cluster is not \
+                 detected (one from another database of the same cluster still is)"
+            );
+        }
+        let origin = self.read_origin().await?;
+        self.origin = Some(origin);
+        let stamp = match &start {
+            Some(Position::Text(t)) => Some(key_from_checkpoint(t)?.1),
+            // A plain-LSN checkpoint predates keys and records no origin.
+            Some(Position::Lsn(_)) => Some(Stamp::default()),
+            None => None,
+        };
+        if let Some(stamp) = stamp {
+            check_origin(stamp, origin)?;
+            if let Some(msg) = stamp_warning(stamp, origin) {
+                tracing::warn!("{msg}");
+            }
+        }
+
         let slot = self.cfg.slot.clone();
         let mut recreated = false;
         let existing = self
             .client()?
             .query_opt(
-                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                "SELECT confirmed_flush_lsn::text, database::text, current_database()::text \
+                 FROM pg_replication_slots WHERE slot_name = $1",
                 &[&slot],
             )
             .await
             .map_err(src_err)?;
         match existing {
             Some(row) => {
+                // Checked before the slot is used; a slot of another database is never touched.
+                let slot_db: Option<String> = row.get(1);
+                let current: String = row.get(2);
+                check_slot_database(&slot, slot_db.as_deref(), &current)?;
                 let flushed: Option<String> = row.get(0);
                 self.acked = flushed.as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
             }
@@ -601,11 +855,7 @@ impl Source for PostgresSource {
                     // past data that was never delivered, so refuse it.
                     if let Some(wal) = self.wal_position().await? {
                         if l > wal {
-                            return Err(Error::Checkpoint(format!(
-                                "checkpoint LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
-                                Position::Lsn(l),
-                                Position::Lsn(wal)
-                            )));
+                            return Err(ahead_of_wal(l, wal, false));
                         }
                     }
                     tracing::warn!(
@@ -615,15 +865,14 @@ impl Source for PostgresSource {
                     );
                 }
                 Position::Text(t) => {
-                    let k = key_from_checkpoint(&t)?;
-                    // Same cross-cluster guard as for a plain LSN, on the commit LSN.
+                    let (k, stamp) = key_from_checkpoint(&t)?;
+                    // Same guard as for a plain LSN, on the commit LSN. `check_origin` already
+                    // refused another cluster, so a recorded `sys` means a restore of this one.
                     if let Some(wal) = self.wal_position().await? {
                         if k.commit > wal {
-                            return Err(Error::Checkpoint(format!(
-                                "checkpoint commit LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
-                                Position::Lsn(k.commit),
-                                Position::Lsn(wal)
-                            )));
+                            let known = stamp.system.is_some()
+                                && stamp.system == self.origin.and_then(|o| o.system);
+                            return Err(ahead_of_wal(k.commit, wal, known));
                         }
                     }
                     self.emitted = k;
@@ -655,7 +904,7 @@ impl Source for PostgresSource {
         // cannot be placed in the commit order, so acking one would be a guess.
         match position {
             Position::Text(t) => {
-                let k = Key::parse(&t)
+                let (k, _) = parse_checkpoint(&t)
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
                 self.advance_acked(k).await
@@ -1040,13 +1289,203 @@ mod key_tests {
     /// as "no checkpoint". The current parser likewise refuses text that is not a key.
     #[test]
     fn foreign_text_checkpoint_is_refused() {
-        assert_eq!(key_from_checkpoint("10@99#3").unwrap().commit, 10);
+        assert_eq!(key_from_checkpoint("10@99#3").unwrap().0.commit, 10);
         for foreign in ["{\"_data\":\"82\"}", "16/B374D848", "10@99"] {
             assert!(
                 matches!(key_from_checkpoint(foreign), Err(Error::Checkpoint(_))),
                 "{foreign:?}"
             );
         }
+    }
+
+    const HERE: Origin = Origin {
+        system: Some(7_312_345_678_901_234_567),
+        timeline: Some(1),
+        database: 16_384,
+    };
+    /// `HERE` as seen with `skip_system_check`.
+    const HERE_NO_SYS: Origin = Origin {
+        system: None,
+        timeline: None,
+        database: 16_384,
+    };
+
+    #[test]
+    fn checkpoint_carries_its_origin() {
+        let k = Key {
+            commit: 10,
+            change: 99,
+            ord: 3,
+        };
+        let text = encode_checkpoint(k, Some(HERE));
+        assert_eq!(text, "10@99#3;sys=7312345678901234567;db=16384;tli=1");
+        let (key, stamp) = parse_checkpoint(&text).unwrap();
+        assert_eq!(key, k);
+        assert_eq!(stamp.system, HERE.system);
+        assert_eq!(stamp.timeline, HERE.timeline);
+        assert_eq!(stamp.database, Some(HERE.database));
+        // Written by the first version of this check, before the timeline was recorded.
+        let (_, old) = parse_checkpoint("10@99#3;sys=7312345678901234567;db=16384").unwrap();
+        assert_eq!(old.timeline, None);
+        // With skip_system_check only the database is recorded.
+        assert_eq!(encode_checkpoint(k, Some(HERE_NO_SYS)), "10@99#3;db=16384");
+        // Before start there is no origin, and the text is the bare key, as before #63.
+        assert_eq!(encode_checkpoint(k, None), "10@99#3");
+        assert_eq!(parse_checkpoint("10@99#3"), Some((k, Stamp::default())));
+    }
+
+    #[test]
+    fn unknown_or_malformed_checkpoint_fields_are_refused() {
+        for bad in [
+            "10@99#3;",
+            "10@99#3;sys",
+            "10@99#3;sys=x",
+            "10@99#3;db=-1",
+            "10@99#3;sys=1;sys=1",
+            "10@99#3;tli=2;tli=2",
+            "10@99#3;tli=-1",
+            "10@99#3;sys=1;db=2;x=3",
+        ] {
+            assert!(
+                matches!(key_from_checkpoint(bad), Err(Error::Checkpoint(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_from_another_cluster_or_database_is_refused() {
+        let same = Stamp {
+            system: HERE.system,
+            timeline: HERE.timeline,
+            database: Some(HERE.database),
+        };
+        assert!(check_origin(same, HERE).is_ok());
+        // Legacy checkpoints carry no origin and are accepted (backfilled on the next save).
+        assert!(check_origin(Stamp::default(), HERE).is_ok());
+
+        let other_cluster = Stamp {
+            system: Some(HERE.system.unwrap() + 1),
+            ..same
+        };
+        let err = check_origin(other_cluster, HERE).unwrap_err().to_string();
+        assert!(err.contains("different or rebuilt cluster"), "{err}");
+        assert!(
+            !err.contains("backup"),
+            "must not promise to catch restores: {err}"
+        );
+
+        let other_db = Stamp {
+            database: Some(HERE.database + 1),
+            ..same
+        };
+        let err = check_origin(other_db, HERE).unwrap_err().to_string();
+        assert!(err.contains("same cluster"), "{err}");
+
+        // Same cluster, new timeline: a promotion or PITR since, which may have lost changes.
+        let old_timeline = Stamp {
+            timeline: Some(2),
+            ..same
+        };
+        let on_three = Origin {
+            timeline: Some(3),
+            ..HERE
+        };
+        let err = check_origin(old_timeline, on_three)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timeline 2")
+                && err.contains("restored, recovered to a point in time (PITR) or failed over"),
+            "{err}"
+        );
+        assert!(
+            err.contains("may never reach Kafka") && err.contains(";tli="),
+            "{err}"
+        );
+        // A checkpoint without a timeline is accepted and gets one on the next save.
+        let no_timeline = Stamp {
+            timeline: None,
+            ..same
+        };
+        assert!(check_origin(no_timeline, on_three).is_ok());
+
+        // skip_system_check drops the cluster and timeline comparisons: the database is still compared.
+        assert!(check_origin(other_cluster, HERE_NO_SYS).is_ok());
+        assert!(check_origin(old_timeline, HERE_NO_SYS).is_ok());
+        let err = check_origin(other_db, HERE_NO_SYS).unwrap_err().to_string();
+        assert!(err.contains("same cluster"), "{err}");
+    }
+
+    #[test]
+    fn stamping_a_new_origin_warns_with_what_it_records() {
+        // Legacy checkpoint: both fields are new, and the warning names them.
+        let msg = stamp_warning(Stamp::default(), HERE).expect("legacy stamp warns");
+        assert!(
+            msg.contains("sys=7312345678901234567 db=16384 tli=1"),
+            "{msg}"
+        );
+        assert!(msg.contains("checkpoint-ahead-of-WAL"), "{msg}");
+        // Written with skip_system_check, now checked: only sys is new.
+        let db_only = Stamp {
+            system: None,
+            timeline: None,
+            database: Some(HERE.database),
+        };
+        let msg = stamp_warning(db_only, HERE).expect("adding sys warns");
+        assert!(
+            msg.contains("sys=7312345678901234567") && !msg.contains("db="),
+            "{msg}"
+        );
+        // Nothing new to record: no warning.
+        assert_eq!(stamp_warning(db_only, HERE_NO_SYS), None);
+        let full = Stamp {
+            system: HERE.system,
+            timeline: HERE.timeline,
+            ..db_only
+        };
+        assert_eq!(stamp_warning(full, HERE), None);
+        // Written before the timeline was recorded: only tli is new.
+        let msg = stamp_warning(
+            Stamp {
+                timeline: None,
+                ..full
+            },
+            HERE,
+        )
+        .expect("adding tli warns");
+        assert!(msg.contains("tli=1") && !msg.contains("sys="), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_ahead_of_wal_names_every_possible_cause() {
+        let same = ahead_of_wal(0x20, 0x10, true).to_string();
+        assert!(
+            same.contains("restored, recovered to a point in time (PITR) or failed over"),
+            "{same}"
+        );
+        assert!(!same.contains("another cluster"), "{same}");
+        let unknown = ahead_of_wal(0x20, 0x10, false).to_string();
+        assert!(
+            unknown.contains("another cluster") && unknown.contains("failed over"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn slot_of_another_database_is_refused() {
+        assert!(check_slot_database("s", Some("app"), "app").is_ok());
+        let err = check_slot_database("s", Some("other"), "app")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("belongs to database \"other\"") && err.contains("untouched"),
+            "{err}"
+        );
+        let err = check_slot_database("s", None, "app")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("physical slot"), "{err}");
     }
 
     /// In-progress transaction streaming (`streaming on`, proto >= 2) must stay off: changes of a

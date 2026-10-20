@@ -132,6 +132,7 @@ topic = "cdc.{schema}.{table}"
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
+| `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
@@ -269,7 +270,33 @@ With a published action table the heartbeat row is itself delivered as an event,
 acknowledged; the jump to the server's WAL position then rarely fires. Both paths are safe. If the action query or the
 WAL position query fails, the source logs a warning and skips that heartbeat instead of stopping. A standby cannot run
 an `UPDATE` action query, so leave it unset there. A checkpoint ahead of the server's WAL position (a state volume
-copied from another cluster) is rejected at startup.
+copied from another cluster, or a restore of this one) is rejected at startup; see [Checkpoint origin check](#checkpoint-origin-check).
+
+### Checkpoint origin check
+
+Every Postgres checkpoint records the cluster's `system_identifier`, the database OID and the cluster's timeline
+(`<commit>@<change>#<ord>;sys=<id>;db=<oid>;tli=<timeline>`). At startup, before the slot is looked up or created,
+Aqueduct reads them from the server (`pg_control_system()` and `pg_control_checkpoint()`; the integration suite calls
+both as a plain `LOGIN REPLICATION` role) and compares. `allow_slot_recreate` does not bypass this.
+
+| The checkpoint was written ... | Result |
+|---|---|
+| on another cluster (another `initdb`: a re-pointed URL, a primary rebuilt from scratch, a major-version `pg_upgrade`) | refused: point the URL back, or remove the checkpoint |
+| on another database of the same cluster | refused |
+| on an earlier timeline of the same cluster (a failover to a replica, or a PITR, since) | refused with "restored, recovered to a point in time (PITR) or failed over" |
+| ahead of the server's WAL on the same cluster (a restore that went back before the checkpoint) | refused with the same message |
+
+A failover or restore can lose changes: everything between the new server's WAL end and the checkpoint never reaches
+Kafka, and before Postgres 17 the logical slot does not follow a failover at all. The safe recovery is a resync:
+remove the checkpoint and reload the tables downstream. If you have verified that nothing was lost (a planned
+switchover with no replication lag), delete only the `;tli=` field from the checkpoint file; the next checkpoint
+records the new timeline.
+
+- A checkpoint written by an older version lacks some fields. It is accepted with a warning, and the next checkpoint
+  records them.
+- If the role cannot call these functions (some managed services), startup fails with a message naming
+  `checkpoint_skip_system_check`. Set it to `true` to skip the cluster and timeline comparison; the database is still
+  compared.
 
 ```sql
 CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
