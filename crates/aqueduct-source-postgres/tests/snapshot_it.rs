@@ -672,6 +672,22 @@ async fn on_demand_requests_start_and_cancel() {
     // At most the chunk in flight still arrives, then nothing more is copied.
     let rest = collect(&mut s, Duration::from_secs(2), |_| false).await;
     assert!(rest.len() <= 50, "{} rows after the cancel", rest.len());
+    // Once it ended, a new request starts a new snapshot.
+    let again = request(
+        &mut s,
+        &tx,
+        SnapshotCommand::Start(vec![format!("public.{table}")]),
+    )
+    .await
+    .unwrap();
+    assert_ne!(again, id);
+    let more = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 100).await;
+    assert!(more.iter().any(|e| e.op == Op::Read));
+    assert_eq!(
+        request(&mut s, &tx, SnapshotCommand::Cancel).await,
+        Ok(again)
+    );
+    collect(&mut s, Duration::from_secs(2), |_| false).await;
     db.execute(&format!("INSERT INTO {table} VALUES (9999)"), &[])
         .await
         .unwrap();
