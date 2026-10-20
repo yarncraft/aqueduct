@@ -528,10 +528,16 @@ impl PostgresSource {
             ));
         }
         if let Some(e) = self.snapshot.as_mut() {
-            if !e.cancelled() {
-                e.append(tables, &catalog, &self.cfg.snapshot);
-                return Ok(e.id().to_owned());
+            if e.cancelled() {
+                // Its last chunk is still in flight; replacing it now would drop those rows,
+                // which the cancel promised to deliver.
+                return Err(
+                    "a cancelled snapshot is finishing its last chunk; try again in a moment"
+                        .into(),
+                );
             }
+            e.append(tables, &catalog, &self.cfg.snapshot);
+            return Ok(e.id().to_owned());
         }
         let id = new_snapshot_id();
         let state = SnapState {
