@@ -19,7 +19,7 @@ use crate::snapshot::{
 use crate::tls::{self, SslMode};
 #[cfg(test)]
 use crate::transport::{peek_sql, PEEK_SQL};
-use crate::transport::{PeekTransport, Transport};
+use crate::transport::{PeekTransport, StreamTransport, Transport};
 
 type Row = Box<RawValue>;
 
@@ -236,6 +236,18 @@ fn check_slot_database(slot: &str, slot_db: Option<&str>, current: &str) -> Resu
     }
 }
 
+/// What decoding carries from one fetch to the next. A peek always starts at a transaction
+/// boundary and re-sends Relation messages, but the stream transport can end a fetch in the
+/// middle of a transaction, so the relation cache, the transaction's keys and its xid and commit
+/// time live on the source.
+#[derive(Default)]
+struct DecodeState {
+    cache: RelationCache,
+    xid: u32,
+    ts: i64,
+    keys: TxKeys,
+}
+
 /// Assigns [`Key`]s to the changes of the transaction being decoded.
 #[derive(Default)]
 struct TxKeys {
@@ -303,6 +315,33 @@ pub struct PostgresSourceConfig {
     pub logical_messages: bool,
     /// Snapshots of existing rows (ADR 0001). Off by default.
     pub snapshot: SnapshotConfig,
+    /// How changes are read from the slot (ADR 0003). Default: polling over SQL.
+    pub transport: TransportKind,
+    /// Stream transport: bytes of decoded-but-not-taken messages to hold before reading pauses.
+    pub stream_buffer_bytes: usize,
+}
+
+/// How the source reads the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportKind {
+    /// `pg_logical_slot_peek_binary_changes` over the SQL connection, every `poll_interval`.
+    #[default]
+    Poll,
+    /// A replication connection (`START_REPLICATION`) that receives changes as they commit.
+    Stream,
+}
+
+impl std::str::FromStr for TransportKind {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "poll" => Ok(Self::Poll),
+            "stream" => Ok(Self::Stream),
+            other => Err(format!(
+                "transport = {other:?}: expected \"poll\" or \"stream\""
+            )),
+        }
+    }
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -328,6 +367,8 @@ impl PostgresSourceConfig {
             skip_system_check: false,
             logical_messages: false,
             snapshot: SnapshotConfig::default(),
+            transport: TransportKind::Poll,
+            stream_buffer_bytes: crate::replication::DEFAULT_STREAM_BUFFER_BYTES,
         }
     }
 
@@ -354,6 +395,8 @@ pub struct PostgresSource {
     snapshot: Option<Engine>,
     /// Snapshot requests from the admin API.
     control: Option<SnapshotReceiver>,
+    /// Decoding state carried across fetches.
+    decode: DecodeState,
     /// Status of the last snapshot that ended, kept for the admin API.
     last_status: Option<SnapshotStatus>,
     buffer: VecDeque<ChangeEvent>,
@@ -382,6 +425,9 @@ pub struct PostgresSource {
     origin: Option<Origin>,
 }
 
+/// How long the stream transport waits for a slot another connection still holds.
+const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
+
 /// How often the slot lag is read from `pg_replication_slots`.
 const SLOT_STATS_EVERY: Duration = Duration::from_secs(5);
 
@@ -393,6 +439,7 @@ impl PostgresSource {
             transport: None,
             snapshot: None,
             control: None,
+            decode: DecodeState::default(),
             last_status: None,
             buffer: VecDeque::new(),
             emitted: Key::default(),
@@ -587,6 +634,79 @@ impl PostgresSource {
             self.last_status = Some(st);
         }
         self.publish_status();
+    }
+
+    /// Opens the replication connection for the stream transport, after the slot exists. It
+    /// must reach the same cluster as the SQL connection (the URL could resolve elsewhere with
+    /// several hosts), and it starts at the slot's confirmed position. Status updates go out
+    /// well within the server's `wal_sender_timeout`, also while the sink holds up reading.
+    async fn open_stream(&mut self) -> Result<StreamTransport> {
+        use crate::replication::{
+            ConnectOptions, ReplicationClient, StartReplication, StreamOptions,
+        };
+        let timeout_ms: i64 = self
+            .client()?
+            .query_one(
+                "SELECT setting::int8 FROM pg_settings WHERE name = 'wal_sender_timeout'",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        // A previous process's walsender can hold the slot for a moment after it went away
+        // (55006, "slot is active"): try again for a while before giving up.
+        let deadline = Instant::now() + SLOT_BUSY_RETRY;
+        let (encrypted, stream, status) = loop {
+            let mut client = ReplicationClient::connect(
+                &self.cfg.url,
+                &ConnectOptions {
+                    ssl_mode: self.cfg.ssl_mode,
+                    ssl_root_cert: self.cfg.ssl_root_cert.clone(),
+                },
+            )
+            .await?;
+            let encrypted = client.encrypted();
+            let system = client.identify_system().await?;
+            if let Some(sys) = self.origin.and_then(|o| o.system) {
+                if system.system_id != sys.to_string() {
+                    return Err(Error::Config(format!(
+                        "the replication connection reached cluster {}, the SQL connection cluster {}; {}",
+                        system.system_id, sys, "point the URL at one server"
+                    )));
+                }
+            }
+            let started = client
+                .start_replication(&StartReplication {
+                    slot: &self.cfg.slot,
+                    start_lsn: 0,
+                    publication: &self.cfg.publication,
+                    logical_messages: self.cfg.logical_messages,
+                })
+                .await;
+            match started {
+                Ok((stream, status)) => break (encrypted, stream, status),
+                Err(e) if e.to_string().contains("(55006)") && Instant::now() < deadline => {
+                    tracing::info!(slot = %self.cfg.slot, "slot still held by a previous connection; retrying");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let opts = StreamOptions {
+            buffer_bytes: self.cfg.stream_buffer_bytes,
+            status_interval: status_interval(timeout_ms),
+        };
+        tracing::info!(
+            slot = %self.cfg.slot,
+            encrypted,
+            status_every_ms = opts.status_interval.as_millis() as u64,
+            "streaming from the replication connection"
+        );
+        Ok(StreamTransport::new(
+            crate::replication::ReplicationHandle::spawn(stream, status, opts),
+            usize::try_from(self.cfg.batch_size).unwrap_or(1000).max(1),
+            self.cfg.poll_interval,
+        ))
     }
 
     /// Report heartbeats and slot lag to `metrics`.
@@ -882,12 +1002,32 @@ impl PostgresSource {
     }
 
     async fn poll(&mut self) -> Result<()> {
+        if self.cfg.transport == TransportKind::Stream {
+            // The fetch waits for data, so the heartbeat runs after it: a heartbeat started
+            // before a fetch that is then cancelled would never finish. The idle target is the
+            // last keepalive's position W, not the server's WAL position: W proves receipt of
+            // everything committed below it, while the WAL position on a busy cluster (or after
+            // the heartbeat action query) is always past W, and the slot would never move.
+            self.refresh_slot_stats().await;
+            let fetched = self.transport()?.fetch().await?;
+            self.apply(fetched.messages)?;
+            if self.heartbeat_begin().await?.is_some() {
+                match fetched.caught_up {
+                    Some(w) => self.heartbeat_end(w, true).await?,
+                    None => self.heartbeat_end(0, false).await?,
+                }
+            }
+            return Ok(());
+        }
         let heartbeat_wal = self.heartbeat_begin().await?;
         self.refresh_slot_stats().await;
         let fetched = self.transport()?.fetch().await?;
         self.apply(fetched.messages)?;
         if let Some(wal) = heartbeat_wal {
-            self.heartbeat_end(wal, fetched.drained).await?;
+            // A peek drained the slot; a stream is drained up to the WAL position its last
+            // keepalive reported, when nothing followed it.
+            let drained = fetched.drained || fetched.caught_up.is_some_and(|w| w >= wal);
+            self.heartbeat_end(wal, drained).await?;
         }
         Ok(())
     }
@@ -923,9 +1063,14 @@ impl PostgresSource {
     /// Turns decoded messages into queued events. This is the one place where changes get their
     /// [`Key`], for every transport.
     fn apply(&mut self, messages: Vec<(u64, Message)>) -> Result<()> {
-        let mut cache = RelationCache::default();
-        let (mut xid, mut ts) = (0u32, 0i64);
-        let mut keys = TxKeys::default();
+        // Taken out while decoding (relations are borrowed across `queue` calls) and put back at
+        // the end. An error ends the stream, so a state lost on the error path is never used.
+        let DecodeState {
+            mut cache,
+            mut xid,
+            mut ts,
+            mut keys,
+        } = std::mem::take(&mut self.decode);
         for (lsn, msg) in messages {
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
@@ -1055,6 +1200,12 @@ impl PostgresSource {
                 Message::Ignored => {}
             }
         }
+        self.decode = DecodeState {
+            cache,
+            xid,
+            ts,
+            keys,
+        };
         Ok(())
     }
 
@@ -1169,6 +1320,11 @@ impl PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
+        // A new stream: nothing decoded or queued before belongs to it.
+        self.decode = DecodeState::default();
+        self.tx_ends.clear();
+        self.last_end = 0;
+        self.buffer.clear();
         let client = self.connect().await?;
         self.client = Some(Arc::new(client));
         if let Some(m) = &self.metrics {
@@ -1294,13 +1450,16 @@ impl Source for PostgresSource {
             .client
             .clone()
             .ok_or_else(|| Error::Source("source not started".into()))?;
-        self.transport = Some(Box::new(PeekTransport {
-            client,
-            slot: self.cfg.slot.clone(),
-            publication: self.cfg.publication.clone(),
-            batch_size: self.cfg.batch_size,
-            logical_messages: self.cfg.logical_messages,
-        }));
+        self.transport = Some(match self.cfg.transport {
+            TransportKind::Poll => Box::new(PeekTransport {
+                client,
+                slot: self.cfg.slot.clone(),
+                publication: self.cfg.publication.clone(),
+                batch_size: self.cfg.batch_size,
+                logical_messages: self.cfg.logical_messages,
+            }),
+            TransportKind::Stream => Box::new(self.open_stream().await?),
+        });
         Ok(())
     }
 
@@ -1325,6 +1484,8 @@ impl Source for PostgresSource {
                 // A chunk in flight waits for its high watermark: poll again soon, but not in a
                 // hot loop (the watermark may not be flushed yet). A due chunk starts at once.
                 let pause = match &self.snapshot {
+                    // A stream fetch already waited for data.
+                    _ if self.cfg.transport == TransportKind::Stream => Duration::ZERO,
                     Some(e) if e.due() => Duration::ZERO,
                     Some(e) if e.in_flight() => {
                         Duration::from_millis(20).min(self.cfg.poll_interval)
@@ -1382,6 +1543,17 @@ fn with_causes(mut msg: String, mut cause: Option<&(dyn std::error::Error + 'sta
         cause = c.source();
     }
     msg
+}
+
+/// Status update interval for a server whose `wal_sender_timeout` is `timeout_ms` (0 = off):
+/// a third of it, so two updates can be lost before the server gives up, and at most the
+/// default 10 s.
+fn status_interval(timeout_ms: i64) -> Duration {
+    let default = crate::replication::DEFAULT_STATUS_INTERVAL;
+    match u64::try_from(timeout_ms) {
+        Ok(ms) if ms > 0 => Duration::from_millis((ms / 3).max(100)).min(default),
+        _ => default,
+    }
 }
 
 /// Parse Postgres `X/Y` hex LSN text.

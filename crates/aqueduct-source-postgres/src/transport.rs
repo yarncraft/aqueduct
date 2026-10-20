@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio_postgres::Client;
 
 use crate::decoder::{decode, Message};
+use crate::replication::{Replication, ReplicationHandle};
 use crate::source::{parse_lsn, src_err};
 
 /// Decoded messages, each with the LSN of its WAL record, in stream order.
@@ -21,6 +22,9 @@ pub struct Fetched {
     /// Everything the server had when the fetch started was returned. Only then may an idle
     /// heartbeat move the slot to the WAL position read before the fetch.
     pub drained: bool,
+    /// Stream transport: the fetch ended on a keepalive with nothing after it, so every
+    /// transaction that committed before this WAL position was received.
+    pub caught_up: Option<u64>,
 }
 
 #[async_trait]
@@ -90,7 +94,11 @@ impl Transport for PeekTransport {
                 .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
             messages.push((lsn, msg));
         }
-        Ok(Fetched { messages, drained })
+        Ok(Fetched {
+            messages,
+            drained,
+            caught_up: None,
+        })
     }
 
     async fn confirm(&mut self, lsn: u64) -> Result<()> {
@@ -101,6 +109,89 @@ impl Transport for PeekTransport {
             )
             .await
             .map_err(src_err)?;
+        Ok(())
+    }
+}
+
+/// Receives pgoutput from a replication connection (ADR 0003): changes arrive as they commit,
+/// nothing is decoded twice, and the slot is confirmed by the connection's status updates.
+pub struct StreamTransport {
+    handle: ReplicationHandle,
+    /// Messages per fetch, so the source keeps turning (heartbeats, snapshot chunks, admin
+    /// requests) inside a large transaction.
+    batch: usize,
+    /// How long a fetch waits for the first message.
+    wait: std::time::Duration,
+    /// WAL end of the last keepalive with no data after it, across fetches: everything that
+    /// committed before it has been received. The server sends one when it is idle and our
+    /// confirmed position is behind; the heartbeat's own fetch is often empty.
+    caught_up: Option<u64>,
+}
+
+impl StreamTransport {
+    pub fn new(handle: ReplicationHandle, batch: usize, wait: std::time::Duration) -> Self {
+        Self {
+            handle,
+            batch,
+            wait,
+            caught_up: None,
+        }
+    }
+}
+
+fn ended() -> Error {
+    Error::Source("replication connection: the server ended the stream".into())
+}
+
+#[async_trait]
+impl Transport for StreamTransport {
+    async fn fetch(&mut self) -> Result<Fetched> {
+        let mut messages = Vec::new();
+        let mut next = match tokio::time::timeout(self.wait, self.handle.recv()).await {
+            Ok(m) => m?.ok_or_else(ended)?,
+            Err(_) => {
+                return Ok(Fetched {
+                    messages,
+                    drained: false,
+                    caught_up: self.caught_up,
+                })
+            }
+        };
+        loop {
+            match next {
+                Replication::Keepalive { wal_end, .. } => self.caught_up = Some(wal_end),
+                Replication::XLogData {
+                    wal_start, data, ..
+                } => {
+                    self.caught_up = None;
+                    let msg = decode(&data).map_err(|e| {
+                        Error::Source(format!(
+                            "pgoutput decode at {}: {e}",
+                            aqueduct_core::Position::Lsn(wal_start)
+                        ))
+                    })?;
+                    messages.push((wal_start, msg));
+                    if messages.len() >= self.batch {
+                        break;
+                    }
+                }
+            }
+            next = match self.handle.try_recv()? {
+                Some(m) => m,
+                None if self.handle.is_finished() => return Err(ended()),
+                None => break,
+            };
+        }
+        Ok(Fetched {
+            messages,
+            drained: false,
+            caught_up: self.caught_up,
+        })
+    }
+
+    async fn confirm(&mut self, lsn: u64) -> Result<()> {
+        // Reported with the next status update; the task never reports more than this.
+        self.handle.ack(lsn);
         Ok(())
     }
 }

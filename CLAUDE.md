@@ -46,7 +46,10 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
 - **Positions**: sources own their `Position` encoding. The event JSON field is still `lsn`, and text positions are checkpointed as `~<text>`. Adding a source = new crate, a `SourceConfig` variant in `config.rs` and a match arm in `main.rs`. SQL Server, Redis and the Kafka source were dropped on purpose.
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.
-- Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it.
+- Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it. With
+  `transport = "stream"` the source opens its own replication connection from the same URL (`replication/`, hand-written
+  on `postgres-protocol`, same TLS and auth rules); poll stays the default and is kept permanently. Keys are assigned
+  in one place (`source.rs::apply`) for both transports.
 - Kafka: record key is `schema.table` (default `partition_by = "table"`, per-table ordering) or `schema.table:<identity>`
   (`partition_by = "key"`); partition is a stable FNV-1a hash of the key (`kafka.rs::record_key`). The identity part is the
   replica-identity columns joined with `0x1f`, binary datums hex (`decoder.rs::key`), or the MongoDB `documentKey` JSON; under `REPLICA IDENTITY FULL` `decoder.rs::key` returns `None` (the whole row would be the key), so those tables use `schema.table`; `key` mode otherwise only orders per row while identity columns are immutable. Truncates use `schema.table`.

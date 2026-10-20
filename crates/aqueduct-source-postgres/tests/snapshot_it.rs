@@ -8,6 +8,7 @@
 //!
 //! Each test makes its own tables, publication and slot, and drives the source the way the
 //! pipeline does: take events, then ack the last one's checkpoint.
+mod common;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ fn unique(prefix: &str) -> String {
 
 fn source(slot: &str, publication: &str, mode: SnapshotMode, chunk: u32) -> PostgresSource {
     let mut cfg = PostgresSourceConfig::new(url(), slot, publication);
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {
@@ -528,7 +530,13 @@ async fn the_slot_advances_during_the_snapshot() {
     let at_start = flushed(&db, &slot).await;
     let events = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 1000).await;
     assert!(events.len() >= 1000);
-    let mid = flushed(&db, &slot).await;
+    // The stream transport confirms with its next status update, a moment after the acks.
+    let mut mid = flushed(&db, &slot).await;
+    let until = Instant::now() + Duration::from_secs(3);
+    while mid <= at_start && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mid = flushed(&db, &slot).await;
+    }
     assert!(
         mid > at_start,
         "the slot advanced mid-snapshot: {at_start} -> {mid}"
@@ -562,6 +570,7 @@ async fn key_columns_let_a_table_without_primary_key_be_copied() {
     .await
     .unwrap();
     let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {
@@ -732,6 +741,7 @@ async fn a_watermark_table_replaces_logical_messages() {
     .await
     .unwrap();
     let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {

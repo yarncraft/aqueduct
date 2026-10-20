@@ -95,6 +95,11 @@ Notable changes to Aqueduct. Newest first.
   `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
   Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
   - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+- **Postgres streaming transport** (#109, ADR 0003): `[postgres] transport = "stream"` receives changes over a
+  replication connection as they commit instead of polling the slot every 500 ms. Same events, keys and checkpoints
+  as `poll`, which stays the default. Needs one more walsender per instance (`max_wal_senders`), a `pg_hba.conf` line
+  for the role on the database, and a direct connection (no pooler). `stream_buffer_bytes` (64 MiB) bounds what is
+  buffered ahead of the sink. See DEPLOYMENT.md, "Streaming transport".
 - **MongoDB snapshots: copy documents that already exist while changes stream** (#77, ADR 0001). New MongoDB
   `[source]` keys `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size` and
   `snapshot_max_rows_per_sec`, the same as for Postgres, and `/api/snapshot` accepts `database.collection`. Documents

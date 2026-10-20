@@ -7,6 +7,7 @@
 //! ```
 //!
 //! Every test makes its own tables, publication and slot, because tests share one server.
+mod common;
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
@@ -82,6 +83,7 @@ impl Fixture {
     fn config(&self, heartbeat: Duration, action: Option<String>) -> PostgresSourceConfig {
         let url = format!("postgres://postgres:aq@{}/postgres", addr());
         let mut cfg = PostgresSourceConfig::new(url, self.slot.clone(), self.publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         cfg.heartbeat_interval = Some(heartbeat);
@@ -444,6 +446,7 @@ async fn capped_replay_window_does_not_skip_later_rows() {
         .clone()
         .expect("postgres events carry a checkpoint");
     drop(first);
+    f.released().await;
     let behind = f.confirmed().await;
     assert!(
         behind < checkpoint,
@@ -475,7 +478,15 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     assert!(ev.after.as_ref().unwrap().get().contains("after-window"));
 
     // The slot kept moving through the replay window although nothing was acked, but not past
-    // the unacked event.
+    // the unacked event. The stream transport can deliver X before its first heartbeat, and
+    // confirms with the next status update, so keep driving it (nothing more may arrive).
+    let until = Instant::now() + Duration::from_secs(5);
+    while f.confirmed().await <= checkpoint && Instant::now() < until {
+        assert!(
+            drive(&mut s, Duration::from_millis(200)).await.is_none(),
+            "an extra event arrived after X"
+        );
+    }
     assert!(
         f.confirmed().await > checkpoint,
         "the slot did not move through the replay window"

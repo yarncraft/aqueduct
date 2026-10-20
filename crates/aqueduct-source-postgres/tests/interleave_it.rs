@@ -10,6 +10,7 @@
 //! change record, so positions are not monotonic across transactions. `queue()` drops every
 //! change at or below the last emitted position; this test overlaps two writers to see whether
 //! that drops a row. Every other integration test runs one transaction at a time.
+mod common;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -81,6 +82,7 @@ async fn overlapping_transactions_lose_no_rows() {
     .unwrap();
 
     let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
     let mut s = PostgresSource::new(cfg);
@@ -157,6 +159,7 @@ async fn restart_after_acking_the_first_committed_transaction_loses_no_rows() {
 
     let new_source = || {
         let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         PostgresSource::new(cfg)
@@ -242,6 +245,7 @@ async fn acking_the_first_committed_transaction_does_not_ack_an_undelivered_one(
 
     let new_source = || {
         let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         PostgresSource::new(cfg)
@@ -329,6 +333,7 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     .unwrap();
 
     let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
     let mut s = PostgresSource::new(cfg);
@@ -439,6 +444,7 @@ async fn restart_after_acking_part_of_a_copy_loses_no_rows() {
 
     let new_source = || {
         let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         PostgresSource::new(cfg)
@@ -507,6 +513,7 @@ async fn plain_lsn_checkpoint_restart_loses_no_rows_and_acks_advance_the_slot() 
 
     let new_source = || {
         let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         PostgresSource::new(cfg)
@@ -562,7 +569,13 @@ async fn plain_lsn_checkpoint_restart_loses_no_rows_and_acks_advance_the_slot() 
         last = e.checkpoint;
     }
     s.ack(last.expect("events arrived")).await.unwrap();
-    let after = confirmed().await;
+    // The stream transport confirms with its next status update, a moment later.
+    let mut after = confirmed().await;
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while after <= before && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = confirmed().await;
+    }
 
     drop(s);
     drop_slot(&db, &slot).await;
