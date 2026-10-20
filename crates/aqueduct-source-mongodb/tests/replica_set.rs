@@ -11,12 +11,9 @@ fn uri() -> String {
 }
 
 fn cfg(db: &str) -> MongoConfig {
-    MongoConfig {
-        uri: uri(),
-        database: db.into(),
-        collections: vec![],
-        pre_images: false,
-    }
+    let mut c = MongoConfig::new(uri(), db);
+    c.pre_images = false;
+    c
 }
 
 async fn next(s: &mut MongoSource) -> ChangeEvent {
@@ -39,6 +36,8 @@ async fn insert_update_delete_then_resume() {
 
     let mut src = MongoSource::new(cfg(&db_name));
     src.start(None).await.unwrap();
+    // Without a checkpoint the start position comes first, before any change.
+    assert_eq!(next(&mut src).await.op, Op::Heartbeat);
 
     // One change at a time: `updateLookup` reads the current document, so changes made
     // faster than the source consumes them would see the later state (or none after a delete).
@@ -121,6 +120,8 @@ async fn skipped_ddl_still_produces_a_heartbeat() {
     c.collections = vec!["watched".into()];
     let mut src = MongoSource::new(c).with_heartbeat_every(Duration::from_secs(1));
     src.start(None).await.unwrap();
+    // The start position; the heartbeat under test comes after it.
+    assert_eq!(next(&mut src).await.op, Op::Heartbeat);
 
     // Drop, then recreate, each round: `watched` exists at start, so the first drop is real and
     // so is every later one. `create` events need `showExpandedEvents`, which the source does
@@ -147,4 +148,33 @@ async fn skipped_ddl_still_produces_a_heartbeat() {
     // Bounded by the 5s loop; a panic in the churn task fails the test.
     churn.await.unwrap();
     db.drop().await.unwrap();
+}
+
+/// Without a checkpoint the stream opens at "now". Its opening token must be handed out (and so
+/// checkpointed) before anything else: otherwise a restart before the first checkpoint would open
+/// at a later "now" and silently skip every change made in between.
+#[tokio::test]
+#[ignore]
+async fn start_position_is_durable_before_the_first_change() {
+    let db_name = format!("aq_start_{}", mongodb::bson::oid::ObjectId::new().to_hex());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let coll = client.database(&db_name).collection::<Document>("users");
+    coll.insert_one(doc! {"_id": 0}).await.unwrap();
+
+    let mut src = MongoSource::new(cfg(&db_name));
+    src.start(None).await.unwrap();
+    let hb = next(&mut src).await;
+    assert_eq!(hb.op, Op::Heartbeat);
+    let saved = hb.checkpoint.clone().unwrap_or(hb.position.clone());
+    // The process dies before it reads anything else; this change happens meanwhile.
+    drop(src);
+    coll.insert_one(doc! {"_id": 1}).await.unwrap();
+
+    let mut again = MongoSource::new(cfg(&db_name));
+    again.start(Some(saved)).await.unwrap();
+    let ev = next(&mut again).await;
+    assert_eq!(ev.op, Op::Insert);
+    assert_eq!(ev.key.as_deref(), Some(r#"{"_id":1}"#));
+
+    client.database(&db_name).drop().await.unwrap();
 }

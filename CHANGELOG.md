@@ -100,6 +100,18 @@ Notable changes to Aqueduct. Newest first.
   as `poll`, which stays the default. Needs one more walsender per instance (`max_wal_senders`), a `pg_hba.conf` line
   for the role on the database, and a direct connection (no pooler). `stream_buffer_bytes` (64 MiB) bounds what is
   buffered ahead of the sink. See DEPLOYMENT.md, "Streaming transport".
+- **MongoDB snapshots: copy documents that already exist while changes stream** (#77, ADR 0001). New MongoDB
+  `[source]` keys `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size` and
+  `snapshot_max_rows_per_sec`, the same as for Postgres, and `/api/snapshot` accepts `database.collection`. Documents
+  arrive as `"op": "read"`, encoded like an `insert` of the same document, in `_id` order (mixed `_id` types work).
+  With snapshots on, Aqueduct writes watermark documents into `<database>.aqueduct_watermarks` and needs `insert`,
+  `remove` and `createIndex` on that collection; startup checks it. See DEPLOYMENT.md, "MongoDB snapshots".
+  - While a MongoDB snapshot runs the checkpoint file holds JSON (`{"pos": <resume token>, "snap": {...}}`); a
+    version without MongoDB snapshots cannot resume from it. Let the snapshot finish before rolling back, or delete
+    the checkpoint.
+  - An older Aqueduct watching the same whole database (no `collections` list) forwards the inserts and deletes of
+    `aqueduct_watermarks` as ordinary events. Upgrade every instance on that database first, or give the old ones a
+    `collections` list.
 - **Snapshots on Postgres 12 and 13** (#92): new `[postgres] snapshot_watermark_table` names a published table whose
   rows carry the watermarks instead of logical messages (Postgres 14+). See DEPLOYMENT.md, "Watermark table".
 - **Cockpit snapshot card** (#78): progress of the running or last snapshot, skipped tables and a Cancel button. Snapshot
@@ -118,6 +130,10 @@ Notable changes to Aqueduct. Newest first.
 
 ### Changed
 
+- **MongoDB: a restart soon after the first start no longer skips changes** (#77). Without a checkpoint the change
+  stream opens at "now", but nothing saved that position until the first event or 30 s heartbeat, so a restart before
+  then opened at a later "now" and lost the changes in between. The opening position is now checkpointed before
+  anything else is read. No config change.
 - **A multi-table `TRUNCATE` now emits one event per table** (#55). `TRUNCATE a, b` is one WAL message, and only the
   first table's event was emitted, so consumers of the others never saw the truncate. No config change; expect extra
   `truncate` events (all with the same `lsn`) for statements that name several tables.
