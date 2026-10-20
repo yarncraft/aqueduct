@@ -2,7 +2,9 @@
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
-use aqueduct_sinks::{KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, RoutePlan};
+use aqueduct_sinks::{
+    FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, RoutePlan,
+};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use serde_json::value::to_raw_value;
@@ -178,7 +180,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         topic: topic.clone(),
         ops: Some(vec!["insert".into()]),
         filter: Some("row.n > 10".into()),
-        key: None,
+        ..Default::default()
     };
     let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
     let stats = plan.stats();
@@ -324,4 +326,62 @@ async fn route_key_keeps_each_rows_changes_on_one_partition() {
         used.len() > 1,
         "rows spread over partitions despite partition_by = table"
     );
+}
+
+#[tokio::test]
+async fn hashed_columns_reach_the_topic_with_the_key_id_header() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let topic = unique("aqueduct-it-hash");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let route = KafkaRoute {
+        name: Some("users".into()),
+        pattern: "public.users".into(),
+        topic: topic.clone(),
+        fields: FieldSpec {
+            hash: vec!["email".into()],
+            mask: vec!["card".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let plan = RoutePlan::build(
+        vec![route],
+        None,
+        None,
+        Some(HashKey::new(secret, "2026-10").unwrap()),
+    )
+    .unwrap();
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 2, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let mut e = ev(1, "users");
+    e.after = Some(
+        to_raw_value(&serde_json::json!({ "email": "ada@example.com", "card": "4111", "n": 1 }))
+            .unwrap(),
+    );
+    e.key = Some(r#"{"email":"ada@example.com"}"#.into());
+    sink.send_batch(&[e]).await.unwrap();
+    sink.flush().await.unwrap();
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let got = read_all(&client, &topic).await;
+    assert_eq!(got.len(), 1);
+    let (key, headers, value) = &got[0];
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let digest: String = ring::hmac::sign(&k, b"ada@example.com")
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(value["after"]["email"], digest.as_str());
+    assert_eq!(value["after"]["card"], "***");
+    assert_eq!(value["after"]["n"], 1);
+    let k: serde_json::Value = serde_json::from_str(key).unwrap();
+    assert_eq!(k["key"]["email"], digest.as_str(), "the key is hashed too");
+    assert!(!key.contains("ada@") && !value.to_string().contains("ada@"));
+    assert_eq!(headers["aqueduct-hash-key-id"], b"2026-10");
 }

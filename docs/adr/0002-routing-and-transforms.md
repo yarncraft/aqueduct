@@ -320,3 +320,39 @@ Per-route key (#83):
 - **Truncates** have no row and get the table-only key (`"key": null`), like dead-letter records.
 - **Validation:** a non-empty list of distinct top-level column names; a dotted path is rejected. The key columns
   are registered with the unseen-field counter as `row.<column>`, on routes with or without `where`.
+
+## As built (R6)
+
+Field operations (#84). Where the code differs from the text above:
+
+- **The record key gets the field operations.** Since #138 the record key always carries the primary key as a
+  `"key"` object (`{"db", "schema", "table", "key": {...}}`), whatever `partition_by` says, so "declare `key`
+  explicitly under `partition_by = "key"`" no longer protects anything. Instead, a route with field operations and
+  no `key = [...]` applies the same operations to the key object's columns: excluded or not-included columns are
+  removed (an object left empty becomes `"key": null`), masked ones masked, hashed ones HMAC'd with the same key as
+  the value (so per-row partitioning keeps working and the key matches the value), renamed ones renamed. The
+  partition is hashed from the rewritten key. A route with `key = [...]` keeps that key, and validation rejects a key
+  column the route excludes, masks, hashes or leaves out of `include`. A renamed column may be a key column: it is
+  not protected, and the key reads the original row, so it keeps its original name there.
+- **Rename collisions are checked twice.** At startup: a target may not be another renamed column, another target,
+  or an included column. With `include` the output columns are known, so that is complete. Without it, a row that
+  already has a column named like a target is a row-level error: it goes to `sink.dead_letter_topic` (required for
+  `rename` without `include`) with an `aqueduct-error` header naming the columns, never values. Its dead-letter
+  value has the other operations applied under the original names.
+- **Also rejected at startup:** an empty `include`; a column both masked and hashed; a column masked, hashed or
+  renamed that `exclude` drops or `include` leaves out (the operation would have no effect).
+- **Dead-letter values** get the route's field operations (§5a), with the `aqueduct-hash-key-id` header when the
+  route hashes. A row that is not a JSON object cannot be rewritten; its dead-letter value has `before`/`after`
+  `null` rather than the unprotected row.
+- **Canonical hash input** for objects and arrays is the JSON as the source wrote it with whitespace outside strings
+  removed (key order and escapes kept), not a re-serialisation.
+- **Hash key.** `AQUEDUCT_HASH_KEY` or `sink.hash_key_file` (one trailing newline trimmed), not both; at least 32
+  bytes; `sink.hash_key_id` (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with a key.
+- **Unseen fields:** every column a field operation names is watched as `row.<column>`. Since R5, `observe` runs on
+  every route, with or without `where`.
+- **Content routing (R4) is not merged yet.** Its side of "no row data may bypass the field operations" (topic
+  templates and `topic_values` may not read a protected column) is a TODO in `RoutePlan::build` against
+  `FieldOps::protection`; R4 adds it.
+- **Cost** (release, 10-column row updated with before and after, 2-column key, one route): no field operations
+  541 ns/event; include 1.8 µs, exclude 2.2 µs, mask 2.3 µs, rename 2.4 µs, hash of 2 columns 4.5 µs, all together
+  5.4 µs.

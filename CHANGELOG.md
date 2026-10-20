@@ -106,6 +106,16 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Routing: include, exclude, mask, hash and rename fields to protect personal data** (#84, ADR 0002).
+  `[[sink.routes]]` takes `include` or `exclude` (top-level columns), `mask` (strings become `"***"`, other values
+  `null`), `hash` (HMAC-SHA256 hex over the value's canonical text, so a Postgres `42` and a MongoDB `42` give the
+  same digest) and `rename`. They apply to `before` and `after`, to the route's dead-letter records and, unless the
+  route sets `key`, to the primary-key object in the record key, which the partition is then hashed from. The hash
+  key comes only from `AQUEDUCT_HASH_KEY` or the new `[sink] hash_key_file` (at least 32 bytes; a `hash_key` in the
+  TOML fails startup), and the new `hash_key_id` is sent as the `aqueduct-hash-key-id` header. A `key` column may
+  not be excluded, masked or hashed. A row whose renamed column collides goes to `dead_letter_topic`. `/api/routes`
+  lists each route's field operations and the key id, never the key. Additive: routes without these keys are
+  unchanged.
 - **Routing: set the Kafka message key per route** (#83, ADR 0002). `key = ["col", ...]` on a `[[sink.routes]]`
   entry builds the record key from those columns of the row (`after`, else `before`, so deletes key by their
   before-image): `{"db", "schema", "table", "key": {"col": value, ...}}`, values copied as JSON, a missing column

@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic · field ops<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -244,6 +244,25 @@ topic = "orders-paid"
 `key = ["col", ...]` on a route keys its records by those row columns instead of the primary key (deletes by their
 before-image), and partitions by that key whatever `partition_by` says. See DEPLOYMENT.md, "Keying a route".
 
+A route can protect personal data: `include` or `exclude` columns, `mask` them (strings become `"***"`, other values
+`null`), `hash` them (HMAC-SHA256 hex, the same digest everywhere so consumers can still join) and `rename` them. The
+operations apply to `before`, `after`, dead-letter records and the primary-key object in the record key. The hash key
+comes only from `AQUEDUCT_HASH_KEY` or `hash_key_file`, and `hash_key_id` is sent as the `aqueduct-hash-key-id`
+header. See DEPLOYMENT.md, "Protecting fields per route".
+
+```toml
+[sink]
+hash_key_file = "/run/secrets/aqueduct-hash-key"  # or AQUEDUCT_HASH_KEY
+hash_key_id = "2026-10"
+
+[[sink.routes]]
+match = "public.customers"
+topic = "customers"
+exclude = ["internal_note"]
+mask = ["card_last4"]
+hash = ["email"]
+```
+
 ### MongoDB source
 
 ```toml
@@ -279,7 +298,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes` | The compiled route plan (match, ops, where, key, field operations, topic per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |

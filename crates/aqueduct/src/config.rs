@@ -209,6 +209,17 @@ pub struct KafkaConfig {
     /// as a route uses `where`; opened (created if missing) at startup.
     #[serde(default)]
     pub dead_letter_topic: Option<String>,
+    /// Never accepted: the key for `hash` comes from `AQUEDUCT_HASH_KEY` or `hash_key_file`
+    /// only. Read here so that a key pasted into the TOML fails startup instead of being ignored.
+    #[serde(default)]
+    pub hash_key: Option<Secret>,
+    /// File holding the key for `hash` (one trailing newline is ignored). Or `AQUEDUCT_HASH_KEY`.
+    #[serde(default)]
+    pub hash_key_file: Option<String>,
+    /// Short label of the hash key, sent as the `aqueduct-hash-key-id` header on every record of
+    /// a hashing route. Required with a key.
+    #[serde(default)]
+    pub hash_key_id: Option<String>,
     /// Encrypt with TLS and verify the broker certificate.
     #[serde(default)]
     pub tls: bool,
@@ -236,6 +247,43 @@ impl KafkaConfig {
             _ => Ok(()),
         }
     }
+
+    /// The key for `hash`, from `env` (the value of `AQUEDUCT_HASH_KEY`) or `hash_key_file`.
+    /// `None` when neither is set; the route plan then refuses any route that hashes. Errors
+    /// never contain the key.
+    pub fn hash_key(&self, env: Option<String>) -> Result<Option<aqueduct_sinks::HashKey>, String> {
+        if self.hash_key.is_some() {
+            return Err(
+                "sink.hash_key is not allowed in the config file, so the key never sits next to the config; set AQUEDUCT_HASH_KEY or sink.hash_key_file"
+                    .into(),
+            );
+        }
+        let env = env.filter(|v| !v.is_empty());
+        let secret = match (env, &self.hash_key_file) {
+            (Some(_), Some(_)) => {
+                return Err("both AQUEDUCT_HASH_KEY and sink.hash_key_file are set; use one".into())
+            }
+            (Some(v), None) => v.into_bytes(),
+            (None, Some(path)) => {
+                let mut b =
+                    std::fs::read(path).map_err(|e| format!("sink.hash_key_file {path}: {e}"))?;
+                if b.ends_with(b"\n") {
+                    b.pop();
+                    if b.ends_with(b"\r") {
+                        b.pop();
+                    }
+                }
+                b
+            }
+            (None, None) => return Ok(None),
+        };
+        let id = self.hash_key_id.as_deref().ok_or(
+            "sink.hash_key_id is required with a hash key: a short label consumers see in the aqueduct-hash-key-id header, changed whenever the key is",
+        )?;
+        aqueduct_sinks::HashKey::new(&secret, id)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,6 +306,21 @@ pub struct KafkaRouteConfig {
     /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
     #[serde(default)]
     pub key: Option<Vec<String>>,
+    /// Keep only these top-level columns. Exclusive with `exclude`.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Drop these top-level columns.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+    /// Strings become `"***"`, other values `null`.
+    #[serde(default)]
+    pub mask: Vec<String>,
+    /// HMAC-SHA256 hex with the key from `AQUEDUCT_HASH_KEY` or `sink.hash_key_file`.
+    #[serde(default)]
+    pub hash: Vec<String>,
+    /// `{ old = "new" }` column renames.
+    #[serde(default)]
+    pub rename: std::collections::BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -536,6 +599,97 @@ admin_insecure_no_auth = true",
         .unwrap();
         let d = format!("{cfg:?}");
         assert!(!d.contains("hunter2") && d.contains("svc"));
+    }
+
+    fn sink_cfg(extra: &str) -> KafkaConfig {
+        toml::from_str(&format!("brokers = ['b:9092']\ntopic = 't'\n{extra}")).unwrap()
+    }
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn hash_key_comes_from_env_or_file_never_the_toml() {
+        // In the TOML: rejected, and redacted in Debug like other secrets.
+        let c = sink_cfg(&format!("hash_key = '{KEY}'\nhash_key_id = 'k1'"));
+        let e = c.hash_key(None).unwrap_err();
+        assert!(e.contains("sink.hash_key is not allowed"), "{e}");
+        assert!(!e.contains(KEY));
+        assert!(!format!("{c:?}").contains(KEY));
+
+        // Neither: no key (a hashing route then fails to compile).
+        assert!(sink_cfg("").hash_key(None).unwrap().is_none());
+        assert!(sink_cfg("")
+            .hash_key(Some(String::new()))
+            .unwrap()
+            .is_none());
+
+        // From the environment, with its id.
+        let c = sink_cfg("hash_key_id = 'k1'");
+        let k = c.hash_key(Some(KEY.into())).unwrap().unwrap();
+        assert_eq!(k.id(), "k1");
+        assert!(!format!("{k:?}").contains(KEY));
+        // A missing id, a short key.
+        let e = sink_cfg("").hash_key(Some(KEY.into())).unwrap_err();
+        assert!(e.contains("sink.hash_key_id is required"), "{e}");
+        let e = c.hash_key(Some(KEY[..31].into())).unwrap_err();
+        assert!(
+            e.contains("shorter than 32 bytes") && !e.contains(&KEY[..31]),
+            "{e}"
+        );
+
+        // From a file: one trailing newline is not part of the key.
+        let dir = std::env::temp_dir().join(format!(
+            "aqueduct-hash-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            sink_cfg(&format!(
+                "hash_key_file = {:?}\nhash_key_id = 'k1'",
+                p.to_str().unwrap()
+            ))
+        };
+        let ok = file("ok", &format!("{KEY}\n"));
+        assert!(ok.hash_key(None).unwrap().is_some());
+        let e = file("short", &format!("{}\r\n", &KEY[..31]))
+            .hash_key(None)
+            .unwrap_err();
+        assert!(e.contains("shorter than 32 bytes"), "{e}");
+        // Both sources: ambiguous, rejected.
+        let e = ok.hash_key(Some(KEY.into())).unwrap_err();
+        assert!(e.contains("use one"), "{e}");
+        let missing = sink_cfg("hash_key_file = '/nonexistent/aqueduct-key'\nhash_key_id = 'k'");
+        assert!(missing
+            .hash_key(None)
+            .unwrap_err()
+            .contains("sink.hash_key_file /nonexistent/aqueduct-key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_field_ops_parse() {
+        let c = sink_cfg(
+            "[[routes]]
+match = 'public.users'
+topic = 'users'
+exclude = ['note']
+mask = ['card']
+hash = ['email']
+rename = { cust_id = 'customer_id' }
+",
+        );
+        let r = &c.routes[0];
+        assert_eq!(r.exclude.as_deref(), Some(&["note".to_string()][..]));
+        assert_eq!(r.mask, ["card"]);
+        assert_eq!(r.hash, ["email"]);
+        assert_eq!(r.rename["cust_id"], "customer_id");
+        assert!(r.include.is_none());
     }
 
     const SINK: &str = "[sink]
