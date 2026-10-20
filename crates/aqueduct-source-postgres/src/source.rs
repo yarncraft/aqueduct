@@ -295,7 +295,7 @@ pub struct PostgresSourceConfig {
     /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
     /// servers where WAL position alone does not move the slot.
     pub heartbeat_action_query: Option<String>,
-    /// Skip reading, recording and checking the cluster's `system_identifier`. Only for servers
+    /// Skip reading, recording and checking the cluster's `system_identifier` and timeline. Only for servers
     /// that refuse `pg_control_system()`; without it such a server fails at startup. The database
     /// check stays on.
     pub skip_system_check: bool,

@@ -88,7 +88,7 @@ pub struct PostgresConfig {
     /// Optional SQL run before each heartbeat, e.g. an upsert into a small published table.
     #[serde(default)]
     pub heartbeat_action_query: Option<String>,
-    /// Do not read, record or check the cluster's `system_identifier`. Only for servers that refuse
+    /// Do not read, record or check the cluster's `system_identifier` and timeline. Only for servers that refuse
     /// `pg_control_system()`. The database check stays on. Default: check, and fail at startup if
     /// it cannot be read.
     #[serde(default)]
