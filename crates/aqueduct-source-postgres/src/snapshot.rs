@@ -17,8 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqueduct_core::{ChunkRow, Mark, Outcome, SnapState, Window};
 use aqueduct_core::{Error, Result};
 use serde_json::value::RawValue;
-use tokio_postgres::types::ToSql;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, SimpleQueryMessage};
 
 use crate::catalog::{quote_ident, Catalog, PublishedTable, ReplicaIdentity};
 use crate::decoder::{self, Column, Datum, Relation, RelationCache, Tuple, WATERMARK_PREFIX};
@@ -181,31 +180,25 @@ impl Plan {
         })
     }
 
-    /// The keyset query for the chunk after `after` (the first chunk when `None`).
-    fn chunk_sql(&self, after: bool, limit: u32) -> String {
-        let cols = self
-            .columns
-            .iter()
-            .map(|c| format!("{}::text", quote_ident(c)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let key = self
-            .key
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+    /// The keyset query for the chunk after `after` (the first chunk when `None`). It runs over
+    /// the simple query protocol, so every value comes back as its type's text output, exactly as
+    /// pgoutput sends it (a `::text` cast is not that: `true::text` is `true`, pgoutput sends `t`).
+    /// Columns are qualified with the alias `t`: an unqualified `ORDER BY` name would bind to an
+    /// output column.
+    fn chunk_sql(&self, after: Option<&[String]>, limit: u32) -> String {
+        let col = |c: &String| format!("t.{}", quote_ident(c));
+        let cols = self.columns.iter().map(col).collect::<Vec<_>>().join(", ");
+        let key = self.key.iter().map(col).collect::<Vec<_>>().join(", ");
         let table = format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name));
         let mut conds = Vec::new();
-        if after {
-            let params = self
-                .key_types
+        if let Some(after) = after {
+            let values = after
                 .iter()
-                .enumerate()
-                .map(|(i, t)| format!("${}::text::{t}", i + 1))
+                .zip(&self.key_types)
+                .map(|(v, t)| format!("{}::{t}", quote_literal(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            conds.push(format!("({key}) > ({params})"));
+            conds.push(format!("({key}) > ({values})"));
         }
         if let Some(f) = &self.row_filter {
             conds.push(format!("({f})"));
@@ -215,7 +208,7 @@ impl Plan {
         } else {
             format!(" WHERE {}", conds.join(" AND "))
         };
-        format!("SELECT {cols} FROM {table}{filter} ORDER BY {key} LIMIT {limit}")
+        format!("SELECT {cols} FROM {table} AS t{filter} ORDER BY {key} LIMIT {limit}")
     }
 
     /// The window key of a tuple of this table's live stream: the key columns' text joined with
@@ -239,6 +232,16 @@ impl Plan {
             out.push_str(s);
         }
         Some(out)
+    }
+}
+
+/// `s` as an SQL string literal. The escape-string form keeps backslashes literal whatever
+/// `standard_conforming_strings` says.
+fn quote_literal(s: &str) -> String {
+    if s.contains('\\') {
+        format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
     }
 }
 
@@ -474,23 +477,21 @@ impl Engine {
             .after
             .clone()
             .filter(|a| a.len() == plan.key.len());
-        let sql = plan.chunk_sql(after.is_some(), self.chunk_size);
-        let params: Vec<&(dyn ToSql + Sync)> = after
-            .iter()
-            .flatten()
-            .map(|v| v as &(dyn ToSql + Sync))
-            .collect();
-        let rows = client
-            .query(sql.as_str(), &params)
+        let sql = plan.chunk_sql(after.as_deref(), self.chunk_size);
+        let messages = client
+            .simple_query(&sql)
             .await
             .map_err(crate::source::src_err)?;
         let mut cache = RelationCache::default();
         cache.insert(plan.relation.clone());
-        let mut chunk = Vec::with_capacity(rows.len());
-        for r in &rows {
+        let mut chunk = Vec::new();
+        for m in &messages {
+            let SimpleQueryMessage::Row(r) = m else {
+                continue;
+            };
             let tuple: Tuple = (0..plan.columns.len())
-                .map(|i| match r.get::<_, Option<String>>(i) {
-                    Some(s) => Datum::Text(s),
+                .map(|i| match r.get(i) {
+                    Some(s) => Datum::Text(s.to_owned()),
                     None => Datum::Null,
                 })
                 .collect();
@@ -658,15 +659,16 @@ mod tests {
     fn chunk_query_is_a_keyset_on_the_quoted_key() {
         let p = Plan::new(&table(ReplicaIdentity::Default), None).unwrap();
         assert_eq!(
-            p.chunk_sql(false, 100),
-            r#"SELECT "b"::text, "a"::text, "v"::text FROM "public"."Orders" ORDER BY "a", "b" LIMIT 100"#
+            p.chunk_sql(None, 100),
+            r#"SELECT t."b", t."a", t."v" FROM "public"."Orders" AS t ORDER BY t."a", t."b" LIMIT 100"#
         );
         let mut t = table(ReplicaIdentity::Default);
         t.row_filter = Some("(v IS NOT NULL)".into());
         let p = Plan::new(&t, None).unwrap();
+        let after = [r"it's \ x".to_string(), "7".to_string()];
         assert_eq!(
-            p.chunk_sql(true, 5),
-            r#"SELECT "b"::text, "a"::text, "v"::text FROM "public"."Orders" WHERE ("a", "b") > ($1::text::text, $2::text::integer) AND ((v IS NOT NULL)) ORDER BY "a", "b" LIMIT 5"#
+            p.chunk_sql(Some(&after), 5),
+            r#"SELECT t."b", t."a", t."v" FROM "public"."Orders" AS t WHERE (t."a", t."b") > (E'it''s \\ x'::text, '7'::integer) AND ((v IS NOT NULL)) ORDER BY t."a", t."b" LIMIT 5"#
         );
     }
 
