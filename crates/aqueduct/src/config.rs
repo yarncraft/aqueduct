@@ -209,6 +209,10 @@ pub struct KafkaConfig {
     /// as a route uses `where`; opened (created if missing) at startup.
     #[serde(default)]
     pub dead_letter_topic: Option<String>,
+    /// How many topics content routing (a route `topic` that reads a row field) may create,
+    /// counted from the broker at startup; beyond it events go to the route's `topic_fallback`.
+    #[serde(default = "default_max_dynamic_topics")]
+    pub max_dynamic_topics: usize,
     /// Encrypt with TLS and verify the broker certificate.
     #[serde(default)]
     pub tls: bool,
@@ -246,8 +250,16 @@ pub struct KafkaRouteConfig {
     /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
     #[serde(rename = "match")]
     pub pattern: String,
-    /// Destination topic; `{schema}` and `{table}` are substituted.
+    /// Destination topic template: `{schema}`, `{table}`, `{op}` and row fields such as
+    /// `{row.region}` (content routing, which needs `topic_fallback`).
     pub topic: String,
+    /// Where events go whose content-routed `topic` cannot be used (null, missing or disallowed
+    /// value, or `max_dynamic_topics` reached). Required when `topic` reads a row field.
+    #[serde(default)]
+    pub topic_fallback: Option<String>,
+    /// The only values a content-routed `topic` may substitute; others go to `topic_fallback`.
+    #[serde(default)]
+    pub topic_values: Option<Vec<String>>,
     /// Only these ops pass: `insert`, `update`, `delete`, `truncate`, `read`. Default: all.
     #[serde(default)]
     pub ops: Option<Vec<String>>,
@@ -258,6 +270,10 @@ pub struct KafkaRouteConfig {
     /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
     #[serde(default)]
     pub key: Option<Vec<String>>,
+}
+
+fn default_max_dynamic_topics() -> usize {
+    aqueduct_sinks::DEFAULT_MAX_DYNAMIC_TOPICS
 }
 
 fn default_true() -> bool {

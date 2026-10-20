@@ -17,9 +17,14 @@ fn plan(cfg: &KafkaConfig) -> Result<RoutePlan> {
             ops: r.ops.clone(),
             filter: r.filter.clone(),
             key: r.key.clone(),
+            topic_fallback: r.topic_fallback.clone(),
+            topic_values: r.topic_values.clone(),
         })
         .collect();
-    RoutePlan::with_dead_letter(routes, cfg.topic.clone(), cfg.dead_letter_topic.clone())
+    let mut plan =
+        RoutePlan::with_dead_letter(routes, cfg.topic.clone(), cfg.dead_letter_topic.clone())?;
+    plan.set_max_dynamic_topics(cfg.max_dynamic_topics);
+    Ok(plan)
 }
 
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
@@ -149,5 +154,44 @@ topic = 'orders'
         .unwrap_err()
         .to_string();
         assert!(e.contains("route `public.orders`: `key`"), "{e}");
+    }
+
+    #[test]
+    fn content_routing_comes_from_the_config_and_is_validated() {
+        let cfg = kafka(
+            "max_dynamic_topics = 7
+[[routes]]
+match = 'public.orders'
+topic = 'orders.{row.region}'
+topic_fallback = 'orders.unknown'
+topic_values = ['eu', 'us']
+",
+        );
+        assert_eq!(cfg.max_dynamic_topics, 7);
+        let d = plan(&cfg).unwrap().describe();
+        assert_eq!(
+            d.routes[0].topic_fallback.as_deref(),
+            Some("orders.unknown")
+        );
+        assert_eq!(
+            d.routes[0].topic_values,
+            Some(vec!["eu".to_string(), "us".to_string()])
+        );
+        assert_eq!(
+            kafka("topic = 't'").max_dynamic_topics,
+            aqueduct_sinks::DEFAULT_MAX_DYNAMIC_TOPICS
+        );
+        let e = plan(&kafka(
+            "[[routes]]
+match = 'public.orders'
+topic = 'orders.{row.region}'
+",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("route `public.orders`") && e.contains("topic_fallback"),
+            "{e}"
+        );
     }
 }

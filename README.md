@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback)<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -244,6 +244,11 @@ topic = "orders-paid"
 `key = ["col", ...]` on a route keys its records by those row columns instead of the primary key (deletes by their
 before-image), and partitions by that key whatever `partition_by` says. See DEPLOYMENT.md, "Keying a route".
 
+A route's `topic` can read the row, such as `topic = "orders.{row.region}"`. It then needs a `topic_fallback`, and it
+takes an optional `topic_values` allow-list. Values must be one segment (`[A-Za-z0-9_-]{1,64}`). Anything else goes to
+the fallback: a null value, a value that is not allowed, or a value past `max_dynamic_topics` (default 100, counted from
+the broker). See DEPLOYMENT.md, "Routing by row content".
+
 ### MongoDB source
 
 ```toml
@@ -279,7 +284,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |

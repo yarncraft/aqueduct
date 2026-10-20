@@ -181,7 +181,12 @@ impl Admin {
                 (name.as_str(), topic)
             })
             .collect();
-        let mut topics: Vec<String> = topic_of.values().flatten().cloned().collect();
+        let mut topics: Vec<String> = topic_of
+            .values()
+            .flatten()
+            .filter(|t| !per_event_topic(t))
+            .cloned()
+            .collect();
         topics.sort();
         topics.dedup();
         let hwms = if topics.is_empty() {
@@ -435,11 +440,24 @@ async fn respond(sock: &mut TcpStream, status: &str, ctype: &str, body: &str) {
 
 /// One table's `kafka` block on `/api/tables`, or why there is none. `topic_of` maps every
 /// table to its topic, to count the tables that share it.
+/// The Tables card's note for a table whose topic comes from row content: there is no one topic
+/// to read offsets from, and the Routing card shows the route.
+const CONTENT_ROUTED: &str = "content-routed (see Routing)";
+
+/// True for a topic that still has placeholders after `{schema}`/`{table}` are filled: it is
+/// chosen per event (`{op}`, row fields). Kafka topic names cannot contain `{`.
+fn per_event_topic(topic: &str) -> bool {
+    topic.contains('{')
+}
+
 fn kafka_entry(
     hwms: &Option<(Instant, Result<Offsets, String>)>,
     topic: Option<&str>,
     topic_of: &BTreeMap<&str, Option<String>>,
 ) -> (Option<serde_json::Value>, Option<String>) {
+    if topic.is_some_and(per_event_topic) {
+        return (None, Some(CONTENT_ROUTED.into()));
+    }
     let Some((_, read)) = hwms else {
         return (
             None,
@@ -1167,10 +1185,14 @@ Authorization: Bearer {token}
         let route = |name: &str, pattern: &str, filter: Option<&str>| aqueduct_sinks::KafkaRoute {
             name: Some(name.into()),
             pattern: pattern.into(),
-            topic: format!("{name}.t"),
+            topic: format!(
+                "{}.t",
+                name.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+            ),
             ops: filter.map(|_| vec!["insert".to_string()]),
             filter: filter.map(Into::into),
             key: None,
+            ..Default::default()
         };
         let plan = RoutePlan::with_dead_letter(
             vec![
@@ -1238,7 +1260,7 @@ Authorization: Bearer {token}
         assert_eq!(
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
-                   "where": "row.status == 'paid'", "key": null, "topic": "paid \"orders\".t",
+                   "where": "row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
                    "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1},
                    "unseen_fields": []})
         );
@@ -1702,6 +1724,14 @@ Authorization: Bearer {token}
                 .as_deref(),
             Some("boom")
         );
+        // A content-routed table has no single topic: the card points at the Routing card,
+        // whether or not offsets could be read.
+        for h in [&hwms, &failed, &None] {
+            assert_eq!(
+                kafka_entry(h, Some("orders.{row.region}"), &topic_of),
+                (None, Some(CONTENT_ROUTED.to_string()))
+            );
+        }
     }
 
     #[test]

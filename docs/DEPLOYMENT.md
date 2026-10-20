@@ -232,7 +232,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `brokers` | required | Bootstrap list, for example `["kafka-1:9093", "kafka-2:9093"]` |
-| `topic` | unset | Fallback topic for events no route matches. May use `{schema}` and `{table}` |
+| `topic` | unset | Fallback topic for events no route matches. May use `{schema}`, `{table}` and `{op}`, not row fields |
 | `partitions` | `1` | Partition count used when Aqueduct has to create a topic |
 | `replication_factor` | `3`, or `1` if the cluster has fewer than 3 brokers (logged as a warning) | Replicas used when Aqueduct has to create a topic. Existing topics are not changed. Must be at least 1. An explicit value the broker rejects (more replicas than brokers) is an error, at startup for the default topic and on first send for routed or templated topics; only the unset default falls back, and it falls back to 1, not to the broker count, so on a 2-broker cluster set `replication_factor = 2` yourself. Set it explicitly in production |
 | `partition_by` | `key` | What the partition is hashed from. `key`: the whole record key (table and primary key), so each row's changes stay ordered and a table spreads over partitions, as with Debezium. `table`: only the table, for total order per table. The record key itself is the same either way |
@@ -241,8 +241,9 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
+| `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
 | `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -340,7 +341,7 @@ topic = "orders-paid"
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where` or `key`, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and field path in `where`, `key` or a topic template, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
@@ -376,8 +377,76 @@ key = ["tenant_id", "order_id"]
   field (above), as `row.<column>`.
 - Dead-letter records keep the table-only key.
 
+#### Routing by row content
+
+A route's `topic` can take values from the row, so one table fans out over several topics:
+
+```toml
+[sink]
+max_dynamic_topics = 100              # default
+
+[[sink.routes]]
+match = "public.orders"
+topic = "orders.{row.region}"         # orders.eu, orders.us, ...
+topic_fallback = "orders.unknown"     # required: where an event goes when the value cannot be used
+topic_values = ["eu", "us", "apac"]   # optional allow-list
+```
+
+- **Placeholders.** `{schema}`, `{table}`, `{op}` (`insert`, `update`, ...), and row fields: `{row.<col>}` (`after`,
+  else `before`, so a delete routes by its before-image), `{after.<col>}`, `{before.<col>}`, dotted for nested MongoDB
+  fields (`{row.address.city}`). Strings substitute their text, numbers and booleans their JSON text. A topic with only
+  `{schema}`, `{table}` and `{op}` works as before and needs no fallback.
+- **Rules, checked at startup** for a `topic` that reads a row field, so row data cannot pick an arbitrary topic:
+  - The template starts with fixed text: `orders.{row.region}` is allowed, `{row.tenant}` and `{schema}.{row.x}` are not.
+    Once any route reads a row field, no topic anywhere in the config (route topics, `sink.topic`, fallbacks, the
+    dead-letter topic) may start with `_` (Kafka's internal topics such as `__consumer_offsets`). Without content
+    routing, such topics are accepted as before.
+  - `topic_fallback` is required. It is a fixed topic name (no placeholders), opened (created if missing) at startup.
+  - No fixed topic in the config may match the template read as a glob (`orders.{row.region}` is `orders.*`): not
+    another route's `topic`, `sink.topic`, another route's `topic_fallback` or `dead_letter_topic`. Only the route's
+    own fallback may (`orders.unknown` above).
+  - The template read as a glob may not overlap another template's glob that has no row field (a route `topic` or
+    `sink.topic` with `{schema}`, `{table}` or `{op}`). For example, `cdc.{row.kind}` next to `cdc.{table}` is
+    refused: a row with `kind = "customers"` would write into the `cdc.customers` topic of the other route. Give the
+    content-routed template fixed text that no other template produces.
+  - `topic_values`, if set, is a non-empty list of values that are each a valid segment (below).
+  - `topic_fallback` and `topic_values` on a topic that reads no row field fail startup.
+- **At runtime** each substituted row value must be one segment, `[A-Za-z0-9_-]{1,64}`: no dots (`x.payments` is
+  refused), no spaces, nothing empty. The event goes to `topic_fallback`, and counts under `fallback`, when a field is
+  null or missing (a truncate has no row), is an object or array, breaks the segment rule, is not in `topic_values`, the
+  topic name would be invalid, or the topic would be new beyond `max_dynamic_topics`. Its key and value are unchanged.
+  The first fallback per route is logged once with the reason (the field path, never the value). Content routing
+  never sends events to the dead-letter topic.
+- **Topics Kafka refuses go to the fallback too.** Kafka refuses a new topic whose name equals an existing one once
+  `.` and `_` are treated as the same (`orders.eu` while `orders_eu` exists, or `events.a_b.c` then `events.a.b_c`).
+  Aqueduct keeps the broker's topic names from startup, plus every topic it opens or creates. It sends a value that
+  would hit such a name to the fallback without trying to create it. If the broker still refuses the create with
+  `InvalidTopicException`, `PolicyViolation`, `TopicAuthorizationFailed` or `ClusterAuthorizationFailed`, the record
+  goes to the fallback and counts under `fallback`, and Aqueduct logs a warning once per route (with the template, not
+  the value). These refusals cannot change on a retry, so Aqueduct remembers the refused name (up to 10 000 names,
+  oldest forgotten first): later rows with that value go to the fallback without asking the broker again. The memory
+  lasts until a restart, so restart Aqueduct after pre-creating such a topic or granting the ACL. Any other create error (broker down, timeout) fails the batch,
+  which is retried, as for every other topic: delivery stays at-least-once. A failed or refused create holds no
+  `max_dynamic_topics` slot.
+- **Without create rights**, pre-create the topics and set `max_dynamic_topics = 0` or `topic_values`, so Aqueduct
+  only uses topics that exist. Otherwise every new value goes to the fallback after a refused create.
+- **Row values appear in topic names.** A content-routed topic's name holds the row value (`orders.eu`). Kafka shows
+  it to everyone who can list topics, and it appears in broker logs and in Aqueduct's error messages for that topic
+  (a failed produce or create). Do not route by a column you would not show to that audience.
+- **`max_dynamic_topics`** counts the topics on the broker that a content-routed template could produce when the sink
+  starts: each placeholder part is one valid segment (and in `topic_values`), and the topic is not one of the fixed
+  topics above. Every new topic since then counts too. So `orders.a.b` or an over-long name does not count against
+  `orders.{row.region}`. So the cap holds across restarts, and a crash loop
+  cannot create more topics on each start. Topics that exist already are always used, even above the cap. A topic
+  someone else created that matches the glob counts too. When the cap is reached, Aqueduct logs a warning once.
+- **Ordering.** Order holds per key within one topic. If a row's routing field changes, its later events go to another
+  topic, and order across the two topics is lost (ADR 0002 §6).
+- **Topics are created on first use** with `partitions` and `replication_factor`. Pre-create them in production, or
+  set `topic_values` so you know the set.
+- The event inspector reads the content-routed topics (the template as a glob) and the fallback.
+
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
-`fallback` (reserved for content routing; always 0 for now) or `errors`. They appear in `/api/metrics` (`routes`),
+`fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
 `/api/routes` and Prometheus:
 
 | Series | Meaning |
@@ -428,6 +497,8 @@ without it the column shows `–`.
 Events and Delivered count every event the source delivered for the table, including events a route filtered
 (`ops`, `where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
 recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
+A table whose route picks the topic per event (`{op}` or a row field in `topic`) has no single topic to read
+offsets from: its Topic column shows the template, and Kafka HWM says `content-routed (see Routing)`.
 
 `GET /api/tables` (Bearer token) returns:
 
@@ -479,8 +550,13 @@ Later routing options add keys to each route, so readers should ignore keys they
  "routes": [
    {"route": "paid-orders", "match": "public.orders", "ops": ["insert", "update", "delete"],
     "where": "row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
+    "topic_fallback": null, "topic_values": null,
     "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1}, "unseen_fields": []},
+   {"route": "regional", "match": "public.customers", "ops": null, "where": null, "key": null,
+    "topic": "customers.{row.region}", "topic_fallback": "customers.unknown", "topic_values": ["eu", "us"],
+    "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0}, "unseen_fields": []},
    {"route": "default", "match": null, "ops": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
+    "topic_fallback": null, "topic_values": null,
     "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0}, "unseen_fields": []}]}
 ```
 
