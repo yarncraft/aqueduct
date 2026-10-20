@@ -23,7 +23,7 @@ flowchart LR
     end
 
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
-        SRC["Source<br/>pgoutput decoder / change-stream mapper"]
+        SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
         SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:identity with partition_by = key"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
@@ -35,7 +35,8 @@ flowchart LR
     K[("Kafka topics")]
     U(["Browser / Prometheus / probes"])
 
-    PG -- "peek changes" --> SRC
+    PG -- "peek changes + watermarks" --> SRC
+    SRC -- "snapshot chunks (keyset SELECT)" --> PG
     MG -- "watch" --> SRC
     SRC --> PIPE --> SINK --> K
     PIPE -- "save position" --> CK
@@ -153,6 +154,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
 | `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default, so a server without TLS fails startup, even on localhost. For a non-TLS dev Postgres set `ssl_mode = "disable"` explicitly |
+| `postgres.snapshot` | `never` | `initial` copies every published table on a start without a checkpoint, `on_demand` only on request; rows arrive as `"op": "read"`. Postgres 14+. `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and `snapshot_key_columns` tune it; see DEPLOYMENT.md, "Snapshots" |
 | `postgres.checkpoint_skip_system_check` | `false` | Skip comparing the checkpoint's cluster and timeline with the server's at startup (the database is still compared). Only for servers that refuse `pg_control_system()`; see DEPLOYMENT.md, "Checkpoint origin check" |
 | `postgres.heartbeat_interval_secs` / `postgres.heartbeat_action_query` | `10` / unset | While idle, the slot is advanced to the server's WAL position this often (never past a checkpointed event), so writes to unpublished tables do not pin WAL. `0` disables it. The optional query (e.g. an upsert into a small published table) runs before each heartbeat; see DEPLOYMENT.md |
 | `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `CHANGELOG.md`.) Without a `[source]` table, `[postgres]` is used |
