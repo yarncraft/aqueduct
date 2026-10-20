@@ -517,8 +517,6 @@ pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
 mod tests {
     use super::*;
 
-    /// Every element the dashboard script looks up by id must exist in the HTML,
-    /// otherwise the script throws on load and every handler after it is dead.
     #[test]
     fn history_carries_every_op_slot_including_reads() {
         let admin = Admin::new(Arc::new(Metrics::new()), None, None);
@@ -534,6 +532,8 @@ mod tests {
         assert_eq!(series, vec![[3, 2, 1, 4, 5], [1, 0, 0, 0, 4]]);
     }
 
+    /// Every element the dashboard script looks up by id must exist in the HTML,
+    /// otherwise the script throws on load and every handler after it is dead.
     #[test]
     fn dashboard_script_ids_exist_in_html() {
         let ids = |prefix: &str, suffix: &str| -> Vec<&str> {
