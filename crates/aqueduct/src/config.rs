@@ -537,7 +537,31 @@ collections=['users']
         ))
         .unwrap();
         match c.source().unwrap() {
-            SourceConfig::Mongodb(m) => assert_eq!(m.collections, ["users"]),
+            SourceConfig::Mongodb(m) => {
+                assert_eq!(m.collections, ["users"]);
+                assert_eq!(m.snapshot, aqueduct_source_mongodb::SnapshotMode::Never);
+            }
+            _ => panic!("expected mongodb"),
+        }
+        let c: Config = toml::from_str(&format!(
+            "[source]
+type='mongodb'
+uri='mongodb://h/?replicaSet=rs0'
+database='app'
+snapshot='initial'
+snapshot_chunk_size=10
+snapshot_max_rows_per_sec=500
+{SINK}"
+        ))
+        .unwrap();
+        match c.source().unwrap() {
+            SourceConfig::Mongodb(m) => {
+                assert_eq!(m.snapshot, aqueduct_source_mongodb::SnapshotMode::Initial);
+                assert_eq!(
+                    (m.snapshot_chunk_size, m.snapshot_max_rows_per_sec),
+                    (10, Some(500))
+                );
+            }
             _ => panic!("expected mongodb"),
         }
     }

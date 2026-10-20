@@ -95,7 +95,13 @@ async fn main() {
                 tracing::error!(error = %e, "invalid mongodb config");
                 std::process::exit(1);
             }
-            Box::new(aqueduct_source_mongodb::MongoSource::new(m))
+            let (tx, rx) = aqueduct_core::snapshot_channel();
+            admin.set_snapshots(tx);
+            Box::new(
+                aqueduct_source_mongodb::MongoSource::new(m)
+                    .with_metrics(metrics.clone())
+                    .with_snapshot_control(rx),
+            )
         }
     };
     let mut store = checkpoint::FileCheckpoint::new(cfg.checkpoint_path.clone());

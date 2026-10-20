@@ -23,7 +23,7 @@ flowchart LR
     end
 
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
-        SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres)"]
+        SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
         SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:identity with partition_by = key"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
@@ -37,7 +37,8 @@ flowchart LR
 
     PG -- "peek changes + watermarks" --> SRC
     SRC -- "snapshot chunks (keyset SELECT)" --> PG
-    MG -- "watch" --> SRC
+    MG -- "watch (changes + watermarks)" --> SRC
+    SRC -- "snapshot chunks (_id index scan) + watermark inserts" --> MG
     SRC --> PIPE --> SINK --> K
     PIPE -- "save position" --> CK
     PIPE -. "ack(position)" .-> SRC
@@ -158,6 +159,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.snapshot` | `never` | `initial` copies every published table on a start without a checkpoint, `on_demand` only on request; rows arrive as `"op": "read"`. Postgres 14+, or 12 and 13 with `snapshot_watermark_table`. `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and `snapshot_key_columns` tune it; see DEPLOYMENT.md, "Snapshots" |
 | `postgres.checkpoint_skip_system_check` | `false` | Skip comparing the checkpoint's cluster and timeline with the server's at startup (the database is still compared). Only for servers that refuse `pg_control_system()`; see DEPLOYMENT.md, "Checkpoint origin check" |
 | `postgres.heartbeat_interval_secs` / `postgres.heartbeat_action_query` | `10` / unset | While idle, the slot is advanced to the server's WAL position this often (never past a checkpointed event), so writes to unpublished tables do not pin WAL. `0` disables it. The optional query (e.g. an upsert into a small published table) runs before each heartbeat; see DEPLOYMENT.md |
+| `source.snapshot` (MongoDB) | `never` | `initial` copies every watched collection on a start without a checkpoint, `on_demand` only on request; documents arrive as `"op": "read"`. Writes watermarks into `<database>.aqueduct_watermarks`. `snapshot_chunk_size` (1024) and `snapshot_max_rows_per_sec` tune it; see DEPLOYMENT.md, "MongoDB snapshots" |
 | `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `CHANGELOG.md`.) Without a `[source]` table, `[postgres]` is used |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
@@ -170,7 +172,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 Kafka is the only sink. Keys under `[sink]`: `brokers`, `topic` (fallback), `[[sink.routes]]`, optional `partitions` (default 1) and `replication_factor` (default 3, or 1 with a warning on a smaller cluster), both used when a topic has to be created, and `partition_by`. Records: JSON value, headers `op` and `lsn`, key `schema.table`; partition = FNV-1a hash of the key, so a table's changes stay ordered. With `partition_by = "key"` the key is `schema.table:<replica-identity columns>` (MongoDB: the `documentKey`), spreading a table over partitions. Per-row order then holds only while the identity columns never change: not with `REPLICA IDENTITY FULL` (every column is identity, so any update changes the key), and not across an update of a key column. `TRUNCATE` and tables without an identity use `schema.table`, so a truncate is not ordered against row events in this mode. Acked by the broker before checkpointing.
 
 Each event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`, `op`
-(`insert`/`update`/`delete`/`truncate`), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
+(`insert`/`update`/`delete`/`truncate`, and `read` for snapshot rows), `before`, `after`. Delivery is at-least-once, so consumers should tolerate duplicates.
 
 Each event goes to the first `[[sink.routes]]` entry whose `match` fits its `schema.table` (`*` is a wildcard), otherwise to `topic`. Topic names may use `{schema}` and `{table}`. Topics are created on first use. An event that matches no route while `topic` is unset fails the pipeline rather than being dropped.
 
@@ -198,13 +200,16 @@ uri = "mongodb://user:pass@host:27017/?replicaSet=rs0&tls=true"
 database = "app"
 collections = ["users", "orders"]   # empty = whole database
 pre_images = true                   # fullDocumentBeforeChange when the collection has it enabled
+snapshot = "never"                  # or "on_demand" / "initial": copy existing documents
 ```
 
 Needs a replica set (change streams). `schema` is the database, `table` the collection; the position is the
 change-stream resume token, so a restart resumes just after the last checkpointed event. Updates use
 `updateLookup`, so `after` is the document as it is when the source reads it (it can be newer than the change,
 or only the `_id` if the document was deleted meanwhile). Deletes carry the pre-image, or just the `_id`.
-Integration test: `crates/aqueduct-source-mongodb/tests/replica_set.rs` (see its header).
+Snapshots copy existing documents in `_id` order between watermark inserts into `aqueduct_watermarks` (needs
+`insert`, `remove` and `createIndex` on that one collection); see DEPLOYMENT.md, "MongoDB snapshots".
+Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `snapshot_it.rs` (see their headers).
 
 ## Admin cockpit
 
@@ -222,7 +227,7 @@ before/after diff and Copy JSON).
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
-| `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres, `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
+| `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
 Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start without `admin_token`, unless
 `admin_insecure_no_auth = true` (logged as a warning). With a token, `/metrics` and `/api/*` need `Authorization: Bearer <token>`
