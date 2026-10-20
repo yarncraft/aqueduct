@@ -377,3 +377,85 @@ async fn a_million_row_transaction_streams_in_bounded_memory() {
     .await
     .unwrap();
 }
+
+/// On a busy cluster whose publication is quiet, the stream transport still moves the slot, so
+/// WAL is not pinned: the server's WAL position is always ahead of the last keepalive there, so
+/// the idle heartbeat must confirm the keepalive's position, not wait to catch up with the WAL.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn a_quiet_publication_on_a_busy_cluster_does_not_pin_wal() {
+    let db = connect().await;
+    let published = unique("tr_quiet");
+    let busy = unique("tr_busy");
+    let publication = unique("tr_quiet_pub");
+    let slot = unique("tr_quiet");
+    db.batch_execute(&format!(
+        "CREATE TABLE {published} (id int PRIMARY KEY);
+         CREATE TABLE {busy} (id serial PRIMARY KEY, v text);
+         CREATE PUBLICATION {publication} FOR TABLE {published};"
+    ))
+    .await
+    .unwrap();
+    let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.poll_interval = Duration::from_millis(50);
+    cfg.transport = TransportKind::Stream;
+    cfg.heartbeat_interval = Some(Duration::from_millis(500));
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+    let start: i64 = db
+        .query_one(
+            "SELECT (confirmed_flush_lsn - '0/0')::int8 FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Unpublished writes never stop while the source idles.
+    let writer = {
+        let busy = busy.clone();
+        tokio::spawn(async move {
+            let db = connect().await;
+            let until = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < until {
+                db.execute(
+                    &format!("INSERT INTO {busy} (v) VALUES (repeat('w', 200))"),
+                    &[],
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), s.next())
+                .await
+                .is_err(),
+            "nothing is published, so nothing may arrive"
+        );
+    }
+    writer.await.unwrap();
+    let end: i64 = db
+        .query_one(
+            "SELECT (confirmed_flush_lsn - '0/0')::int8 FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        end - start > 100_000,
+        "the slot moved only {} bytes while the cluster kept writing",
+        end - start
+    );
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {published}, {busy};"
+    ))
+    .await
+    .unwrap();
+}

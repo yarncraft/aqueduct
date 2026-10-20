@@ -664,8 +664,8 @@ impl PostgresSource {
             if let Some(sys) = self.origin.and_then(|o| o.system) {
                 if system.system_id != sys.to_string() {
                     return Err(Error::Config(format!(
-                        "the replication connection reached cluster {}, the SQL connection cluster {sys};                          point the URL at one server",
-                        system.system_id
+                        "the replication connection reached cluster {}, the SQL connection cluster {}; {}",
+                        system.system_id, sys, "point the URL at one server"
                     )));
                 }
             }
@@ -998,15 +998,18 @@ impl PostgresSource {
     async fn poll(&mut self) -> Result<()> {
         if self.cfg.transport == TransportKind::Stream {
             // The fetch waits for data, so the heartbeat runs after it: a heartbeat started
-            // before a fetch that is then cancelled would never finish. The order does not
-            // matter here: a keepalive at W proves receipt of everything committed below W,
-            // whenever the WAL position is read.
+            // before a fetch that is then cancelled would never finish. The idle target is the
+            // last keepalive's position W, not the server's WAL position: W proves receipt of
+            // everything committed below it, while the WAL position on a busy cluster (or after
+            // the heartbeat action query) is always past W, and the slot would never move.
             self.refresh_slot_stats().await;
             let fetched = self.transport()?.fetch().await?;
             self.apply(fetched.messages)?;
-            if let Some(wal) = self.heartbeat_begin().await? {
-                let drained = fetched.caught_up.is_some_and(|w| w >= wal);
-                self.heartbeat_end(wal, drained).await?;
+            if self.heartbeat_begin().await?.is_some() {
+                match fetched.caught_up {
+                    Some(w) => self.heartbeat_end(w, true).await?,
+                    None => self.heartbeat_end(0, false).await?,
+                }
             }
             return Ok(());
         }
@@ -1311,6 +1314,11 @@ impl PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
+        // A new stream: nothing decoded or queued before belongs to it.
+        self.decode = DecodeState::default();
+        self.tx_ends.clear();
+        self.last_end = 0;
+        self.buffer.clear();
         let client = self.connect().await?;
         self.client = Some(Arc::new(client));
         if let Some(m) = &self.metrics {
