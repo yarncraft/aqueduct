@@ -308,3 +308,15 @@ event format:
 - **Unseen fields** are reported only while the field has never been seen in a row that had the row the path reads,
   so a delete's key-only before-image does not trigger the warning.
 - **Route labels** must be unique, and `default` is reserved for the `sink.topic` fallback.
+
+## As built (R5)
+
+Per-route key (#83):
+
+- **Key format.** Since #138 the record key is JSON, so `key = [...]` does not produce `schema.table:<values joined
+  0x1f>` (§5 "Key"). It produces the usual JSON key with `"key": {"col": value, ...}`: the listed top-level columns
+  of `row` in config order, each value copied as raw JSON, a missing column `null`. The partition is the FNV-1a hash
+  of that whole key (what `partition_by = "key"` hashes), overriding `partition_by` for the route.
+- **Truncates** have no row and get the table-only key (`"key": null`), like dead-letter records.
+- **Validation:** a non-empty list of distinct top-level column names; a dotted path is rejected. The key columns
+  are registered with the unseen-field counter as `row.<column>`, on routes with or without `where`.

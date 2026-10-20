@@ -1150,6 +1150,7 @@ Authorization: Bearer {token}
             topic: format!("{name}.t"),
             ops: filter.map(|_| vec!["insert".to_string()]),
             filter: filter.map(Into::into),
+            key: None,
         };
         let plan = RoutePlan::with_dead_letter(
             vec![
@@ -1217,7 +1218,7 @@ Authorization: Bearer {token}
         assert_eq!(
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
-                   "where": "row.status == 'paid'", "topic": "paid \"orders\".t",
+                   "where": "row.status == 'paid'", "key": null, "topic": "paid \"orders\".t",
                    "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1},
                    "unseen_fields": []})
         );

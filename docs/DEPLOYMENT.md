@@ -242,7 +242,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -340,10 +340,41 @@ topic = "orders-paid"
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where`, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and field path in `where` or `key`, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
+
+#### Keying a route
+
+`key = ["col", ...]` on a route sets the record key from columns of the row, instead of the primary key:
+
+```toml
+[[sink.routes]]
+match = "public.orders"
+topic = "orders"
+key = ["tenant_id", "order_id"]
+```
+
+- **Format.** The record key keeps its JSON shape, with `"key"` built from the listed columns in the order given:
+  `{"db": "app", "schema": "public", "table": "orders", "key": {"tenant_id": "acme", "order_id": 42}}` (MongoDB:
+  `{"db", "collection", "key"}`). Each value is copied from the row as is (its JSON), and a column the row lacks is
+  `null`.
+- **Which row.** The columns are read from `row`: `after`, else `before`. So an update is keyed by its new values and a
+  delete by its before-image. Under the default `REPLICA IDENTITY`, a Postgres delete's before-image holds only the
+  replica-identity (primary-key) columns, so key by those columns, or set `REPLICA IDENTITY FULL`, or deletes get
+  `null` for the other columns and land on another partition than the row's other changes. MongoDB deletes carry the
+  `documentKey` (`_id`) unless pre-images are enabled. A truncate has no row and gets `"key": null`.
+- **Partition.** The partition is the FNV-1a hash of that whole key, whatever `partition_by` says: the route's
+  `key` overrides `partition_by` for the events it produces.
+- **Ordering.** Changes keep their order per key value within one topic. If a key column changes, the row's later
+  events hash to another partition, and order across the change is lost, as with an update of a primary-key column
+  under `partition_by = "key"`. Key by columns that never change (the primary key, a tenant id) to keep a row's
+  events in order. This is also the fix for keying by an immutable column when the replica identity does not match it.
+- **Validation.** `key` must be a non-empty list of distinct, top-level column names (no dots: nested MongoDB fields
+  are not supported); anything else fails startup naming the route. A misspelled column is reported as an unseen
+  field (above), as `row.<column>`.
+- Dead-letter records keep the table-only key.
 
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (reserved for content routing; always 0 for now) or `errors`. They appear in `/api/metrics` (`routes`),
@@ -421,9 +452,9 @@ Later routing options add keys to each route, so readers should ignore keys they
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
  "routes": [
    {"route": "paid-orders", "match": "public.orders", "ops": ["insert", "update", "delete"],
-    "where": "row.status == 'paid' or op == 'delete'", "topic": "orders-paid",
+    "where": "row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
     "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1}, "unseen_fields": []},
-   {"route": "default", "match": null, "ops": null, "where": null, "topic": "cdc.{schema}.{table}",
+   {"route": "default", "match": null, "ops": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
     "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0}, "unseen_fields": []}]}
 ```
 

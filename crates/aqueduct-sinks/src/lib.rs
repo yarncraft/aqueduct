@@ -160,7 +160,8 @@ pub fn table_key(event: &ChangeEvent, info: &SourceInfo) -> String {
     key_json(event, info, "null")
 }
 
-fn key_json(event: &ChangeEvent, info: &SourceInfo, key: &str) -> String {
+/// The record key around `key`, the JSON of the `"key"` member.
+pub(crate) fn key_json(event: &ChangeEvent, info: &SourceInfo, key: &str) -> String {
     let s = |v: &str| serde_json::to_string(v).unwrap_or_default();
     match info {
         SourceInfo::Postgres { db } => format!(

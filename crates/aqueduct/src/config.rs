@@ -254,6 +254,10 @@ pub struct KafkaRouteConfig {
     /// Predicate over the event (ADR 0002 §3); only events it is true for pass.
     #[serde(default, rename = "where")]
     pub filter: Option<String>,
+    /// Top-level columns of the row (`after`, else `before`) that make the record key, in order.
+    /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
+    #[serde(default)]
+    pub key: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {

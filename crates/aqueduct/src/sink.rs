@@ -16,6 +16,7 @@ fn plan(cfg: &KafkaConfig) -> Result<RoutePlan> {
             topic: r.topic.clone(),
             ops: r.ops.clone(),
             filter: r.filter.clone(),
+            key: r.key.clone(),
         })
         .collect();
     RoutePlan::with_dead_letter(routes, cfg.topic.clone(), cfg.dead_letter_topic.clone())
@@ -121,5 +122,32 @@ topic = 'orders'
             e.contains("route `public.orders`: unknown op `upsert`"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn route_keys_come_from_the_config_and_are_validated() {
+        let d = plan(&kafka(
+            "[[routes]]
+match = 'public.orders'
+key = ['tenant', 'id']
+topic = 'orders'
+",
+        ))
+        .unwrap()
+        .describe();
+        assert_eq!(
+            d.routes[0].key,
+            Some(vec!["tenant".to_string(), "id".to_string()])
+        );
+        let e = plan(&kafka(
+            "[[routes]]
+match = 'public.orders'
+key = ['address.city']
+topic = 'orders'
+",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("route `public.orders`: `key`"), "{e}");
     }
 }

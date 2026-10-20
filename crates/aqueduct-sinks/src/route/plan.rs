@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::expr::{op_name, EventView, Expr, FieldRef, Tri};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
-use crate::{encode, op_code, record_key, table_key, SourceInfo};
+use crate::{encode, key_json, op_code, record_key, table_key, SourceInfo};
 
 /// Rows of a matched table seen without a field a route references, while the field has never been
 /// seen, before the field is reported as unseen (warn-once log, metric, cockpit).
@@ -33,6 +33,8 @@ pub struct KafkaRoute {
     pub ops: Option<Vec<String>>,
     /// The `where` predicate (ADR 0002 §3); only events it is definitely true for pass.
     pub filter: Option<String>,
+    /// Top-level columns of `row` that make the record key, in order; overrides `partition_by`.
+    pub key: Option<Vec<String>>,
 }
 
 /// One Kafka record, before it is handed to the client. Topic and key decide the partition.
@@ -92,6 +94,54 @@ struct CompiledRoute {
     /// `None`: every op passes.
     ops: Option<Vec<Op>>,
     filter: Option<Expr>,
+    /// `key = [...]`: the columns and the `row.<column>` paths that read them, in config order.
+    key: Option<RouteKey>,
+}
+
+/// A route's `key = [...]`.
+#[derive(Debug, Clone)]
+struct RouteKey {
+    columns: Vec<String>,
+    fields: Vec<FieldRef>,
+}
+
+impl CompiledRoute {
+    /// The top-level columns `key = [...]` reads, in order; `None` without a per-route key.
+    /// Field operations (R6) check these: no masked, hashed or excluded column may be in the key.
+    pub(crate) fn key_columns(&self) -> Option<&[String]> {
+        self.key.as_ref().map(|k| k.columns.as_slice())
+    }
+}
+
+/// Validates `key = [...]`: a non-empty list of distinct top-level column names.
+fn parse_key(name: &str, cols: &[String]) -> Result<RouteKey> {
+    let bad = |msg: String| Error::Config(format!("sink route `{name}`: `key` {msg}"));
+    if cols.is_empty() {
+        return Err(bad(
+            "is empty; list the columns to key by, or remove it to use `partition_by`".into(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(cols.len());
+    for (i, c) in cols.iter().enumerate() {
+        if c.is_empty() {
+            return Err(bad("has an empty column name".into()));
+        }
+        if c.contains('.') {
+            return Err(bad(format!(
+                "column `{c}` is a dotted path; only top-level column names are supported"
+            )));
+        }
+        if cols[..i].contains(c) {
+            return Err(bad(format!("names column `{c}` twice")));
+        }
+        fields.push(
+            FieldRef::parse(&format!("row.{c}")).map_err(|e| bad(format!("column `{c}`: {e}")))?,
+        );
+    }
+    Ok(RouteKey {
+        columns: cols.to_vec(),
+        fields,
+    })
 }
 
 /// One field path a route references, watched for the unseen-field warning (ADR 0002 §5).
@@ -273,6 +323,8 @@ pub struct RouteDescription {
     /// The `where` expression as configured; `null` without one.
     #[serde(rename = "where")]
     pub filter: Option<String>,
+    /// The `key` columns, in order; `null` when the record key follows `partition_by`.
+    pub key: Option<Vec<String>>,
     /// The topic template, placeholders included.
     pub topic: String,
     pub counts: RouteCounts,
@@ -386,12 +438,21 @@ impl RoutePlan {
                     "sink route `{name}` uses `where`, which needs `sink.dead_letter_topic`: rows it cannot evaluate go there instead of stopping the pipeline"
                 )));
             }
-            fields.push(filter.iter().flat_map(|f| f.fields()).cloned().collect());
+            let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
+            fields.push(
+                filter
+                    .iter()
+                    .flat_map(|f| f.fields())
+                    .chain(key.iter().flat_map(|k| k.fields.iter()))
+                    .cloned()
+                    .collect(),
+            );
             compiled.push(CompiledRoute {
                 pattern: r.pattern.clone(),
                 topic: TopicTemplate::new(&r.topic),
                 ops,
                 filter,
+                key,
             });
             names.push(name);
         }
@@ -501,6 +562,7 @@ impl RoutePlan {
                 filter: r
                     .and_then(|r| r.filter.as_ref())
                     .map(|f| f.source().to_string()),
+                key: r.and_then(|r| r.key_columns()).map(<[String]>::to_vec),
                 topic: topic.to_string(),
                 counts: self.stats.counts(i),
                 unseen_fields: self.stats.unseen(i),
@@ -545,14 +607,17 @@ impl RoutePlan {
                 event.schema, event.table
             ))
         })?;
+        // The record key and the partition input, when the route sets its own key.
+        let mut route_key = None;
         if let Some(r) = self.routes.get(route) {
             if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op)) {
                 self.stats.claimed(&self.stats.filtered, route);
                 return Ok(());
             }
+            // Parses the rows only on first use, so a route that reads no field pays nothing.
+            let view = EventView::new(event);
+            self.stats.observe(route, &view);
             if let Some(filter) = &r.filter {
-                let view = EventView::new(event);
-                self.stats.observe(route, &view);
                 match filter.eval(&view) {
                     Ok(Tri::True) => {}
                     Ok(Tri::False | Tri::Unknown) => {
@@ -571,11 +636,20 @@ impl RoutePlan {
                     }
                 }
             }
+            route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
         }
-        let key = record_key(event, &self.source);
+        let (key, partition_key) = match route_key {
+            // A per-route key partitions by the whole key, whatever `partition_by` says.
+            Some(key) => (key.clone(), key),
+            None => {
+                let key = record_key(event, &self.source);
+                let partition_key = partition_input(event, &key, self.partition_by);
+                (key, partition_key)
+            }
+        };
         out.push(OutRecord {
             topic,
-            partition_key: partition_input(event, &key, self.partition_by),
+            partition_key,
             key,
             value: encode(event, &self.source, now_us)?,
             op: op_code(event.op),
@@ -585,6 +659,29 @@ impl RoutePlan {
         });
         self.stats.claimed(&self.stats.produced, route);
         Ok(())
+    }
+
+    /// The record key of a route with `key = [...]`: the usual JSON key with `"key"` built from the
+    /// listed columns of `row` (`after`, else `before`, so a delete keys by its before-image), in
+    /// order, each value copied as raw JSON and `null` when the row lacks the column. An event
+    /// without a row (a truncate) gets the table-only key.
+    fn route_key(&self, key: &RouteKey, view: &EventView<'_>) -> String {
+        let event = view.event();
+        if event.after.is_none() && event.before.is_none() {
+            return table_key(event, &self.source);
+        }
+        let mut obj = String::with_capacity(16 * key.columns.len() + 2);
+        obj.push('{');
+        for (i, (col, field)) in key.columns.iter().zip(&key.fields).enumerate() {
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(&serde_json::to_string(col).unwrap_or_default());
+            obj.push(':');
+            obj.push_str(view.raw(field).map_or("null", |v| v.get()));
+        }
+        obj.push('}');
+        key_json(event, &self.source, &obj)
     }
 
     /// The dead-letter record for an event route `route` could not evaluate. `reason` names the
@@ -1126,7 +1223,7 @@ mod tests {
                 Some(&["insert", "update"]),
                 Some("row.status == 'paid'"),
             ),
-            route("public.*", "cdc.{table}"),
+            keyed("public.*", "cdc.{table}", &["id", "tenant"]),
         ]);
         p.set_partition_by(PartitionBy::Table);
         p.render(
@@ -1143,14 +1240,15 @@ mod tests {
                 "partition_by": "table",
                 "routes": [
                     {"route": "orders", "match": "public.orders", "ops": ["insert", "update"],
-                     "where": "row.status == 'paid'", "topic": "orders.topic",
+                     "where": "row.status == 'paid'", "key": null, "topic": "orders.topic",
                      "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0},
                      "unseen_fields": []},
                     {"route": "public.*", "match": "public.*", "ops": null, "where": null,
-                     "topic": "cdc.{table}",
+                     "key": ["id", "tenant"], "topic": "cdc.{table}",
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0},
                      "unseen_fields": []},
-                    {"route": "default", "match": null, "ops": null, "where": null, "topic": "rest",
+                    {"route": "default", "match": null, "ops": null, "where": null, "key": null,
+                     "topic": "rest",
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0},
                      "unseen_fields": []}
                 ]
@@ -1170,6 +1268,190 @@ mod tests {
         let p = plan_with(vec![route("public.users", "users")]);
         assert_eq!(p.topic_globs(), vec!["users", "rest", DLQ]);
         assert_eq!(p.dead_letter_topic(), Some(DLQ));
+    }
+
+    // --- per-route key (R5) -----------------------------------------------------------------------
+
+    fn keyed(p: &str, t: &str, cols: &[&str]) -> KafkaRoute {
+        KafkaRoute {
+            key: Some(cols.iter().map(|c| c.to_string()).collect()),
+            ..route(p, t)
+        }
+    }
+
+    fn keyed_plan(info: SourceInfo, by: PartitionBy) -> RoutePlan {
+        let mut p = RoutePlan::new(
+            vec![keyed("*.orders", "orders", &["tenant", "id"])],
+            Some("rest".into()),
+        )
+        .unwrap();
+        p.set_source(info);
+        p.set_partition_by(by);
+        p
+    }
+
+    #[test]
+    fn key_columns_make_the_record_key_in_order_and_the_partition_input() {
+        for by in [PartitionBy::Key, PartitionBy::Table] {
+            let p = keyed_plan(pg(), by);
+            let e = row(
+                "orders",
+                Op::Insert,
+                r#"{"id":5,"n":"x","tenant":"acme","addr":{"c":"eu"}}"#,
+            );
+            let r = p.render(&e, NOW).unwrap().remove(0);
+            assert_eq!(
+                r.key,
+                r#"{"db":"app","schema":"public","table":"orders","key":{"tenant":"acme","id":5}}"#
+            );
+            // The whole key is the partition input, whatever `partition_by` says.
+            assert_eq!(r.partition_key, r.key, "{by:?}");
+            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+        }
+    }
+
+    #[test]
+    fn deletes_key_by_the_before_image_and_updates_by_the_after_image() {
+        let p = keyed_plan(pg(), PartitionBy::Key);
+        let ins = row("orders", Op::Insert, r#"{"id":5,"tenant":"acme","n":1}"#);
+        let del = row("orders", Op::Delete, r#"{"tenant":"acme","id":5}"#);
+        let mut upd = row("orders", Op::Update, r#"{"id":5,"tenant":"acme","n":2}"#);
+        upd.before = raw(r#"{"id":4,"tenant":"old"}"#);
+        let keys: Vec<String> = [ins, upd, del]
+            .iter()
+            .map(|e| p.render(e, NOW).unwrap().remove(0).key)
+            .collect();
+        assert_eq!(keys[0], keys[1], "an update keys by `after`");
+        assert_eq!(keys[0], keys[2], "a delete keys by `before`");
+        // So all three land on the same partition.
+        let parts: Vec<usize> = keys
+            .iter()
+            .map(|k| crate::kafka::partition_index(k, 12))
+            .collect();
+        assert!(parts.iter().all(|&x| x == parts[0]));
+    }
+
+    #[test]
+    fn key_values_are_raw_json_and_missing_columns_are_null() {
+        let mut p = RoutePlan::new(
+            vec![keyed("public.*", "t", &["a", "missing", "b", "c", "d"])],
+            None,
+        )
+        .unwrap();
+        p.set_source(pg());
+        let e = row(
+            "x",
+            Op::Insert,
+            r#"{"d":null,"c":"é\"q","b":{"k":[1,2.50]},"a":1.0e3}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"app","schema":"public","table":"x","key":{"a":1.0e3,"missing":null,"b":{"k":[1,2.50]},"c":"é\"q","d":null}}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.key).unwrap();
+        assert_eq!(v["key"]["c"], "é\"q");
+    }
+
+    #[test]
+    fn truncates_get_the_table_key() {
+        let p = keyed_plan(pg(), PartitionBy::Key);
+        let r = p
+            .render(&row("orders", Op::Truncate, "{}"), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"app","schema":"public","table":"orders","key":null}"#
+        );
+        assert_eq!(r.partition_key, r.key);
+    }
+
+    #[test]
+    fn mongodb_keys_name_the_database_and_collection() {
+        let p = keyed_plan(SourceInfo::Mongodb, PartitionBy::Table);
+        let mut e = row(
+            "orders",
+            Op::Insert,
+            r#"{"_id":{"$oid":"6530"},"tenant":"acme","id":7}"#,
+        );
+        e.schema = "shop".into();
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"shop","collection":"orders","key":{"tenant":"acme","id":7}}"#
+        );
+        assert_eq!(r.partition_key, r.key);
+    }
+
+    #[test]
+    fn a_keyed_route_with_where_keys_what_passes() {
+        let p = plan_with(vec![KafkaRoute {
+            key: Some(vec!["id".into()]),
+            ..filtered("o", "public.orders", None, Some("row.n > 1"))
+        }]);
+        let r = p
+            .render(&row("orders", Op::Insert, r#"{"id":3,"n":2}"#), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"app","schema":"public","table":"orders","key":{"id":3}}"#
+        );
+        // Dead-letter records keep the table-only key.
+        let r = p
+            .render(&row("orders", Op::Insert, r#"{"id":3,"n":"x"}"#), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert!(r.key.ends_with(r#""key":null}"#), "{}", r.key);
+    }
+
+    #[test]
+    fn key_lists_are_validated_at_startup() {
+        let build = |cols: &[&str]| {
+            RoutePlan::new(vec![keyed("public.*", "t", cols)], None)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(build(&["id"]), Ok(()));
+        assert_eq!(build(&["tenant", "id"]), Ok(()));
+        for (cols, want) in [
+            (&[][..], "sink route `public.*`: `key` is empty"),
+            (&["a.b"][..], "column `a.b` is a dotted path"),
+            (&["id", "x", "id"][..], "names column `id` twice"),
+            (&[""][..], "has an empty column name"),
+        ] {
+            let err = build(cols).expect_err(want);
+            assert!(err.contains(want), "{err} should contain {want}");
+        }
+    }
+
+    #[test]
+    fn key_columns_are_exposed_for_field_operation_checks() {
+        let p = keyed_plan(pg(), PartitionBy::Key);
+        assert_eq!(
+            p.routes[0].key_columns(),
+            Some(&["tenant".to_string(), "id".to_string()][..])
+        );
+        let p = RoutePlan::new(vec![route("a.*", "t")], None).unwrap();
+        assert_eq!(p.routes[0].key_columns(), None);
+    }
+
+    #[test]
+    fn unseen_key_columns_are_reported_on_routes_without_where() {
+        let p = RoutePlan::new(vec![keyed("public.*", "t", &["id", "tenant_id"])], None).unwrap();
+        let ev = row("orders", Op::Insert, r#"{"id":1,"tenant":"acme"}"#);
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            p.render(&ev, NOW).unwrap();
+        }
+        assert_eq!(p.stats().snapshot()[0].unseen_fields, vec!["row.tenant_id"]);
+        // Truncates have no row and never count.
+        let q = RoutePlan::new(vec![keyed("public.*", "t", &["id"])], None).unwrap();
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            q.render(&row("orders", Op::Truncate, "{}"), NOW).unwrap();
+        }
+        assert!(q.stats().snapshot()[0].unseen_fields.is_empty());
     }
 
     // --- golden: byte-identical to the router and record builders this plan replaced ----------
