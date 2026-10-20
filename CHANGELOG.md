@@ -92,6 +92,8 @@ Notable changes to Aqueduct. Newest first.
   `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
   Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
   - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+- **Cockpit snapshot card** (#78): progress of the running or last snapshot, skipped tables and a Cancel button. Snapshot
+  rows count as `READ` in the operations bar, the per-op event-rate chart and the inspector's op filter.
 - **Admin API for snapshots** (#75): `GET`/`POST`/`DELETE /api/snapshot` shows, starts and cancels a Postgres table
   snapshot (with `snapshot = "on_demand"` or `"initial"`), behind the admin token. Progress is in `/api/metrics`
   (`snapshot`) and Prometheus (`aqueduct_snapshot_*`). A request is not durable until the first chunk is

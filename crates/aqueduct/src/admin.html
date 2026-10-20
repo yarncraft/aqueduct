@@ -75,6 +75,30 @@
     </div>
   </section>
 
+  <!-- Snapshot progress (hidden until the source reports a snapshot) -->
+  <section id="snapshot" hidden class="rounded-sm border border-ink-600 bg-ink-800">
+    <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Snapshot</h2>
+      <span id="snapstate" class="rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">–</span>
+      <span id="snapid" class="font-mono text-[11px] text-ink-300">–</span>
+      <button id="snapcancel" type="button" hidden class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider text-ink-100 hover:border-red">Cancel</button>
+    </div>
+    <div class="grid gap-4 p-4 md:grid-cols-3">
+      <div>
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Tables</div>
+        <div id="snaptables" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+        <div id="snaptable" class="mt-1 truncate font-mono text-[11px] text-ink-300">–</div>
+      </div>
+      <div class="md:col-span-2">
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Rows copied</div>
+        <div id="snaprows" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+        <div class="mt-2 h-1.5 rounded-sm bg-ink-700"><div id="snapbar" class="h-1.5 rounded-sm bg-amber" style="width:0%"></div></div>
+        <div id="snapsub" class="mt-1 font-mono text-[11px] text-ink-300">–</div>
+      </div>
+    </div>
+    <div id="snapskipped" hidden class="border-t border-ink-600 px-4 py-2 font-mono text-[11px] text-amber"></div>
+  </section>
+
   <!-- Chart + operations -->
   <section class="grid gap-4 lg:grid-cols-3">
     <div class="rounded-sm border border-ink-600 bg-ink-800 lg:col-span-2">
@@ -88,6 +112,7 @@
         <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="1" checked> UPDATE</label>
         <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="2" checked> DELETE</label>
         <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="3" checked> TRUNCATE</label>
+        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="4" checked> READ</label>
       </div>
       <svg id="chart" viewBox="0 0 800 220" preserveAspectRatio="none" class="block h-56 w-full"></svg>
     </div>
@@ -103,6 +128,7 @@
           <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-blue"></i><span class="text-ink-200">UPDATE</span><b id="op-updates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-updates" class="w-12 text-right text-ink-300">–</span></li>
           <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-red"></i><span class="text-ink-200">DELETE</span><b id="op-deletes" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-deletes" class="w-12 text-right text-ink-300">–</span></li>
           <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-violet"></i><span class="text-ink-200">TRUNCATE</span><b id="op-truncates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-truncates" class="w-12 text-right text-ink-300">–</span></li>
+          <li class="flex items-center" title="Rows copied by a snapshot"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-amber"></i><span class="text-ink-200">READ</span><b id="op-reads" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-reads" class="w-12 text-right text-ink-300">–</span></li>
         </ul>
       </div>
     </div>
@@ -117,7 +143,7 @@
       <div class="ml-auto flex flex-wrap items-center gap-2 font-mono text-[12px]">
         <input id="evsearch" type="search" placeholder="Search payload…" class="w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 placeholder:text-ink-500 focus:border-blue focus:outline-none">
         <select id="evop" class="rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none">
-          <option value="">All ops</option><option value="insert">insert</option><option value="update">update</option><option value="delete">delete</option><option value="truncate">truncate</option>
+          <option value="">All ops</option><option value="insert">insert</option><option value="update">update</option><option value="delete">delete</option><option value="truncate">truncate</option><option value="read">read</option>
         </select>
         <select id="evtopic" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All topics</option></select>
         <select id="evtable" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All tables</option></select>
@@ -194,8 +220,8 @@ const token = (() => {
   try { return sessionStorage.getItem('aqueduct_token'); } catch (_) { return null; }
 })();
 const authInit = extra => Object.assign({}, extra, token ? { headers: { Authorization: 'Bearer ' + token } } : {});
-const OPS = ['inserts', 'updates', 'deletes', 'truncates'];
-const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet' };
+const OPS = ['inserts', 'updates', 'deletes', 'truncates', 'reads'];
+const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet', reads: 'bg-amber' };
 const fmt = n => n.toLocaleString('en-US');
 const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
@@ -236,7 +262,7 @@ function syncRateTables(d) {
   sel.value = cur;
 }
 
-const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee'];
+const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee', '#ec9a3c'];
 function chart(series) {
   const W = 800, H = 220, PL = 34, PR = 8, PT = 10, PB = 8;
   const len = Math.max(0, ...series.map(s => s.h.length));
@@ -291,6 +317,26 @@ function renderHealth(d) {
   $('hbreason').textContent = h.last_skip_reason ? 'last: ' + h.last_skip_reason : 'none skipped';
 }
 
+// Snapshot card: hidden until the source reports one, then shows the running or last snapshot.
+const SNAP_BADGE = { running: 'bg-blue/15 text-blue', finished: 'bg-green/15 text-green', cancelled: 'bg-ink-700 text-ink-200' };
+function renderSnapshot(d) {
+  const s = d.snapshot;
+  $('snapshot').hidden = !s;
+  if (!s) return;
+  $('snapstate').textContent = s.state;
+  $('snapstate').className = 'rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ' + (SNAP_BADGE[s.state] || 'bg-ink-700 text-ink-200');
+  $('snapid').textContent = s.id;
+  $('snapcancel').hidden = s.state !== 'running';
+  $('snaptables').textContent = s.tables_done + ' / ' + s.tables.length;
+  $('snaptable').textContent = s.table ? 'copying ' + s.table : s.state;
+  $('snaprows').textContent = fmt(s.rows);
+  const pct = s.rows_estimated ? Math.min(100, 100 * s.rows / s.rows_estimated) : (s.state === 'finished' ? 100 : 0);
+  $('snapbar').style.width = pct + '%';
+  $('snapsub').textContent = s.rows_estimated ? 'of about ' + fmt(s.rows_estimated) + ' (planner estimate) · this process only' : 'no row estimate (run ANALYZE) · this process only';
+  $('snapskipped').hidden = !s.skipped.length;
+  $('snapskipped').textContent = s.skipped.length ? 'skipped: ' + s.skipped.map(x => x.table + ' (' + x.reason + ')').join(', ') : '';
+}
+
 function render(d) {
   $('state-text').textContent = d.state;
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
@@ -315,6 +361,7 @@ function render(d) {
   $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
   $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
   renderHealth(d);
+  renderSnapshot(d);
   lastData = d;
   syncRateTables(d);
   chart(rateSeries(d));
@@ -345,6 +392,7 @@ function setConn(live, text) {
 const OP_BADGE = {
   insert: 'bg-green/15 text-green', update: 'bg-blue/15 text-blue',
   delete: 'bg-red/15 text-red', truncate: 'bg-violet/15 text-violet',
+  read: 'bg-amber/15 text-amber',
 };
 const FETCH_EVENTS = 100;
 let evs = [];          // newest first, as read from Kafka
@@ -434,6 +482,16 @@ $('events').addEventListener('click', ev => {
   renderEvents();
 });
 for (const el of [$('ratetable'), ...document.querySelectorAll('.rateop')]) el.addEventListener('input', () => lastData && chart(rateSeries(lastData)));
+$('snapcancel').addEventListener('click', async () => {
+  if (!confirm('Cancel the snapshot after the chunk in flight?')) return;
+  $('snapcancel').disabled = true;
+  try {
+    const r = await fetch('/api/snapshot', authInit({ method: 'DELETE' }));
+    if (!r.ok) alert('Cancel failed: ' + ((await r.json().catch(() => ({}))).error || r.status));
+  } finally {
+    $('snapcancel').disabled = false;
+  }
+});
 for (const id of ['evsearch', 'evop', 'evtable']) $(id).addEventListener('input', renderEvents);
 $('evtopic').addEventListener('input', pollEvents);
 $('evpause').addEventListener('click', () => {
