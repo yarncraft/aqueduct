@@ -112,11 +112,16 @@ Notable changes to Aqueduct. Newest first.
   raw `aggregate_id` value (a string's content, not the JSON table key; the partition is hashed from it), value = the
   `payload` column as is (`jsonb` as JSON text, text as its content), headers `id` and `type` from the configured
   columns besides `op` and `lsn`. Unset keys take Debezium's defaults (`aggregatetype`, `aggregateid`, `payload`,
-  `outbox.event.{aggregate_type}`). Updates, deletes, truncates and snapshot rows of the outbox are filtered. A row
+  `outbox.event.{aggregate_type}`). Updates, deletes and truncates of the outbox are filtered; snapshot rows too,
+  unless the route's `ops` lists `read` (then rows still in the table are published again on every snapshot). An `ops`
+  list without `insert` or `read`, and a `where` on `before.*`, fail startup. Differences from Debezium's outbox
+  router: a `jsonb` payload that is a bare string loses its quotes, a `text` payload holding JSON reads as JSON, and
+  `bytea` arrives as hex text, so use a `jsonb` object or array, or `text`, as the payload. A row
   without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
   `aqueduct-error` header naming the column. `outbox` excludes `topic` and `key` on the same route. The route's
   `topic` key is now optional in the config when `outbox` is set. `/api/routes` shows an `outbox` object, the cockpit
-  an `outbox` badge, and `/api/events` now returns each record's headers and shows non-envelope values raw.
+  an `outbox` badge, and `/api/events` now returns each record's headers (only `op`, `lsn`, `aqueduct-error`,
+  `aqueduct-hash-key-id`, and the outbox `id`/`type`) and shows non-envelope values raw.
 - **Routing: choose the topic from the row's contents** (#82, ADR 0002). A route's `topic` can read row fields, such as
   `orders.{row.region}`, and also takes `{op}`. Such a template must start with fixed text and needs a fixed
   `topic_fallback`. An optional `topic_values` allow-list limits the values. No fixed topic in the config may match the

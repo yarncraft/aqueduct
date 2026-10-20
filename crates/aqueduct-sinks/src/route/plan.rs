@@ -402,22 +402,28 @@ impl Outbox {
         let id = spec.id.as_deref().map(|c| field("id", c)).transpose()?;
         let kind = spec.kind.as_deref().map(|c| field("type", c)).transpose()?;
         let what = format!("sink route `{name}`: `outbox` `topic`");
-        let rewritten = spec.topic.replace(
-            "{aggregate_type}",
-            &format!("{{after.{}}}", spec.aggregate_type),
-        );
+        let replacement = format!("{{after.{}}}", spec.aggregate_type);
+        let rewritten = spec.topic.replace(AGGREGATE_TYPE, &replacement);
+        // Syntax errors name the template as written, with the position in it.
+        if let Err(e) = Template::parse(&rewritten) {
+            let pos = written_pos(&spec.topic, replacement.len(), e.pos);
+            return Err(Error::Config(format!(
+                "{what} `{}` is not a valid template: {} (at byte {pos})",
+                spec.topic, e.msg
+            )));
+        }
         let mut topic = parse_topic(&what, &rewritten).map_err(|e| {
             // Report the template as written, not the rewritten form.
             Error::Config(e.to_string().replace(&rewritten, &spec.topic))
         })?;
-        // Only inserts are published, and an insert has no before-image.
+        // Only inserts and snapshot reads are published, and they have no before-image.
         if let Some(f) = topic
             .parsed
             .fields()
             .find(|f| f.as_str().starts_with("before."))
         {
             return Err(bad(format!(
-                "`topic` `{}` reads `{f}`, but only inserts are published and they have no before-image; use `{{aggregate_type}}` or `{{after.<column>}}`",
+                "`topic` `{}` reads `{f}`, but only inserts and snapshot reads are published and they have no before-image; use `{{aggregate_type}}` or `{{after.<column>}}`",
                 spec.topic
             )));
         }
@@ -441,6 +447,27 @@ impl Outbox {
             .chain(self.id.as_ref())
             .chain(self.kind.as_ref())
     }
+}
+
+/// The outbox topic placeholder for the `aggregate_type` column.
+const AGGREGATE_TYPE: &str = "{aggregate_type}";
+
+/// Maps byte `pos` in a template whose [`AGGREGATE_TYPE`] placeholders were each replaced by
+/// `replacement_len` bytes back to `written`, the template as configured. A position inside a
+/// replacement maps to the start of its placeholder.
+fn written_pos(written: &str, replacement_len: usize, pos: usize) -> usize {
+    let mut shift: isize = 0;
+    for (i, _) in written.match_indices(AGGREGATE_TYPE) {
+        let start = i.saturating_add_signed(shift);
+        if pos < start {
+            break;
+        }
+        if pos < start + replacement_len {
+            return i;
+        }
+        shift += replacement_len as isize - AGGREGATE_TYPE.len() as isize;
+    }
+    pos.saturating_add_signed(-shift)
 }
 
 /// The text of an outbox column as Kafka gets it: a JSON string's content, unescaped, and any
@@ -1047,6 +1074,25 @@ impl RoutePlan {
                             "sink route `{name}`: `key` and `outbox` are mutually exclusive; an outbox record is keyed by its `aggregate_id`"
                         )));
                     }
+                    // Only inserts (and, when `ops` lists it, `read`) are published, so an `ops`
+                    // list without either, or a `where` on the before-image, drops every row.
+                    if ops
+                        .as_ref()
+                        .is_some_and(|o| !o.contains(&Op::Insert) && !o.contains(&Op::Read))
+                    {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `ops` lists neither `insert` nor `read`, but an outbox route only publishes those, so it would publish nothing"
+                        )));
+                    }
+                    if let Some(f) = filter.as_ref().and_then(|w| {
+                        w.fields()
+                            .into_iter()
+                            .find(|f| f.as_str().starts_with("before."))
+                    }) {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `where` reads `{f}`, but an outbox route only publishes inserts and snapshot reads, which have no before-image; use `after.` or `row.`"
+                        )));
+                    }
                     if dead_letter_topic.is_none() {
                         return Err(Error::Config(format!(
                             "sink route `{name}` uses `outbox`, which needs `sink.dead_letter_topic`: outbox rows without an `aggregate_id` or `payload` go there instead of stopping the pipeline"
@@ -1253,6 +1299,11 @@ impl RoutePlan {
         self.default.as_ref().map(|t| t.raw.as_str())
     }
 
+    /// True when a route uses `outbox`, whose records carry `id` and `type` headers.
+    pub fn has_outbox(&self) -> bool {
+        self.routes.iter().any(|r| r.outbox.is_some())
+    }
+
     /// `sink.dead_letter_topic`, if configured.
     pub fn dead_letter_topic(&self) -> Option<&str> {
         self.dead_letter.as_deref()
@@ -1362,10 +1413,13 @@ impl RoutePlan {
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
-                // An outbox publishes inserts only (ADR 0002 §5): updates, deletes, truncates and
-                // snapshot reads of the outbox table are filtered before anything else.
+                // An outbox publishes inserts, and snapshot reads only when `ops` lists `read`
+                // (ADR 0002 §5, "As built (R8)"): updates, deletes and truncates of the outbox
+                // table are filtered before anything else.
+                let ops_read = r.ops.as_ref().is_some_and(|ops| ops.contains(&Op::Read));
                 if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op))
-                    || (r.outbox.is_some() && event.op != Op::Insert)
+                    || (r.outbox.is_some()
+                        && !(event.op == Op::Insert || (event.op == Op::Read && ops_read)))
                 {
                     self.stats.claimed(&self.stats.filtered, route);
                     return Ok(());
@@ -3187,6 +3241,90 @@ mod tests {
     }
 
     #[test]
+    fn outbox_publishes_snapshot_reads_only_when_ops_lists_read() {
+        let with_ops = |ops: &[&str]| {
+            plan_with(vec![KafkaRoute {
+                ops: Some(ops.iter().map(|s| s.to_string()).collect()),
+                ..outbox_route(outbox_spec())
+            }])
+        };
+        let p = with_ops(&["insert", "read", "update", "delete", "truncate"]);
+        // A snapshot read is published like an insert, with the `r` op header.
+        let r = p
+            .render(&row("outbox", Op::Read, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (r.topic.as_str(), r.key.as_str(), r.op),
+            ("outbox.order", "A-1", "r")
+        );
+        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        // Listing them in `ops` never publishes updates, deletes or truncates.
+        for op in [Op::Update, Op::Delete, Op::Truncate] {
+            assert_eq!(
+                outcome(&p, &row("outbox", op, OUTBOX_ROW)),
+                "filtered",
+                "{op:?}"
+            );
+        }
+        // `ops = ["read"]` publishes snapshot reads only.
+        let q = with_ops(&["read"]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "filtered"
+        );
+        // Without `read` in `ops` (or without `ops`), snapshot reads are filtered.
+        let q = with_ops(&["insert"]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
+            "filtered"
+        );
+        // A snapshot read without an aggregate id goes to the dead-letter topic too.
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Read, r#"{"payload":"p"}"#)),
+            "dlq"
+        );
+    }
+
+    #[test]
+    fn outbox_template_errors_point_into_the_template_as_written() {
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 1), 1);
+        // Inside the replacement: the placeholder's start.
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 10), 2);
+        // After it: shifted back by the length difference (24 - 16).
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 27), 19);
+        assert_eq!(
+            written_pos("{aggregate_type}.{aggregate_type}.}", 9, 20),
+            34
+        );
+        let err = RoutePlan::with_dead_letter(
+            vec![outbox_route(OutboxSpec {
+                topic: "outbox.{aggregate_type}.{x".into(),
+                ..outbox_spec()
+            })],
+            None,
+            Some(DLQ.into()),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(
+                "`outbox.{aggregate_type}.{x` is not a valid template: unclosed `{` (at byte 24)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn outbox_key_is_the_raw_aggregate_id_and_value_the_raw_payload() {
         let p = outbox_plan();
         let r = p
@@ -3454,7 +3592,17 @@ mod tests {
             (
                 spec(|s| s.topic = "outbox.{before.kind}".into()),
                 Some(DLQ),
-                "reads `before.kind`, but only inserts are published",
+                "reads `before.kind`, but only inserts and snapshot reads are published",
+            ),
+            (
+                KafkaRoute { ops: Some(vec!["update".into(), "delete".into()]), ..ok.clone() },
+                Some(DLQ),
+                "`ops` lists neither `insert` nor `read`",
+            ),
+            (
+                KafkaRoute { filter: Some("before.status == 'x' or after.n > 1".into()), ..ok.clone() },
+                Some(DLQ),
+                "`where` reads `before.status`, but an outbox route only publishes inserts and snapshot reads",
             ),
             (
                 spec(|s| s.topic = "outbox.{aggregate_id}".into()),

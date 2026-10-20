@@ -447,8 +447,8 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
 
 #### Outbox
 
-`outbox` on a route publishes the rows of an outbox table as their own events, like Debezium's outbox event router.
-The application writes an event into the outbox table in the same transaction as its business change. Aqueduct turns
+`outbox` on a route publishes the rows of an outbox table as their own events, much like Debezium's outbox event
+router, with the differences listed under "Differences from Debezium" below. The application writes an event into the outbox table in the same transaction as its business change. Aqueduct turns
 each **insert** into one Kafka record whose key is the aggregate id and whose value is the payload:
 
 ```toml
@@ -475,25 +475,31 @@ The defaults are Debezium's column names and topic, so `outbox = {}` reads a Deb
 and `type` headers are opt-in: set `id` and `type` to the columns. Unknown keys inside `outbox` fail startup, so a
 misspelled key never falls back to a default column.
 
-- **Inserts only.** Updates, deletes and truncates of the outbox table produce nothing and count as `filtered`, as in
-  Debezium, so deleting outbox rows once written is safe. **Snapshot rows (`read`) are filtered too:** the rows still
-  in the outbox table were published when they were inserted, and a snapshot would publish them again. `ops` and
-  `where` still apply to inserts if you set them.
+- **Inserts, and snapshot rows only on request.** Updates, deletes and truncates of the outbox table never produce a
+  record (even if `ops` lists them) and count as `filtered`, so deleting outbox rows once written is safe. Snapshot
+  rows (`read`) are filtered unless the route's `ops` lists `"read"`, for example `ops = ["insert", "read"]`; they are
+  then published like inserts, with the `op` header `r`. Enable `read` to publish rows that were already in the
+  outbox table before Aqueduct streamed it (a first deployment with `snapshot = "initial"`). The trade-off: every
+  snapshot of the table publishes every row still in it, including rows already published when they were inserted,
+  so consumers see those events twice. Delete outbox rows once written, or snapshot the table only once, to keep
+  that small. `where` still applies if you set it.
+- **Startup refusals.** An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.<column>`
+  (inserts and snapshot rows have no before-image, so it could never be true), fail startup naming the route.
 - **Key: the raw `aggregate_id` value**, not the JSON record key other routes use. A string is sent as its content
   (unescaped UTF-8: `A-1`, not `"A-1"`), a number or boolean as its JSON text (`42`), an object (a MongoDB `ObjectId`)
   as its JSON (`{"$oid":"..."}`). The partition is the FNV-1a hash of that key, whatever `partition_by` says, so the
   events of one aggregate stay in order on one partition. Consumers of an outbox expect this key; code that parses
   the JSON keys of other topics cannot read outbox topics unchanged.
 - **Value: the `payload` value, passed through.** A `json` or `jsonb` payload is its JSON text as stored. A text
-  payload is sent as its content, not as a JSON string literal: `say "hi"`, not `"say \"hi\""`. A `jsonb` payload that
-  holds a bare JSON string is sent as that string's content too, since the row does not say which column type it was.
-  Other types are sent as the source writes them in rows (a `bytea` payload as its text form). The value is not the
-  change-event envelope: it has no `source`, `op` or timestamps.
-- **Headers:** `op` (`c`) and `lsn`, as on every record, plus `id` and `type` from the configured columns, with the
+  payload is sent as its content, not as a JSON string literal: `say "hi"`, not `"say \"hi\""`. The value is not the
+  change-event envelope: it has no `source`, `op` or timestamps. **Use a `jsonb` object or array, or `text`, as the
+  payload**; the other cases differ from Debezium (below).
+- **Headers:** `op` (`c`, or `r` for a snapshot row) and `lsn`, as on every record, plus `id` and `type` from the configured columns, with the
   same text rules as the key. A null or missing `id` or `type` leaves that header out. These two headers carry row
   values; no other header does.
 - **Topic.** The template may use `{aggregate_type}`, `{schema}`, `{table}`, `{after.<column>}` and `{row.<column>}`
-  (both read the inserted row). `{before.<column>}` fails startup, since an insert has no before-image. A template that
+  (both read the inserted row). `{before.<column>}` fails startup, since an insert has no before-image; a syntax
+  error names its byte position in the template as written. A template that
   reads a row value follows every rule of [Routing by row content](#routing-by-row-content): fixed text first,
   `topic_fallback` required, one segment per value, `topic_values`, no collision with fixed topics,
   `max_dynamic_topics`. A null or invalid `aggregate_type` sends the record (same key, value and headers) to the
@@ -508,7 +514,20 @@ misspelled key never falls back to a default column.
 - **Unseen fields.** The outbox columns are watched like any other field path, as `after.<column>`: a misspelled
   column is reported after 1000 inserts that lack it.
 - The cockpit shows an `outbox` badge on the route. The event inspector shows outbox records as raw values with their
-  headers, since they are not envelopes.
+  headers and their topic in place of the table, since they are not envelopes.
+- **Differences from Debezium's outbox event router.** Aqueduct reads the payload from the row's JSON, which does not
+  record the column type, so:
+  - A `jsonb` payload that is a bare JSON string (`'"hello"'::jsonb`) is sent without its quotes (`hello`); Debezium
+    keeps the JSON text (`"hello"`).
+  - A `text` payload that holds JSON text (`{"a":1}`) is sent as that text, so a JSON consumer reads an object;
+    Debezium (with the JSON converter) delivers a JSON string.
+  - A `bytea` payload arrives as Postgres hex text (`\x4869`), not as the raw bytes or base64.
+  - Debezium publishes snapshot rows like inserts and only warns on updates; Aqueduct publishes snapshot rows only
+    when `ops` lists `read` and always drops updates.
+  - The `id` and `type` headers are opt-in.
+
+  Use a `jsonb` object or array as the payload (the same JSON Debezium sends), or `text` (sent as plain text). Avoid
+  `jsonb` scalars and `bytea`.
 
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),

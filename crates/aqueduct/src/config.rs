@@ -272,8 +272,9 @@ pub struct KafkaRouteConfig {
     /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
     #[serde(default)]
     pub key: Option<Vec<String>>,
-    /// Publish the rows of an outbox table as their own events: inserts only, key = the
-    /// `aggregate_id` column, value = the `payload` column. Excludes `topic` and `key`.
+    /// Publish the rows of an outbox table as their own events: inserts (and snapshot rows when
+    /// `ops` lists `read`), key = the `aggregate_id` column, value = the `payload` column.
+    /// Excludes `topic` and `key`.
     #[serde(default)]
     pub outbox: Option<OutboxConfig>,
 }

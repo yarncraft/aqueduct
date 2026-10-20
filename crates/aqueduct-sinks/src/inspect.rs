@@ -29,8 +29,9 @@ pub struct InspectedEvent {
     /// event envelope; an outbox payload (a route's `outbox`) is whatever the row held, and a
     /// tombstone is `null`.
     pub event: serde_json::Value,
-    /// The record headers (`op`, `lsn`, and e.g. `aqueduct-error`, or an outbox record's `id`
-    /// and `type`), as text. They tell the op and position of a value that is not an envelope.
+    /// The record headers Aqueduct writes, as text: `op`, `lsn`, `aqueduct-error`,
+    /// `aqueduct-hash-key-id`, and `id` and `type` when a route uses `outbox`. Other headers are
+    /// left out. They tell the op and position of a value that is not an envelope.
     pub headers: BTreeMap<String, String>,
 }
 
@@ -155,7 +156,7 @@ impl KafkaInspector {
                     .partition_client(name, p, UnknownTopicHandling::Error)
                     .await
                     .map_err(|e| Error::Sink(format!("kafka partition client: {e}")))?;
-                tail(&pc, name, p, limit, &mut events).await?;
+                tail(&pc, name, p, limit, self.router.has_outbox(), &mut events).await?;
             }
         }
         events.sort_by(|a, b| {
@@ -174,12 +175,33 @@ impl KafkaInspector {
     }
 }
 
-/// Append the last `limit` records of one partition to `out`.
+/// Headers Aqueduct writes that the inspector shows: `op`, `lsn`, the dead-letter reason and
+/// the hash key id.
+const SHOWN_HEADERS: [&str; 4] = ["op", "lsn", "aqueduct-error", "aqueduct-hash-key-id"];
+/// The headers an outbox route adds, shown only when the plan has one.
+const OUTBOX_HEADERS: [&str; 2] = ["id", "type"];
+
+/// The headers of a record the inspector shows, as text. Only the allow-list: the inspected
+/// topics can also hold records of other producers, whose headers (tracing, auth) must not reach
+/// the cockpit.
+fn shown_headers(headers: BTreeMap<String, Vec<u8>>, outbox: bool) -> BTreeMap<String, String> {
+    headers
+        .into_iter()
+        .filter(|(k, _)| {
+            SHOWN_HEADERS.contains(&k.as_str()) || (outbox && OUTBOX_HEADERS.contains(&k.as_str()))
+        })
+        .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+        .collect()
+}
+
+/// Append the last `limit` records of one partition to `out`. `outbox`: also show the outbox
+/// headers.
 async fn tail(
     pc: &PartitionClient,
     topic: &str,
     partition: i32,
     limit: usize,
+    outbox: bool,
     out: &mut Vec<InspectedEvent>,
 ) -> Result<()> {
     let e = |what: &str, e: rskafka::client::error::Error| {
@@ -218,15 +240,55 @@ async fn tail(
                     .key
                     .map(|k| String::from_utf8_lossy(&k).into_owned()),
                 event,
-                headers: r
-                    .record
-                    .headers
-                    .into_iter()
-                    .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
-                    .collect(),
+                headers: shown_headers(r.record.headers, outbox),
             });
         }
         next = last + 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_allow_listed_headers_are_shown() {
+        let headers = || -> BTreeMap<String, Vec<u8>> {
+            [
+                ("op", "c"),
+                ("lsn", "7"),
+                ("aqueduct-error", "route `r`: ..."),
+                ("aqueduct-hash-key-id", "k1"),
+                ("id", "e-1"),
+                ("type", "OrderCreated"),
+                ("traceparent", "00-abc-def-01"),
+                ("authorization", "Bearer secret"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+            .collect()
+        };
+        let keys = |outbox| {
+            shown_headers(headers(), outbox)
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(false),
+            ["aqueduct-error", "aqueduct-hash-key-id", "lsn", "op"]
+        );
+        assert_eq!(
+            keys(true),
+            [
+                "aqueduct-error",
+                "aqueduct-hash-key-id",
+                "id",
+                "lsn",
+                "op",
+                "type"
+            ]
+        );
+        assert_eq!(shown_headers(headers(), true)["type"], "OrderCreated");
+    }
 }

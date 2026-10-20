@@ -373,16 +373,24 @@ and keys JSON:
   so all of R4 applies unchanged: fixed prefix, one segment per value, `topic_fallback` required (route-level key, as
   for any route), `topic_values`, the glob collision checks, refused names and `max_dynamic_topics`. The route-level
   `topic` must be unset (it is optional in the config for this reason).
-- **Inserts only, including no snapshot rows.** Updates, deletes, truncates and `read` (snapshot) events are filtered
-  before `where` and the unseen-field count. Rows still in the outbox table were published when inserted, so a
-  snapshot would publish them twice; Debezium also ignores every op but create.
+- **Inserts, and snapshot rows on request.** Updates, deletes and truncates are always filtered, even when `ops` lists
+  them, before `where` and the unseen-field count. Snapshot (`read`) rows are filtered by default and published like
+  inserts (op header `r`) when the route's `ops` lists `read`. Rows still in the outbox table were published when
+  inserted, so a snapshot republishes them; opting in is for a first deployment (`snapshot = "initial"`) with rows
+  that were never published, and DEPLOYMENT.md states the double-publish trade-off. This differs from Debezium's
+  `EventRouterDelegate`, which skips only deletes, warns on updates (`table.op.invalid.behavior`) and publishes
+  snapshot rows like creates. An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.*`
+  (never true for an insert or a snapshot row), fail startup.
 - **Key.** Since #138 table keys are JSON, but the outbox key is the raw `aggregate_id` value, as Debezium and outbox
   consumers expect: a JSON string's unescaped content as UTF-8, any other value its JSON text as the row holds it (a
   number `42`, an object such as a MongoDB `ObjectId` compactly). The partition is the FNV-1a hash of that key,
   overriding `partition_by`.
 - **Value.** The `payload` value with the same rule: `json`/`jsonb` is the JSON text in the row; a text column is its
-  content, not a JSON string literal. A `jsonb` value that is a bare JSON string is indistinguishable from text in the
-  row and is sent as its content too. The value is never an envelope.
+  content, not a JSON string literal. The value is never an envelope. **Divergences from Debezium**, because the row
+  JSON does not carry the column type: a `jsonb` bare JSON string is sent without its quotes (Debezium keeps the JSON
+  text); a `text` payload holding JSON text is sent as that text, so a JSON consumer reads an object (Debezium's JSON
+  converter delivers a string); `bytea` arrives as Postgres hex text (`\x...`). The docs advise a `jsonb` object or
+  array, or `text`, as the payload.
 - **Headers.** `op` and `lsn` as on every record, plus `id` and `type` when configured and present (null or missing:
   no header). These carry row values, an exception to §5 "Headers only ever carry `op`, `lsn` and
   `aqueduct-hash-key-id`" that the outbox pattern requires.
@@ -398,6 +406,8 @@ and keys JSON:
 - **Unseen fields.** The outbox columns are registered as `after.<col>` (the topic template's fields as usual), so a
   misspelled column is reported after 1000 inserts without it.
 - **Visibility.** `/api/routes` has an `outbox` object (the spec as configured) on outbox routes only; `topic` is the
-  template as written. The cockpit's existing `outbox` badge shows it. `/api/events` now returns each record's headers,
-  and the cockpit shows a value that is not an envelope raw, with op and lsn from the headers (§7), instead of an
-  empty row.
+  template as written; template syntax errors give the byte position in the template as written. The cockpit's
+  existing `outbox` badge shows it. `/api/events` now returns each record's headers, limited to an allow-list (`op`,
+  `lsn`, `aqueduct-error`, `aqueduct-hash-key-id`, and `id`/`type` when a route uses `outbox`), since the inspected
+  globs can match topics other producers write to. The cockpit shows a value that is not an envelope raw, with op and
+  lsn from the headers and the topic in place of the table (§7), instead of an empty row.

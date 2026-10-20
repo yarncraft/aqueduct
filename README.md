@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback)<br/>Debezium-style envelope, or outbox payload (inserts only)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback)<br/>Debezium-style envelope, or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -249,11 +249,13 @@ takes an optional `topic_values` allow-list. Values must be one segment (`[A-Za-
 the fallback: a null value, a value that is not allowed, or a value past `max_dynamic_topics` (default 100, counted from
 the broker). See DEPLOYMENT.md, "Routing by row content".
 
-`outbox = { ... }` on a route publishes an outbox table's inserts as their own events, like Debezium's outbox router:
-topic from a template such as `outbox.{aggregate_type}`, key = the raw `aggregate_id` value (not the JSON table key),
-value = the `payload` column as is, headers `id` and `type` when configured. Updates, deletes and snapshot rows of
-the outbox are dropped; a row without an `aggregate_id` or `payload` goes to the dead-letter topic. See DEPLOYMENT.md,
-"Outbox".
+`outbox = { ... }` on a route publishes an outbox table's inserts as their own events, much like Debezium's outbox
+router: topic from a template such as `outbox.{aggregate_type}`, key = the raw `aggregate_id` value (not the JSON
+table key), value = the `payload` column as is, headers `id` and `type` when configured. Updates and deletes of the
+outbox are dropped, and snapshot rows too unless the route's `ops` lists `read`; a row without an `aggregate_id` or
+`payload` goes to the dead-letter topic. Unlike Debezium, a `jsonb` payload that is a bare string loses its quotes, a
+`text` payload holding JSON reads as JSON, and `bytea` arrives as hex text: use a `jsonb` object or array, or `text`,
+as the payload. See DEPLOYMENT.md, "Outbox".
 
 ```toml
 [[sink.routes]]

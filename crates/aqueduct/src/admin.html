@@ -542,11 +542,13 @@ const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
 const OP_NAME = { c: 'insert', u: 'update', d: 'delete', t: 'truncate', r: 'read' };
 const isEnv = ev => !!ev && typeof ev === 'object' && !Array.isArray(ev) && !!ev.source && typeof ev.source === 'object' && typeof ev.op === 'string';
 const hdr = (e, k) => (e.headers || {})[k];
-const opOf = e => { const o = isEnv(e.event) ? e.event.op : hdr(e, 'op'); return OP_NAME[o] || o; };
+const opOf = e => { const o = isEnv(e.event) ? e.event.op : hdr(e, 'op'); return Object.hasOwn(OP_NAME, o) ? OP_NAME[o] : o; };
+const opBadge = e => { const o = opOf(e); return Object.hasOwn(OP_BADGE, o) ? OP_BADGE[o] : ''; };
 const src = ev => isEnv(ev) ? ev.source : {};
 const lsnOf = e => isEnv(e.event) ? src(e.event).lsn ?? '' : hdr(e, 'lsn') ?? '';
 const rawText = v => typeof v === 'string' ? v : JSON.stringify(v, null, 2) ?? '';
-const rel = e => (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
+// The table of an envelope; a value that is not one (an outbox payload) names no table, so its topic stands in.
+const rel = e => !isEnv(e.event) ? e.topic : (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
 const isoMs = ms => { const d = new Date(ms); return isNaN(d) ? '–' : d.toISOString(); };
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
 const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v) ?? ''; return t.length > 28 ? t.slice(0, 27) + '…' : t; };
@@ -584,7 +586,7 @@ function renderEvents() {
   $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
     const ev = e.event, id = evid(e);
-    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[opOf(e)] || ''}">${esc(opOf(e) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(lsnOf(e)))}</td><td class="px-4 py-1.5 text-ink-200">${summary(e)}</td></tr>`;
+    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${opBadge(e)}">${esc(opOf(e) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(lsnOf(e)))}</td><td class="px-4 py-1.5 text-ink-200">${summary(e)}</td></tr>`;
     return openId === id ? row + detail(e) : row;
   }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events in Kafka yet'}</td></tr>`;
 }
@@ -626,7 +628,7 @@ $('events').addEventListener('click', ev => {
   const copy = ev.target.closest('[data-copy]');
   if (copy) {
     const e = evs.find(x => evid(x) === copy.dataset.copy);
-    if (e && navigator.clipboard) navigator.clipboard.writeText(JSON.stringify(e.event, null, 2));
+    if (e && navigator.clipboard) navigator.clipboard.writeText(typeof e.event === 'string' ? e.event : JSON.stringify(e.event, null, 2));
     return;
   }
   const tr = ev.target.closest('tr[data-id]');
