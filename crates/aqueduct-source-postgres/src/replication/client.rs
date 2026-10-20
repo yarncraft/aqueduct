@@ -455,8 +455,7 @@ impl StatusSender {
 }
 
 /// A streaming session over an arbitrary byte stream, as if `START_REPLICATION` had succeeded.
-/// For tests that script the server side.
-#[cfg(test)]
+/// For tests and fuzzing that script the server side.
 pub(crate) fn streaming(io: BoxIo) -> (ReplicationStream, StatusSender) {
     let c = ReplicationClient::from_io(io);
     (
