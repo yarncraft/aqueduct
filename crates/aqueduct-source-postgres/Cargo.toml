@@ -14,3 +14,4 @@ tokio-postgres = "0.7"
 tracing.workspace = true
 aqueduct-tls = { path = "../aqueduct-tls" }
 tokio-postgres-rustls = "0.13"
+bytes = "1"
