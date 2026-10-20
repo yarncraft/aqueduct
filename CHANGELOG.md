@@ -6,11 +6,6 @@ Notable changes to Aqueduct. Newest first.
 
 ### Breaking changes and upgrade notes
 
-- **Topic names are checked at startup, and none may start with `_`** (#82). Every route `topic`, `sink.topic` and
-  `topic_fallback` must be a valid Kafka topic name, or a template whose fixed text is, and must not start with `_`
-  (Kafka's internal topics, such as `__consumer_offsets`). Braces other than placeholders (`{schema}`, `{table}`,
-  `{op}`, `{row.<col>}`, ...) fail startup as an invalid template. Such configs used to start and then fail on the first
-  send. Upgrade: rename any topic that starts with `_` or holds other characters than `A-Z a-z 0-9 . _ -`.
 - **Events use Debezium's envelope, keys and time encodings** (Postgres and MongoDB). Every consumer must be updated:
   - Value: `{"before", "after", "source": {"version", "connector", "ts_ms", "ts_us", "snapshot", "db", "schema",
     "table", "txId", "lsn"}, "op", "ts_ms", "ts_us"}` (MongoDB: `db` and `collection` in `source`). The old top-level
@@ -122,7 +117,12 @@ Notable changes to Aqueduct. Newest first.
     so it holds across restarts.
 
   Fallbacks are opened at startup. The inspector reads the content-routed topics, and `GET /api/routes` shows
-  `topic_fallback` and `topic_values`.
+  `topic_fallback` and `topic_values`. Once any route reads a row field, no topic in the config (route topics,
+  `sink.topic`, fallbacks) may start with `_`; configs without content routing are unaffected.
+- **Topic names are checked at startup** (#82). A route `topic`, `sink.topic` or `topic_fallback` with characters other
+  than `A-Z a-z 0-9 . _ -` in its fixed text, or braces that are not a known placeholder (`{schema}`, `{table}`, `{op}`,
+  `{row.<col>}`, ...), now fails startup naming the key. Kafka refuses such names anyway, so these configs used to fail
+  on the first send instead.
 - **Routing: set the Kafka message key per route** (#83, ADR 0002). `key = ["col", ...]` on a `[[sink.routes]]`
   entry builds the record key from those columns of the row (`after`, else `before`, so deletes key by their
   before-image): `{"db", "schema", "table", "key": {"col": value, ...}}`, values copied as JSON, a missing column

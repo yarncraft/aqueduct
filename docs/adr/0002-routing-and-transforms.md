@@ -340,6 +340,8 @@ Content routing (#82):
   counts those matching a template glob, minus the fixed topics. Existing topics are always usable. A new topic is
   counted when the plan first routes to it, before it is created. A failed create is counted until the next restart's
   re-count.
-- **No static topic may start with `_`.** This applies to every route `topic`, `sink.topic`, fallback and the dead-letter
-  topic, whether or not content routing is used. Fixed text must be valid topic characters. Both are now startup
-  errors, listed as a breaking change in the CHANGELOG.
+- **The leading-`_` rule applies only when content routing is in use**, so "Breaking: none" holds. Once any route's
+  topic reads a row field, no route `topic`, `sink.topic` or fallback may start with `_`. Without one, such topics are
+  accepted as before. The dead-letter topic's `_` check is R3's and applies always.
+- **Topic names are checked at startup.** Fixed text must be valid topic characters, and braces must be known
+  placeholders. Kafka refuses other names, so this only moves a first-send failure to startup.

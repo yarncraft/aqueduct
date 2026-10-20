@@ -243,7 +243,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (topics that already match a template count). Beyond it, events go to the route's `topic_fallback`. See [Routing by row content](#routing-by-row-content) |
 | `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). No topic may start with `_` |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -398,7 +398,9 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   `{schema}`, `{table}` and `{op}` works as before and needs no fallback.
 - **Rules, checked at startup** for a `topic` that reads a row field, so row data cannot pick an arbitrary topic:
   - The template starts with fixed text: `orders.{row.region}` is allowed, `{row.tenant}` and `{schema}.{row.x}` are not.
-    No topic anywhere in the config may start with `_` (Kafka's internal topics such as `__consumer_offsets`).
+    Once any route reads a row field, no topic anywhere in the config (route topics, `sink.topic`, fallbacks, the
+    dead-letter topic) may start with `_` (Kafka's internal topics such as `__consumer_offsets`). Without content
+    routing, such topics are accepted as before.
   - `topic_fallback` is required. It is a fixed topic name (no placeholders), opened (created if missing) at startup.
   - No fixed topic in the config may match the template read as a glob (`orders.{row.region}` is `orders.*`): not
     another route's `topic`, `sink.topic`, another route's `topic_fallback` or `dead_letter_topic`. Only the route's

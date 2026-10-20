@@ -512,16 +512,12 @@ fn parse_ops(name: &str, ops: &[String]) -> Result<Vec<Op>> {
     Ok(out)
 }
 
-/// Parses a topic or topic template. Fixed text must be valid in a Kafka topic name, and no topic
-/// may start with `_` (Kafka's internal topics, such as `__consumer_offsets`).
+/// Parses a topic or topic template. Fixed text must be valid in a Kafka topic name (Kafka would
+/// refuse anything else on the first send). The leading-`_` rule is checked by the plan, since it
+/// only applies when content routing is in use.
 fn parse_topic(what: &str, raw: &str) -> Result<TopicTemplate> {
     let t = TopicTemplate::new(raw)
         .map_err(|e| Error::Config(format!("{what} `{raw}` is not a valid template: {e}")))?;
-    if raw.starts_with('_') {
-        return Err(Error::Config(format!(
-            "{what} `{raw}` must not start with `_` (reserved for internal topics)"
-        )));
-    }
     let ok = if t.is_static() {
         valid_topic_name(raw)
     } else {
@@ -747,6 +743,24 @@ impl RoutePlan {
             return Err(Error::Config(
                 "sink.topic cannot read a row field (it has no topic_fallback); route such tables with a [[sink.routes]] entry that sets `topic_fallback`".into(),
             ));
+        }
+        // Once row data can choose topics, no topic in the config may start with `_` (Kafka's
+        // internal topics, such as `__consumer_offsets`). Without content routing, topics are
+        // accepted as before. Fallbacks and the dead-letter topic are checked on their own.
+        if compiled.iter().any(|r| r.topic.reads_row) {
+            let topics = compiled
+                .iter()
+                .zip(&names)
+                .map(|(r, n)| (format!("sink route `{n}`: `topic`"), &r.topic))
+                .chain(default.as_ref().map(|d| ("sink.topic".to_string(), d)));
+            for (what, t) in topics {
+                if t.raw.starts_with('_') {
+                    return Err(Error::Config(format!(
+                        "{what} `{}` must not start with `_` (reserved for internal topics) when a route chooses its topic from row content",
+                        t.raw
+                    )));
+                }
+            }
         }
         if let Some(dlq) = &dead_letter_topic {
             if !valid_topic_name(dlq) {
@@ -2239,18 +2253,24 @@ mod tests {
                 None,
                 "sink.topic cannot read a row field",
             ),
-            // no fixed topic starts with `_`
+            // with content routing, no topic starts with `_`
             (
-                vec![route("public.*", "_internal")],
+                vec![ok.clone(), route("public.*", "_internal")],
                 None,
                 None,
-                "must not start with `_`",
+                "sink route `public.*`: `topic` `_internal` must not start with `_`",
             ),
             (
-                vec![],
+                vec![ok.clone()],
                 Some("__consumer_offsets"),
                 None,
-                "must not start with `_`",
+                "sink.topic `__consumer_offsets` must not start with `_`",
+            ),
+            (
+                vec![ok.clone()],
+                Some("_cdc.{table}"),
+                None,
+                "sink.topic `_cdc.{table}` must not start with `_`",
             ),
             (
                 vec![route("public.*", "bad topic")],
@@ -2264,6 +2284,18 @@ mod tests {
             let err = got.expect_err(want);
             assert!(err.contains(want), "{err}\nshould contain: {want}");
         }
+        // Without content routing, `_`-prefixed topics are accepted as before.
+        assert_eq!(
+            build(
+                vec![
+                    route("public.*", "_internal"),
+                    route("hr.*", "_hr.{table}.{op}")
+                ],
+                Some("__cdc.{schema}"),
+                None
+            ),
+            Ok(())
+        );
         // A route's own fallback may match its own template; templated topics may share a prefix
         // with another `{schema}`/`{table}` template.
         assert_eq!(
