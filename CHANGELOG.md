@@ -106,6 +106,12 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Postgres: sign in with an Azure managed identity** (#140). New `[postgres]` keys `auth` (`password` by default,
+  `azure-workload-identity` for AKS Workload Identity, `azure-container-apps`) and `azure_client_id`. A Microsoft
+  Entra token, cached until 5 minutes before it expires, is the password of every connection (SQL and replication),
+  so reconnects keep working past the token's one-hour lifetime. Startup refuses an `azure-*` mode without verified
+  TLS (`disable`, `prefer`, `require` without `ssl_root_cert`), with a password in the URL, or without the platform's
+  environment variables. The image is unchanged. See DEPLOYMENT.md, "Azure managed identity".
 - **Route plan inside the Kafka sink** (#79). Routing now compiles once into a `RoutePlan` with a pure `render` step;
   output (topic, key, partition, value, headers) is unchanged, which a golden test pins. `[[sink.routes]]` accepts an
   optional unique `name` that labels the route in the per-route counters (`matched`, `produced`; shown in a later
