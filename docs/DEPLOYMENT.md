@@ -271,8 +271,8 @@ topic = "audit"
 ## 4. Admin cockpit
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
-sink latency, errors, per-operation and per-table breakdowns and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+sink latency, errors, a per-operation breakdown, per-table high-water marks and an event inspector.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -280,6 +280,41 @@ with TLS and authentication, or set `inspector = false`.
 The inspector adds no work to the pipeline: nothing is buffered in memory. Each refresh (every 3 s while a tab is open,
 shared across tabs for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
 routes to, using its own connection (created on first use). A closed tab costs nothing.
+
+### Tables · high-water marks
+
+The card shows, per table (or collection) that has delivered events since the process started, how far it has got:
+
+| Column | Source |
+|--------|--------|
+| Topic | The sink route the table matches |
+| Events, Ops | Events delivered by this process, and a bar of the table's share of all events split by `c`/`u`/`d`/`t`/`r` |
+| Last LSN | LSN of the newest delivered change (`–` for MongoDB, whose resume tokens are not shown per table) |
+| Last commit | How long ago that change committed. Amber when the table is more than 1 minute behind the freshest table, red past 10 minutes; only while the pipeline is streaming. Measured against the freshest table rather than the clock, so a database that is idle as a whole is not flagged; a table that is simply written rarely is |
+| Delivered | How long ago the sink acknowledged it |
+| Kafka HWM | Sum over the topic's partitions of the next offset Kafka will assign; click the row for each partition. A topic several tables share shows `×N` and the whole topic's offsets |
+
+The header shows the last checkpointed position, which is global, not per table. Pipeline numbers refresh every second
+with the stream. Kafka offsets come from `GET /api/tables`, polled every 5 s: one offsets request per partition of
+the routed topics (no records are read), with the inspector's connection and TLS/SASL settings, shared across tabs
+for 5 s and abandoned after 3 s, so a Kafka outage leaves the column empty (the reason is in the card header and the
+cell's tooltip) but never blocks the cockpit. Offsets need the inspector (`admin_token` and `inspector = true`);
+without it the column shows `–`.
+
+`GET /api/tables` (Bearer token) returns:
+
+```json
+{"state": "streaming", "checkpoint": "0/1A2B3C8", "inspector": true, "kafka_read_ms": 1760965426000,
+ "tables": [{"table": "public.orders", "topic": "cdc.public.orders", "events": 1200,
+             "ops": {"c": 800, "u": 350, "d": 40, "t": 0, "r": 10},
+             "last_lsn": "0/1A2B3C0", "last_commit_ms": 1760965425210, "last_delivered_ms": 1760965425250,
+             "kafka": {"hwm_total": 5310, "partitions": [{"partition": 0, "hwm": 2650}, {"partition": 1, "hwm": 2660}],
+                       "tables_on_topic": 1}}]}
+```
+
+`kafka` is `null` with an `error` string when the offsets could not be read (inspector off, Kafka unreachable or slow,
+topic missing). Counts and marks start from zero when the process restarts. Prometheus has the commit time per table
+as `aqueduct_table_last_commit_timestamp_seconds{table="schema.table"}`; Kafka offsets are not exported there.
 
 ## 5. Operating Aqueduct
 

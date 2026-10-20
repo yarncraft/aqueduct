@@ -7,7 +7,7 @@ Mongo resume token) is checkpointed and acknowledged only after the sink succeed
 
 - Sources: **Postgres** (default), **MongoDB**, chosen with `[source] type`; a top-level `[postgres]` table still works
 - Sink: **Kafka** (the only sink), with per-table topic routing
-- **Admin cockpit**: live throughput, lag, latency, per-table stats and an event inspector
+- **Admin cockpit**: live throughput, lag, latency, per-table high-water marks and an event inspector
 - Distroless, non-root image; state in one volume
 
 ## Architecture
@@ -45,7 +45,7 @@ flowchart LR
     SRC -. "slot advance (Postgres)" .-> PG
     PIPE --> MET --> ADM
     ADM -. "snapshot start / cancel" .-> SRC
-    K -- "read back recent events" --> INS --> ADM
+    K -- "read back recent events<br/>and topic offsets" --> INS --> ADM
     U -- "Bearer for /api/* and /metrics<br/>/, /healthz, /readyz are open" --> ADM
 ```
 
@@ -246,7 +246,7 @@ Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `sn
 ## Admin cockpit
 
 The HTTP port serves a dark operations console at `/`: throughput chart, total events, end-to-end lag,
-sink latency, errors, operation and per-table breakdown, last fault, and an **event inspector**
+sink latency, errors, operation breakdown, per-table high-water marks, last fault, and an **event inspector**
 (reads the newest events straight from the Kafka topics, nothing is buffered in the pipeline; pick a topic, filter by op/table, search payloads, pause, click a row for a
 before/after diff and Copy JSON).
 
@@ -259,6 +259,7 @@ before/after diff and Copy JSON).
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
+| `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
 Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start without `admin_token`, unless
@@ -272,6 +273,12 @@ The cockpit smooths throughput, peak and recent sink latency as trailing average
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
 counted as `READ` in the operations breakdown, the event-rate chart and the inspector's op filter.
+
+The **Tables · high-water marks** card has one row per table that delivered events: its topic, event count, a bar
+of its share of all events split by operation, the newest delivered change's LSN, how long ago that change committed
+and was delivered, and the topic's Kafka high-water mark (click a row for the offset per partition). The last-commit
+age turns amber when a table is more than 1 minute behind the freshest table and red past 10 minutes, only while the
+pipeline is streaming. Click a column header to sort. The checkpoint shown in the card header is global.
 
 A second row shows replication health: slot lag in bytes and the confirmed flush LSN, the age of the last heartbeat against its interval (amber past 2x, red past 5x), and how many heartbeats were skipped and why. These come from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. A field the server does not send shows `–`, and `off` means heartbeats are disabled. The age is measured against the browser clock, so a large clock skew between the browser and the container shifts it.
 

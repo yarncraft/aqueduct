@@ -74,10 +74,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // The tables card names each table's topic even when the inspector is off.
+    let router = inspector.router().clone();
     // The inspector shows row data, so it needs the admin token as well.
     let inspector = (cfg.inspector && cfg.admin_token.as_deref().is_some_and(|t| !t.is_empty()))
         .then_some(inspector);
     let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone(), inspector);
+    admin.set_router(router);
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin.clone()));
 
