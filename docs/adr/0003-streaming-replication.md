@@ -1,6 +1,6 @@
 # ADR 0003: Streaming replication for the Postgres source
 
-- Status: proposed (revised after Megatron's review of f1614cc; Lucas accepted the three recommendations)
+- Status: implemented (2026-10-20); `stream` is opt-in, the default is still `poll` (see "As built")
 - Issue: #58 (related: #57, #47, #63, ADR 0001)
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author)
 - Date: 2026-10-19
@@ -269,3 +269,21 @@ Order: T1 → T2 → T3 → T4 → T5 (docs ship with T3 where behaviour is user
    with the frame cap, the fuzzing and the auth requirements in §3, §6 and T1/T2.
 2. `stream` ships opt-in, and the default flips after the §8 numbers and a soak period: **accepted**.
 3. `poll` stays permanently, so #57 gets the cursor fix for `poll`: **accepted**.
+
+## As built (2026-10-20)
+
+T1 #111, T2 #131, T3 #132, T4 #135, T5 #136. Where the code differs from the text above:
+
+- **Transport trait** (§4, from #74): `fetch()` returns `(lsn, Message)` in WAL order and `confirm(commit_end_lsn)`;
+  keys are assigned in one place, `PostgresSource::apply`, for both transports, instead of the transport carrying
+  #99's key. A per-message key cannot express a multi-table TRUNCATE (one message, several keys), and one numbering
+  site is what keeps poll and stream equal. The decoding state (relation cache, transaction keys) lives on the
+  source because a stream fetch can end mid-transaction.
+- **Idle progress:** with `stream`, the idle heartbeat confirms the last keepalive's `wal_end` (everything committed
+  below it was received), not the server's WAL position, which a busy cluster always keeps ahead of it.
+- **Status updates** go out within 200 ms of an ack and at least every `wal_sender_timeout / 3` (at most 10 s).
+- **Channel binding (§6):** refused in every sslmode, not only `verify-full`, when the server offers `-PLUS` and no
+  `tls-server-end-point` hash can be computed.
+- **§8 numbers** (#136, dev laptop, postgres:16): stream 213k-269k events/s vs poll 32k-34k; idle single-row p99
+  1.5 ms vs ~60 ms; 1M-row transaction peak RSS 74-94 MiB vs ~581 MiB. All three criteria hold; the default stays
+  `poll` until the soak period of decision 2.

@@ -1,6 +1,7 @@
 # ADR 0001: Initial and incremental snapshots
 
-- Status: proposed
+- Status: implemented (2026-10-20). Approved by Lucas when he asked for every slice to be built; see
+  "As built" at the end for where the code differs from this text.
 - Issue: #46
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author)
 - Date: 2026-10-19
@@ -204,3 +205,26 @@ Order: 1 → 2/3 → 4 → 5 → 6, with 7 alongside 4. 8 can start after 1 and 
 2. Is "snapshots need Postgres 14+" acceptable? The alternative for 10–13 is a watermark table added to the
    publication, which needs write access and a publication change. Recommendation: 14+ only.
 3. Is write access to `aqueduct_watermarks` acceptable for MongoDB snapshots? Recommendation: yes, opt-in.
+
+## As built (2026-10-20)
+
+Slices: S1 #105, S2 #116 + #125, S3 #123, S4 #115, S5 + S7 + #91 #126, S6 #128, S9 #129, #92 #130, S8 #133, and the
+fix #134. Where the code differs from the text above:
+
+- **Modes:** `snapshot = "never" | "on_demand" | "initial"`. `on_demand` was added so the admin API can be used
+  without an initial snapshot (§5 had only `never` and `initial`).
+- **Postgres versions:** logical messages on 14+, or a watermark table (`snapshot_watermark_table`, #92) on 12 and
+  13. The source itself needs 12+ (10 lacks `pg_replication_slot_advance`, 11 runs out of relcache callback slots on
+  repeated peeks); the docs said 10+.
+- **Window keys** are the primary-key (or override) columns, looked up by name in the stream's Relation, not the
+  replica-identity key. A live change whose key cannot be read (an unsent TOAST key, a delete or key-changing
+  update the identity does not cover) makes the window return `Outcome::Retry`, and the chunk is read again with
+  backoff. This also covers `REPLICA IDENTITY FULL`.
+- **Chunk reads** use the simple query protocol (type text output, exactly as pgoutput sends it) with alias-qualified
+  columns; `::text` casts differ for some types (`true::text` is `true`, pgoutput sends `t`).
+- **Key overrides (#91)** must name a unique index of `NOT NULL` columns, or the table is skipped.
+- **Checkpoint:** `pos` is the full Postgres checkpoint text including the `;sys=;db=;tli=` origin stamp (#124).
+- **Chunk ids** start at a random value, so a watermark cannot be forged by guessing one.
+- **MongoDB** also needs `createIndex` on `aqueduct_watermarks` (a 24 h TTL index), writes watermarks with
+  `w: majority` and reads chunks with `readConcern: majority` in a causally consistent session; a collection whose
+  chunk read keeps failing is skipped instead of stopping the source.
