@@ -515,6 +515,16 @@ mod tests {
     }
 
     #[test]
+    fn read_events_get_a_read_op_header() {
+        let mut e = crate::sample();
+        e.op = Op::Read;
+        let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
+        assert_eq!(r.headers["op"], b"read");
+        let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "read");
+    }
+
+    #[test]
     fn record_has_key_headers_and_json_value() {
         let e = crate::sample();
         let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
