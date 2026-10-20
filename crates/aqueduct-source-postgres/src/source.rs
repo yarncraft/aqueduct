@@ -8,9 +8,18 @@ use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::tls::{self, SslMode};
+use aqueduct_core::{Checkpoint, SnapState};
 
-use crate::decoder::{decode, Message, RelationCache};
+use crate::catalog::read_catalog;
+use crate::decoder::{Message, RelationCache};
+use crate::snapshot::{
+    new_snapshot_id, table_id, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
+    MIN_SERVER_VERSION,
+};
+use crate::tls::{self, SslMode};
+#[cfg(test)]
+use crate::transport::{peek_sql, PEEK_SQL};
+use crate::transport::{PeekTransport, Transport};
 
 type Row = Box<RawValue>;
 
@@ -107,6 +116,14 @@ fn key_from_checkpoint(t: &str) -> Result<(Key, Stamp)> {
             "checkpoint {t:?} is not a Postgres checkpoint; it belongs to another source type"
         ))
     })
+}
+
+/// Splits checkpoint text into the resume key, its origin stamp and the snapshot progress it
+/// carries (ADR 0001 §4: `{"pos": <key text>, "snap": {...}}` while a snapshot runs).
+fn split_checkpoint(t: &str) -> Result<(Key, Stamp, Option<SnapState>)> {
+    let c = Checkpoint::decode(t).map_err(Error::Checkpoint)?;
+    let (key, stamp) = key_from_checkpoint(&c.pos)?;
+    Ok((key, stamp, c.snap))
 }
 
 /// What to do after a restore, PITR or failover of the same cluster, which cannot be told apart.
@@ -251,25 +268,6 @@ impl TxKeys {
     }
 }
 
-/// The peek query. `proto_version` stays 1 and `streaming` is never set: a streamed in-progress
-/// transaction has no commit LSN until it commits, so no [`Key`] could be built for its changes.
-const PEEK_SQL: &str = "SELECT lsn::text, data \
-     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
-     'proto_version', '1', 'publication_names', $3::text)";
-
-/// [`PEEK_SQL`] plus `messages`, so logical messages (snapshot watermarks) are sent. Postgres 14+.
-const PEEK_SQL_WITH_MESSAGES: &str = "SELECT lsn::text, data \
-     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
-     'proto_version', '1', 'publication_names', $3::text, 'messages', 'true')";
-
-fn peek_sql(logical_messages: bool) -> &'static str {
-    if logical_messages {
-        PEEK_SQL_WITH_MESSAGES
-    } else {
-        PEEK_SQL
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PostgresSourceConfig {
     /// libpq-style connection string / URL.
@@ -300,8 +298,11 @@ pub struct PostgresSourceConfig {
     /// check stays on.
     pub skip_system_check: bool,
     /// Ask the slot for logical messages (`'messages', 'true'`), which snapshots use as watermarks.
-    /// Needs Postgres 14+. Off by default, so the peek is unchanged.
+    /// Needs Postgres 14+. Off by default, so the peek is unchanged; any snapshot mode but
+    /// `Never` turns it on.
     pub logical_messages: bool,
+    /// Snapshots of existing rows (ADR 0001). Off by default.
+    pub snapshot: SnapshotConfig,
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -326,6 +327,7 @@ impl PostgresSourceConfig {
             heartbeat_action_query: None,
             skip_system_check: false,
             logical_messages: false,
+            snapshot: SnapshotConfig::default(),
         }
     }
 
@@ -345,7 +347,11 @@ impl PostgresSourceConfig {
 /// (at-least-once).
 pub struct PostgresSource {
     cfg: PostgresSourceConfig,
-    client: Option<Client>,
+    client: Option<Arc<Client>>,
+    /// Where decoded changes come from; set by `start`.
+    transport: Option<Box<dyn Transport>>,
+    /// The running snapshot, if any.
+    snapshot: Option<Engine>,
     buffer: VecDeque<ChangeEvent>,
     /// Highest key already queued; later peeks skip changes at or below it.
     emitted: Key,
@@ -380,6 +386,8 @@ impl PostgresSource {
         Self {
             cfg,
             client: None,
+            transport: None,
+            snapshot: None,
             buffer: VecDeque::new(),
             emitted: Key::default(),
             acked: 0,
@@ -535,7 +543,13 @@ impl PostgresSource {
 
     fn client(&self) -> Result<&Client> {
         self.client
-            .as_ref()
+            .as_deref()
+            .ok_or_else(|| Error::Source("source not started".into()))
+    }
+
+    fn transport(&mut self) -> Result<&mut Box<dyn Transport>> {
+        self.transport
+            .as_mut()
             .ok_or_else(|| Error::Source("source not started".into()))
     }
 
@@ -551,13 +565,7 @@ impl PostgresSource {
         if lsn <= self.acked {
             return Ok(());
         }
-        self.client()?
-            .execute(
-                "SELECT pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
-                &[&self.cfg.slot, &Position::Lsn(lsn).to_string()],
-            )
-            .await
-            .map_err(src_err)?;
+        self.transport()?.confirm(lsn).await?;
         self.acked = lsn;
         Ok(())
     }
@@ -573,10 +581,12 @@ impl PostgresSource {
         before: Option<Row>,
         after: Option<Row>,
         row_key: Option<String>,
-    ) {
-        if key > self.emitted {
-            self.emitted = key;
-            self.buffer.push_back(ChangeEvent {
+    ) -> bool {
+        let snap = self.snapshot.as_ref().map(|e| e.state().clone());
+        let checkpoint = self.checkpoint_text(key, snap);
+        self.push(
+            key,
+            ChangeEvent {
                 position: Position::Lsn(key.change),
                 xid,
                 commit_ts_micros,
@@ -586,8 +596,83 @@ impl PostgresSource {
                 before,
                 after,
                 key: row_key,
-                checkpoint: Some(Position::Text(encode_checkpoint(key, self.origin))),
-            });
+                checkpoint: Some(Position::Text(checkpoint)),
+            },
+        )
+    }
+
+    /// Queues `ev` unless a change with this key was queued before (a peek re-decodes from the
+    /// slot's confirmed position). Returns whether it was queued.
+    fn push(&mut self, key: Key, ev: ChangeEvent) -> bool {
+        if key <= self.emitted {
+            return false;
+        }
+        self.emitted = key;
+        self.buffer.push_back(ev);
+        true
+    }
+
+    /// Checkpoint text for `key`: the key with its origin, wrapped with the snapshot progress
+    /// while a snapshot runs, so both are saved in one atomic write.
+    fn checkpoint_text(&self, key: Key, snap: Option<SnapState>) -> String {
+        Checkpoint {
+            pos: encode_checkpoint(key, self.origin),
+            snap,
+        }
+        .encode()
+    }
+
+    /// Queues what closing a snapshot chunk produced, inside the high watermark's transaction:
+    /// each row gets the next key at the watermark's LSN, so the rows sort after every live change
+    /// of the window and the transaction's commit end covers them. Rows before the last carry the
+    /// progress from before the chunk (a crash part-way reads the chunk again: duplicates only),
+    /// the last row the new progress. A chunk without rows saves its progress with a heartbeat.
+    fn queue_closed(
+        &mut self,
+        closed: Closed,
+        before: SnapState,
+        lsn: u64,
+        keys: &mut TxKeys,
+        xid: u32,
+        ts: i64,
+    ) {
+        let n = closed.rows.len();
+        for (i, r) in closed.rows.into_iter().enumerate() {
+            let key = keys.next(lsn);
+            let snap = if i + 1 == n {
+                closed.state.clone()
+            } else {
+                Some(before.clone())
+            };
+            let checkpoint = self.checkpoint_text(key, snap);
+            self.push(
+                key,
+                ChangeEvent {
+                    position: Position::Lsn(lsn),
+                    xid,
+                    commit_ts_micros: ts,
+                    schema: r.schema,
+                    table: r.table,
+                    op: Op::Read,
+                    before: None,
+                    after: Some(r.row),
+                    key: r.key,
+                    checkpoint: Some(Position::Text(checkpoint)),
+                },
+            );
+        }
+        if n == 0 && closed.state.as_ref() != Some(&before) {
+            let checkpoint = self.checkpoint_text(self.emitted, closed.state.clone());
+            let mut hb = ChangeEvent::heartbeat(Position::Lsn(lsn), ts);
+            hb.checkpoint = Some(Position::Text(checkpoint));
+            self.buffer.push_back(hb);
+        }
+        if closed.state.is_none() {
+            if let Some(e) = &self.snapshot {
+                let st = e.status();
+                tracing::info!(snapshot = %st.id, rows = st.rows, "snapshot finished");
+            }
+            self.snapshot = None;
         }
     }
 
@@ -640,9 +725,11 @@ impl PostgresSource {
     /// Finishes a heartbeat after the peek was processed. Advances the slot only when nothing
     /// is queued or awaiting a checkpoint; see [`heartbeat_targets`].
     async fn heartbeat_end(&mut self, wal: u64, drained: bool) -> Result<()> {
+        // A chunk in flight counts as queued: its watermarks and rows are not delivered yet.
+        let in_flight = self.snapshot.as_ref().is_some_and(|e| e.in_flight());
         let targets = heartbeat_targets(
             &mut self.tx_ends,
-            drained && self.buffer.is_empty(),
+            drained && self.buffer.is_empty() && !in_flight,
             self.checkpointed,
             wal,
         );
@@ -658,30 +745,21 @@ impl PostgresSource {
     async fn poll(&mut self) -> Result<()> {
         let heartbeat_wal = self.heartbeat_begin().await?;
         self.refresh_slot_stats().await;
-        let rows = self
-            .client()?
-            .query(
-                peek_sql(self.cfg.logical_messages),
-                &[&self.cfg.slot, &self.cfg.batch_size, &self.cfg.publication],
-            )
-            .await
-            .map_err(src_err)?;
-        // `upto_nchanges` ends a capped peek at the first commit past the limit, possibly well
-        // below `heartbeat_wal`. Only a peek that returned fewer rows than the cap saw everything.
-        // A peek that reached the end can still return `batch_size` rows or more (it stops at a
-        // commit boundary); that only delays the jump to `wal` by one interval, never skips data.
-        let drained = i64::try_from(rows.len()).is_ok_and(|n| n < i64::from(self.cfg.batch_size));
+        let fetched = self.transport()?.fetch().await?;
+        self.apply(fetched.messages)?;
+        if let Some(wal) = heartbeat_wal {
+            self.heartbeat_end(wal, fetched.drained).await?;
+        }
+        Ok(())
+    }
 
+    /// Turns decoded messages into queued events. This is the one place where changes get their
+    /// [`Key`], for every transport.
+    fn apply(&mut self, messages: Vec<(u64, Message)>) -> Result<()> {
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
         let mut keys = TxKeys::default();
-        for row in rows {
-            // Borrow from the result buffer instead of copying each change out of it.
-            let lsn_text: &str = row.get(0);
-            let data: &[u8] = row.get(1);
-            let lsn = parse_lsn(lsn_text)?;
-            let msg = decode(data)
-                .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
+        for (lsn, msg) in messages {
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
                 Message::Begin {
@@ -704,6 +782,9 @@ impl PostgresSource {
                             "REPLICA IDENTITY FULL: with partition_by = key this table uses the table key (per-table order only)"
                         );
                     }
+                    if let Some(e) = self.snapshot.as_mut() {
+                        e.relation(&table_id(&rel.schema, &rel.name), &rel);
+                    }
                     cache.insert(rel)
                 }
                 Message::Insert { relation, new } => {
@@ -712,7 +793,12 @@ impl PostgresSource {
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let row_key = cache.key(relation, &new).map_err(dec)?;
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Insert, None, after, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(&id, Live::Insert { rel: r, new: &new });
+                        }
+                    }
                 }
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
@@ -721,12 +807,25 @@ impl PostgresSource {
                         .key_with_old(relation, &new, old.as_ref())
                         .map_err(dec)?;
                     let before = old
-                        .map(|t| cache.row(relation, &t))
+                        .as_ref()
+                        .map(|t| cache.row(relation, t))
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Update, before, after, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Update, before, after, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(
+                                &id,
+                                Live::Update {
+                                    rel: r,
+                                    old: old.as_ref(),
+                                    new: &new,
+                                },
+                            );
+                        }
+                    }
                 }
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
@@ -734,14 +833,24 @@ impl PostgresSource {
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
                     let row_key = cache.key(relation, &old).map_err(dec)?;
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Delete, before, None, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(&id, Live::Delete { rel: r, old: &old });
+                        }
+                    }
                 }
                 Message::Truncate { relations } => {
-                    for id in relations {
-                        let r = cache.get(id).map_err(dec)?;
+                    for rel_id in relations {
+                        let r = cache.get(rel_id).map_err(dec)?;
                         let name = (r.schema.clone(), r.name.clone());
                         let key = keys.next(lsn);
-                        self.queue(key, xid, ts, name, Op::Truncate, None, None, None);
+                        let id = table_id(&name.0, &name.1);
+                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None) {
+                            if let Some(e) = self.snapshot.as_mut() {
+                                e.observe(&id, Live::Truncate);
+                            }
+                        }
                     }
                 }
                 Message::Commit { end_lsn, .. } => {
@@ -754,12 +863,88 @@ impl PostgresSource {
                         self.tx_ends.push_back((end, end_lsn));
                     }
                 }
-                // Nothing consumes watermarks yet; the snapshot engine will.
-                Message::Logical(_) | Message::Ignored => {}
+                Message::Logical(l) => {
+                    // Watermarks of this slot close snapshot chunks; any other message (another
+                    // slot's, another tool's, a non-transactional one) is not ours.
+                    let (Some(wm), Some(e)) =
+                        (l.watermark_for(&self.cfg.slot), self.snapshot.as_mut())
+                    else {
+                        continue;
+                    };
+                    let before = e.state().clone();
+                    if let Some(closed) = e.mark(&wm)? {
+                        self.queue_closed(closed, before, l.lsn, &mut keys, xid, ts);
+                    }
+                }
+                Message::Ignored => {}
             }
         }
-        if let Some(wal) = heartbeat_wal {
-            self.heartbeat_end(wal, drained).await?;
+        Ok(())
+    }
+
+    /// Sets up the snapshot this start needs: resumes the one the checkpoint carries, or starts
+    /// the initial one when there is no checkpoint. Fails when snapshots are on but the server
+    /// cannot send watermarks; that is checked here, never in the poll loop.
+    async fn start_snapshot(&mut self, resume: Option<SnapState>, first_start: bool) -> Result<()> {
+        let cfg = self.cfg.snapshot.clone();
+        if cfg.mode == SnapshotMode::Never {
+            if let Some(s) = resume {
+                tracing::warn!(
+                    snapshot = %s.id,
+                    "the checkpoint carries an unfinished snapshot, but snapshot = \"never\"; \
+                     it is abandoned (rows not copied yet are not delivered)"
+                );
+            }
+            return Ok(());
+        }
+        let catalog = read_catalog(self.client()?, &self.cfg.publication).await?;
+        if catalog.server_version_num < MIN_SERVER_VERSION {
+            return Err(Error::Config(format!(
+                "postgres.snapshot = {:?} needs Postgres 14 or newer for its watermarks; this server is {}",
+                cfg.mode, catalog.server_version_num
+            )));
+        }
+        let allowed: bool = self
+            .client()?
+            .query_one(
+                // By OID, not signature: PG17 added a fourth argument (`flush`).
+                "SELECT COALESCE(bool_or(has_function_privilege(p.oid, 'EXECUTE')), false)                  FROM pg_proc p WHERE p.proname = 'pg_logical_emit_message'                  AND p.pronamespace = 'pg_catalog'::regnamespace AND p.proargtypes[1] = 'text'::regtype",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        if !allowed {
+            return Err(Error::Config(
+                "snapshots write watermarks with pg_logical_emit_message(); grant EXECUTE on it to \
+                 the Aqueduct role, or set postgres.snapshot = \"never\""
+                    .into(),
+            ));
+        }
+        self.cfg.logical_messages = true;
+        let state = match resume {
+            Some(s) => Some(s),
+            None if first_start && cfg.mode == SnapshotMode::Initial => Some(SnapState {
+                id: new_snapshot_id(),
+                tables: catalog
+                    .tables
+                    .iter()
+                    .map(|t| table_id(&t.schema, &t.name))
+                    .collect(),
+                table: 0,
+                after: None,
+            }),
+            None => None,
+        };
+        if let Some(state) = state {
+            let id = state.id.clone();
+            self.snapshot = Engine::new(&self.cfg.slot, state, &catalog, &cfg);
+            match &self.snapshot {
+                Some(e) => {
+                    tracing::info!(snapshot = %id, tables = e.state().tables.len(), "snapshot running")
+                }
+                None => tracing::info!(snapshot = %id, "nothing to snapshot"),
+            }
         }
         Ok(())
     }
@@ -769,7 +954,7 @@ impl PostgresSource {
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
         let client = self.connect().await?;
-        self.client = Some(client);
+        self.client = Some(Arc::new(client));
         if let Some(m) = &self.metrics {
             m.heartbeat_configured(self.cfg.heartbeat_interval);
         }
@@ -786,9 +971,14 @@ impl Source for PostgresSource {
         }
         let origin = self.read_origin().await?;
         self.origin = Some(origin);
-        let stamp = match &start {
-            Some(Position::Text(t)) => Some(key_from_checkpoint(t)?.1),
+        let parsed = match &start {
+            Some(Position::Text(t)) => Some(split_checkpoint(t)?),
             // A plain-LSN checkpoint predates keys and records no origin.
+            Some(Position::Lsn(_)) => None,
+            None => None,
+        };
+        let stamp = match &start {
+            Some(Position::Text(_)) => parsed.as_ref().map(|p| p.1),
             Some(Position::Lsn(_)) => Some(Stamp::default()),
             None => None,
         };
@@ -844,6 +1034,7 @@ impl Source for PostgresSource {
         // The checkpoint can be ahead of the slot if we crashed between save and ack, and
         // the slot replays whole transactions: skip changes already delivered.
         // A recreated slot starts a new stream, so the old checkpoint no longer applies.
+        let first_start = start.is_none();
         if let (Some(pos), false) = (start, recreated) {
             match pos {
                 Position::Lsn(l) => {
@@ -865,7 +1056,7 @@ impl Source for PostgresSource {
                     );
                 }
                 Position::Text(t) => {
-                    let (k, stamp) = key_from_checkpoint(&t)?;
+                    let (k, stamp, _) = split_checkpoint(&t)?;
                     // Same guard as for a plain LSN, on the commit LSN. `check_origin` already
                     // refused another cluster, so a recorded `sys` means a restore of this one.
                     if let Some(wal) = self.wal_position().await? {
@@ -880,6 +1071,20 @@ impl Source for PostgresSource {
                 }
             }
         }
+        // A recreated slot starts a new stream, so an old snapshot's progress no longer applies.
+        let resume = parsed.and_then(|p| p.2).filter(|_| !recreated);
+        self.start_snapshot(resume, first_start).await?;
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| Error::Source("source not started".into()))?;
+        self.transport = Some(Box::new(PeekTransport {
+            client,
+            slot: self.cfg.slot.clone(),
+            publication: self.cfg.publication.clone(),
+            batch_size: self.cfg.batch_size,
+            logical_messages: self.cfg.logical_messages,
+        }));
         Ok(())
     }
 
@@ -888,9 +1093,25 @@ impl Source for PostgresSource {
             if let Some(ev) = self.buffer.pop_front() {
                 return Ok(Some(ev));
             }
+            // The next chunk starts only when everything before it is handed on, so memory stays
+            // at one chunk.
+            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref()) {
+                if e.due() {
+                    e.start_chunk(c).await?;
+                }
+            }
             self.poll().await?;
             if self.buffer.is_empty() {
-                tokio::time::sleep(self.cfg.poll_interval).await;
+                // A chunk in flight waits for its high watermark: poll again soon, but not in a
+                // hot loop (the watermark may not be flushed yet). A due chunk starts at once.
+                let pause = match &self.snapshot {
+                    Some(e) if e.due() => Duration::ZERO,
+                    Some(e) if e.in_flight() => {
+                        Duration::from_millis(20).min(self.cfg.poll_interval)
+                    }
+                    _ => self.cfg.poll_interval,
+                };
+                tokio::time::sleep(pause).await;
             }
         }
     }
@@ -904,7 +1125,9 @@ impl Source for PostgresSource {
         // cannot be placed in the commit order, so acking one would be a guess.
         match position {
             Position::Text(t) => {
-                let (k, _) = parse_checkpoint(&t)
+                let (k, _) = Checkpoint::decode(&t)
+                    .ok()
+                    .and_then(|c| parse_checkpoint(&c.pos))
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
                 self.advance_acked(k).await
@@ -921,7 +1144,7 @@ impl Source for PostgresSource {
 /// (`UnknownIssuer`, "server does not support TLS", ...) is only reachable via `source()`.
 /// A server error contributes its SQLSTATE and message only: DETAIL/HINT can carry row values
 /// and would otherwise reach `last_error`, `/api/metrics` and the logs.
-fn src_err(e: tokio_postgres::Error) -> Error {
+pub(crate) fn src_err(e: tokio_postgres::Error) -> Error {
     if let Some(db) = e.as_db_error() {
         return Error::Source(format!("{e}: {} {}", db.code().code(), db.message()));
     }

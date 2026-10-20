@@ -87,6 +87,13 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Postgres snapshots: copy rows that already exist while changes stream** (#74, ADR 0001). New `[postgres]` keys
+  `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and
+  `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
+  Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
+  - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+  - While a snapshot runs the checkpoint file holds JSON (`{"pos": ..., "snap": {...}}`); a version without snapshots
+    refuses it. Let a snapshot finish before rolling back, or delete the checkpoint.
 - **Cockpit replication-health tiles** (#54, UI half). Slot lag, last-heartbeat age and skipped heartbeats, read from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. Each tile shows `–` until the server reports the field, so this ships independently of the backend half.
 - **Postgres idle heartbeat** (#47). Writes to tables outside the publication no longer pin WAL: every `heartbeat_interval_secs`
   (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is
