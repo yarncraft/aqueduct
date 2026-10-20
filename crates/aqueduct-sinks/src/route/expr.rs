@@ -1138,6 +1138,29 @@ impl Template {
             .collect()
     }
 
+    /// True when some values for the placeholders, each non-empty and accepted by `check`, render
+    /// exactly `s`. The inverse of [`Template::render_checked`].
+    pub fn matches(&self, s: &str, check: impl Fn(&FieldRef, &str) -> bool) -> bool {
+        fn go(parts: &[Part], s: &str, check: &dyn Fn(&FieldRef, &str) -> bool) -> bool {
+            match parts.split_first() {
+                None => s.is_empty(),
+                Some((Part::Lit(l), rest)) => s
+                    .strip_prefix(l.as_str())
+                    .is_some_and(|tail| go(rest, tail, check)),
+                Some((Part::Field(f), rest)) => s
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(s.len()))
+                    .filter(|&end| end > 0)
+                    .any(|end| {
+                        s.get(..end).is_some_and(|v| check(f, v))
+                            && s.get(end..).is_some_and(|tail| go(rest, tail, check))
+                    }),
+            }
+        }
+        go(&self.parts, s, &check)
+    }
+
     /// Fills the placeholders. Strings insert their content, numbers and booleans their JSON text.
     pub fn render(&self, view: &EventView<'_>) -> Result<String, TemplateError> {
         self.render_checked(view, |_, _| true)

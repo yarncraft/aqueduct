@@ -241,7 +241,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
-| `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (topics that already match a template count). Beyond it, events go to the route's `topic_fallback`. See [Routing by row content](#routing-by-row-content) |
+| `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
 | `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
 | `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup |
 
@@ -405,16 +405,36 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   - No fixed topic in the config may match the template read as a glob (`orders.{row.region}` is `orders.*`): not
     another route's `topic`, `sink.topic`, another route's `topic_fallback` or `dead_letter_topic`. Only the route's
     own fallback may (`orders.unknown` above).
+  - The template read as a glob may not overlap another template's glob that has no row field (a route `topic` or
+    `sink.topic` with `{schema}`, `{table}` or `{op}`). For example, `cdc.{row.kind}` next to `cdc.{table}` is
+    refused: a row with `kind = "customers"` would write into the `cdc.customers` topic of the other route. Give the
+    content-routed template fixed text that no other template produces.
   - `topic_values`, if set, is a non-empty list of values that are each a valid segment (below).
   - `topic_fallback` and `topic_values` on a topic that reads no row field fail startup.
 - **At runtime** each substituted row value must be one segment, `[A-Za-z0-9_-]{1,64}`: no dots (`x.payments` is
   refused), no spaces, nothing empty. The event goes to `topic_fallback`, and counts under `fallback`, when a field is
   null or missing (a truncate has no row), is an object or array, breaks the segment rule, is not in `topic_values`, the
   topic name would be invalid, or the topic would be new beyond `max_dynamic_topics`. Its key and value are unchanged.
-  The first fallback per route is logged once with the reason (the field path, never the value). Content routing never
-  fails the pipeline or sends events to the dead-letter topic.
-- **`max_dynamic_topics`** counts the topics on the broker that match a content-routed template's glob (excluding the
-  fixed topics above) when the sink starts, plus every new one since. So the cap holds across restarts, and a crash loop
+  The first fallback per route is logged once with the reason (the field path, never the value). Content routing
+  never sends events to the dead-letter topic.
+- **Topics Kafka refuses go to the fallback too.** Kafka refuses a new topic whose name equals an existing one once
+  `.` and `_` are treated as the same (`orders.eu` while `orders_eu` exists, or `events.a_b.c` then `events.a.b_c`).
+  Aqueduct keeps the broker's topic names from startup, plus every topic it opens or creates. It sends a value that
+  would hit such a name to the fallback without trying to create it. If the broker still refuses the create with
+  `InvalidTopicException`, `PolicyViolation`, `TopicAuthorizationFailed` or `ClusterAuthorizationFailed`, the record
+  goes to the fallback and counts under `fallback`, and Aqueduct logs a warning once per route (with the template, not
+  the value). These refusals cannot change on a retry. Any other create error (broker down, timeout) fails the batch,
+  which is retried, as for every other topic: delivery stays at-least-once. A failed or refused create holds no
+  `max_dynamic_topics` slot.
+- **Without create rights**, pre-create the topics and set `max_dynamic_topics = 0` or `topic_values`, so Aqueduct
+  only uses topics that exist. Otherwise every new value goes to the fallback after a refused create.
+- **Row values appear in topic names.** A content-routed topic's name holds the row value (`orders.eu`). Kafka shows
+  it to everyone who can list topics, and it appears in broker logs and in Aqueduct's error messages for that topic
+  (a failed produce or create). Do not route by a column you would not show to that audience.
+- **`max_dynamic_topics`** counts the topics on the broker that a content-routed template could produce when the sink
+  starts: each placeholder part is one valid segment (and in `topic_values`), and the topic is not one of the fixed
+  topics above. Every new topic since then counts too. So `orders.a.b` or an over-long name does not count against
+  `orders.{row.region}`. So the cap holds across restarts, and a crash loop
   cannot create more topics on each start. Topics that exist already are always used, even above the cap. A topic
   someone else created that matches the glob counts too. When the cap is reached, Aqueduct logs a warning once.
 - **Ordering.** Order holds per key within one topic. If a row's routing field changes, its later events go to another
@@ -473,6 +493,8 @@ without it the column shows `–`.
 Events and Delivered count every event the source delivered for the table, including events a route filtered
 (`ops`, `where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
 recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
+A table whose route picks the topic per event (`{op}` or a row field in `topic`) has no single topic to read
+offsets from: its Topic column shows the template, and Kafka HWM says `content-routed (see Routing)`.
 
 `GET /api/tables` (Bearer token) returns:
 

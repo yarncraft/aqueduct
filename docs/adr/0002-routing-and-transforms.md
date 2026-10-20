@@ -335,11 +335,22 @@ Content routing (#82):
   valid Kafka name (longer than 249 bytes) also goes to the fallback.
 - **Collision rule.** Fixed topics are a static route `topic`, a static `sink.topic`, every `topic_fallback` and
   `sink.dead_letter_topic`. None may match a content-routed template's glob, except that route's own fallback (the §2
-  example `orders.unknown` for `orders.{row.region}`). Overlaps between two templates are not checked.
+  example `orders.unknown` for `orders.{row.region}`). A content-routed template's glob may also not intersect the glob
+  of a template without row fields (`cdc.{row.kind}` next to `cdc.{table}`), so a row value cannot write into another
+  route's topics. Overlaps between two content-routed templates are not checked.
 - **The cap** is one count across all content-routed templates. At connect the sink lists the broker's topics and
-  counts those matching a template glob, minus the fixed topics. Existing topics are always usable. A new topic is
-  counted when the plan first routes to it, before it is created. A failed create is counted until the next restart's
-  re-count.
+  counts those a template could render: each placeholder part one valid segment (and in `topic_values`), not a fixed
+  topic, not produced by a template without row fields. Existing topics are always usable. A new topic is counted when
+  the plan first routes to it. A failed or refused create releases the slot. A value that renders a fixed topic (the
+  route's own fallback) goes to the fallback without taking a slot. `max_dynamic_topics = 0` allows existing topics
+  only.
+- **Names Kafka refuses never stall the pipeline.** Kafka refuses a topic that equals an existing one once `.` and `_`
+  are the same. The plan keeps the `.`-to-`_` form of every broker topic listed at connect, every fixed topic, and
+  every topic opened or admitted since. It sends a name that collides under another spelling to the fallback. If the
+  broker still refuses a create for a reason a retry cannot change (`InvalidTopicException`, `PolicyViolation`,
+  `TopicAuthorizationFailed`, `ClusterAuthorizationFailed`), `send_batch` re-routes that record to the fallback (counted
+  under `fallback`), frees the name and logs a warning once per route. Other create errors still fail the batch, so
+  delivery stays at-least-once.
 - **The leading-`_` rule applies only when content routing is in use**, so "Breaking: none" holds. Once any route's
   topic reads a row field, no route `topic`, `sink.topic` or fallback may start with `_`. Without one, such topics are
   accepted as before. The dead-letter topic's `_` check is R3's and applies always.

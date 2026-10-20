@@ -1,6 +1,6 @@
 //! The compiled routing table and its pure `render` step.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -60,6 +60,16 @@ pub struct OutRecord {
     /// Headers besides `op` and `lsn`, e.g. `aqueduct-error` on a dead-letter record. Never row
     /// data. Empty (no allocation) on the normal path.
     pub headers: Vec<(&'static str, String)>,
+    /// Set when `topic` was chosen from row content: if the broker refuses to create it, the sink
+    /// sends the record to this route's fallback instead ([`RoutePlan::topic_refused`]).
+    pub content: Option<ContentTopic>,
+}
+
+/// The route and fallback of a record whose topic came from row content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentTopic {
+    pub route: usize,
+    pub fallback: String,
 }
 
 /// The longest value one placeholder of a content-routed topic may substitute.
@@ -137,12 +147,40 @@ fn valid_segment(v: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
-/// The topics content routing created or found, counted against `sink.max_dynamic_topics`.
-/// Shared by every clone of a plan; the sink seeds it from the broker at connect.
+/// Kafka refuses a topic whose name equals an existing one once `.` and `_` are made the same
+/// (the two collide in its metric names).
+fn collision_key(topic: &str) -> String {
+    topic.replace('.', "_")
+}
+
+/// Why a content-routed topic cannot be used.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Yes,
+    /// Another topic has the same name up to `.` vs `_`; Kafka would refuse to create this one.
+    Collides,
+    /// New, and `sink.max_dynamic_topics` is reached.
+    Cap,
+}
+
+#[derive(Debug, Default)]
+struct TopicNames {
+    /// Content-routed topics counted against the cap: found on the broker or admitted since.
+    counted: HashSet<String>,
+    /// Topics known to exist (the broker's at connect, the fixed ones, every one opened since),
+    /// which are never un-counted.
+    existing: HashSet<String>,
+    /// [`collision_key`] -> the spelling that holds it: every existing and counted topic.
+    keys: HashMap<String, String>,
+}
+
+/// The topics content routing created or found, counted against `sink.max_dynamic_topics`, and
+/// every topic name known to exist, to refuse a new name Kafka would reject. Shared by every
+/// clone of a plan; the sink seeds it from the broker at connect.
 #[derive(Debug)]
 struct DynamicTopics {
     cap: AtomicUsize,
-    known: RwLock<HashSet<String>>,
+    names: RwLock<TopicNames>,
     warned: AtomicBool,
 }
 
@@ -150,47 +188,83 @@ impl DynamicTopics {
     fn new() -> Self {
         Self {
             cap: AtomicUsize::new(DEFAULT_MAX_DYNAMIC_TOPICS),
-            known: RwLock::new(HashSet::new()),
+            names: RwLock::new(TopicNames::default()),
             warned: AtomicBool::new(false),
         }
     }
 
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, TopicNames> {
+        self.names.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn len(&self) -> usize {
-        self.known.read().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
-    /// Adds topics that exist already; they always stay usable, even above the cap.
-    fn add(&self, topics: impl IntoIterator<Item = String>) {
-        let mut w = self.known.write().unwrap_or_else(|e| e.into_inner());
-        w.extend(topics);
-    }
-
-    /// True when `topic` is known, or is new and the cap leaves room (it is then counted).
-    fn admit(&self, topic: &str) -> bool {
-        if self
-            .known
+        self.names
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .counted
+            .len()
+    }
+
+    /// Notes topics that exist; `counted` ones also count against the cap and stay usable,
+    /// even above it.
+    fn exists<'a>(&self, topics: impl IntoIterator<Item = (&'a str, bool)>) {
+        let mut w = self.write();
+        for (t, counted) in topics {
+            w.existing.insert(t.to_string());
+            w.keys
+                .entry(collision_key(t))
+                .or_insert_with(|| t.to_string());
+            if counted {
+                w.counted.insert(t.to_string());
+            }
+        }
+    }
+
+    /// Whether a content-routed `topic` may be used; a new one is counted.
+    fn admit(&self, topic: &str) -> Admit {
+        if self
+            .names
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .counted
             .contains(topic)
         {
-            return true;
+            return Admit::Yes;
         }
-        let mut w = self.known.write().unwrap_or_else(|e| e.into_inner());
-        if w.contains(topic) {
-            return true;
+        let mut w = self.write();
+        if w.counted.contains(topic) {
+            return Admit::Yes;
+        }
+        let key = collision_key(topic);
+        if w.keys.get(&key).is_some_and(|held| held != topic) {
+            return Admit::Collides;
         }
         let cap = self.cap.load(Ordering::Relaxed);
-        if w.len() >= cap {
+        if w.counted.len() >= cap {
             if !self.warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     max_dynamic_topics = cap,
                     "sink.max_dynamic_topics reached: events that would create another content-routed topic go to their route's topic_fallback"
                 );
             }
-            return false;
+            return Admit::Cap;
         }
-        w.insert(topic.to_string());
-        true
+        w.counted.insert(topic.to_string());
+        w.keys.insert(key, topic.to_string());
+        Admit::Yes
+    }
+
+    /// Releases an admitted topic that could not be created, so it holds no cap slot and no name.
+    fn release(&self, topic: &str) {
+        let mut w = self.write();
+        if w.existing.contains(topic) {
+            return;
+        }
+        w.counted.remove(topic);
+        let key = collision_key(topic);
+        if w.keys.get(&key).is_some_and(|held| held == topic) {
+            w.keys.remove(&key);
+        }
     }
 }
 
@@ -300,6 +374,8 @@ pub struct RouteStats {
     error_logged: Vec<AtomicBool>,
     /// Per route, whether the first event sent to `topic_fallback` was logged.
     fallback_logged: Vec<AtomicBool>,
+    /// Per route, whether the first refused topic create was logged.
+    refused_logged: Vec<AtomicBool>,
 }
 
 /// The outcome counters of one route. Every event a route claims counts `matched`, then exactly
@@ -357,6 +433,7 @@ impl RouteStats {
             fields,
             error_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             fallback_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
+            refused_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             names,
         }
     }
@@ -477,6 +554,8 @@ pub struct RoutePlan {
     source: SourceInfo,
     stats: Arc<RouteStats>,
     dynamic: Arc<DynamicTopics>,
+    /// [`RoutePlan::static_topics`], computed once.
+    fixed: Vec<String>,
 }
 
 /// A Kafka topic name: 1 to 249 of `[A-Za-z0-9._-]`, and not `.` or `..`.
@@ -510,6 +589,40 @@ fn parse_ops(name: &str, ops: &[String]) -> Result<Vec<Op>> {
         }
     }
     Ok(out)
+}
+
+/// Whether a content-routed template may substitute `v` for `f`: row fields must be one segment
+/// and in `topic_values`; `{schema}`, `{table}` and `{op}` are not checked.
+fn value_allowed(r: &CompiledRoute, f: &FieldRef, v: &str) -> bool {
+    f.column().is_none()
+        || (valid_segment(v)
+            && r.topic_values
+                .as_ref()
+                .is_none_or(|vals| vals.iter().any(|a| a == v)))
+}
+
+/// True when some string matches both globs (`*` matches any run of characters).
+fn globs_intersect(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // memo[i][j]: Some(result) for the suffixes a[i..] and b[j..].
+    let mut memo = vec![vec![None; b.len() + 1]; a.len() + 1];
+    fn go(a: &[u8], b: &[u8], i: usize, j: usize, memo: &mut Vec<Vec<Option<bool>>>) -> bool {
+        if let Some(r) = memo[i][j] {
+            return r;
+        }
+        let r = if i == a.len() && j == b.len() {
+            true
+        } else if i < a.len() && a[i] == b'*' {
+            go(a, b, i + 1, j, memo) || (j < b.len() && go(a, b, i, j + 1, memo))
+        } else if j < b.len() && b[j] == b'*' {
+            go(a, b, i, j + 1, memo) || (i < a.len() && go(a, b, i + 1, j, memo))
+        } else {
+            i < a.len() && j < b.len() && a[i] == b[j] && go(a, b, i + 1, j + 1, memo)
+        };
+        memo[i][j] = Some(r);
+        r
+    }
+    go(a, b, 0, 0, &mut memo)
 }
 
 /// Parses a topic or topic template. Fixed text must be valid in a Kafka topic name (Kafka would
@@ -632,8 +745,32 @@ fn check_collisions(
     if let Some(d) = dead_letter {
         fixed.push((d, "sink.dead_letter_topic".into(), None));
     }
+    // Topics a `{schema}`/`{table}`/`{op}` template writes: a row value must not reach them either.
+    let plain: Vec<(String, &str, String)> = routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.topic.reads_row && !r.topic.is_static())
+        .map(|(i, r)| {
+            (
+                r.topic.glob(),
+                r.topic.raw.as_str(),
+                format!("route `{}`'s `topic`", names[i]),
+            )
+        })
+        .chain(
+            default
+                .filter(|d| !d.is_static())
+                .map(|d| (d.glob(), d.raw.as_str(), "sink.topic".to_string())),
+        )
+        .collect();
     for (i, r) in routes.iter().enumerate().filter(|(_, r)| r.topic.reads_row) {
         let glob = r.topic.glob();
+        if let Some((other, raw, what)) = plain.iter().find(|(g, _, _)| globs_intersect(&glob, g)) {
+            return Err(Error::Config(format!(
+                "sink route `{}`: `topic` `{}` (as the glob `{glob}`) overlaps {what} `{raw}` (as `{other}`): a row value could write into that route's topics. Give the content-routed template a fixed text no other template can produce",
+                names[i], r.topic.raw
+            )));
+        }
         if let Some((topic, what, _)) = fixed
             .iter()
             .find(|(t, _, owner)| *owner != Some(i) && glob_match(&glob, t))
@@ -799,7 +936,7 @@ impl RoutePlan {
             default.as_ref(),
             dead_letter_topic.as_deref(),
         )?;
-        Ok(Self {
+        let mut plan = Self {
             routes: compiled,
             default,
             dead_letter: dead_letter_topic,
@@ -807,7 +944,13 @@ impl RoutePlan {
             source: SourceInfo::default(),
             stats: Arc::new(RouteStats::new(names, fields)),
             dynamic: Arc::new(DynamicTopics::new()),
-        })
+            fixed: Vec::new(),
+        };
+        plan.fixed = plan.static_topics();
+        // A content-routed name must not collide (`.` vs `_`) with a fixed topic either.
+        plan.dynamic
+            .exists(plan.fixed.iter().map(|t| (t.as_str(), false)));
+        Ok(plan)
     }
 
     /// `sink.max_dynamic_topics`: how many content-routed topics may exist, counting the ones
@@ -821,24 +964,36 @@ impl RoutePlan {
     /// (fallbacks, `sink.topic`, the dead-letter topic). They count against the cap and stay
     /// usable. Returns how many content-routed topics are counted now.
     pub fn add_existing_topics<'a>(&self, listed: impl IntoIterator<Item = &'a str>) -> usize {
-        let globs: Vec<String> = self
-            .routes
-            .iter()
-            .filter(|r| r.topic.reads_row)
-            .map(|r| r.topic.glob())
-            .collect();
-        if globs.is_empty() {
+        if !self.routes.iter().any(|r| r.topic.reads_row) {
             return 0;
         }
-        let fixed = self.static_topics();
-        self.dynamic.add(
+        // Every listed name is kept for the `.`/`_` collision check; only names a row could
+        // actually render count against the cap.
+        self.dynamic.exists(
             listed
                 .into_iter()
-                .filter(|t| globs.iter().any(|g| glob_match(g, t)))
-                .filter(|t| !fixed.contains(t))
-                .map(str::to_string),
+                .map(|t| (t, !self.fixed.iter().any(|f| f == t) && self.producible(t))),
         );
         self.dynamic.len()
+    }
+
+    /// True when a content-routed template renders `topic` for some row: every row placeholder
+    /// matches an allowed segment. Topics a `{schema}`/`{table}` template could write are not
+    /// content-routed (startup rejects templates whose globs overlap, so this is a safeguard).
+    fn producible(&self, topic: &str) -> bool {
+        let plain = self
+            .routes
+            .iter()
+            .map(|r| &r.topic)
+            .chain(self.default.as_ref())
+            .filter(|t| !t.reads_row && !t.is_static());
+        if plain.into_iter().any(|t| glob_match(&t.glob(), topic)) {
+            return false;
+        }
+        self.routes
+            .iter()
+            .filter(|r| r.topic.reads_row)
+            .any(|r| r.topic.parsed.matches(topic, |f, v| value_allowed(r, f, v)))
     }
 
     /// Content-routed topics counted against `sink.max_dynamic_topics`.
@@ -848,7 +1003,7 @@ impl RoutePlan {
 
     /// Every fixed topic name in the plan: static route topics, a static `sink.topic`, the
     /// fallbacks and the dead-letter topic.
-    fn static_topics(&self) -> Vec<&str> {
+    fn static_topics(&self) -> Vec<String> {
         self.routes
             .iter()
             .map(|r| &r.topic)
@@ -857,6 +1012,7 @@ impl RoutePlan {
             .map(|t| t.raw.as_str())
             .chain(self.fallback_topics())
             .chain(self.dead_letter.as_deref())
+            .map(str::to_string)
             .collect()
     }
 
@@ -991,6 +1147,7 @@ impl RoutePlan {
         // The record key and the partition input, when the route sets its own key.
         let mut route_key = None;
         let mut outcome = &self.stats.produced;
+        let mut content = None;
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
@@ -1020,7 +1177,15 @@ impl RoutePlan {
                 }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
                 match self.content_topic(route, r, &view) {
-                    Ok(topic) => topic,
+                    Ok((topic, from_row)) => {
+                        if from_row {
+                            content = r
+                                .topic_fallback
+                                .clone()
+                                .map(|fallback| ContentTopic { route, fallback });
+                        }
+                        topic
+                    }
                     Err(fallback) => {
                         outcome = &self.stats.fallback;
                         fallback
@@ -1046,6 +1211,7 @@ impl RoutePlan {
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
             headers: Vec::new(),
+            content,
         });
         self.stats.claimed(outcome, route);
         Ok(())
@@ -1061,23 +1227,28 @@ impl RoutePlan {
         route: usize,
         r: &CompiledRoute,
         view: &EventView<'_>,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<(String, bool), String> {
         let Some(fallback) = r.topic_fallback.as_ref().filter(|_| r.topic.reads_row) else {
-            return Ok(r.topic.render(view));
+            return Ok((r.topic.render(view), false));
         };
-        let rendered = r.topic.parsed.render_checked(view, |f, v| {
-            f.column().is_none()
-                || (valid_segment(v)
-                    && r.topic_values
-                        .as_ref()
-                        .is_none_or(|vals| vals.iter().any(|a| a == v)))
-        });
+        let rendered = r
+            .topic
+            .parsed
+            .render_checked(view, |f, v| value_allowed(r, f, v));
         let why = match rendered {
             Ok(t) if !valid_topic_name(&t) => {
                 "the rendered topic is not a valid Kafka topic name".to_string()
             }
-            Ok(t) if self.dynamic.admit(&t) => return Ok(t),
-            Ok(_) => "sink.max_dynamic_topics is reached".to_string(),
+            // The route's own fallback (the only fixed topic its glob may match): no cap slot.
+            Ok(t) if self.fixed.contains(&t) => "the value names a fixed topic".to_string(),
+            Ok(t) => match self.dynamic.admit(&t) {
+                Admit::Yes => return Ok((t, true)),
+                Admit::Collides => {
+                    "a topic with the same name up to `.` vs `_` exists, so Kafka would refuse it"
+                        .to_string()
+                }
+                Admit::Cap => "sink.max_dynamic_topics is reached".to_string(),
+            },
             Err(e) => e.to_string(),
         };
         if !self.stats.fallback_logged[route].swap(true, Ordering::Relaxed) {
@@ -1090,6 +1261,42 @@ impl RoutePlan {
             );
         }
         Err(fallback.clone())
+    }
+
+    /// The broker refused to create a content-routed topic for a reason that will not change on a
+    /// retry (`kind`: an invalid name, a create policy, no create permission). Sends `out` to its
+    /// route's fallback instead, counts it under `fallback` rather than `produced`, and frees the
+    /// name and its cap slot. Logged once per route, with the template, never the value.
+    pub fn topic_refused(&self, out: &mut OutRecord, kind: &str) {
+        let Some(c) = out.content.take() else {
+            return;
+        };
+        self.dynamic.release(&out.topic);
+        self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
+        self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
+        if !self.stats.refused_logged[c.route].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                route = %self.stats.names[c.route],
+                topic = %self.routes.get(c.route).map_or("", |r| r.topic.raw.as_str()),
+                fallback = %c.fallback,
+                error = kind,
+                "the broker refused to create a content-routed topic; such events go to the route's topic_fallback (pre-create the topics or set topic_values)"
+            );
+        }
+        out.topic = c.fallback;
+    }
+
+    /// A content-routed topic could not be created for a passing reason: free its cap slot, so a
+    /// failed create never holds one. The batch fails and is retried.
+    pub fn topic_failed(&self, topic: &str) {
+        self.dynamic.release(topic);
+    }
+
+    /// The sink opened `topic`: it exists, so no other spelling of it may be created.
+    pub fn topic_opened(&self, topic: &str) {
+        if self.routes.iter().any(|r| r.topic.reads_row) {
+            self.dynamic.exists([(topic, false)]);
+        }
     }
 
     /// The record key of a route with `key = [...]`: the usual JSON key with `"key"` built from the
@@ -1146,6 +1353,7 @@ impl RoutePlan {
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
             headers: vec![("aqueduct-error", reason.clone())],
+            content: None,
         });
         if !self.stats.error_logged[route].swap(true, Ordering::Relaxed) {
             tracing::warn!(
@@ -2296,16 +2504,238 @@ mod tests {
             ),
             Ok(())
         );
-        // A route's own fallback may match its own template; templated topics may share a prefix
-        // with another `{schema}`/`{table}` template.
+        // A route's own fallback may match its own template, and `{schema}`/`{table}` templates
+        // with other fixed text are fine.
         assert_eq!(
             build(
-                vec![ok.clone(), route("public.*", "orders.{table}")],
-                Some("cdc.{schema}.{table}"),
+                vec![ok.clone(), route("public.*", "cdc.{table}")],
+                Some("all.{schema}.{table}"),
                 None
             ),
             Ok(())
         );
+        // A content template may not overlap a `{schema}`/`{table}`/`{op}` template: a row value
+        // could write into that route's topics (`cdc.{row.kind}` = `customers` -> `cdc.customers`).
+        for (routes, default, want) in [
+            (
+                vec![
+                    content("o", "cdc.{row.kind}", Some("fb"), None),
+                    route("public.*", "cdc.{table}"),
+                ],
+                None,
+                "overlaps route `public.*`'s `topic` `cdc.{table}`",
+            ),
+            (
+                vec![
+                    route("public.*", "cdc.{table}"),
+                    content("o", "cdc.{row.kind}", Some("fb"), None),
+                ],
+                None,
+                "overlaps route `public.*`'s `topic` `cdc.{table}`",
+            ),
+            (
+                vec![ok.clone()],
+                Some("orders.{schema}.{table}"),
+                "overlaps sink.topic `orders.{schema}.{table}`",
+            ),
+            (
+                vec![ok.clone(), route("public.*", "ord{table}")],
+                None,
+                "overlaps route `public.*`'s `topic` `ord{table}`",
+            ),
+            (
+                vec![ok.clone(), route("public.*", "x.{op}")],
+                Some("{table}"),
+                "overlaps sink.topic `{table}`",
+            ),
+        ] {
+            let err = build(routes, default, None).expect_err(want);
+            assert!(err.contains(want), "{err}\nshould contain: {want}");
+        }
+    }
+
+    #[test]
+    fn glob_intersection() {
+        for (a, b, want) in [
+            ("orders.*", "orders.*", true),
+            ("orders.*", "cdc.*", false),
+            ("orders.*", "ord*", true),
+            ("orders.*", "*", true),
+            ("orders.*", "*.eu", true),
+            ("orders.*.x", "orders.y.*", true),
+            ("a*b", "a*c", false),
+            ("orders.unknown", "orders.*", true),
+            ("x", "x", true),
+            ("x", "y", false),
+            ("*a", "b*", true),
+        ] {
+            assert_eq!(globs_intersect(a, b), want, "{a} {b}");
+            assert_eq!(globs_intersect(b, a), want, "{b} {a}");
+        }
+    }
+
+    #[test]
+    fn a_name_kafka_would_refuse_as_a_collision_goes_to_the_fallback() {
+        // Two placeholders: `a_b` + `c` and `a` + `b_c` render names equal up to `.` vs `_`.
+        let mut p = RoutePlan::new(
+            vec![content(
+                "e",
+                "events.{row.tenant}.{row.kind}",
+                Some("events-fallback"),
+                None,
+            )],
+            None,
+        )
+        .unwrap();
+        p.set_source(pg());
+        let r = |tenant: &str, kind: &str| {
+            let json = format!(r#"{{"tenant":"{tenant}","kind":"{kind}"}}"#);
+            outcome(&p, &row("orders", Op::Insert, &json))
+        };
+        assert_eq!(r("a_b", "c"), "events.a_b.c");
+        assert_eq!(r("a", "b_c"), "events-fallback");
+        assert_eq!(
+            r("a_b", "c"),
+            "events.a_b.c",
+            "the first spelling stays usable"
+        );
+        assert_eq!(
+            p.dynamic_topic_count(),
+            1,
+            "a refused name holds no cap slot"
+        );
+        // A broker topic that only differs by `.` vs `_`, even one no template produces.
+        let q = content_plan(None, 100);
+        q.add_existing_topics(["orders_eu", "unrelated"]);
+        assert_eq!(q.dynamic_topic_count(), 0);
+        let r = |region: &str| {
+            outcome(
+                &q,
+                &row("orders", Op::Insert, &format!(r#"{{"region":"{region}"}}"#)),
+            )
+        };
+        assert_eq!(r("eu"), "orders.unknown");
+        assert_eq!(r("us"), "orders.us");
+        // The same against a fixed topic of the config.
+        let s = RoutePlan::new(
+            vec![
+                content("o", "orders.{row.region}", Some("orders.unknown"), None),
+                route("hr.*", "orders_us"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome(&s, &row("orders", Op::Insert, r#"{"region":"us"}"#)),
+            "orders.unknown"
+        );
+    }
+
+    #[test]
+    fn a_value_naming_the_fallback_uses_no_cap_slot() {
+        let p = content_plan(None, 1);
+        let r = |region: &str| {
+            outcome(
+                &p,
+                &row("orders", Op::Insert, &format!(r#"{{"region":"{region}"}}"#)),
+            )
+        };
+        assert_eq!(r("unknown"), "orders.unknown");
+        assert_eq!(p.dynamic_topic_count(), 0);
+        assert_eq!(p.stats().snapshot()[0].counts.fallback, 1);
+        assert_eq!(r("eu"), "orders.eu", "the one slot is still free");
+    }
+
+    #[test]
+    fn only_topics_a_row_could_produce_count_against_the_cap() {
+        let long = format!("orders.{}", "a".repeat(MAX_SEGMENT + 1));
+        let p = content_plan(None, 100);
+        let n = p.add_existing_topics([
+            "orders.a",
+            "orders.a.b",
+            long.as_str(),
+            "orders.",
+            "orders.é",
+        ]);
+        assert_eq!(n, 1, "only orders.a is one valid segment");
+        let q = content_plan(Some(&["eu"]), 100);
+        assert_eq!(
+            q.add_existing_topics(["orders.eu", "orders.us"]),
+            1,
+            "topic_values"
+        );
+        // Topics a `{schema}`/`{table}` template writes never count.
+        let s = RoutePlan::new(
+            vec![
+                content("o", "orders.{row.region}", Some("fb"), None),
+                route("public.*", "cdc.{table}"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.add_existing_topics(["cdc.customers", "orders.eu"]), 1);
+    }
+
+    #[test]
+    fn a_refused_or_failed_create_frees_the_cap_slot() {
+        let p = content_plan(None, 1);
+        let mut out = p
+            .render(&row("orders", Op::Insert, r#"{"region":"eu"}"#), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(out.topic, "orders.eu");
+        assert_eq!(
+            out.content,
+            Some(ContentTopic {
+                route: 0,
+                fallback: "orders.unknown".into()
+            })
+        );
+        assert_eq!(p.dynamic_topic_count(), 1);
+        // The broker refuses it for good: the record goes to the fallback, counted there.
+        p.topic_refused(&mut out, "PolicyViolation");
+        assert_eq!(
+            (out.topic.as_str(), out.content.as_ref()),
+            ("orders.unknown", None)
+        );
+        assert_eq!(p.dynamic_topic_count(), 0);
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.fallback), (1, 0, 1));
+        // A passing failure frees the slot too; the batch is retried.
+        let us = p
+            .render(&row("orders", Op::Insert, r#"{"region":"us"}"#), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(us.topic, "orders.us");
+        p.topic_failed("orders.us");
+        assert_eq!(p.dynamic_topic_count(), 0);
+        // An opened topic is never released, and blocks other spellings.
+        p.topic_opened("orders.ap");
+        p.topic_failed("orders.ap");
+        assert_eq!(
+            outcome(&p, &row("orders", Op::Insert, r#"{"region":"ap"}"#)),
+            "orders.ap"
+        );
+        // Records of other routes, and fallbacks, are not content-routed.
+        let rest = p
+            .render(&row("users", Op::Insert, "{}"), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(rest.content, None);
+    }
+
+    #[test]
+    fn a_zero_cap_allows_only_existing_topics() {
+        let p = content_plan(None, 0);
+        p.add_existing_topics(["orders.eu"]);
+        let r = |region: &str| {
+            outcome(
+                &p,
+                &row("orders", Op::Insert, &format!(r#"{{"region":"{region}"}}"#)),
+            )
+        };
+        assert_eq!(r("eu"), "orders.eu");
+        assert_eq!(r("us"), "orders.unknown");
     }
 
     #[test]

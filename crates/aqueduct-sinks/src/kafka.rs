@@ -170,6 +170,39 @@ enum CreateOutcome<'a> {
     Other,
 }
 
+/// A create refusal that a retry will not change: the name, a create policy or the permissions.
+/// A content-routed record that hits one goes to its fallback instead of failing the batch.
+fn refusal(outcome: &std::result::Result<(), ClientError>) -> Option<&'static str> {
+    match create_outcome(outcome) {
+        CreateOutcome::Protocol(ProtocolError::InvalidTopicException) => {
+            Some("InvalidTopicException")
+        }
+        CreateOutcome::Protocol(ProtocolError::PolicyViolation) => Some("PolicyViolation"),
+        CreateOutcome::Protocol(ProtocolError::TopicAuthorizationFailed) => {
+            Some("TopicAuthorizationFailed")
+        }
+        CreateOutcome::Protocol(ProtocolError::ClusterAuthorizationFailed) => {
+            Some("ClusterAuthorizationFailed")
+        }
+        _ => None,
+    }
+}
+
+/// Why a topic could not be opened; `refused` is set for a [`refusal`] of the create.
+struct OpenError {
+    error: Error,
+    refused: Option<&'static str>,
+}
+
+impl From<Error> for OpenError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            refused: None,
+        }
+    }
+}
+
 fn create_outcome(outcome: &std::result::Result<(), ClientError>) -> CreateOutcome<'_> {
     match outcome {
         Ok(()) => CreateOutcome::Ok,
@@ -304,7 +337,7 @@ impl KafkaSink {
         self
     }
 
-    async fn partition_ids(&self, topic: &str) -> Result<Vec<i32>> {
+    async fn partition_ids(&self, topic: &str) -> std::result::Result<Vec<i32>, OpenError> {
         let find = |topics: Vec<rskafka::topic::Topic>| {
             topics
                 .into_iter()
@@ -324,7 +357,10 @@ impl KafkaSink {
             .controller_client()
             .map_err(|e| err("controller", &e))?;
         let create = |rf: i16| ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000);
-        let failed = |e: &ClientError| err(&format!("create topic {topic}"), e);
+        let failed = |outcome: &std::result::Result<(), ClientError>, e: &ClientError| OpenError {
+            error: err(&format!("create topic {topic}"), e),
+            refused: refusal(outcome),
+        };
         let first = self
             .replication_factor
             .unwrap_or(DEFAULT_REPLICATION_FACTOR);
@@ -340,18 +376,19 @@ impl KafkaSink {
                 // The fallback is an explicit factor of 1: anything but success fails.
                 if after_create(Some(1), create_outcome(&retry)) != AfterCreate::Created {
                     if let Err(e) = &retry {
-                        return Err(failed(e));
+                        return Err(failed(&retry, e));
                     }
                 }
             }
             AfterCreate::Reject => {
                 return Err(Error::Sink(format!(
                     "kafka broker rejected replication_factor = {first} for topic {topic} (fewer than {first} brokers?)"
-                )));
+                ))
+                .into());
             }
             AfterCreate::Failed => {
                 if let Err(e) = &outcome {
-                    return Err(failed(e));
+                    return Err(failed(&outcome, e));
                 }
             }
         }
@@ -370,18 +407,20 @@ impl KafkaSink {
                 return Ok(ids);
             }
         }
-        Err(Error::Sink(format!("kafka topic {topic} not available")))
+        Err(Error::Sink(format!("kafka topic {topic} not available")).into())
     }
 
     async fn open_topic(&mut self, topic: &str) -> Result<()> {
+        self.try_open_topic(topic).await.map_err(|e| e.error)
+    }
+
+    async fn try_open_topic(&mut self, topic: &str) -> std::result::Result<(), OpenError> {
         if self.topics.contains_key(topic) {
             return Ok(());
         }
         let ids = self.partition_ids(topic).await?;
         if ids.is_empty() {
-            return Err(Error::Sink(format!(
-                "kafka topic {topic} has no partitions"
-            )));
+            return Err(Error::Sink(format!("kafka topic {topic} has no partitions")).into());
         }
         let mut clients = Vec::with_capacity(ids.len());
         for id in ids {
@@ -393,6 +432,7 @@ impl KafkaSink {
             clients.push(Arc::new(pc));
         }
         self.topics.insert(topic.to_string(), clients);
+        self.plan.topic_opened(topic);
         Ok(())
     }
 }
@@ -453,8 +493,22 @@ impl Sink for KafkaSink {
         for event in deliverable(events) {
             rendered.clear();
             self.plan.render_into(event, now_us, &mut rendered)?;
-            for out in rendered.drain(..) {
-                self.open_topic(&out.topic).await?;
+            for mut out in rendered.drain(..) {
+                if let Err(e) = self.try_open_topic(&out.topic).await {
+                    match (out.content.is_some(), e.refused) {
+                        // A content-routed topic the broker will never create: its fallback.
+                        (true, Some(kind)) => {
+                            self.plan.topic_refused(&mut out, kind);
+                            self.open_topic(&out.topic).await?;
+                        }
+                        // Passing: the batch fails and is retried, without holding a cap slot.
+                        (true, None) => {
+                            self.plan.topic_failed(&out.topic);
+                            return Err(e.error);
+                        }
+                        (false, _) => return Err(e.error),
+                    }
+                }
                 let part = partition_index(&out.partition_key, self.topics[&out.topic].len());
                 groups
                     .entry((out.topic.clone(), part))
