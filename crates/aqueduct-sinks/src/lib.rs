@@ -10,8 +10,9 @@ pub mod route;
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
 pub use route::{
-    FieldSpec, HashKey, KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription,
-    RoutePlan, RouteStats, RoutesDescription, HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
+    ContentTopic, FieldSpec, HashKey, KafkaRoute, OutRecord, RouteCount, RouteCounts,
+    RouteDescription, RoutePlan, RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
+    HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
 };
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};

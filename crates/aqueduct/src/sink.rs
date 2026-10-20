@@ -17,6 +17,8 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             ops: r.ops.clone(),
             filter: r.filter.clone(),
             key: r.key.clone(),
+            topic_fallback: r.topic_fallback.clone(),
+            topic_values: r.topic_values.clone(),
             fields: FieldSpec {
                 include: r.include.clone(),
                 exclude: r.exclude.clone(),
@@ -26,12 +28,14 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             },
         })
         .collect();
-    RoutePlan::build(
+    let mut plan = RoutePlan::build(
         routes,
         cfg.topic.clone(),
         cfg.dead_letter_topic.clone(),
         hash_key,
-    )
+    )?;
+    plan.set_max_dynamic_topics(cfg.max_dynamic_topics);
+    Ok(plan)
 }
 
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
@@ -200,5 +204,47 @@ hash = ['email']
             Some(vec!["id".to_string(), "email".to_string()])
         );
         assert_eq!(d.routes[0].hash, Some(vec!["email".to_string()]));
+    }
+
+    #[test]
+    fn content_routing_comes_from_the_config_and_is_validated() {
+        let cfg = kafka(
+            "max_dynamic_topics = 7
+[[routes]]
+match = 'public.orders'
+topic = 'orders.{row.region}'
+topic_fallback = 'orders.unknown'
+topic_values = ['eu', 'us']
+",
+        );
+        assert_eq!(cfg.max_dynamic_topics, 7);
+        let d = plan(&cfg, None).unwrap().describe();
+        assert_eq!(
+            d.routes[0].topic_fallback.as_deref(),
+            Some("orders.unknown")
+        );
+        assert_eq!(
+            d.routes[0].topic_values,
+            Some(vec!["eu".to_string(), "us".to_string()])
+        );
+        assert_eq!(
+            kafka("topic = 't'").max_dynamic_topics,
+            aqueduct_sinks::DEFAULT_MAX_DYNAMIC_TOPICS
+        );
+        let e = plan(
+            &kafka(
+                "[[routes]]
+match = 'public.orders'
+topic = 'orders.{row.region}'
+",
+            ),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("route `public.orders`") && e.contains("topic_fallback"),
+            "{e}"
+        );
     }
 }

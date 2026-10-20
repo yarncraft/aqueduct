@@ -321,6 +321,44 @@ Per-route key (#83):
 - **Validation:** a non-empty list of distinct top-level column names; a dotted path is rejected. The key columns
   are registered with the unseen-field counter as `row.<column>`, on routes with or without `where`.
 
+## As built (R4)
+
+Content routing (#82):
+
+- **Which templates are "dynamic".** The prefix rule, the segment rule, `topic_fallback` and `topic_values` apply to
+  templates that read a row field (`before.`, `after.`, `row.`). Templates with only `{schema}`, `{table}` and `{op}`
+  keep today's behaviour (no prefix rule, no fallback; `{schema}`/`{table}` values are not segment-checked), so existing
+  configs such as `{schema}.{table}` still start. `sink.topic` may not read a row field (it has no fallback).
+- **`topic_fallback` is a fixed topic name** (no placeholders), opened at startup like the dead-letter topic.
+  `topic_fallback` or `topic_values` on a template that reads no row field is a startup error.
+- **Every substituted row value** must pass the segment rule and the allow-list. A rendered topic that is still not a
+  valid Kafka name (longer than 249 bytes) also goes to the fallback.
+- **Collision rule.** Fixed topics are a static route `topic`, a static `sink.topic`, every `topic_fallback` and
+  `sink.dead_letter_topic`. None may match a content-routed template's glob, except that route's own fallback (the §2
+  example `orders.unknown` for `orders.{row.region}`). A content-routed template's glob may also not intersect the glob
+  of a template without row fields (`cdc.{row.kind}` next to `cdc.{table}`), so a row value cannot write into another
+  route's topics. Overlaps between two content-routed templates are not checked.
+- **The cap** is one count across all content-routed templates. At connect the sink lists the broker's topics and
+  counts those a template could render: each placeholder part one valid segment (and in `topic_values`), not a fixed
+  topic, not produced by a template without row fields. Existing topics are always usable. A new topic is counted when
+  the plan first routes to it. A failed or refused create releases the slot. A value that renders a fixed topic (the
+  route's own fallback) goes to the fallback without taking a slot. `max_dynamic_topics = 0` allows existing topics
+  only.
+- **Names Kafka refuses never stall the pipeline.** Kafka refuses a topic that equals an existing one once `.` and `_`
+  are the same. The plan keeps the `.`-to-`_` form of every broker topic listed at connect, every fixed topic, and
+  every topic opened or admitted since. It sends a name that collides under another spelling to the fallback. If the
+  broker still refuses a create for a reason a retry cannot change (`InvalidTopicException`, `PolicyViolation`,
+  `TopicAuthorizationFailed`, `ClusterAuthorizationFailed`), `send_batch` re-routes that record to the fallback (counted
+  under `fallback`), frees the name and logs a warning once per route. The refused name is remembered for the run
+  (at most 10 000 names, oldest dropped first), so later rows that render it go to the fallback at render time with no
+  broker call; a restart clears the memory and picks up a pre-created topic or a new ACL. Other create errors still fail the batch, so
+  delivery stays at-least-once.
+- **The leading-`_` rule applies only when content routing is in use**, so "Breaking: none" holds. Once any route's
+  topic reads a row field, no route `topic`, `sink.topic` or fallback may start with `_`. Without one, such topics are
+  accepted as before. The dead-letter topic's `_` check is R3's and applies always.
+- **Topic names are checked at startup.** Fixed text must be valid topic characters, and braces must be known
+  placeholders. Kafka refuses other names, so this only moves a first-send failure to startup.
+
 ## As built (R6)
 
 Field operations (#84). Where the code differs from the text above:
@@ -358,9 +396,12 @@ Field operations (#84). Where the code differs from the text above:
   one.
 - **Unseen fields:** every column a field operation names is watched as `row.<column>`. Since R5, `observe` runs on
   every route, with or without `where`.
-- **Content routing (R4) is not merged yet.** Its side of "no row data may bypass the field operations" (topic
-  templates and `topic_values` may not read a protected column) is a TODO in `RoutePlan::build` against
-  `FieldOps::protection`; R4 adds it.
+- **Content routing (R4).** A topic template may not read a column the route excludes, masks, hashes or leaves out
+  of `include` (`check_field_ops` over `CompiledRoute::topic_fields`, by `FieldRef::column`, so nested and
+  `before.`/`after.` paths count). `topic_values` constrains those same fields and `topic_fallback` is fixed, so the
+  template check covers them. Field operations run before the topic is chosen: a row they cannot rewrite goes to the
+  dead-letter topic without taking a `max_dynamic_topics` slot, and a fallback record (at render time, or re-routed
+  by `topic_refused` when the broker refuses a create) keeps the rewritten value, key and `aqueduct-hash-key-id`.
 - **Cost** (release, 10-column row updated with before and after, 2-column key, one route): no field operations
   541 ns/event; include 1.8 µs, exclude 2.2 µs, mask 2.3 µs, rename 2.4 µs, hash of 2 columns 4.5 µs, all together
   5.4 µs.
