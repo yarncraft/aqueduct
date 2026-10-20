@@ -563,10 +563,10 @@ fn token_text(token: &ResumeToken) -> Result<String> {
 }
 
 /// A change doc's own resume token in the same text form as event positions.
+/// Converts only `_id`, not the whole (possibly large) document; the text is the same.
 fn doc_token_text(doc: &Document) -> Result<String> {
-    let ev = Bson::Document(doc.clone()).into_relaxed_extjson();
-    ev.get("_id")
-        .map(Value::to_string)
+    doc.get("_id")
+        .map(|id| id.clone().into_relaxed_extjson().to_string())
         .ok_or_else(|| Error::Source("change event without resume token".into()))
 }
 
@@ -773,6 +773,13 @@ mod tests {
         "ns": {"db": "app", "coll": "u"}};
         assert!(to_change_event(&d).unwrap().is_none());
         assert_eq!(doc_token_text(&d).unwrap(), r#"{"_data":"8265A2"}"#);
+        // The same text a mapped event gets as its position.
+        let ins = doc! {"_id": {"_data": "8265A3"}, "operationType": "insert",
+        "ns": {"db": "app", "coll": "u"}, "documentKey": {"_id": 1}};
+        assert_eq!(
+            Position::Text(doc_token_text(&ins).unwrap()),
+            to_change_event(&ins).unwrap().unwrap().position
+        );
         assert!(doc_token_text(&doc! {"operationType": "drop"}).is_err());
     }
 
