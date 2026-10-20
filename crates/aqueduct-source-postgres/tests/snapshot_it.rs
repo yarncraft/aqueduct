@@ -391,3 +391,155 @@ async fn never_copies_nothing() {
     .await
     .unwrap();
 }
+
+/// A `TRUNCATE` and re-inserts while the snapshot runs: the consumer still ends up with the table
+/// (#76).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn a_truncate_during_the_snapshot_converges() {
+    let db = connect().await;
+    let table = unique("snap_trunc");
+    let publication = unique("snap_trunc_pub");
+    let slot = unique("snap_trunc");
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, v text NOT NULL);
+         INSERT INTO {table} SELECT g, 'v' FROM generate_series(1, 2000) g;
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+    let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
+    s.start(None).await.unwrap();
+    let mut events = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 500).await;
+    db.batch_execute(&format!(
+        "TRUNCATE {table}; INSERT INTO {table} SELECT g, 'again' FROM generate_series(1500, 1600) g;"
+    ))
+    .await
+    .unwrap();
+    events.extend(collect(&mut s, Duration::from_secs(3), |_| false).await);
+    assert!(events.iter().any(|e| e.op == Op::Truncate));
+    assert_eq!(fold(&events, &table), table_rows(&db, &table).await);
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}
+
+/// Kill points of ADR 0001 §4 that the restart test does not cover (#76): before the first
+/// checkpoint (the initial snapshot starts again) and after the last row (nothing is copied
+/// again and the snapshot ends).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn crashes_before_the_first_and_after_the_last_checkpoint() {
+    let db = connect().await;
+    let table = unique("snap_kill");
+    let publication = unique("snap_kill_pub");
+    let slot = unique("snap_kill");
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY);
+         INSERT INTO {table} SELECT generate_series(1, 300);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    // Rows delivered but never checkpointed: the next start has no checkpoint and copies again.
+    let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
+    s.start(None).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), s.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.op, Op::Read);
+    drop(s);
+    let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
+    s.start(None).await.unwrap();
+    let all = collect(&mut s, Duration::from_secs(3), |_| false).await;
+    assert_eq!(fold(&all, &table).len(), 300);
+    let last_read = all
+        .iter()
+        .rev()
+        .find(|e| e.op == Op::Read)
+        .unwrap()
+        .checkpoint
+        .clone()
+        .unwrap();
+    drop(s);
+
+    // Restart at the last row: the snapshot reads one empty chunk and ends, copying nothing.
+    let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
+    s.start(Some(last_read)).await.unwrap();
+    db.execute(&format!("INSERT INTO {table} VALUES (1000)"), &[])
+        .await
+        .unwrap();
+    let tail = collect(&mut s, Duration::from_secs(5), |e| {
+        e.iter().any(|e| e.op == Op::Insert)
+    })
+    .await;
+    assert!(
+        tail.iter().all(|e| e.op != Op::Read),
+        "nothing is copied again"
+    );
+    let Some(Position::Text(t)) = &tail.last().unwrap().checkpoint else {
+        panic!("text checkpoint")
+    };
+    assert!(!t.contains("snap"), "the snapshot ended: {t}");
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}
+
+/// The slot's confirmed position moves while a snapshot runs, so WAL is not pinned (#76).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn the_slot_advances_during_the_snapshot() {
+    let db = connect().await;
+    let table = unique("snap_slot");
+    let publication = unique("snap_slot_pub");
+    let slot = unique("snap_slot");
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY);
+         INSERT INTO {table} SELECT generate_series(1, 3000);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+    let flushed = |db: &Client, slot: String| {
+        let db = db;
+        async move {
+            let row = db
+                .query_one(
+                    "SELECT (confirmed_flush_lsn - '0/0')::int8 FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&slot],
+                )
+                .await
+                .unwrap();
+            row.get::<_, i64>(0)
+        }
+    };
+    let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
+    s.start(None).await.unwrap();
+    let at_start = flushed(&db, slot.clone()).await;
+    let events = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 1000).await;
+    assert!(events.len() >= 1000);
+    let mid = flushed(&db, slot.clone()).await;
+    assert!(
+        mid > at_start,
+        "the slot advanced mid-snapshot: {at_start} -> {mid}"
+    );
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}
