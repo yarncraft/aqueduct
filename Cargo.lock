@@ -121,12 +121,16 @@ dependencies = [
  "aqueduct-tls",
  "async-trait",
  "bytes",
+ "postgres-protocol",
+ "ring",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-rustls",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
-//! Streaming replication client against a real server. Needs a Postgres with
-//! `wal_level=logical` that accepts the `postgres` user **without a password** on replication
-//! connections (`trust`), because the client does not do password authentication yet:
+//! Streaming replication client against a real server, with trust authentication (password
+//! methods and TLS are covered by `replication_auth_it`). Needs a Postgres with
+//! `wal_level=logical` that accepts the `postgres` user **without a password** (`trust`):
 //!
 //! ```text
 //! podman run -d -p 5435:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 -c wal_level=logical
@@ -14,7 +14,9 @@
 use std::time::Duration;
 
 use aqueduct_source_postgres::parse_lsn;
-use aqueduct_source_postgres::replication::{Replication, ReplicationClient, StartReplication};
+use aqueduct_source_postgres::replication::{
+    AuthMethod, ConnectOptions, Replication, ReplicationClient, StartReplication,
+};
 use tokio_postgres::NoTls;
 
 #[tokio::test]
@@ -50,7 +52,11 @@ async fn streamed_transaction_matches_the_peeked_one() {
         .unwrap();
     }
 
-    let mut client = ReplicationClient::connect(&url).await.unwrap();
+    let mut client = ReplicationClient::connect(&url, &ConnectOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(client.auth_method(), AuthMethod::Trust);
+    assert!(!client.encrypted());
     let info = client.identify_system().await.unwrap();
     assert!(info.xlogpos > 0 && info.timeline >= 1);
     let quoted = format!("\"{publication}\"");
@@ -194,7 +200,9 @@ async fn a_latin1_database_streams_the_same_utf8_bytes_as_the_peek() {
         .await
         .unwrap();
     }
-    let client = ReplicationClient::connect(&url).await.unwrap();
+    let client = ReplicationClient::connect(&url, &ConnectOptions::default())
+        .await
+        .unwrap();
     let (mut stream, status) = client
         .start_replication(&StartReplication {
             slot: &stream_slot,
