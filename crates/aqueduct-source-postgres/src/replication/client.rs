@@ -39,6 +39,9 @@ struct Target {
     port: u16,
     user: String,
     database: String,
+    application_name: Option<String>,
+    /// Command-line options for the backend (`options=-c ...`), as the SQL connection sends.
+    options: Option<String>,
     connect_timeout: Option<std::time::Duration>,
 }
 
@@ -94,13 +97,39 @@ impl Target {
         let database = cfg.get_dbname().unwrap_or(&user).to_string();
         reject_nul("user", &user)?;
         reject_nul("database", &database)?;
+        let application_name = cfg.get_application_name().map(str::to_string);
+        let options = cfg.get_options().map(str::to_string);
+        for (what, v) in [
+            ("application_name", &application_name),
+            ("options", &options),
+        ] {
+            if let Some(v) = v {
+                reject_nul(what, v)?;
+            }
+        }
         Ok(Target {
             host,
             port,
             user,
             database,
+            application_name,
+            options,
             connect_timeout: cfg.get_connect_timeout().copied(),
         })
+    }
+}
+
+impl Target {
+    /// `application_name` and `options` from the URL, for the startup message.
+    fn startup_extras(&self) -> Vec<(&str, &str)> {
+        let mut extra = Vec::new();
+        if let Some(v) = &self.application_name {
+            extra.push(("application_name", v.as_str()));
+        }
+        if let Some(v) = &self.options {
+            extra.push(("options", v.as_str()));
+        }
+        extra
     }
 }
 
@@ -168,11 +197,15 @@ impl ReplicationClient {
         tcp.set_nodelay(true).ok();
         let mut c = Self::from_io(Box::new(tcp));
         c.writer
-            .send(&startup_message(&target.user, &target.database))
+            .send(&startup_message(
+                &target.user,
+                &target.database,
+                &target.startup_extras(),
+            ))
             .await?;
         loop {
             match c.reader.read().await? {
-                Backend::Auth(0) => {}
+                Backend::Auth(0) => c.reader.set_authenticated(),
                 Backend::Auth(code) => {
                     return Err(err(format!(
                         "server requested authentication method {code}; only trust \
@@ -444,6 +477,23 @@ mod tests {
         ] {
             assert!(Target::parse(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn application_name_and_options_reach_the_startup_message() {
+        let t = Target::parse(
+            "postgres://u@localhost/d?sslmode=disable&application_name=aq&options=-c%20statement_timeout%3D0",
+        )
+        .unwrap();
+        assert_eq!(
+            t.startup_extras(),
+            vec![
+                ("application_name", "aq"),
+                ("options", "-c statement_timeout=0")
+            ]
+        );
+        let t = Target::parse("postgres://u@localhost/d?sslmode=disable").unwrap();
+        assert!(t.startup_extras().is_empty());
     }
 
     #[test]

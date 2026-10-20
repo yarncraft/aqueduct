@@ -151,3 +151,112 @@ async fn streamed_transaction_matches_the_peeked_one() {
         }
     }
 }
+
+/// pgoutput converts text to the client encoding. The SQL connection (and so the peek) always
+/// uses UTF-8; the replication connection must ask for it too, or a LATIN1 database streams
+/// different bytes for the same row.
+#[tokio::test]
+#[ignore = "needs a trust-auth Postgres server, see the module docs"]
+async fn a_latin1_database_streams_the_same_utf8_bytes_as_the_peek() {
+    let addr = std::env::var("AQUEDUCT_TEST_PG_TRUST")
+        .expect("AQUEDUCT_TEST_PG_TRUST must name a trust-auth Postgres, see the module docs");
+    let admin_url = format!("postgres://postgres@{addr}/postgres?sslmode=disable");
+    let (admin, conn) = tokio_postgres::connect(&admin_url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let dbname = format!("aq_latin1_{id}");
+    admin
+        .batch_execute(&format!(
+            "CREATE DATABASE {dbname} ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
+        ))
+        .await
+        .unwrap();
+
+    let url = format!("postgres://postgres@{addr}/{dbname}?sslmode=disable");
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let conn = tokio::spawn(conn);
+    let (stream_slot, peek_slot) = (format!("aq_l1_s_{id}"), format!("aq_l1_p_{id}"));
+    db.batch_execute(
+        "CREATE TABLE t (k int PRIMARY KEY, v text NOT NULL);
+         CREATE PUBLICATION p FOR TABLE t;",
+    )
+    .await
+    .unwrap();
+    for slot in [&stream_slot, &peek_slot] {
+        db.execute(
+            "SELECT pg_create_logical_replication_slot($1::text, 'pgoutput')",
+            &[slot],
+        )
+        .await
+        .unwrap();
+    }
+    let client = ReplicationClient::connect(&url).await.unwrap();
+    let (mut stream, status) = client
+        .start_replication(&StartReplication {
+            slot: &stream_slot,
+            start_lsn: 0,
+            publication: "p",
+            logical_messages: false,
+        })
+        .await
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'café')", &[])
+        .await
+        .unwrap();
+
+    let streamed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(Replication::XLogData { data, .. }) = stream.next_message().await.unwrap() {
+                if data.first() == Some(&b'I') {
+                    break data.to_vec();
+                }
+            }
+        }
+    })
+    .await
+    .expect("no Insert arrived over the stream");
+    let peeked: Vec<u8> = db
+        .query(
+            "SELECT data FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, NULL, \
+             'proto_version', '1', 'publication_names', 'p')",
+            &[&peek_slot],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, Vec<u8>>(0))
+        .find(|d| d.first() == Some(&b'I'))
+        .expect("the peek returned no Insert");
+
+    status.close().await;
+    drop(stream);
+    for slot in [&stream_slot, &peek_slot] {
+        for _ in 0..50 {
+            if db
+                .execute("SELECT pg_drop_replication_slot($1::text)", &[slot])
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    drop(db);
+    let _ = conn.await;
+    admin
+        .batch_execute(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+        .await
+        .unwrap();
+
+    let utf8 = "café".as_bytes();
+    assert!(
+        peeked.windows(utf8.len()).any(|w| w == utf8),
+        "the peek is not UTF-8: {peeked:?}"
+    );
+    assert_eq!(streamed, peeked, "stream and peek bytes differ");
+}

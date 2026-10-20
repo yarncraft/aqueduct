@@ -22,6 +22,10 @@ pub const MAX_FRAME: usize = 0x3fff_ffff;
 /// `IDENTIFY_SYSTEM` and `ErrorResponse` are tiny, and this limit applies before authentication.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 
+/// Largest accepted `ErrorResponse` or `NoticeResponse` once the session is authenticated: a
+/// server error with a long detail or context must not kill a running stream.
+pub const MAX_NOTICE_FRAME: usize = 1 << 20;
+
 /// Tag and length: the bytes in front of every backend message body.
 const HEADER: usize = 5;
 
@@ -29,6 +33,10 @@ const HEADER: usize = 5;
 /// size, so memory follows the bytes that actually arrive (at most about twice what arrived plus
 /// this), not the announced length.
 const READ_CHUNK: usize = 256 * 1024;
+
+/// Read buffer capacity above which it is replaced once the large frame that grew it has been
+/// handed out, so one huge message does not pin its memory for the life of the connection.
+const SHRINK_ABOVE: usize = 4 << 20;
 
 /// Seconds between the Unix epoch and the Postgres epoch (2000-01-01).
 const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
@@ -75,7 +83,13 @@ pub enum Backend {
 /// `buf` untouched while the message is incomplete. An invalid or over-cap length header is an
 /// error as soon as its 5 bytes are in `buf`, before anything is reserved for the body.
 pub fn decode(buf: &mut BytesMut) -> Result<Option<Backend>> {
-    let Some(need) = frame_len(buf)? else {
+    decode_with(buf, false)
+}
+
+/// [`decode`], with the larger error and notice limit of an authenticated session when
+/// `authenticated` is set.
+pub fn decode_with(buf: &mut BytesMut, authenticated: bool) -> Result<Option<Backend>> {
+    let Some(need) = frame_len(buf, authenticated)? else {
         return Ok(None);
     };
     if buf.len() < need {
@@ -89,12 +103,12 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<Backend>> {
 
 /// Total length (header included) of the message at the front of `buf`, once its header is
 /// there.
-fn frame_len(buf: &[u8]) -> Result<Option<usize>> {
+fn frame_len(buf: &[u8], authenticated: bool) -> Result<Option<usize>> {
     let Some(header) = buf.get(..HEADER) else {
         return Ok(None);
     };
     let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-    Ok(Some(body_len(header[0], len)? + HEADER))
+    Ok(Some(body_len(header[0], len, authenticated)? + HEADER))
 }
 
 /// Reads backend messages from `R` through a buffer that outlives each read.
@@ -107,6 +121,7 @@ pub struct FrameReader<R> {
     io: R,
     buf: BytesMut,
     broken: bool,
+    authenticated: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -115,7 +130,15 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             io,
             buf: BytesMut::new(),
             broken: false,
+            authenticated: false,
         }
+    }
+
+    /// Raises the limit on `ErrorResponse` and `NoticeResponse` to [`MAX_NOTICE_FRAME`]. Call
+    /// it once the server has accepted authentication; before that, every message except
+    /// `CopyData` is held to [`MAX_CONTROL_FRAME`].
+    pub fn set_authenticated(&mut self) {
+        self.authenticated = true;
     }
 
     /// The next backend message. After an error the reader stays broken: the stream position
@@ -135,10 +158,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         loop {
             // `decode` is synchronous and only removes a message once it is complete, so the
             // only await point below is `read_buf`, which tokio documents as cancel-safe.
-            if let Some(msg) = decode(&mut self.buf)? {
+            let before = self.buf.len();
+            if let Some(msg) = decode_with(&mut self.buf, self.authenticated)? {
+                self.shrink(before - self.buf.len());
                 return Ok(msg);
             }
-            let missing = match frame_len(&self.buf)? {
+            let missing = match frame_len(&self.buf, self.authenticated)? {
                 Some(need) => need - self.buf.len(),
                 None => HEADER - self.buf.len(),
             };
@@ -149,20 +174,33 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 .await
                 .map_err(|e| proto(format!("read: {e}")))?;
             if n == 0 {
-                return Err(match (self.buf.first(), frame_len(&self.buf)?) {
-                    (None, _) => proto("the server closed the connection"),
-                    (Some(tag), Some(need)) => proto(format!(
-                        "connection closed in the body of {:?}: got {} of {} bytes",
-                        *tag as char,
-                        self.buf.len() - HEADER,
-                        need - HEADER
-                    )),
-                    (Some(tag), None) => proto(format!(
-                        "connection closed in the header of {:?}",
-                        *tag as char
-                    )),
-                });
+                return Err(
+                    match (self.buf.first(), frame_len(&self.buf, self.authenticated)?) {
+                        (None, _) => proto("the server closed the connection"),
+                        (Some(tag), Some(need)) => proto(format!(
+                            "connection closed in the body of {:?}: got {} of {} bytes",
+                            *tag as char,
+                            self.buf.len() - HEADER,
+                            need - HEADER
+                        )),
+                        (Some(tag), None) => proto(format!(
+                            "connection closed in the header of {:?}",
+                            *tag as char
+                        )),
+                    },
+                );
             }
+        }
+    }
+
+    /// After a large frame has been split off, the remaining buffer still points into its
+    /// allocation, and that allocation stays alive for as long as the buffer does (up to about
+    /// 2 GiB after a 1 GiB frame). Moving the few remaining bytes to a fresh buffer lets it go
+    /// once the caller drops the frame.
+    fn shrink(&mut self, consumed: usize) {
+        let large = consumed > READ_CHUNK || self.buf.capacity() > SHRINK_ABOVE;
+        if large && self.buf.len() <= READ_CHUNK {
+            self.buf = BytesMut::from(&self.buf[..]);
         }
     }
 
@@ -178,7 +216,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 }
 
 /// Body length for a header, or a protocol error for a length that is too small or over the cap.
-pub fn body_len(tag: u8, len: i32) -> Result<usize> {
+/// `CopyData` may be up to [`MAX_FRAME`]; errors and notices up to [`MAX_NOTICE_FRAME`] once
+/// `authenticated`; everything else up to [`MAX_CONTROL_FRAME`].
+pub fn body_len(tag: u8, len: i32, authenticated: bool) -> Result<usize> {
     let body = usize::try_from(len)
         .ok()
         .and_then(|n| n.checked_sub(4))
@@ -188,10 +228,10 @@ pub fn body_len(tag: u8, len: i32) -> Result<usize> {
                 tag as char
             ))
         })?;
-    let cap = if tag == b'd' {
-        MAX_FRAME
-    } else {
-        MAX_CONTROL_FRAME
+    let cap = match tag {
+        b'd' => MAX_FRAME,
+        b'E' | b'N' if authenticated => MAX_NOTICE_FRAME,
+        _ => MAX_CONTROL_FRAME,
     };
     if body > cap {
         return Err(proto(format!(
@@ -335,14 +375,21 @@ pub fn reject_nul(what: &str, value: &str) -> Result<()> {
 // ---- frontend messages ----------------------------------------------------------------------
 
 /// The startup message for a logical replication connection (`replication=database`).
-pub fn startup_message(user: &str, database: &str) -> Vec<u8> {
+///
+/// `client_encoding=UTF8` is always sent, as tokio-postgres does for the SQL connection:
+/// pgoutput converts text values to the client encoding, so without it a LATIN1 or SQL_ASCII
+/// database would stream different bytes than poll mode's peek returns. `extra` carries the
+/// URL's `application_name` and `options`.
+pub fn startup_message(user: &str, database: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&196_608i32.to_be_bytes());
-    for (k, v) in [
+    let fixed = [
         ("user", user),
         ("database", database),
         ("replication", "database"),
-    ] {
+        ("client_encoding", "UTF8"),
+    ];
+    for (k, v) in fixed.iter().chain(extra) {
         body.extend_from_slice(k.as_bytes());
         body.push(0);
         body.extend_from_slice(v.as_bytes());
@@ -584,6 +631,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_buffer_of_a_huge_frame_is_released_after_it() {
+        // 6 MiB frame then a small one: once the frame is handed out the reader must not keep
+        // its allocation (which can be ~2 GiB for a 1 GiB frame) for the rest of the session.
+        let mut bytes = wire(b'd', &vec![1u8; 6 << 20]);
+        bytes.extend(wire(b'Z', b"I"));
+        let mut r = FrameReader::new(&bytes[..]);
+        let big = r.read().await.unwrap();
+        assert!(r.capacity() <= READ_CHUNK, "{}", r.capacity());
+        drop(big);
+        assert_eq!(r.read().await.unwrap(), Backend::ReadyForQuery);
+        assert!(r.capacity() <= READ_CHUNK, "{}", r.capacity());
+    }
+
+    #[tokio::test]
     async fn a_dropped_read_resumes_the_same_message() {
         // ADR 0003 T3 selects over reads: a read cancelled mid-frame must not lose the bytes it
         // already took off the socket.
@@ -637,13 +698,38 @@ mod tests {
     }
 
     #[test]
+    fn errors_and_notices_may_be_larger_once_authenticated() {
+        let big = (MAX_CONTROL_FRAME + 5) as i32;
+        for tag in *b"EN" {
+            assert!(body_len(tag, big, false).is_err());
+            assert!(body_len(tag, big, true).is_ok());
+            assert!(body_len(tag, (MAX_NOTICE_FRAME + 4) as i32, true).is_ok());
+            assert!(body_len(tag, (MAX_NOTICE_FRAME + 5) as i32, true).is_err());
+        }
+        // Only errors and notices.
+        assert!(body_len(b'D', big, true).is_err());
+        assert!(body_len(b'Z', big, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_large_error_while_streaming_is_reported_not_rejected() {
+        let mut body = b"SERROR\0CXX000\0M".to_vec();
+        body.extend(vec![b'x'; 200_000]);
+        body.extend(b"\0\0");
+        let bytes = wire(b'E', &body);
+        let mut r = FrameReader::new(&bytes[..]);
+        r.set_authenticated();
+        assert!(matches!(r.read().await.unwrap(), Backend::Error { .. }));
+    }
+
+    #[test]
     fn only_copy_data_may_be_large() {
         let over = (MAX_CONTROL_FRAME + 5) as i32;
-        assert!(body_len(b'E', over).is_err());
-        assert!(body_len(b'D', over).is_err());
-        assert!(body_len(b'R', over).is_err());
-        assert!(body_len(b'd', over).is_ok());
-        assert!(body_len(b'E', (MAX_CONTROL_FRAME + 4) as i32).is_ok());
+        assert!(body_len(b'E', over, false).is_err());
+        assert!(body_len(b'D', over, false).is_err());
+        assert!(body_len(b'R', over, false).is_err());
+        assert!(body_len(b'd', over, false).is_ok());
+        assert!(body_len(b'E', (MAX_CONTROL_FRAME + 4) as i32, false).is_ok());
     }
 
     #[test]
@@ -655,12 +741,15 @@ mod tests {
 
     #[test]
     fn body_length_edges() {
-        assert_eq!(body_len(b'd', 4).unwrap(), 0);
-        assert_eq!(body_len(b'd', MAX_FRAME as i32 + 4).unwrap(), MAX_FRAME);
-        assert!(body_len(b'd', MAX_FRAME as i32 + 5).is_err());
-        assert!(body_len(b'd', 3).is_err());
-        assert!(body_len(b'd', -1).is_err());
-        assert!(body_len(b'd', i32::MIN).is_err());
+        assert_eq!(body_len(b'd', 4, false).unwrap(), 0);
+        assert_eq!(
+            body_len(b'd', MAX_FRAME as i32 + 4, false).unwrap(),
+            MAX_FRAME
+        );
+        assert!(body_len(b'd', MAX_FRAME as i32 + 5, false).is_err());
+        assert!(body_len(b'd', 3, false).is_err());
+        assert!(body_len(b'd', -1, false).is_err());
+        assert!(body_len(b'd', i32::MIN, false).is_err());
     }
 
     #[test]
@@ -725,13 +814,22 @@ mod tests {
 
     #[test]
     fn frontend_messages() {
-        let s = startup_message("u", "d");
+        let s = startup_message("u", "d", &[]);
         assert_eq!(
             i32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize,
             s.len()
         );
         assert_eq!(&s[4..8], &196_608i32.to_be_bytes());
-        assert!(s.ends_with(b"replication\0database\0\0"));
+        assert_eq!(
+            &s[8..],
+            b"user\0u\0database\0d\0replication\0database\0client_encoding\0UTF8\0\0"
+        );
+        let s = startup_message(
+            "u",
+            "d",
+            &[("application_name", "aq"), ("options", "-c x=1")],
+        );
+        assert!(s.ends_with(b"client_encoding\0UTF8\0application_name\0aq\0options\0-c x=1\0\0"));
         assert_eq!(query("X"), b"Q\0\0\0\x06X\0");
         let u = status_update(0x0102, 4, true);
         assert_eq!(u.len(), 34);
