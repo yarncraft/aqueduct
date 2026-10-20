@@ -252,6 +252,7 @@ fn op_name(op: Op) -> &'static str {
         Op::Update => "update",
         Op::Delete => "delete",
         Op::Truncate => "truncate",
+        Op::Read => "read",
         Op::Heartbeat => "heartbeat",
     }
 }
