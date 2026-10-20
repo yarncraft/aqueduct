@@ -80,7 +80,8 @@ async fn sql(url: &str) -> tokio_postgres::Client {
 }
 
 /// Runs the pipeline over `src` until `target` inserts were delivered; returns the time from the
-/// first delivered event to the last, and the peak RSS seen meanwhile.
+/// pipeline's start (connecting, and for poll the first peek, included) to the last event, and
+/// the peak RSS seen meanwhile.
 async fn pipeline_until(src: &mut PostgresSource, target: u64, dir: &Path) -> (Duration, u64) {
     let seen = Arc::new(AtomicU64::new(0));
     let (stop, rx) = watch::channel(false);
@@ -101,21 +102,12 @@ async fn pipeline_until(src: &mut PostgresSource, target: u64, dir: &Path) -> (D
             }
         })
     };
-    let first = {
-        let seen = seen.clone();
-        tokio::spawn(async move {
-            while seen.load(Ordering::Relaxed) == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Instant::now()
-        })
-    };
+    let began = Instant::now();
     run_pipeline_with_metrics(src, &mut sink, &mut store, rx, &metrics)
         .await
         .expect("pipeline");
     let end = Instant::now();
     sampler.abort();
-    let began = first.await.expect("first-event watcher");
     (end - began, peak.load(Ordering::Relaxed))
 }
 
