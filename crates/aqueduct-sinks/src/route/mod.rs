@@ -6,6 +6,6 @@ pub mod expr;
 mod plan;
 
 pub use plan::{
-    KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan, RouteStats,
-    RoutesDescription, UNSEEN_FIELD_ROWS,
+    ContentTopic, KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan,
+    RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS, UNSEEN_FIELD_ROWS,
 };

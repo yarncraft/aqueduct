@@ -1036,6 +1036,8 @@ pub enum TemplateError {
     Missing(String),
     /// The field holds an object or array.
     NotScalar(String),
+    /// The caller's check refused the field's value.
+    Rejected(String),
 }
 
 impl fmt::Display for TemplateError {
@@ -1043,6 +1045,7 @@ impl fmt::Display for TemplateError {
         match self {
             TemplateError::Missing(p) => write!(f, "`{p}` is missing or null"),
             TemplateError::NotScalar(p) => write!(f, "`{p}` is an object or array"),
+            TemplateError::Rejected(p) => write!(f, "`{p}` holds a value that is not allowed"),
         }
     }
 }
@@ -1108,19 +1111,85 @@ impl Template {
         })
     }
 
+    /// The literal text before the first placeholder; empty when the template starts with one.
+    pub fn static_prefix(&self) -> &str {
+        match self.parts.first() {
+            Some(Part::Lit(s)) => s,
+            _ => "",
+        }
+    }
+
+    /// Every literal part, in order.
+    pub fn literals(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|p| match p {
+            Part::Lit(s) => Some(s.as_str()),
+            Part::Field(_) => None,
+        })
+    }
+
+    /// The template with every placeholder replaced by `*`, as a topic glob.
+    pub fn glob(&self) -> String {
+        self.parts
+            .iter()
+            .map(|p| match p {
+                Part::Lit(s) => s.as_str(),
+                Part::Field(_) => "*",
+            })
+            .collect()
+    }
+
+    /// True when some values for the placeholders, each non-empty and accepted by `check`, render
+    /// exactly `s`. The inverse of [`Template::render_checked`].
+    pub fn matches(&self, s: &str, check: impl Fn(&FieldRef, &str) -> bool) -> bool {
+        fn go(parts: &[Part], s: &str, check: &dyn Fn(&FieldRef, &str) -> bool) -> bool {
+            match parts.split_first() {
+                None => s.is_empty(),
+                Some((Part::Lit(l), rest)) => s
+                    .strip_prefix(l.as_str())
+                    .is_some_and(|tail| go(rest, tail, check)),
+                Some((Part::Field(f), rest)) => s
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(s.len()))
+                    .filter(|&end| end > 0)
+                    .any(|end| {
+                        s.get(..end).is_some_and(|v| check(f, v))
+                            && s.get(end..).is_some_and(|tail| go(rest, tail, check))
+                    }),
+            }
+        }
+        go(&self.parts, s, &check)
+    }
+
     /// Fills the placeholders. Strings insert their content, numbers and booleans their JSON text.
     pub fn render(&self, view: &EventView<'_>) -> Result<String, TemplateError> {
+        self.render_checked(view, |_, _| true)
+    }
+
+    /// [`Template::render`], with every substituted value passed to `check` first; a value it
+    /// refuses fails the render with [`TemplateError::Rejected`].
+    pub fn render_checked(
+        &self,
+        view: &EventView<'_>,
+        check: impl Fn(&FieldRef, &str) -> bool,
+    ) -> Result<String, TemplateError> {
         let mut out = String::new();
         for p in &self.parts {
             match p {
                 Part::Lit(s) => out.push_str(s),
-                Part::Field(f) => match view.value(f) {
-                    Leaf::Null => return Err(TemplateError::Missing(f.text.clone())),
-                    Leaf::Other => return Err(TemplateError::NotScalar(f.text.clone())),
-                    Leaf::Bool(b) => out.push_str(if b { "true" } else { "false" }),
-                    Leaf::Num(n) => out.push_str(n),
-                    Leaf::Str(s) => out.push_str(&s),
-                },
+                Part::Field(f) => {
+                    let v = match view.value(f) {
+                        Leaf::Null => return Err(TemplateError::Missing(f.text.clone())),
+                        Leaf::Other => return Err(TemplateError::NotScalar(f.text.clone())),
+                        Leaf::Bool(b) => Cow::Borrowed(if b { "true" } else { "false" }),
+                        Leaf::Num(n) => Cow::Borrowed(n),
+                        Leaf::Str(s) => s,
+                    };
+                    if !check(f, &v) {
+                        return Err(TemplateError::Rejected(f.text.clone()));
+                    }
+                    out.push_str(&v);
+                }
             }
         }
         Ok(out)

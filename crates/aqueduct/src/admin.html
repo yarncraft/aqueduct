@@ -483,7 +483,7 @@ function renderTables() {
       + `<td class="px-4 py-2 text-right tabular-nums text-ink-100">${hwmCell}</td></tr>`;
     return openTable === r.name ? row + hwmDetail(r) : row;
   }).join('') : '<tr><td colspan="8" class="px-4 py-6 text-center text-ink-300">No events received yet</td></tr>';
-  const failed = rows.filter(r => !r.kafka && r.error);
+  const failed = rows.filter(r => !r.kafka && r.error && !r.error.startsWith('content-routed'));
   $('hwmnote').textContent = hwm.error ? 'Kafka offsets: ' + hwm.error
     : rows.length && failed.length === rows.length ? 'Kafka offsets: ' + failed[0].error
     : hwm.read_ms ? 'Kafka offsets read ' + ago(hwm.read_ms) : 'Kafka offsets: –';

@@ -181,7 +181,12 @@ impl Admin {
                 (name.as_str(), topic)
             })
             .collect();
-        let mut topics: Vec<String> = topic_of.values().flatten().cloned().collect();
+        let mut topics: Vec<String> = topic_of
+            .values()
+            .flatten()
+            .filter(|t| !per_event_topic(t))
+            .cloned()
+            .collect();
         topics.sort();
         topics.dedup();
         let hwms = if topics.is_empty() {
@@ -435,11 +440,24 @@ async fn respond(sock: &mut TcpStream, status: &str, ctype: &str, body: &str) {
 
 /// One table's `kafka` block on `/api/tables`, or why there is none. `topic_of` maps every
 /// table to its topic, to count the tables that share it.
+/// The Tables card's note for a table whose topic comes from row content: there is no one topic
+/// to read offsets from, and the Routing card shows the route.
+const CONTENT_ROUTED: &str = "content-routed (see Routing)";
+
+/// True for a topic that still has placeholders after `{schema}`/`{table}` are filled: it is
+/// chosen per event (`{op}`, row fields). Kafka topic names cannot contain `{`.
+fn per_event_topic(topic: &str) -> bool {
+    topic.contains('{')
+}
+
 fn kafka_entry(
     hwms: &Option<(Instant, Result<Offsets, String>)>,
     topic: Option<&str>,
     topic_of: &BTreeMap<&str, Option<String>>,
 ) -> (Option<serde_json::Value>, Option<String>) {
+    if topic.is_some_and(per_event_topic) {
+        return (None, Some(CONTENT_ROUTED.into()));
+    }
     let Some((_, read)) = hwms else {
         return (
             None,
@@ -1167,10 +1185,14 @@ Authorization: Bearer {token}
         let route = |name: &str, pattern: &str, filter: Option<&str>| aqueduct_sinks::KafkaRoute {
             name: Some(name.into()),
             pattern: pattern.into(),
-            topic: format!("{name}.t"),
+            topic: format!(
+                "{}.t",
+                name.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+            ),
             ops: filter.map(|_| vec!["insert".to_string()]),
             filter: filter.map(Into::into),
             key: None,
+            ..Default::default()
         };
         let plan = RoutePlan::with_dead_letter(
             vec![
@@ -1238,7 +1260,7 @@ Authorization: Bearer {token}
         assert_eq!(
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
-                   "where": "row.status == 'paid'", "key": null, "topic": "paid \"orders\".t",
+                   "where": "row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
                    "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1},
                    "unseen_fields": []})
         );
@@ -1562,6 +1584,37 @@ Authorization: Bearer {token}
     }
 
     #[tokio::test]
+    async fn the_snapshot_cursor_is_never_shown_as_the_checkpoint() {
+        use aqueduct_core::{Checkpoint, Position, SnapState};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let admin = Admin::new(metrics.clone(), Some("k".into()), None);
+        admin.set_router(router());
+        let ckpt = Checkpoint {
+            pos: "16/B374D848@16/B374D8E0#2;db=5".into(),
+            snap: Some(SnapState {
+                id: "s1".into(),
+                tables: vec!["public.users".into(), "public.orders".into()],
+                table: 1,
+                after: Some(vec!["ada@example.com".into()]),
+            }),
+        };
+        metrics.record_checkpoint(&Position::Text(ckpt.encode()));
+        tokio::spawn(serve(listener, admin));
+        let want = "16/B374D848@16/B374D8E0#2;db=5 (snapshot: public.orders 2/2)";
+        for path in ["/api/tables", "/api/metrics"] {
+            let r = get_bearer(addr, path, "k").await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+            assert!(
+                !r.contains("ada@example.com"),
+                "{path} leaks the cursor: {r}"
+            );
+            assert_eq!(json_body(&r)["checkpoint"], want, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn tables_api_needs_the_token_and_lists_marks_without_kafka() {
         let addr = start_tables(None).await;
         assert!(get(addr, "/api/tables").await.starts_with("HTTP/1.1 401"));
@@ -1671,6 +1724,14 @@ Authorization: Bearer {token}
                 .as_deref(),
             Some("boom")
         );
+        // A content-routed table has no single topic: the card points at the Routing card,
+        // whether or not offsets could be read.
+        for h in [&hwms, &failed, &None] {
+            assert_eq!(
+                kafka_entry(h, Some("orders.{row.region}"), &topic_of),
+                (None, Some(CONTENT_ROUTED.to_string()))
+            );
+        }
     }
 
     #[test]
