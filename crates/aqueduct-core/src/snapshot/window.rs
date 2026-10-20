@@ -46,6 +46,10 @@ pub enum Outcome<R> {
         rows: Vec<ChunkRow<R>>,
         last_key: Option<String>,
     },
+    /// The high watermark closed the window, but a live change of the chunk's table could not be
+    /// matched to a key (an unsent TOAST key, a delete that does not carry the key). Any chunk row
+    /// may be stale, so emit nothing and read the same chunk again; the cursor does not move.
+    Retry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +87,7 @@ struct InFlight<R> {
     chunk: Option<Vec<ChunkRow<R>>>,
     touched: HashSet<String>,
     truncated: bool,
+    unknown: bool,
 }
 
 /// At most one chunk of one table is in flight. Memory is the chunk plus the keys of the live
@@ -120,6 +125,7 @@ impl<R> Window<R> {
             chunk: None,
             touched: HashSet::new(),
             truncated: false,
+            unknown: false,
         });
         Ok(())
     }
@@ -142,6 +148,14 @@ impl<R> Window<R> {
     pub fn live_key(&mut self, table: &str, key: &str) {
         if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen && c.table == table) {
             c.touched.insert(key.to_owned());
+        }
+    }
+
+    /// A live change of `table` whose key cannot be told passed on the stream. If it is the
+    /// chunk's table, the chunk is read again ([`Outcome::Retry`]) unless a `TRUNCATE` voids it.
+    pub fn live_unknown(&mut self, table: &str) {
+        if let Some(c) = self.cur.as_mut().filter(|c| c.low_seen && c.table == table) {
+            c.unknown = true;
         }
     }
 
@@ -175,11 +189,16 @@ impl<R> Window<R> {
                     chunk: Some(rows),
                     touched,
                     truncated,
+                    unknown,
                     ..
                 }) = self.cur.take()
                 else {
                     return Err(WindowError::ChunkMissing(id));
                 };
+                // After a TRUNCATE no chunk row exists any more, so an unknown key does not matter.
+                if unknown && !truncated {
+                    return Ok(Outcome::Retry);
+                }
                 let last_key = rows.last().map(|r| r.key.clone());
                 let rows = if truncated {
                     Vec::new()

@@ -6,13 +6,19 @@
 //! (at-least-once delivery).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod control;
 mod event;
 mod metrics;
 mod pipeline;
 mod snapshot;
 
+pub use control::{
+    snapshot_channel, SnapshotCommand, SnapshotReceiver, SnapshotRequest, SnapshotSender,
+};
 pub use event::{ChangeEvent, Op, Position};
-pub use metrics::{HeartbeatSnapshot, Metrics, Snapshot, State, OP_SLOTS};
+pub use metrics::{
+    HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State, OP_SLOTS,
+};
 pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,
     MAX_BATCH,

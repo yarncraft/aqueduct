@@ -18,6 +18,22 @@ Notable changes to Aqueduct. Newest first.
   - **Rollback is not supported.** An older binary refuses the new checkpoint (`not a Postgres LSN`) and will not
     start. To go back, delete the checkpoint file; the slot's `confirmed_flush_lsn` then decides where it resumes.
   - Rows already lost by earlier versions are not recovered by this fix; re-snapshot or backfill the affected tables.
+- **Postgres: a checkpoint from another cluster, database or timeline is refused at startup (#63).** Checkpoints now
+  record the cluster's `system_identifier`, the database OID and the timeline (`;sys=<id>;db=<oid>;tli=<n>` after the
+  key). Startup fails if the cluster or database differs (a re-pointed URL, a rebuilt primary, a major-version
+  `pg_upgrade`), and also after a failover or PITR of the same cluster (a new timeline), because changes may have been
+  lost; the error says "restored, recovered to a point in time (PITR) or failed over" and how to resync. See
+  DEPLOYMENT.md, "Checkpoint origin check".
+  - Upgrade: existing checkpoints lack these fields; they are accepted with a warning and the next checkpoint records
+    them.
+  - The Aqueduct role must be able to call `pg_control_system()` and `pg_control_checkpoint()`; a plain
+    `LOGIN REPLICATION` role can. Where a managed service refuses them, startup fails; set
+    `checkpoint_skip_system_check = true` under `[postgres]` to skip the cluster and timeline comparison.
+  - After a planned switchover you have verified, delete only the `;tli=` field from the checkpoint file.
+  - A slot with the configured name that belongs to another database (or is a physical slot) is now refused instead
+    of used.
+  - Rollback: a version before this one refuses the new checkpoint (`not a Postgres checkpoint`) and will not start.
+    To go back, remove the `;sys=...` suffix from the checkpoint file, or delete the file.
 - **Postgres TLS defaults to `verify-full`** (#12, PR #14). With no `ssl_mode` and no `sslmode=` in the URL, Aqueduct
   now requires TLS and verifies the server certificate and hostname. A Postgres server without TLS fails at startup,
   **including on localhost** (verify-full never falls back to plaintext). To upgrade:
@@ -71,6 +87,17 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Postgres snapshots: copy rows that already exist while changes stream** (#74, ADR 0001). New `[postgres]` keys
+  `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and
+  `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
+  Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
+  - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+- **Admin API for snapshots** (#75): `GET`/`POST`/`DELETE /api/snapshot` shows, starts and cancels a Postgres table
+  snapshot (with `snapshot = "on_demand"` or `"initial"`), behind the admin token. Progress is in `/api/metrics`
+  (`snapshot`) and Prometheus (`aqueduct_snapshot_*`). A request is not durable until the first chunk is
+  checkpointed. The admin server now reads a request split over several TCP segments whole (up to 16 KiB).
+  - While a snapshot runs the checkpoint file holds JSON (`{"pos": ..., "snap": {...}}`); a version without snapshots
+    refuses it. Let a snapshot finish before rolling back, or delete the checkpoint.
 - **Cockpit replication-health tiles** (#54, UI half). Slot lag, last-heartbeat age and skipped heartbeats, read from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. Each tile shows `–` until the server reports the field, so this ships independently of the backend half.
 - **Postgres idle heartbeat** (#47). Writes to tables outside the publication no longer pin WAL: every `heartbeat_interval_secs`
   (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is

@@ -18,14 +18,15 @@ Postgres (logical slot, pgoutput) --> Aqueduct --> Kafka
 
 Limits to know about:
 
-- Only changes made after the slot is created are captured. There is **no initial table snapshot**.
+- Only changes made after the slot is created are streamed. Rows that already exist are copied only by a
+  [snapshot](#snapshots) (Postgres 14+, off by default).
 - One Aqueduct instance per slot. Run a second instance with a different `slot` name, never two on one slot.
 - Postgres connections use TLS with certificate and hostname verification (`ssl_mode = "verify-full"`) by default, so a server without TLS fails at startup, **including on localhost**. Plaintext needs an explicit `ssl_mode = "disable"` (non-loopback plaintext then logs a warning).
 - DDL is not streamed. Add a new table to the publication, and expect `before` images only if the table's `REPLICA IDENTITY` allows it.
 
 ## 1. Prepare Postgres
 
-Postgres 10 or newer (tested on 16).
+Postgres 10 or newer (tested on 16). Snapshots need 14 or newer.
 
 ```conf
 # postgresql.conf (restart required)
@@ -132,6 +133,11 @@ topic = "cdc.{schema}.{table}"
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
+| `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
+| `snapshot` | `never` | `never`, `on_demand` or `initial`. Copies rows that already exist; see [Snapshots](#snapshots). Anything but `never` needs Postgres 14+ |
+| `snapshot_chunk_size` | `1024` | Rows per snapshot chunk |
+| `snapshot_max_rows_per_sec` | unset | Upper bound on snapshot rows read per second. Unset is unthrottled |
+| `snapshot_key_columns` | empty | Key columns for tables without a primary key, e.g. `{ "public.events" = ["day", "seq"] }`. They must be published, `NOT NULL` and unique together |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
@@ -225,7 +231,7 @@ topic = "audit"
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, per-operation and per-table breakdowns and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka).
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -269,7 +275,33 @@ With a published action table the heartbeat row is itself delivered as an event,
 acknowledged; the jump to the server's WAL position then rarely fires. Both paths are safe. If the action query or the
 WAL position query fails, the source logs a warning and skips that heartbeat instead of stopping. A standby cannot run
 an `UPDATE` action query, so leave it unset there. A checkpoint ahead of the server's WAL position (a state volume
-copied from another cluster) is rejected at startup.
+copied from another cluster, or a restore of this one) is rejected at startup; see [Checkpoint origin check](#checkpoint-origin-check).
+
+### Checkpoint origin check
+
+Every Postgres checkpoint records the cluster's `system_identifier`, the database OID and the cluster's timeline
+(`<commit>@<change>#<ord>;sys=<id>;db=<oid>;tli=<timeline>`). At startup, before the slot is looked up or created,
+Aqueduct reads them from the server (`pg_control_system()` and `pg_control_checkpoint()`; the integration suite calls
+both as a plain `LOGIN REPLICATION` role) and compares. `allow_slot_recreate` does not bypass this.
+
+| The checkpoint was written ... | Result |
+|---|---|
+| on another cluster (another `initdb`: a re-pointed URL, a primary rebuilt from scratch, a major-version `pg_upgrade`) | refused: point the URL back, or remove the checkpoint |
+| on another database of the same cluster | refused |
+| on an earlier timeline of the same cluster (a failover to a replica, or a PITR, since) | refused with "restored, recovered to a point in time (PITR) or failed over" |
+| ahead of the server's WAL on the same cluster (a restore that went back before the checkpoint) | refused with the same message |
+
+A failover or restore can lose changes: everything between the new server's WAL end and the checkpoint never reaches
+Kafka, and before Postgres 17 the logical slot does not follow a failover at all. The safe recovery is a resync:
+remove the checkpoint and take a [snapshot](#snapshots). If you have verified that nothing was lost (a planned
+switchover with no replication lag), delete only the `;tli=` field from the checkpoint file; the next checkpoint
+records the new timeline.
+
+- A checkpoint written by an older version lacks some fields. It is accepted with a warning, and the next checkpoint
+  records them.
+- If the role cannot call these functions (some managed services), startup fails with a message naming
+  `checkpoint_skip_system_check`. Set it to `true` to skip the cluster and timeline comparison; the database is still
+  compared.
 
 ```sql
 CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
@@ -300,6 +332,72 @@ by default, one per interval); route or ignore that topic downstream. Monitor th
 The `heartbeat` object is absent for sources without heartbeats (MongoDB). Heartbeats are not events: they are not counted in `events_total`
 and never reach the sink. `/metrics` has `aqueduct_slot_lag_bytes`, `aqueduct_heartbeat_skipped_total` and
 `aqueduct_heartbeat_last_timestamp_seconds`; each is left out while its value is unknown.
+
+### Snapshots
+
+A snapshot copies rows that already exist into the same topics as live changes, while streaming continues. It is
+off by default.
+
+| `snapshot =` | What happens |
+|---|---|
+| `never` (default) | Nothing is copied, and the slot is read exactly as without this feature |
+| `on_demand` | Snapshots run only when requested through the admin API |
+| `initial` | On a start **without a checkpoint**, every published table is copied; later starts do not repeat it |
+
+Each table is copied in chunks of `snapshot_chunk_size` rows, in primary-key order. Around each chunk Aqueduct writes
+two watermarks into the WAL with `pg_logical_emit_message` and reads the chunk between them. A live insert, update or
+delete of a row while its chunk is in flight replaces the chunk's copy of that row, so a snapshot row never
+overwrites a newer change. A `TRUNCATE` in that window drops the chunk. Rows that already exist arrive as events with
+`"op": "read"` (Kafka header `op: read`), `before` null and `after` the full row, encoded byte for byte like an
+`insert` of the same row and keyed the same way, so they land on the row's partition. Consumers that apply events
+"last write wins" end up with the table.
+
+- **Requirements:** Postgres 14 or newer, and `EXECUTE` on `pg_logical_emit_message(boolean, text, text)` for the
+  Aqueduct role (startup checks both). The role already needs `SELECT` on the published tables.
+- **Which columns and rows:** the publication's column list and row filter (Postgres 15+) apply to snapshot rows too.
+- **Tables without a primary key** are skipped with a warning, unless `snapshot_key_columns` names a published,
+  `NOT NULL`, unique key for them. A key column outside the publication's column list skips the table too.
+- **Crash safety:** progress (table and last key of the last chunk fully delivered) is saved in the same checkpoint
+  write as the stream position. After a crash the current chunk is read again: duplicates, never a missing row. The
+  checkpoint file holds JSON (`{"pos": ..., "snap": {...}}`) while a snapshot runs and returns to the plain form when
+  it finishes. Setting `snapshot = "never"` while one is unfinished abandons it with a warning.
+- **WAL and load:** no long transaction is held open; each chunk is one short `SELECT` and two tiny WAL records, and
+  the slot keeps advancing as events are delivered. `snapshot_max_rows_per_sec` throttles the reads.
+- **Ordering:** a row's snapshot copy can arrive after a live change of another row, but never after a newer change
+  of the same row.
+- **`REPLICA IDENTITY USING INDEX`** on a key that is not the primary key: a live delete then does not tell which row
+  went, so a chunk with such a delete in its window is read again (with a growing pause, up to 10 s).
+
+#### Starting a snapshot on request
+
+With `snapshot = "on_demand"` (or `"initial"`), the admin API starts, inspects and cancels snapshots. It needs the admin
+token like every `/api/*` route.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -X POST http://host:8080/api/snapshot \
+     -d '{"tables": ["public.orders", "public.customers"]}'
+# 202 {"id":"s1792…","state":"running","durable":false,"note":"…"}
+curl -H "Authorization: Bearer $TOKEN" http://host:8080/api/snapshot           # progress
+curl -H "Authorization: Bearer $TOKEN" -X DELETE http://host:8080/api/snapshot # cancel
+```
+
+| Request | Answer |
+|---|---|
+| `POST` with tables while none runs | `202`, a new snapshot of those tables |
+| `POST` while one runs | `202` with the running snapshot's id; the tables are appended to it |
+| `POST` naming a table outside the publication, or with `snapshot = "never"` | `409` with the reason |
+| `POST` with a body that is not `{"tables": ["schema.table", ...]}` | `400` |
+| `DELETE` | `202`; the snapshot stops after the chunk in flight, its rows are still delivered. `409` when none runs |
+| `GET` | the running or last snapshot: `id`, `state` (`running`, `finished`, `cancelled`), `tables`, `tables_done`, `table`, `rows`, `rows_estimated`, `skipped`; `{"state":"idle"}` before the first |
+
+**A request is not durable until the first chunk is checkpointed.** If Aqueduct restarts before then, the request is
+forgotten; send it again. After that, the snapshot resumes from its checkpoint like an initial one. The source answers
+requests between batches, so a reply can take as long as one Kafka round trip (`504` after 30 s).
+
+The same progress is in `/api/metrics` and `/api/stream` (`snapshot`), and in Prometheus as
+`aqueduct_snapshot_running`, `aqueduct_snapshot_rows_total`, `aqueduct_snapshot_tables_total`,
+`aqueduct_snapshot_tables_done` and `aqueduct_snapshot_rows_estimated` (each absent before the first snapshot). `rows`
+counts this process only: after a restart it starts again from 0.
 
 ## 6. Troubleshooting
 

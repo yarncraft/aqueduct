@@ -137,6 +137,27 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Waits until no backend holds the slot. Dropping a source does not stop a peek its
+    /// connection already sent, and a new source's peek fails with 55006 while that one runs.
+    async fn released(&self) {
+        for _ in 0..100 {
+            let active: bool = self
+                .db
+                .query_one(
+                    "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&self.slot],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if !active {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("slot {} stayed active", self.slot);
+    }
+
     async fn confirmed(&self) -> u64 {
         let row = self
             .db
@@ -347,6 +368,7 @@ async fn unacked_event_is_redelivered_after_a_restart() {
         assert!(drive(&mut s, Duration::from_millis(500)).await.is_none());
     }
     drop(s);
+    f.released().await;
 
     let mut again = f.source(Duration::from_secs(1));
     again.start(None).await.unwrap();
@@ -489,6 +511,7 @@ async fn checkpoint_ahead_of_the_wal_is_rejected() {
     let mut s = f.source(Duration::from_secs(1));
     s.start(None).await.unwrap();
     drop(s);
+    f.released().await;
     let mut s = f.source(Duration::from_secs(1));
     let err = s
         .start(Some(Position::Lsn(f.wal().await + (1 << 32))))

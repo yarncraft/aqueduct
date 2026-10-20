@@ -8,9 +8,18 @@ use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::tls::{self, SslMode};
+use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, SnapshotStatus};
 
-use crate::decoder::{decode, Message, RelationCache};
+use crate::catalog::read_catalog;
+use crate::decoder::{Message, RelationCache};
+use crate::snapshot::{
+    new_snapshot_id, table_id, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
+    MIN_SERVER_VERSION,
+};
+use crate::tls::{self, SslMode};
+#[cfg(test)]
+use crate::transport::{peek_sql, PEEK_SQL};
+use crate::transport::{PeekTransport, Transport};
 
 type Row = Box<RawValue>;
 
@@ -45,13 +54,186 @@ impl Key {
     }
 }
 
-/// Parses a text checkpoint; anything that is not a [`Key`] belongs to another source type.
-fn key_from_checkpoint(t: &str) -> Result<Key> {
-    Key::parse(t).ok_or_else(|| {
+/// The database a checkpoint was written against: the cluster's `system_identifier` (set by
+/// `initdb`, so it is the same on physical replicas and on restores of that cluster), its
+/// timeline (a new one after every promotion and PITR) and the database OID within it. `system`
+/// and `timeline` are `None` with `skip_system_check`; the database is always known, because
+/// `current_database()` needs no privilege.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Origin {
+    system: Option<u64>,
+    timeline: Option<u32>,
+    database: u32,
+}
+
+/// What a text checkpoint records about its origin. Checkpoints written before #63 have none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Stamp {
+    system: Option<u64>,
+    timeline: Option<u32>,
+    database: Option<u32>,
+}
+
+/// Checkpoint text: the [`Key`], then the `;name=value` fields (`sys`, `db`, `tli`) of the origin
+/// that is known.
+fn encode_checkpoint(key: Key, origin: Option<Origin>) -> String {
+    let mut t = key.encode();
+    if let Some(o) = origin {
+        if let Some(sys) = o.system {
+            t.push_str(&format!(";sys={sys}"));
+        }
+        t.push_str(&format!(";db={}", o.database));
+        if let Some(tli) = o.timeline {
+            t.push_str(&format!(";tli={tli}"));
+        }
+    }
+    t
+}
+
+/// Parses checkpoint text. An unknown or repeated field makes the whole checkpoint invalid, so a
+/// format this version does not understand is refused rather than half-read.
+fn parse_checkpoint(t: &str) -> Option<(Key, Stamp)> {
+    let mut parts = t.split(';');
+    let key = Key::parse(parts.next()?)?;
+    let mut stamp = Stamp::default();
+    for field in parts {
+        let (name, value) = field.split_once('=')?;
+        match name {
+            "sys" if stamp.system.is_none() => stamp.system = Some(value.parse().ok()?),
+            "db" if stamp.database.is_none() => stamp.database = Some(value.parse().ok()?),
+            "tli" if stamp.timeline.is_none() => stamp.timeline = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some((key, stamp))
+}
+
+/// Parses a text checkpoint; anything that is not a Postgres checkpoint belongs to another source
+/// type (or to a newer Aqueduct version).
+fn key_from_checkpoint(t: &str) -> Result<(Key, Stamp)> {
+    parse_checkpoint(t).ok_or_else(|| {
         Error::Checkpoint(format!(
             "checkpoint {t:?} is not a Postgres checkpoint; it belongs to another source type"
         ))
     })
+}
+
+/// Splits checkpoint text into the resume key, its origin stamp and the snapshot progress it
+/// carries (ADR 0001 §4: `{"pos": <key text>, "snap": {...}}` while a snapshot runs).
+fn split_checkpoint(t: &str) -> Result<(Key, Stamp, Option<SnapState>)> {
+    let c = Checkpoint::decode(t).map_err(Error::Checkpoint)?;
+    let (key, stamp) = key_from_checkpoint(&c.pos)?;
+    Ok((key, stamp, c.snap))
+}
+
+/// What to do after a restore, PITR or failover of the same cluster, which cannot be told apart.
+const RESYNC: &str = "The cluster was restored, recovered to a point in time (PITR) or failed \
+     over since the checkpoint was written, so changes between the server's WAL end and the \
+     checkpoint may never reach Kafka. Resync the consumers: remove the checkpoint and take a \
+     snapshot. If you have verified that nothing was lost, for example after a planned \
+     switchover with no lag, delete only the `;tli=` field from the checkpoint";
+
+/// Refuses a checkpoint written against another cluster (a different `initdb`: a re-pointed URL
+/// or a rebuilt primary), another timeline of the same cluster (a promotion or PITR since) or
+/// another database of the same cluster. A restore that stays on the same timeline is only
+/// caught by the checkpoint-ahead-of-WAL check in `start`.
+///
+/// With `skip_system_check` the server's cluster and timeline are unknown and only the database
+/// is compared.
+fn check_origin(saved: Stamp, server: Origin) -> Result<()> {
+    if let (Some(sys), Some(server_sys)) = (saved.system, server.system) {
+        if sys != server_sys {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against Postgres cluster {sys}, but this server is cluster {server_sys}. \
+                 The URL points at a different or rebuilt cluster (pg_upgrade to a new major \
+                 version also makes a new one). Point it back, or remove the checkpoint to start over"
+            )));
+        }
+        if let (Some(tli), Some(server_tli)) = (saved.timeline, server.timeline) {
+            if tli != server_tli {
+                return Err(Error::Checkpoint(format!(
+                    "checkpoint was written on timeline {tli} of this cluster, but the server is \
+                     on timeline {server_tli}. {RESYNC}"
+                )));
+            }
+        }
+    }
+    if let Some(db) = saved.database {
+        if db != server.database {
+            return Err(Error::Checkpoint(format!(
+                "checkpoint was written against database OID {db}, but this connection is to \
+                 database OID {} on the same cluster. Point the URL back at that database, or \
+                 remove the checkpoint to start over",
+                server.database
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A checkpoint ahead of the server's WAL. Treating it as acknowledged would move the slot past
+/// data that was never delivered, so it is refused. `same_cluster` is true when the checkpoint
+/// records this cluster's `system_identifier`: then only a restore, PITR or failover explains it.
+fn ahead_of_wal(lsn: u64, wal: u64, same_cluster: bool) -> Error {
+    let cause = if same_cluster {
+        RESYNC
+    } else {
+        "It belongs to another cluster, or this cluster was restored, recovered to a point in \
+         time or failed over since, and then changes after the server's WAL end may never reach \
+         Kafka. Remove the checkpoint to start over, and resync the consumers"
+    };
+    Error::Checkpoint(format!(
+        "checkpoint LSN {} is ahead of this server's WAL position {}. {cause}",
+        Position::Lsn(lsn),
+        Position::Lsn(wal)
+    ))
+}
+
+/// The WARN logged when a checkpoint lacks part of the origin and the next save will record this
+/// server's: nothing has verified that this is the server the checkpoint came from, so the first
+/// start after an upgrade is protected only by the checkpoint-ahead-of-WAL check. `None` when the
+/// checkpoint already records everything that is known.
+fn stamp_warning(saved: Stamp, server: Origin) -> Option<String> {
+    let new_sys = server.system.filter(|_| saved.system.is_none());
+    let new_db = saved.database.is_none();
+    let new_tli = server.timeline.filter(|_| saved.timeline.is_none());
+    if new_sys.is_none() && !new_db && new_tli.is_none() {
+        return None;
+    }
+    let mut fields = Vec::new();
+    if let Some(sys) = new_sys {
+        fields.push(format!("sys={sys}"));
+    }
+    if new_db {
+        fields.push(format!("db={}", server.database));
+    }
+    if let Some(tli) = new_tli {
+        fields.push(format!("tli={tli}"));
+    }
+    Some(format!(
+        "checkpoint does not record which cluster or database it belongs to (written before this \
+         check existed, or with checkpoint_skip_system_check); the next checkpoint records {} as \
+         its origin. Only the checkpoint-ahead-of-WAL check confirmed this is the right server; \
+         if the URL was changed, stop now and remove the checkpoint",
+        fields.join(" ")
+    ))
+}
+
+/// Refuses an existing slot of the configured name that does not belong to the connected
+/// database (a logical slot of another database, or a physical slot). Such a slot is someone
+/// else's: it is never used, dropped or recreated, whatever `allow_slot_recreate` says.
+fn check_slot_database(slot: &str, slot_db: Option<&str>, current: &str) -> Result<()> {
+    match slot_db {
+        Some(db) if db == current => Ok(()),
+        Some(db) => Err(Error::Source(format!(
+            "replication slot {slot:?} belongs to database {db:?}, not {current:?}. It was left \
+             untouched; use another slot name, or point the URL at {db:?}"
+        ))),
+        None => Err(Error::Source(format!(
+            "replication slot {slot:?} is a physical slot, not a logical slot of database \
+             {current:?}. It was left untouched; use another slot name"
+        ))),
+    }
 }
 
 /// Assigns [`Key`]s to the changes of the transaction being decoded.
@@ -86,25 +268,6 @@ impl TxKeys {
     }
 }
 
-/// The peek query. `proto_version` stays 1 and `streaming` is never set: a streamed in-progress
-/// transaction has no commit LSN until it commits, so no [`Key`] could be built for its changes.
-const PEEK_SQL: &str = "SELECT lsn::text, data \
-     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
-     'proto_version', '1', 'publication_names', $3::text)";
-
-/// [`PEEK_SQL`] plus `messages`, so logical messages (snapshot watermarks) are sent. Postgres 14+.
-const PEEK_SQL_WITH_MESSAGES: &str = "SELECT lsn::text, data \
-     FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, $2::int4, \
-     'proto_version', '1', 'publication_names', $3::text, 'messages', 'true')";
-
-fn peek_sql(logical_messages: bool) -> &'static str {
-    if logical_messages {
-        PEEK_SQL_WITH_MESSAGES
-    } else {
-        PEEK_SQL
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PostgresSourceConfig {
     /// libpq-style connection string / URL.
@@ -130,9 +293,16 @@ pub struct PostgresSourceConfig {
     /// Optional SQL run before each heartbeat (e.g. an upsert into a tiny published table), for
     /// servers where WAL position alone does not move the slot.
     pub heartbeat_action_query: Option<String>,
+    /// Skip reading, recording and checking the cluster's `system_identifier` and timeline. Only for servers
+    /// that refuse `pg_control_system()`; without it such a server fails at startup. The database
+    /// check stays on.
+    pub skip_system_check: bool,
     /// Ask the slot for logical messages (`'messages', 'true'`), which snapshots use as watermarks.
-    /// Needs Postgres 14+. Off by default, so the peek is unchanged.
+    /// Needs Postgres 14+. Off by default, so the peek is unchanged; any snapshot mode but
+    /// `Never` turns it on.
     pub logical_messages: bool,
+    /// Snapshots of existing rows (ADR 0001). Off by default.
+    pub snapshot: SnapshotConfig,
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -155,7 +325,9 @@ impl PostgresSourceConfig {
             ssl_root_cert: None,
             heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
             heartbeat_action_query: None,
+            skip_system_check: false,
             logical_messages: false,
+            snapshot: SnapshotConfig::default(),
         }
     }
 
@@ -175,7 +347,15 @@ impl PostgresSourceConfig {
 /// (at-least-once).
 pub struct PostgresSource {
     cfg: PostgresSourceConfig,
-    client: Option<Client>,
+    client: Option<Arc<Client>>,
+    /// Where decoded changes come from; set by `start`.
+    transport: Option<Box<dyn Transport>>,
+    /// The running snapshot, if any.
+    snapshot: Option<Engine>,
+    /// Snapshot requests from the admin API.
+    control: Option<SnapshotReceiver>,
+    /// Status of the last snapshot that ended, kept for the admin API.
+    last_status: Option<SnapshotStatus>,
     buffer: VecDeque<ChangeEvent>,
     /// Highest key already queued; later peeks skip changes at or below it.
     emitted: Key,
@@ -198,6 +378,8 @@ pub struct PostgresSource {
     metrics: Option<Arc<Metrics>>,
     /// When the slot lag was last read.
     last_slot_stats: Option<Instant>,
+    /// The connected cluster and database, stamped on every checkpoint. `None` before `start`.
+    origin: Option<Origin>,
 }
 
 /// How often the slot lag is read from `pg_replication_slots`.
@@ -208,6 +390,10 @@ impl PostgresSource {
         Self {
             cfg,
             client: None,
+            transport: None,
+            snapshot: None,
+            control: None,
+            last_status: None,
             buffer: VecDeque::new(),
             emitted: Key::default(),
             acked: 0,
@@ -218,7 +404,181 @@ impl PostgresSource {
             last_heartbeat: Instant::now(),
             metrics: None,
             last_slot_stats: None,
+            origin: None,
         }
+    }
+
+    /// The current database's OID and, unless `skip_system_check`, the connected cluster's
+    /// `system_identifier`.
+    async fn read_origin(&self) -> Result<Origin> {
+        let database: i64 = self
+            .client()?
+            .query_one(
+                "SELECT oid::int8 FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        let database = u32::try_from(database)
+            .map_err(|_| Error::Source(format!("invalid database OID {database}")))?;
+        if self.cfg.skip_system_check {
+            return Ok(Origin {
+                system: None,
+                timeline: None,
+                database,
+            });
+        }
+        let row = self
+            .client()?
+            .query_one(
+                "SELECT s.system_identifier::text, c.timeline_id::int8 \
+                 FROM pg_control_system() s, pg_control_checkpoint() c",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                Error::Source(format!(
+                    "{}. Aqueduct reads pg_control_system() and pg_control_checkpoint() to tell \
+                     which cluster and timeline a checkpoint belongs to; grant them, or set \
+                     postgres.checkpoint_skip_system_check = true",
+                    src_err(e)
+                ))
+            })?;
+        let system: String = row.get(0);
+        let timeline: i64 = row.get(1);
+        let system = system
+            .parse()
+            .map_err(|_| Error::Source(format!("invalid system_identifier {system:?}")))?;
+        let timeline = u32::try_from(timeline)
+            .map_err(|_| Error::Source(format!("invalid timeline {timeline}")))?;
+        Ok(Origin {
+            system: Some(system),
+            timeline: Some(timeline),
+            database,
+        })
+    }
+
+    /// Take snapshot requests (start, cancel) from the admin API.
+    pub fn with_snapshot_control(mut self, control: SnapshotReceiver) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Reports the running or last snapshot to the metrics.
+    fn publish_status(&self) {
+        if let Some(m) = &self.metrics {
+            let status = match &self.snapshot {
+                Some(e) => Some(e.status("running")),
+                None => self.last_status.clone(),
+            };
+            m.set_snapshot(status);
+        }
+    }
+
+    /// Answers the admin API's snapshot requests. Runs between batches, never while a chunk is
+    /// half set up.
+    async fn handle_requests(&mut self) -> Result<()> {
+        loop {
+            let Some(req) = self.control.as_mut().and_then(|c| c.try_recv().ok()) else {
+                return Ok(());
+            };
+            let answer = match req.command {
+                SnapshotCommand::Start(tables) => self.request_snapshot(tables).await,
+                SnapshotCommand::Cancel => self.cancel_snapshot(),
+            };
+            let _ = req.reply.send(answer);
+            self.publish_status();
+        }
+    }
+
+    /// Starts a snapshot of `tables`, or appends them to the running one. The answer is the
+    /// snapshot id. The request is durable only once an event carrying the snapshot is
+    /// checkpointed; a crash before that forgets it.
+    async fn request_snapshot(
+        &mut self,
+        tables: Vec<String>,
+    ) -> std::result::Result<String, String> {
+        if self.cfg.snapshot.mode == SnapshotMode::Never {
+            return Err(
+                "snapshots are off; set postgres.snapshot = \"on_demand\" or \"initial\"".into(),
+            );
+        }
+        let client = self.client().map_err(|e| e.to_string())?;
+        let catalog = read_catalog(client, &self.cfg.publication)
+            .await
+            .map_err(|e| e.to_string())?;
+        let published: Vec<String> = catalog
+            .tables
+            .iter()
+            .map(|t| table_id(&t.schema, &t.name))
+            .collect();
+        let unknown: Vec<&str> = tables
+            .iter()
+            .filter(|t| !published.contains(t))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "not in publication {:?}: {}",
+                self.cfg.publication,
+                unknown.join(", ")
+            ));
+        }
+        if let Some(e) = self.snapshot.as_mut() {
+            if !e.cancelled() {
+                e.append(tables, &catalog, &self.cfg.snapshot);
+                return Ok(e.id().to_owned());
+            }
+        }
+        let id = new_snapshot_id();
+        let state = SnapState {
+            id: id.clone(),
+            tables,
+            table: 0,
+            after: None,
+        };
+        match Engine::new(&self.cfg.slot, state, &catalog, &self.cfg.snapshot) {
+            Some(e) => {
+                tracing::info!(snapshot = %id, tables = e.state().tables.len(), "snapshot requested");
+                self.snapshot = Some(e);
+                Ok(id)
+            }
+            None => Err("none of these tables can be snapshotted (see the log for why)".into()),
+        }
+    }
+
+    /// Stops the running snapshot after the chunk in flight.
+    fn cancel_snapshot(&mut self) -> std::result::Result<String, String> {
+        let Some(e) = self.snapshot.as_mut() else {
+            return Err("no snapshot is running".into());
+        };
+        e.cancel();
+        let id = e.id().to_owned();
+        if !e.in_flight() {
+            // Nothing in flight: end now, and return the checkpoint to the plain form.
+            let checkpoint = self.checkpoint_text(self.emitted, None);
+            let mut hb = ChangeEvent::heartbeat(Position::Lsn(self.emitted.change), 0);
+            hb.checkpoint = Some(Position::Text(checkpoint));
+            self.buffer.push_back(hb);
+            self.end_snapshot();
+        }
+        Ok(id)
+    }
+
+    /// Forgets the running snapshot, keeping its final status for the admin API.
+    fn end_snapshot(&mut self) {
+        if let Some(e) = self.snapshot.take() {
+            let state = if e.cancelled() {
+                "cancelled"
+            } else {
+                "finished"
+            };
+            let st = e.status(state);
+            tracing::info!(snapshot = %st.id, rows = st.rows, "snapshot {state}");
+            self.last_status = Some(st);
+        }
+        self.publish_status();
     }
 
     /// Report heartbeats and slot lag to `metrics`.
@@ -311,7 +671,13 @@ impl PostgresSource {
 
     fn client(&self) -> Result<&Client> {
         self.client
-            .as_ref()
+            .as_deref()
+            .ok_or_else(|| Error::Source("source not started".into()))
+    }
+
+    fn transport(&mut self) -> Result<&mut Box<dyn Transport>> {
+        self.transport
+            .as_mut()
             .ok_or_else(|| Error::Source("source not started".into()))
     }
 
@@ -327,13 +693,7 @@ impl PostgresSource {
         if lsn <= self.acked {
             return Ok(());
         }
-        self.client()?
-            .execute(
-                "SELECT pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
-                &[&self.cfg.slot, &Position::Lsn(lsn).to_string()],
-            )
-            .await
-            .map_err(src_err)?;
+        self.transport()?.confirm(lsn).await?;
         self.acked = lsn;
         Ok(())
     }
@@ -349,10 +709,12 @@ impl PostgresSource {
         before: Option<Row>,
         after: Option<Row>,
         row_key: Option<String>,
-    ) {
-        if key > self.emitted {
-            self.emitted = key;
-            self.buffer.push_back(ChangeEvent {
+    ) -> bool {
+        let snap = self.snapshot.as_ref().map(|e| e.state().clone());
+        let checkpoint = self.checkpoint_text(key, snap);
+        self.push(
+            key,
+            ChangeEvent {
                 position: Position::Lsn(key.change),
                 xid,
                 commit_ts_micros,
@@ -362,8 +724,86 @@ impl PostgresSource {
                 before,
                 after,
                 key: row_key,
-                checkpoint: Some(Position::Text(key.encode())),
-            });
+                checkpoint: Some(Position::Text(checkpoint)),
+            },
+        )
+    }
+
+    /// Queues `ev` unless a change with this key was queued before (a peek re-decodes from the
+    /// slot's confirmed position). Returns whether it was queued.
+    fn push(&mut self, key: Key, ev: ChangeEvent) -> bool {
+        if key <= self.emitted {
+            return false;
+        }
+        self.emitted = key;
+        self.buffer.push_back(ev);
+        true
+    }
+
+    /// Checkpoint text for `key`: the key with its origin, wrapped with the snapshot progress
+    /// while a snapshot runs, so both are saved in one atomic write.
+    fn checkpoint_text(&self, key: Key, snap: Option<SnapState>) -> String {
+        Checkpoint {
+            pos: encode_checkpoint(key, self.origin),
+            snap,
+        }
+        .encode()
+    }
+
+    /// Queues what closing a snapshot chunk produced, inside the high watermark's transaction:
+    /// each row gets the next key at the watermark's LSN, so the rows sort after every live change
+    /// of the window and the transaction's commit end covers them. Rows before the last carry the
+    /// progress from before the chunk (a crash part-way reads the chunk again: duplicates only),
+    /// the last row the new progress. A chunk without rows saves its progress with a heartbeat.
+    fn queue_closed(
+        &mut self,
+        mut closed: Closed,
+        before: SnapState,
+        lsn: u64,
+        keys: &mut TxKeys,
+        xid: u32,
+        ts: i64,
+    ) {
+        // A cancelled snapshot ends with this chunk: its rows are delivered, then the checkpoint
+        // returns to the plain form.
+        if self.snapshot.as_ref().is_some_and(|e| e.cancelled()) {
+            closed.state = None;
+        }
+        let n = closed.rows.len();
+        for (i, r) in closed.rows.into_iter().enumerate() {
+            let key = keys.next(lsn);
+            let snap = if i + 1 == n {
+                closed.state.clone()
+            } else {
+                Some(before.clone())
+            };
+            let checkpoint = self.checkpoint_text(key, snap);
+            self.push(
+                key,
+                ChangeEvent {
+                    position: Position::Lsn(lsn),
+                    xid,
+                    commit_ts_micros: ts,
+                    schema: r.schema,
+                    table: r.table,
+                    op: Op::Read,
+                    before: None,
+                    after: Some(r.row),
+                    key: r.key,
+                    checkpoint: Some(Position::Text(checkpoint)),
+                },
+            );
+        }
+        if n == 0 && closed.state.as_ref() != Some(&before) {
+            let checkpoint = self.checkpoint_text(self.emitted, closed.state.clone());
+            let mut hb = ChangeEvent::heartbeat(Position::Lsn(lsn), ts);
+            hb.checkpoint = Some(Position::Text(checkpoint));
+            self.buffer.push_back(hb);
+        }
+        if closed.state.is_none() {
+            self.end_snapshot();
+        } else {
+            self.publish_status();
         }
     }
 
@@ -416,9 +856,11 @@ impl PostgresSource {
     /// Finishes a heartbeat after the peek was processed. Advances the slot only when nothing
     /// is queued or awaiting a checkpoint; see [`heartbeat_targets`].
     async fn heartbeat_end(&mut self, wal: u64, drained: bool) -> Result<()> {
+        // A chunk in flight counts as queued: its watermarks and rows are not delivered yet.
+        let in_flight = self.snapshot.as_ref().is_some_and(|e| e.in_flight());
         let targets = heartbeat_targets(
             &mut self.tx_ends,
-            drained && self.buffer.is_empty(),
+            drained && self.buffer.is_empty() && !in_flight,
             self.checkpointed,
             wal,
         );
@@ -434,30 +876,21 @@ impl PostgresSource {
     async fn poll(&mut self) -> Result<()> {
         let heartbeat_wal = self.heartbeat_begin().await?;
         self.refresh_slot_stats().await;
-        let rows = self
-            .client()?
-            .query(
-                peek_sql(self.cfg.logical_messages),
-                &[&self.cfg.slot, &self.cfg.batch_size, &self.cfg.publication],
-            )
-            .await
-            .map_err(src_err)?;
-        // `upto_nchanges` ends a capped peek at the first commit past the limit, possibly well
-        // below `heartbeat_wal`. Only a peek that returned fewer rows than the cap saw everything.
-        // A peek that reached the end can still return `batch_size` rows or more (it stops at a
-        // commit boundary); that only delays the jump to `wal` by one interval, never skips data.
-        let drained = i64::try_from(rows.len()).is_ok_and(|n| n < i64::from(self.cfg.batch_size));
+        let fetched = self.transport()?.fetch().await?;
+        self.apply(fetched.messages)?;
+        if let Some(wal) = heartbeat_wal {
+            self.heartbeat_end(wal, fetched.drained).await?;
+        }
+        Ok(())
+    }
 
+    /// Turns decoded messages into queued events. This is the one place where changes get their
+    /// [`Key`], for every transport.
+    fn apply(&mut self, messages: Vec<(u64, Message)>) -> Result<()> {
         let mut cache = RelationCache::default();
         let (mut xid, mut ts) = (0u32, 0i64);
         let mut keys = TxKeys::default();
-        for row in rows {
-            // Borrow from the result buffer instead of copying each change out of it.
-            let lsn_text: &str = row.get(0);
-            let data: &[u8] = row.get(1);
-            let lsn = parse_lsn(lsn_text)?;
-            let msg = decode(data)
-                .map_err(|e| Error::Source(format!("pgoutput decode at {lsn_text}: {e}")))?;
+        for (lsn, msg) in messages {
             let dec = |e: crate::decoder::DecodeError| Error::Source(e.to_string());
             match msg {
                 Message::Begin {
@@ -480,6 +913,9 @@ impl PostgresSource {
                             "REPLICA IDENTITY FULL: with partition_by = key this table uses the table key (per-table order only)"
                         );
                     }
+                    if let Some(e) = self.snapshot.as_mut() {
+                        e.relation(&table_id(&rel.schema, &rel.name), &rel);
+                    }
                     cache.insert(rel)
                 }
                 Message::Insert { relation, new } => {
@@ -488,7 +924,12 @@ impl PostgresSource {
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let row_key = cache.key(relation, &new).map_err(dec)?;
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Insert, None, after, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(&id, Live::Insert { rel: r, new: &new });
+                        }
+                    }
                 }
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
@@ -497,12 +938,25 @@ impl PostgresSource {
                         .key_with_old(relation, &new, old.as_ref())
                         .map_err(dec)?;
                     let before = old
-                        .map(|t| cache.row(relation, &t))
+                        .as_ref()
+                        .map(|t| cache.row(relation, t))
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Update, before, after, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Update, before, after, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(
+                                &id,
+                                Live::Update {
+                                    rel: r,
+                                    old: old.as_ref(),
+                                    new: &new,
+                                },
+                            );
+                        }
+                    }
                 }
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
@@ -510,14 +964,24 @@ impl PostgresSource {
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
                     let row_key = cache.key(relation, &old).map_err(dec)?;
                     let key = keys.next(lsn);
-                    self.queue(key, xid, ts, name, Op::Delete, before, None, row_key);
+                    let id = table_id(&name.0, &name.1);
+                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key) {
+                        if let Some(e) = self.snapshot.as_mut() {
+                            e.observe(&id, Live::Delete { rel: r, old: &old });
+                        }
+                    }
                 }
                 Message::Truncate { relations } => {
-                    for id in relations {
-                        let r = cache.get(id).map_err(dec)?;
+                    for rel_id in relations {
+                        let r = cache.get(rel_id).map_err(dec)?;
                         let name = (r.schema.clone(), r.name.clone());
                         let key = keys.next(lsn);
-                        self.queue(key, xid, ts, name, Op::Truncate, None, None, None);
+                        let id = table_id(&name.0, &name.1);
+                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None) {
+                            if let Some(e) = self.snapshot.as_mut() {
+                                e.observe(&id, Live::Truncate);
+                            }
+                        }
                     }
                 }
                 Message::Commit { end_lsn, .. } => {
@@ -530,13 +994,90 @@ impl PostgresSource {
                         self.tx_ends.push_back((end, end_lsn));
                     }
                 }
-                // Nothing consumes watermarks yet; the snapshot engine will.
-                Message::Logical(_) | Message::Ignored => {}
+                Message::Logical(l) => {
+                    // Watermarks of this slot close snapshot chunks; any other message (another
+                    // slot's, another tool's, a non-transactional one) is not ours.
+                    let (Some(wm), Some(e)) =
+                        (l.watermark_for(&self.cfg.slot), self.snapshot.as_mut())
+                    else {
+                        continue;
+                    };
+                    let before = e.state().clone();
+                    if let Some(closed) = e.mark(&wm)? {
+                        self.queue_closed(closed, before, l.lsn, &mut keys, xid, ts);
+                    }
+                }
+                Message::Ignored => {}
             }
         }
-        if let Some(wal) = heartbeat_wal {
-            self.heartbeat_end(wal, drained).await?;
+        Ok(())
+    }
+
+    /// Sets up the snapshot this start needs: resumes the one the checkpoint carries, or starts
+    /// the initial one when there is no checkpoint. Fails when snapshots are on but the server
+    /// cannot send watermarks; that is checked here, never in the poll loop.
+    async fn start_snapshot(&mut self, resume: Option<SnapState>, first_start: bool) -> Result<()> {
+        let cfg = self.cfg.snapshot.clone();
+        if cfg.mode == SnapshotMode::Never {
+            if let Some(s) = resume {
+                tracing::warn!(
+                    snapshot = %s.id,
+                    "the checkpoint carries an unfinished snapshot, but snapshot = \"never\"; \
+                     it is abandoned (rows not copied yet are not delivered)"
+                );
+            }
+            return Ok(());
         }
+        let catalog = read_catalog(self.client()?, &self.cfg.publication).await?;
+        if catalog.server_version_num < MIN_SERVER_VERSION {
+            return Err(Error::Config(format!(
+                "postgres.snapshot = {:?} needs Postgres 14 or newer for its watermarks; this server is {}",
+                cfg.mode, catalog.server_version_num
+            )));
+        }
+        let allowed: bool = self
+            .client()?
+            .query_one(
+                // By OID, not signature: PG17 added a fourth argument (`flush`).
+                "SELECT COALESCE(bool_or(has_function_privilege(p.oid, 'EXECUTE')), false)                  FROM pg_proc p WHERE p.proname = 'pg_logical_emit_message'                  AND p.pronamespace = 'pg_catalog'::regnamespace AND p.proargtypes[1] = 'text'::regtype",
+                &[],
+            )
+            .await
+            .map_err(src_err)?
+            .get(0);
+        if !allowed {
+            return Err(Error::Config(
+                "snapshots write watermarks with pg_logical_emit_message(); grant EXECUTE on it to \
+                 the Aqueduct role, or set postgres.snapshot = \"never\""
+                    .into(),
+            ));
+        }
+        self.cfg.logical_messages = true;
+        let state = match resume {
+            Some(s) => Some(s),
+            None if first_start && cfg.mode == SnapshotMode::Initial => Some(SnapState {
+                id: new_snapshot_id(),
+                tables: catalog
+                    .tables
+                    .iter()
+                    .map(|t| table_id(&t.schema, &t.name))
+                    .collect(),
+                table: 0,
+                after: None,
+            }),
+            None => None,
+        };
+        if let Some(state) = state {
+            let id = state.id.clone();
+            self.snapshot = Engine::new(&self.cfg.slot, state, &catalog, &cfg);
+            match &self.snapshot {
+                Some(e) => {
+                    tracing::info!(snapshot = %id, tables = e.state().tables.len(), "snapshot running")
+                }
+                None => tracing::info!(snapshot = %id, "nothing to snapshot"),
+            }
+        }
+        self.publish_status();
         Ok(())
     }
 }
@@ -545,9 +1086,39 @@ impl PostgresSource {
 impl Source for PostgresSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
         let client = self.connect().await?;
-        self.client = Some(client);
+        self.client = Some(Arc::new(client));
         if let Some(m) = &self.metrics {
             m.heartbeat_configured(self.cfg.heartbeat_interval);
+        }
+
+        // Which cluster and database this is, checked against the checkpoint before the slot is
+        // looked up or created, so a checkpoint is never applied to (and no slot is created on)
+        // the wrong database. `allow_slot_recreate` does not bypass this. `skip_system_check`
+        // only drops the cluster part; the database is always compared.
+        if self.cfg.skip_system_check {
+            tracing::warn!(
+                "checkpoint_skip_system_check is set: a checkpoint from another cluster is not \
+                 detected (one from another database of the same cluster still is)"
+            );
+        }
+        let origin = self.read_origin().await?;
+        self.origin = Some(origin);
+        let parsed = match &start {
+            Some(Position::Text(t)) => Some(split_checkpoint(t)?),
+            // A plain-LSN checkpoint predates keys and records no origin.
+            Some(Position::Lsn(_)) => None,
+            None => None,
+        };
+        let stamp = match &start {
+            Some(Position::Text(_)) => parsed.as_ref().map(|p| p.1),
+            Some(Position::Lsn(_)) => Some(Stamp::default()),
+            None => None,
+        };
+        if let Some(stamp) = stamp {
+            check_origin(stamp, origin)?;
+            if let Some(msg) = stamp_warning(stamp, origin) {
+                tracing::warn!("{msg}");
+            }
         }
 
         let slot = self.cfg.slot.clone();
@@ -555,13 +1126,18 @@ impl Source for PostgresSource {
         let existing = self
             .client()?
             .query_opt(
-                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                "SELECT confirmed_flush_lsn::text, database::text, current_database()::text \
+                 FROM pg_replication_slots WHERE slot_name = $1",
                 &[&slot],
             )
             .await
             .map_err(src_err)?;
         match existing {
             Some(row) => {
+                // Checked before the slot is used; a slot of another database is never touched.
+                let slot_db: Option<String> = row.get(1);
+                let current: String = row.get(2);
+                check_slot_database(&slot, slot_db.as_deref(), &current)?;
                 let flushed: Option<String> = row.get(0);
                 self.acked = flushed.as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
             }
@@ -590,6 +1166,7 @@ impl Source for PostgresSource {
         // The checkpoint can be ahead of the slot if we crashed between save and ack, and
         // the slot replays whole transactions: skip changes already delivered.
         // A recreated slot starts a new stream, so the old checkpoint no longer applies.
+        let first_start = start.is_none();
         if let (Some(pos), false) = (start, recreated) {
             match pos {
                 Position::Lsn(l) => {
@@ -601,11 +1178,7 @@ impl Source for PostgresSource {
                     // past data that was never delivered, so refuse it.
                     if let Some(wal) = self.wal_position().await? {
                         if l > wal {
-                            return Err(Error::Checkpoint(format!(
-                                "checkpoint LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
-                                Position::Lsn(l),
-                                Position::Lsn(wal)
-                            )));
+                            return Err(ahead_of_wal(l, wal, false));
                         }
                     }
                     tracing::warn!(
@@ -615,15 +1188,14 @@ impl Source for PostgresSource {
                     );
                 }
                 Position::Text(t) => {
-                    let k = key_from_checkpoint(&t)?;
-                    // Same cross-cluster guard as for a plain LSN, on the commit LSN.
+                    let (k, stamp, _) = split_checkpoint(&t)?;
+                    // Same guard as for a plain LSN, on the commit LSN. `check_origin` already
+                    // refused another cluster, so a recorded `sys` means a restore of this one.
                     if let Some(wal) = self.wal_position().await? {
                         if k.commit > wal {
-                            return Err(Error::Checkpoint(format!(
-                                "checkpoint commit LSN {} is ahead of this server's WAL position {}; it belongs to another cluster. Remove the checkpoint to start over",
-                                Position::Lsn(k.commit),
-                                Position::Lsn(wal)
-                            )));
+                            let known = stamp.system.is_some()
+                                && stamp.system == self.origin.and_then(|o| o.system);
+                            return Err(ahead_of_wal(k.commit, wal, known));
                         }
                     }
                     self.emitted = k;
@@ -631,6 +1203,20 @@ impl Source for PostgresSource {
                 }
             }
         }
+        // A recreated slot starts a new stream, so an old snapshot's progress no longer applies.
+        let resume = parsed.and_then(|p| p.2).filter(|_| !recreated);
+        self.start_snapshot(resume, first_start).await?;
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| Error::Source("source not started".into()))?;
+        self.transport = Some(Box::new(PeekTransport {
+            client,
+            slot: self.cfg.slot.clone(),
+            publication: self.cfg.publication.clone(),
+            batch_size: self.cfg.batch_size,
+            logical_messages: self.cfg.logical_messages,
+        }));
         Ok(())
     }
 
@@ -639,9 +1225,29 @@ impl Source for PostgresSource {
             if let Some(ev) = self.buffer.pop_front() {
                 return Ok(Some(ev));
             }
+            self.handle_requests().await?;
+            if let Some(ev) = self.buffer.pop_front() {
+                return Ok(Some(ev));
+            }
+            // The next chunk starts only when everything before it is handed on, so memory stays
+            // at one chunk.
+            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref()) {
+                if e.due() {
+                    e.start_chunk(c).await?;
+                }
+            }
             self.poll().await?;
             if self.buffer.is_empty() {
-                tokio::time::sleep(self.cfg.poll_interval).await;
+                // A chunk in flight waits for its high watermark: poll again soon, but not in a
+                // hot loop (the watermark may not be flushed yet). A due chunk starts at once.
+                let pause = match &self.snapshot {
+                    Some(e) if e.due() => Duration::ZERO,
+                    Some(e) if e.in_flight() => {
+                        Duration::from_millis(20).min(self.cfg.poll_interval)
+                    }
+                    _ => self.cfg.poll_interval,
+                };
+                tokio::time::sleep(pause).await;
             }
         }
     }
@@ -655,7 +1261,9 @@ impl Source for PostgresSource {
         // cannot be placed in the commit order, so acking one would be a guess.
         match position {
             Position::Text(t) => {
-                let k = Key::parse(&t)
+                let (k, _) = Checkpoint::decode(&t)
+                    .ok()
+                    .and_then(|c| parse_checkpoint(&c.pos))
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
                 self.advance_acked(k).await
@@ -672,7 +1280,7 @@ impl Source for PostgresSource {
 /// (`UnknownIssuer`, "server does not support TLS", ...) is only reachable via `source()`.
 /// A server error contributes its SQLSTATE and message only: DETAIL/HINT can carry row values
 /// and would otherwise reach `last_error`, `/api/metrics` and the logs.
-fn src_err(e: tokio_postgres::Error) -> Error {
+pub(crate) fn src_err(e: tokio_postgres::Error) -> Error {
     if let Some(db) = e.as_db_error() {
         return Error::Source(format!("{e}: {} {}", db.code().code(), db.message()));
     }
@@ -1040,13 +1648,203 @@ mod key_tests {
     /// as "no checkpoint". The current parser likewise refuses text that is not a key.
     #[test]
     fn foreign_text_checkpoint_is_refused() {
-        assert_eq!(key_from_checkpoint("10@99#3").unwrap().commit, 10);
+        assert_eq!(key_from_checkpoint("10@99#3").unwrap().0.commit, 10);
         for foreign in ["{\"_data\":\"82\"}", "16/B374D848", "10@99"] {
             assert!(
                 matches!(key_from_checkpoint(foreign), Err(Error::Checkpoint(_))),
                 "{foreign:?}"
             );
         }
+    }
+
+    const HERE: Origin = Origin {
+        system: Some(7_312_345_678_901_234_567),
+        timeline: Some(1),
+        database: 16_384,
+    };
+    /// `HERE` as seen with `skip_system_check`.
+    const HERE_NO_SYS: Origin = Origin {
+        system: None,
+        timeline: None,
+        database: 16_384,
+    };
+
+    #[test]
+    fn checkpoint_carries_its_origin() {
+        let k = Key {
+            commit: 10,
+            change: 99,
+            ord: 3,
+        };
+        let text = encode_checkpoint(k, Some(HERE));
+        assert_eq!(text, "10@99#3;sys=7312345678901234567;db=16384;tli=1");
+        let (key, stamp) = parse_checkpoint(&text).unwrap();
+        assert_eq!(key, k);
+        assert_eq!(stamp.system, HERE.system);
+        assert_eq!(stamp.timeline, HERE.timeline);
+        assert_eq!(stamp.database, Some(HERE.database));
+        // Written by the first version of this check, before the timeline was recorded.
+        let (_, old) = parse_checkpoint("10@99#3;sys=7312345678901234567;db=16384").unwrap();
+        assert_eq!(old.timeline, None);
+        // With skip_system_check only the database is recorded.
+        assert_eq!(encode_checkpoint(k, Some(HERE_NO_SYS)), "10@99#3;db=16384");
+        // Before start there is no origin, and the text is the bare key, as before #63.
+        assert_eq!(encode_checkpoint(k, None), "10@99#3");
+        assert_eq!(parse_checkpoint("10@99#3"), Some((k, Stamp::default())));
+    }
+
+    #[test]
+    fn unknown_or_malformed_checkpoint_fields_are_refused() {
+        for bad in [
+            "10@99#3;",
+            "10@99#3;sys",
+            "10@99#3;sys=x",
+            "10@99#3;db=-1",
+            "10@99#3;sys=1;sys=1",
+            "10@99#3;tli=2;tli=2",
+            "10@99#3;tli=-1",
+            "10@99#3;sys=1;db=2;x=3",
+        ] {
+            assert!(
+                matches!(key_from_checkpoint(bad), Err(Error::Checkpoint(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_from_another_cluster_or_database_is_refused() {
+        let same = Stamp {
+            system: HERE.system,
+            timeline: HERE.timeline,
+            database: Some(HERE.database),
+        };
+        assert!(check_origin(same, HERE).is_ok());
+        // Legacy checkpoints carry no origin and are accepted (backfilled on the next save).
+        assert!(check_origin(Stamp::default(), HERE).is_ok());
+
+        let other_cluster = Stamp {
+            system: Some(HERE.system.unwrap() + 1),
+            ..same
+        };
+        let err = check_origin(other_cluster, HERE).unwrap_err().to_string();
+        assert!(err.contains("different or rebuilt cluster"), "{err}");
+        assert!(
+            !err.contains("backup"),
+            "must not promise to catch restores: {err}"
+        );
+
+        let other_db = Stamp {
+            database: Some(HERE.database + 1),
+            ..same
+        };
+        let err = check_origin(other_db, HERE).unwrap_err().to_string();
+        assert!(err.contains("same cluster"), "{err}");
+
+        // Same cluster, new timeline: a promotion or PITR since, which may have lost changes.
+        let old_timeline = Stamp {
+            timeline: Some(2),
+            ..same
+        };
+        let on_three = Origin {
+            timeline: Some(3),
+            ..HERE
+        };
+        let err = check_origin(old_timeline, on_three)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timeline 2")
+                && err.contains("restored, recovered to a point in time (PITR) or failed over"),
+            "{err}"
+        );
+        assert!(
+            err.contains("may never reach Kafka") && err.contains(";tli="),
+            "{err}"
+        );
+        // A checkpoint without a timeline is accepted and gets one on the next save.
+        let no_timeline = Stamp {
+            timeline: None,
+            ..same
+        };
+        assert!(check_origin(no_timeline, on_three).is_ok());
+
+        // skip_system_check drops the cluster and timeline comparisons: the database is still compared.
+        assert!(check_origin(other_cluster, HERE_NO_SYS).is_ok());
+        assert!(check_origin(old_timeline, HERE_NO_SYS).is_ok());
+        let err = check_origin(other_db, HERE_NO_SYS).unwrap_err().to_string();
+        assert!(err.contains("same cluster"), "{err}");
+    }
+
+    #[test]
+    fn stamping_a_new_origin_warns_with_what_it_records() {
+        // Legacy checkpoint: both fields are new, and the warning names them.
+        let msg = stamp_warning(Stamp::default(), HERE).expect("legacy stamp warns");
+        assert!(
+            msg.contains("sys=7312345678901234567 db=16384 tli=1"),
+            "{msg}"
+        );
+        assert!(msg.contains("checkpoint-ahead-of-WAL"), "{msg}");
+        // Written with skip_system_check, now checked: only sys is new.
+        let db_only = Stamp {
+            system: None,
+            timeline: None,
+            database: Some(HERE.database),
+        };
+        let msg = stamp_warning(db_only, HERE).expect("adding sys warns");
+        assert!(
+            msg.contains("sys=7312345678901234567") && !msg.contains("db="),
+            "{msg}"
+        );
+        // Nothing new to record: no warning.
+        assert_eq!(stamp_warning(db_only, HERE_NO_SYS), None);
+        let full = Stamp {
+            system: HERE.system,
+            timeline: HERE.timeline,
+            ..db_only
+        };
+        assert_eq!(stamp_warning(full, HERE), None);
+        // Written before the timeline was recorded: only tli is new.
+        let msg = stamp_warning(
+            Stamp {
+                timeline: None,
+                ..full
+            },
+            HERE,
+        )
+        .expect("adding tli warns");
+        assert!(msg.contains("tli=1") && !msg.contains("sys="), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_ahead_of_wal_names_every_possible_cause() {
+        let same = ahead_of_wal(0x20, 0x10, true).to_string();
+        assert!(
+            same.contains("restored, recovered to a point in time (PITR) or failed over"),
+            "{same}"
+        );
+        assert!(!same.contains("another cluster"), "{same}");
+        let unknown = ahead_of_wal(0x20, 0x10, false).to_string();
+        assert!(
+            unknown.contains("another cluster") && unknown.contains("failed over"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn slot_of_another_database_is_refused() {
+        assert!(check_slot_database("s", Some("app"), "app").is_ok());
+        let err = check_slot_database("s", Some("other"), "app")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("belongs to database \"other\"") && err.contains("untouched"),
+            "{err}"
+        );
+        let err = check_slot_database("s", None, "app")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("physical slot"), "{err}");
     }
 
     /// In-progress transaction streaming (`streaming on`, proto >= 2) must stay off: changes of a
