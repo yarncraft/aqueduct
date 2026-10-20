@@ -134,6 +134,29 @@
     </div>
   </section>
 
+  <!-- Routing graph: tables → routes in match order → topics. The plan comes from /api/routes, counts from the stream. -->
+  <section id="routing" class="rounded-sm border border-ink-600 bg-ink-800">
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Routing</h2>
+      <span id="routesum" class="font-mono text-[11px] text-ink-300">–</span>
+      <span id="routewarn" hidden class="rounded-sm bg-amber/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-amber"></span>
+      <span id="routenote" class="ml-auto truncate font-mono text-[11px] text-ink-500">first match wins</span>
+    </div>
+    <div class="overflow-x-auto">
+      <div id="graph" class="relative min-w-[860px] p-4">
+        <svg id="graphedges" class="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true"></svg>
+        <div id="graphcols" class="relative grid grid-cols-[minmax(170px,1fr)_minmax(250px,1.3fr)_minmax(190px,1fr)] gap-x-20 font-mono text-[11px] text-ink-300">loading route plan…</div>
+      </div>
+    </div>
+    <div id="routedetail" hidden class="border-t border-ink-600 bg-ink-900 px-4 py-3 font-mono text-[11px]"></div>
+  </section>
+  <script type="application/json" id="globcases">
+  [["public.users", "public.users", true], ["public.users", "public.users2", false], ["*", "a.b", true],
+   ["public.*", "public.orders", true], ["public.*", "sales.orders", false], ["*.audit_*", "hr.audit_log", true],
+   ["a*b*c", "aXXbYYc", true], ["a*b*c", "aXXcYYb", false], ["ab*ba", "aba", false], ["*.orders", "a.b.orders", true],
+   ["public.*s", "public.users", true], ["public.*s", "public.user", false], ["", "", true], ["*", "", true]]
+  </script>
+
   <!-- Event inspector -->
   <section id="inspector" class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
@@ -383,6 +406,7 @@ function render(d) {
   }
 
   renderTables();
+  renderGraph(true);
 
   $('errpanel').hidden = !d.last_error;
   if (d.last_error) $('lasterr').textContent = d.last_error;
@@ -476,6 +500,7 @@ async function pollTables() {
     for (const t of d.tables) byName[t.table] = t;
     hwm = { tables: byName, error: null, read_ms: d.kafka_read_ms };
     renderTables();
+    renderGraph();
   } catch (_) { /* the connection badge covers outages */ }
 }
 
@@ -619,6 +644,339 @@ $('evpause').addEventListener('click', () => {
 $('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
 const pollTimer = setInterval(pollEvents, 3000);
 pollEvents();
+
+// ---- Routing graph ----
+// Tables (stream + /api/tables) → routes in match order, first match wins → topics, and the dead-letter topic.
+// The plan is read once from /api/routes; counts and unseen fields come with every stream frame. Nodes are
+// HTML, edges an SVG drawn behind them from the nodes' measured positions.
+const GRAPH_TABLES = 6, GRAPH_TOPICS = 6, FLOW_MS = 3000;
+const EDGE_BASE = '#404854', EDGE_HL = '#4c90f0', EDGE_FLOW = '#abb3bf', EDGE_RED = '#e76a6e';
+// Optional route keys shown as a badge, label by key: one line per key. Keys not listed are ignored.
+const ROUTE_BADGES = {
+  topic_fallback: 'fallback',
+  topic_values: 'topic values',
+  key: 'key',
+  include: 'include',
+  exclude: 'exclude',
+  mask: 'mask',
+  hash: 'hash',
+  rename: 'rename',
+  format: 'format',
+  deletes: 'deletes',
+  tombstones: 'tombstones',
+  unchanged: 'unchanged',
+  outbox: 'outbox',
+};
+// Outcome counters of a route, with their tone in the counts row and the bar.
+const ROUTE_COUNTS = [['produced', 'bg-green'], ['filtered', 'bg-ink-500'], ['fallback', 'bg-violet'], ['errors', 'bg-red']];
+
+// Same as kafka.rs::glob_match: `*` matches any run of characters, dots included; nothing else is special.
+// Checked on load against #globcases, which admin.rs also runs through the Rust function.
+function globMatch(p, t) {
+  const parts = p.split('*');
+  if (parts.length === 1) return p === t;
+  const first = parts[0], last = parts[parts.length - 1];
+  if (!t.startsWith(first) || t.length < first.length + last.length || !t.endsWith(last)) return false;
+  let rest = t.slice(first.length, t.length - last.length);
+  for (const mid of parts.slice(1, -1)) {
+    const i = rest.indexOf(mid);
+    if (i < 0) return false;
+    rest = rest.slice(i + mid.length);
+  }
+  return true;
+}
+for (const [p, t, want] of JSON.parse($('globcases').textContent)) console.assert(globMatch(p, t) === want, 'globMatch', p, t, want);
+
+const fillTopic = (tpl, name) => { const i = name.indexOf('.'); return tpl.replaceAll('{schema}', name.slice(0, i)).replaceAll('{table}', name.slice(i + 1)); };
+const isTemplate = tpl => /\{(schema|table)\}/.test(tpl);
+let plan = null, planError = null, graphModel = null, graphKey = '';
+let graphSel = null, graphHover = null;
+const graphOpen = new Set();        // 'r:<route>' and 'g:<template>' groups shown in full
+const flowUntil = {};               // edge id → time until which it counts as having recent traffic
+let flowPrev = null;
+
+// The graph as nodes, edges and the numbers that change with every frame.
+function graphModelOf(d) {
+  const live = (d && d.routes) || [];
+  const routes = plan.routes.map((r, i) => {
+    const l = live[i] && live[i].route === r.route ? live[i] : null;
+    const c = l || Object.assign({ unseen_fields: r.unseen_fields || [] }, r.counts);
+    return { r, i, c, id: 'r:' + i, tables: [], topics: new Map(), out: [] };
+  });
+  const fallback = routes.findIndex(x => x.r.match == null);
+  const claim = name => { const i = routes.findIndex(x => x.r.match != null && globMatch(x.r.match, name)); return i >= 0 ? i : fallback; };
+  const evs = (d && d.tables) || {};
+  const unrouted = [];
+  for (const name of [...new Set([...Object.keys(evs), ...Object.keys(hwm.tables)])].sort()) {
+    const k = hwm.tables[name] || {}, ri = claim(name);
+    const t = { name, events: evs[name] ?? k.events ?? 0, id: 't:' + name };
+    if (ri < 0) { unrouted.push(t); continue; }
+    const x = routes[ri];
+    t.route = ri;
+    t.topic = k.topic || fillTopic(x.r.topic, name);
+    x.tables.push(t);
+    x.topics.set(t.topic, (x.topics.get(t.topic) || 0) + t.events);
+  }
+  // Tables per route: the busiest few, the rest behind "+N more".
+  const values = {}, edges = [], tableEdges = {};
+  for (const x of routes) {
+    const all = [...x.tables].sort((a, b) => b.events - a.events);
+    const cut = graphOpen.has(x.id) || all.length <= GRAPH_TABLES ? all.length : GRAPH_TABLES - 1;
+    x.shown = all.slice(0, cut).sort((a, b) => a.name < b.name ? -1 : 1);
+    x.hidden = all.slice(cut);
+    x.moreId = 'tm:' + x.i;
+    for (const t of x.shown) values[t.id] = fmt(t.events);
+    if (x.hidden.length) values[x.moreId] = fmt(x.hidden.reduce((a, t) => a + t.events, 0));
+    for (const k of ['matched', ...ROUTE_COUNTS.map(c => c[0])]) values[x.id + ':' + k] = fmt(x.c[k] || 0);
+  }
+  // Topics, grouped by the template that renders them; a topic two routes share is drawn once.
+  const groups = new Map(), owner = new Map();
+  const addTopic = (g, name, n) => {
+    const og = owner.get(name) || g;
+    owner.set(name, og);
+    og.topics.set(name, (og.topics.get(name) || 0) + n);
+  };
+  for (const x of routes) {
+    const tpl = x.r.topic;
+    if (!groups.has(tpl)) groups.set(tpl, { tpl, dynamic: isTemplate(tpl), topics: new Map(), id: 'tpl:' + tpl });
+    const g = groups.get(tpl);
+    if (!g.dynamic) addTopic(g, tpl, 0);
+    for (const [t, n] of x.topics) addTopic(g, g.dynamic ? t : tpl, n);
+  }
+  const topicNode = new Map();
+  for (const g of groups.values()) {
+    const all = [...g.topics].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+    const cut = graphOpen.has('g:' + g.tpl) || all.length <= GRAPH_TOPICS ? all.length : GRAPH_TOPICS - 1;
+    g.shown = all.slice(0, cut).sort();
+    g.hidden = all.slice(cut);
+    g.moreId = 'pm:' + g.tpl;
+    for (const t of g.shown) topicNode.set(t, 'p:' + t);
+    for (const t of g.hidden) topicNode.set(t, g.moreId);
+  }
+  // Edges: table → claiming route, route → each topic it wrote (its produced count split by the tables' events),
+  // route → dead-letter topic.
+  const edge = (from, to, w, dlq) => { const id = from + '>' + to; edges.push({ id, from, to, w, dlq }); return id; };
+  const dlq = plan.dead_letter_topic;
+  for (const x of routes) {
+    for (const t of x.shown) tableEdges[t.name] = [edge(t.id, x.id, t.events)];
+    if (x.hidden.length) {
+      const id = edge(x.moreId, x.id, x.hidden.reduce((a, t) => a + t.events, 0));
+      for (const t of x.hidden) tableEdges[t.name] = [id];
+    }
+    const g = groups.get(x.r.topic);
+    const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
+    const targets = new Map();
+    if (!x.topics.size) targets.set(g.dynamic ? g.id : topicNode.get(x.r.topic), x.c.produced || 0);
+    for (const [t, n] of x.topics) {
+      const to = topicNode.get(t);
+      targets.set(to, (targets.get(to) || 0) + (sum ? (x.c.produced || 0) * n / sum : 0));
+    }
+    for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
+    for (const t of x.tables) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
+    if (dlq && (x.r.where != null || x.c.errors > 0)) x.dlqEdge = edge(x.id, 'dlq', x.c.errors || 0, true);
+  }
+  if (dlq) values.dlq = fmt(routes.reduce((a, x) => a + (x.c.errors || 0), 0));
+  return { routes, groups: [...groups.values()], unrouted, edges, values, tableEdges, dlq };
+}
+
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="flex items-center gap-2 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 transition-opacity"><span class="truncate text-ink-100" title="${esc(t.name)}">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="flex w-full items-center gap-2 rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</button>`;
+const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
+const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
+const badgeVal = v => Array.isArray(v) ? v.join(', ') : v && typeof v === 'object' ? Object.keys(v).join(', ') : String(v);
+const routeBadges = r => Object.keys(ROUTE_BADGES).filter(k => r[k] != null && r[k] !== false).map(k =>
+  `<span class="rounded-sm bg-blue/15 px-1.5 py-0.5 text-[10px] text-blue" title="${esc(k + ' = ' + JSON.stringify(r[k]))}">${esc(r[k] === true ? ROUTE_BADGES[k] : ROUTE_BADGES[k] + ' ' + short(badgeVal(r[k])))}</span>`).join('');
+const routeBar = x => {
+  const m = ROUTE_COUNTS.reduce((a, [k]) => a + (x.c[k] || 0), 0);
+  return m ? ROUTE_COUNTS.map(([k, tone]) => x.c[k] ? `<div class="${tone}" style="width:${100 * x.c[k] / m}%"></div>` : '').join('') : '';
+};
+
+function routeNode(x, last) {
+  const r = x.r, sel = graphSel === x.i;
+  const ops = r.ops ? r.ops.map(o => `<span class="rounded-sm bg-ink-700 px-1 text-[10px] uppercase text-ink-200">${esc(o)}</span>`).join('') : '<span class="text-[10px] uppercase text-ink-500">all ops</span>';
+  const unseen = x.c.unseen_fields || [];
+  return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
+    + `<div class="flex items-center gap-2"><span class="flex h-5 min-w-5 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
+    + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span>`
+    + `<span class="ml-auto truncate text-ink-300" title="match">${r.match == null ? 'sink.topic' : esc(r.match)}</span></div>`
+    + `<div class="mt-1.5 flex flex-wrap items-center gap-1">${ops}${routeBadges(r)}</div>`
+    + (r.where != null ? `<div class="mt-1.5 truncate text-ink-200" title="${esc(r.where)}"><span class="text-ink-500">where</span> ${esc(r.where)}</div>` : '')
+    + `<div class="mt-1.5 flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(([k]) => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</div>`
+    + `<div data-bar="${x.id}" class="mt-1.5 flex h-1 overflow-hidden rounded-sm bg-ink-700">${routeBar(x)}</div>`
+    + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
+    + `</div>`;
+}
+
+function topicNodeHtml(id, name, opts) {
+  const can = !!(lastData && lastData.inspector);
+  const tone = opts.dlq ? 'border-red/40 bg-red/10' : 'border-ink-600 bg-ink-900';
+  const label = opts.dlq ? '<span class="shrink-0 text-[10px] uppercase tracking-wider text-red">dead letter</span>' : '';
+  const n = opts.dlq ? `<span data-v="dlq" class="ml-auto tabular-nums text-red"></span>` : '';
+  return `<div data-node="${esc(id)}" ${can ? `data-topic="${esc(name)}"` : ''} class="flex items-center gap-2 rounded-sm border ${tone} px-2 py-1 transition-opacity ${can ? 'cursor-pointer hover:border-blue' : ''}" title="${esc(name)}${can ? ' · click to inspect' : ' · the inspector is off'}">${label}<span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>`;
+}
+
+function graphHtml(m) {
+  const tables = m.routes.filter(x => x.tables.length).map(x => `<div class="space-y-1">${x.shown.map(tableNode).join('')}${x.hidden.length ? moreNode(x.moreId, x.id, x.hidden.length, 'tables') : graphOpen.has(x.id) ? lessNode(x.id) : ''}</div>`).join('')
+    + (m.unrouted.length ? `<div class="space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">no route · events fail</div>${m.unrouted.map(tableNode).join('')}</div>` : '');
+  const routes = m.routes.map((x, i) => routeNode(x, i === m.routes.length - 1)).join('');
+  const topics = m.groups.map(g => `<div class="space-y-1">`
+    + (g.dynamic ? `<div data-node="${esc(g.id)}" class="truncate rounded-sm border border-dashed border-ink-600 px-2 py-1 text-ink-300 transition-opacity" title="Topic template; the topics below are the ones it rendered">${esc(g.tpl)}</div>` : '')
+    + g.shown.map(t => topicNodeHtml('p:' + t, t, {})).join('')
+    + (g.hidden.length ? moreNode(g.moreId, 'g:' + g.tpl, g.hidden.length, 'topics') : graphOpen.has('g:' + g.tpl) ? lessNode('g:' + g.tpl) : '')
+    + `</div>`).join('')
+    + (m.dlq ? `<div class="mt-2">${topicNodeHtml('dlq', m.dlq, { dlq: true })}</div>` : '');
+  return `<div class="flex flex-col">${colHead('Tables')}<div class="flex flex-1 flex-col justify-center gap-3">${tables || '<div class="text-ink-500">no events yet</div>'}</div></div>`
+    + `<div class="flex flex-col">${colHead('Routes', 'first match wins')}<div class="flex flex-1 flex-col justify-center gap-3">${routes}</div></div>`
+    + `<div class="flex flex-col">${colHead('Topics')}<div class="flex flex-1 flex-col justify-center gap-3">${topics}</div></div>`;
+}
+
+// What hovering a table lights up: its edge to its route, the route, the route's edge to its topic, the topic.
+function graphPath(m, name) {
+  const ids = m.tableEdges[name];
+  if (!ids) return null;
+  const on = new Set(['t:' + name]);
+  for (const id of ids) { on.add(id); for (const n of id.split('>')) on.add(n); }
+  return on;
+}
+
+function drawEdges() {
+  const m = graphModel, g = $('graph'), svg = $('graphedges');
+  if (!m) { svg.innerHTML = ''; return; }
+  const box = g.getBoundingClientRect(), els = {};
+  for (const el of g.querySelectorAll('[data-node]')) els[el.dataset.node] = el;
+  const at = (id, right) => {
+    const el = els[id];
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return [(right ? r.right : r.left) - box.left, r.top + r.height / 2 - box.top];
+  };
+  const hl = graphHover && graphPath(m, graphHover);
+  for (const [id, el] of Object.entries(els)) el.classList.toggle('opacity-40', !!hl && !hl.has(id));
+  const max = Math.max(1, ...m.edges.map(e => e.w));
+  const now = Date.now();
+  let out = '';
+  for (const e of m.edges) {
+    const a = at(e.from, true), b = at(e.to, false);
+    if (!a || !b) continue;
+    const mx = ((a[0] + b[0]) / 2).toFixed(1);
+    const d = `M${a[0].toFixed(1)},${a[1].toFixed(1)} C${mx},${a[1].toFixed(1)} ${mx},${b[1].toFixed(1)} ${b[0].toFixed(1)},${b[1].toFixed(1)}`;
+    const on = !hl || hl.has(e.id);
+    const width = e.w > 0 ? 1.5 + 4.5 * Math.sqrt(e.w / max) : 1;
+    const color = e.dlq ? EDGE_RED : hl && on ? EDGE_HL : EDGE_BASE;
+    out += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width.toFixed(1)}" stroke-opacity="${on ? (e.dlq ? 0.7 : 1) : 0.15}"${e.dlq ? ' stroke-dasharray="5 4"' : ''}/>`;
+    // Recent traffic: a dotted line that flows (static when the viewer prefers reduced motion).
+    if ((flowUntil[e.id] || 0) > now) out += `<path d="${d}" fill="none" stroke="${e.dlq ? EDGE_RED : EDGE_FLOW}" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 10" stroke-opacity="${on ? 0.9 : 0.15}" class="motion-safe:animate-flow"/>`;
+  }
+  svg.innerHTML = out;
+}
+
+// Marks the edges whose counts moved since the last frame as having recent traffic.
+function trackFlow(m) {
+  const now = Date.now(), cur = { t: {}, r: [] };
+  for (const x of m.routes) {
+    cur.r[x.i] = { produced: x.c.produced || 0, errors: x.c.errors || 0 };
+    const was = flowPrev && flowPrev.r[x.i];
+    let moved = false;
+    for (const t of x.tables) {
+      cur.t[t.name] = t.events;
+      if (!flowPrev || !(t.events > (flowPrev.t[t.name] ?? t.events))) continue;
+      const [into, out] = m.tableEdges[t.name];
+      flowUntil[into] = now + FLOW_MS;
+      if (was && cur.r[x.i].produced > was.produced) { flowUntil[out] = now + FLOW_MS; moved = true; }
+    }
+    if (was && cur.r[x.i].produced > was.produced && !moved) for (const o of x.out) flowUntil[o.id] = now + FLOW_MS;
+    if (was && x.dlqEdge && cur.r[x.i].errors > was.errors) flowUntil[x.dlqEdge] = now + FLOW_MS;
+  }
+  flowPrev = cur;
+}
+
+function routeDetail(m) {
+  const x = graphSel == null ? null : m.routes[graphSel];
+  $('routedetail').hidden = !x;
+  if (!x) return;
+  const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
+  const extra = Object.keys(r).filter(k => !['route', 'match', 'ops', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
+  $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span><button type="button" id="routeclose" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button></div><div class="space-y-1">`
+    + row('match', esc(r.match ?? 'everything else (sink.topic)'))
+    + row('ops', esc(r.ops ? r.ops.join(', ') : 'all'))
+    + row('where', r.where != null ? `<pre class="whitespace-pre-wrap">${esc(r.where)}</pre>` : '<span class="text-ink-500">–</span>')
+    + row('topic', esc(r.topic) + (x.topics.size && isTemplate(r.topic) ? ` <span class="text-ink-500">→ ${esc([...x.topics.keys()].sort().join(', '))}</span>` : ''))
+    + row('counts', ['matched', ...ROUTE_COUNTS.map(c => c[0])].map(k => `${k} <span data-v="${x.id}:${k}">${fmt(x.c[k] || 0)}</span>`).join(' · '))
+    + row('unseen', (x.c.unseen_fields || []).length ? `<span class="text-amber">${esc(x.c.unseen_fields.join(', '))}</span>` : '<span class="text-ink-500">none</span>')
+    + row('tables', x.tables.length ? esc(x.tables.map(t => t.name).join(', ')) : '<span class="text-ink-500">none seen yet</span>')
+    + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
+    + `</div>`;
+}
+
+function renderGraph(frame) {
+  if (!plan) {
+    $('graphcols').textContent = planError || 'loading route plan…';
+    $('graphedges').innerHTML = '';
+    return;
+  }
+  const m = graphModelOf(lastData);
+  if (frame) trackFlow(m);
+  const key = JSON.stringify([m.routes.map(x => [x.shown.map(t => t.name), x.hidden.length, x.c.unseen_fields]),
+    m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), graphSel, [...graphOpen], !!(lastData && lastData.inspector)]);
+  graphModel = m;
+  if (key !== graphKey) {
+    graphKey = key;
+    $('graphcols').innerHTML = graphHtml(m);
+    routeDetail(m);
+  }
+  for (const el of document.querySelectorAll('#routing [data-v]')) {
+    const v = m.values[el.dataset.v];
+    if (v != null) el.textContent = v;
+    if (el.dataset.v.endsWith(':errors')) el.classList.toggle('text-red', v != null && v !== '0');
+  }
+  for (const x of m.routes) { const b = document.querySelector(`[data-bar="${x.id}"]`); if (b) b.innerHTML = routeBar(x); }
+  const named = m.routes.filter(x => x.r.match != null).length;
+  const topics = m.groups.reduce((a, g) => a + g.topics.size, 0);
+  $('routesum').textContent = `${named} ${named === 1 ? 'route' : 'routes'}${m.routes.length > named ? ' + default' : ''} · ${m.routes.reduce((a, x) => a + x.tables.length, 0) + m.unrouted.length} tables · ${topics} ${topics === 1 ? 'topic' : 'topics'}`;
+  const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);
+  $('routewarn').hidden = !warn;
+  $('routewarn').textContent = warn + (warn === 1 ? ' field never seen' : ' fields never seen');
+  $('routenote').textContent = 'first match wins · partition by ' + plan.partition_by + (plan.dead_letter_topic ? ' · dead letter ' + plan.dead_letter_topic : '');
+  drawEdges();
+}
+
+async function loadPlan() {
+  try {
+    const r = await fetch('/api/routes', authInit());
+    if (r.status === 401 || r.status === 403) { planError = r.status === 401 ? 'Unauthorized. Open the page once with #token=...' : 'Routing plan not available'; renderGraph(); return; }
+    if (r.status === 404) { planError = 'No route plan yet'; renderGraph(); setTimeout(loadPlan, 5000); return; }
+    if (!r.ok) throw new Error('routes ' + r.status);
+    plan = await r.json();
+    planError = null;
+    renderGraph();
+  } catch (_) { setTimeout(loadPlan, 5000); }
+}
+
+function inspectTopic(name) {
+  const sel = $('evtopic');
+  if (![...sel.options].some(o => o.value === name)) sel.add(new Option(name, name));
+  sel.value = name;
+  pollEvents();
+  $('inspector').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+}
+
+$('graph').addEventListener('click', ev => {
+  const open = ev.target.closest('[data-open]');
+  if (open) { graphOpen.has(open.dataset.open) ? graphOpen.delete(open.dataset.open) : graphOpen.add(open.dataset.open); renderGraph(); return; }
+  const topic = ev.target.closest('[data-topic]');
+  if (topic) { inspectTopic(topic.dataset.topic); return; }
+  const route = ev.target.closest('[data-route]');
+  if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; renderGraph(); }
+});
+$('routedetail').addEventListener('click', ev => { if (ev.target.closest('#routeclose')) { graphSel = null; renderGraph(); } });
+$('graph').addEventListener('pointerover', ev => {
+  const t = ev.target.closest('[data-table]');
+  const name = t ? t.dataset.table : null;
+  if (name !== graphHover) { graphHover = name; drawEdges(); }
+});
+$('graph').addEventListener('pointerleave', () => { if (graphHover) { graphHover = null; drawEdges(); } });
+new ResizeObserver(drawEdges).observe($('graph'));
+loadPlan();
 
 // SSE over fetch: EventSource cannot set headers. Each frame is a full snapshot, so a reconnect
 // needs no resume position, only a backoff. The server sends a frame every second, so STALL_MS

@@ -264,7 +264,7 @@ Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `sn
 ## Admin cockpit
 
 The HTTP port serves a dark operations console at `/`: throughput chart, total events, end-to-end lag,
-sink latency, errors, operation breakdown, per-table high-water marks, last fault, and an **event inspector**
+sink latency, errors, operation breakdown, a **routing graph**, per-table high-water marks, last fault, and an **event inspector**
 (reads the newest events straight from the Kafka topics, nothing is buffered in the pipeline; pick a topic, filter by op/table, search payloads, pause, click a row for a
 before/after diff and Copy JSON).
 
@@ -276,7 +276,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, topic per route, plus `default`) with live per-route counts and unseen fields; no row data |
+| `GET /api/routes` | The compiled route plan (match, ops, where, topic per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
@@ -298,6 +298,17 @@ of its share of all events split by operation, the newest delivered change's LSN
 and was delivered, and the topic's Kafka high-water mark (click a row for the offset per partition). The last-commit
 age turns amber when a table is more than 1 minute behind the freshest table and red past 10 minutes, only while the
 pipeline is streaming. Click a column header to sort. The checkpoint shown in the card header is global.
+
+The **Routing** card draws the sink's routing as a graph, left to right: every table seen, the
+`[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`), and the topics they
+write, plus the dead-letter topic in red. A table connects to the first route whose `match` fits it; a route
+connects to the topics it rendered and, when it has a `where` or errors, with a dashed line to the dead-letter topic.
+Each route shows its `match`, `ops` and `where`, its produced / filtered / fallback / errors counts with a bar, and an
+amber **never seen** warning for fields its `where` reads that no row has had (usually a typo). Line width follows the
+counts and lines with traffic in the last 3 s animate. Hover a table to light up its path, click a route for its
+details and full `where`, click a topic to open it in the event inspector. A route with more than 6 tables or topics
+shows the busiest and a "+N more" node that expands. Without `[[sink.routes]]` the graph is simply tables →
+`default` → topics.
 
 A second row shows replication health: slot lag in bytes and the confirmed flush LSN, the age of the last heartbeat against its interval (amber past 2x, red past 5x), and how many heartbeats were skipped and why. These come from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. A field the server does not send shows `–`, and `off` means heartbeats are disabled. The age is measured against the browser clock, so a large clock skew between the browser and the container shifts it.
 
