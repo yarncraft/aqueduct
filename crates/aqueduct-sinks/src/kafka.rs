@@ -185,9 +185,14 @@ fn create_outcome(outcome: &std::result::Result<(), ClientError>) -> CreateOutco
 /// factor falls back; an explicit one the broker rejects is an error.
 fn after_create(configured: Option<i16>, outcome: CreateOutcome<'_>) -> AfterCreate {
     match (outcome, configured) {
-        (CreateOutcome::Ok | CreateOutcome::Protocol(ProtocolError::TopicAlreadyExists), _) => {
-            AfterCreate::Created
-        }
+        // A timed-out create may still have gone through: the re-list decides.
+        (
+            CreateOutcome::Ok
+            | CreateOutcome::Protocol(
+                ProtocolError::TopicAlreadyExists | ProtocolError::RequestTimedOut,
+            ),
+            _,
+        ) => AfterCreate::Created,
         (CreateOutcome::Protocol(ProtocolError::InvalidReplicationFactor), None) => {
             AfterCreate::FallBack
         }
@@ -474,7 +479,6 @@ mod tests {
             ProtocolError::ClusterAuthorizationFailed,
             ProtocolError::InvalidTopicException,
             ProtocolError::PolicyViolation,
-            ProtocolError::RequestTimedOut,
         ] {
             for cfg in [None, Some(1), Some(3)] {
                 assert_eq!(
@@ -485,6 +489,8 @@ mod tests {
             }
         }
         assert_eq!(after_create(None, Other), AfterCreate::Failed);
+        let timeout = ProtocolError::RequestTimedOut;
+        assert_eq!(after_create(None, Protocol(&timeout)), AfterCreate::Created);
         // The fallback create(1) is judged as an explicit factor: a refusal is an error too.
         let bad = ProtocolError::InvalidReplicationFactor;
         assert_eq!(after_create(Some(1), Protocol(&bad)), AfterCreate::Reject);
