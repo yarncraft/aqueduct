@@ -82,6 +82,10 @@ pub struct Catalog {
 
 /// Column lists and row filters exist from this version on.
 const PG15: u32 = 150_000;
+/// Generated columns exist from this version on.
+const PG12: u32 = 120_000;
+/// `pg_index.indnkeyatts` (INCLUDE columns) exists from this version on.
+const PG11: u32 = 110_000;
 
 /// `what` of each key column of the index of table `c` matching `filter`, in key order.
 fn index_columns(filter: &str, what: &str) -> String {
@@ -103,13 +107,24 @@ fn tables_query(server_version_num: u32) -> String {
     } else {
         ("true", "NULL::text")
     };
-    // pgoutput never sends generated columns (before PG18), and PG14 has no column lists.
+    // pgoutput never sends generated columns (before PG18), which exist from PG12 on.
+    let generated = if server_version_num >= PG12 {
+        "AND a.attgenerated = ''"
+    } else {
+        ""
+    };
     let cols = |what: &str| {
         format!(
             "(SELECT array_agg({what} ORDER BY a.attnum) FROM pg_attribute a
               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-                AND a.attgenerated = '' AND {listed})"
+                {generated} AND {listed})"
         )
+    };
+    // INCLUDE columns (past `indnkeyatts`, PG11+) are not part of a key.
+    let key_atts = if server_version_num >= PG11 {
+        "i.indnkeyatts"
+    } else {
+        "i.indnatts"
     };
     let (names, types) = (cols("a.attname::text"), cols("a.atttypid"));
     let type_names = cols("format_type(a.atttypid, a.atttypmod)");
@@ -123,18 +138,20 @@ fn tables_query(server_version_num: u32) -> String {
         ARRAY[]::text[])";
     // Each unique key as its column names joined with the unit separator (0x1f); INCLUDE
     // columns (past `indnkeyatts`) are not part of the key.
-    let unique = "COALESCE((SELECT array_agg(u.cols) FROM (
+    let unique = format!(
+        "COALESCE((SELECT array_agg(u.cols) FROM (
         SELECT (SELECT string_agg(a.attname::text, E'\\x1f' ORDER BY k.ord)
                 FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                WHERE k.ord <= i.indnkeyatts) AS cols
+                WHERE k.ord <= {key_atts}) AS cols
         FROM pg_index i
         WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-            WHERE k.ord <= i.indnkeyatts AND NOT a.attnotnull)) u),
-        ARRAY[]::text[])";
+            WHERE k.ord <= {key_atts} AND NOT a.attnotnull)) u),
+        ARRAY[]::text[])"
+    );
     format!(
         "SELECT p.schemaname::text, p.tablename::text, c.oid, COALESCE({names}, ARRAY[]::text[]),
                 COALESCE({types}, ARRAY[]::oid[]), {pk}, {pk_types}, c.relreplident::text,
@@ -233,9 +250,15 @@ mod tests {
 
     #[test]
     fn generated_columns_are_never_listed() {
-        for v in [140_012, 150_000, 170_000] {
+        for v in [120_000, 140_012, 150_000, 170_000] {
             assert!(tables_query(v).contains("a.attgenerated = ''"), "{v}");
         }
+        // PG10 and 11 have neither generated columns nor INCLUDE columns.
+        for v in [100_023, 110_022] {
+            assert!(!tables_query(v).contains("attgenerated"), "{v}");
+        }
+        assert!(tables_query(100_023).contains("i.indnatts"));
+        assert!(tables_query(110_022).contains("i.indnkeyatts"));
     }
 
     #[test]

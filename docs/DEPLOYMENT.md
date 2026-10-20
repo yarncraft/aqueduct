@@ -19,14 +19,16 @@ Postgres (logical slot, pgoutput) --> Aqueduct --> Kafka
 Limits to know about:
 
 - Only changes made after the slot is created are streamed. Rows that already exist are copied only by a
-  [snapshot](#snapshots) (Postgres 14+, off by default).
+  [snapshot](#snapshots) (off by default).
 - One Aqueduct instance per slot. Run a second instance with a different `slot` name, never two on one slot.
 - Postgres connections use TLS with certificate and hostname verification (`ssl_mode = "verify-full"`) by default, so a server without TLS fails at startup, **including on localhost**. Plaintext needs an explicit `ssl_mode = "disable"` (non-loopback plaintext then logs a warning).
 - DDL is not streamed. Add a new table to the publication, and expect `before` images only if the table's `REPLICA IDENTITY` allows it.
 
 ## 1. Prepare Postgres
 
-Postgres 10 or newer (tested on 16). Snapshots need 14 or newer.
+Postgres 12 or newer (tested on 12, 13, 14, 16 and 17). Postgres 10 has no `pg_replication_slot_advance`, and on 11
+repeated slot peeks over one connection fail with `out of relcache_callback_list slots`, so neither works. Snapshots
+use logical messages on 14 or newer, or a [watermark table](#watermark-table-postgres-12-and-13) on 12 and 13.
 
 ```conf
 # postgresql.conf (restart required)
@@ -134,9 +136,10 @@ topic = "cdc.{schema}.{table}"
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
 | `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
-| `snapshot` | `never` | `never`, `on_demand` or `initial`. Copies rows that already exist; see [Snapshots](#snapshots). Anything but `never` needs Postgres 14+ |
+| `snapshot` | `never` | `never`, `on_demand` or `initial`. Copies rows that already exist; see [Snapshots](#snapshots). Anything but `never` needs Postgres 14+, or `snapshot_watermark_table` |
 | `snapshot_chunk_size` | `1024` | Rows per snapshot chunk |
 | `snapshot_max_rows_per_sec` | unset | Upper bound on snapshot rows read per second. Unset is unthrottled |
+| `snapshot_watermark_table` | unset | `schema.table` of a published table that carries snapshot watermarks as rows, for Postgres 12 and 13 (or where `pg_logical_emit_message` is not allowed). See [Watermark table](#watermark-table-postgres-12-and-13) |
 | `snapshot_key_columns` | empty | Key columns for tables without a primary key, e.g. `{ "public.events" = ["day", "seq"] }`. They must be published, `NOT NULL` and unique together |
 
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
@@ -352,8 +355,9 @@ overwrites a newer change. A `TRUNCATE` in that window drops the chunk. Rows tha
 `insert` of the same row and keyed the same way, so they land on the row's partition. Consumers that apply events
 "last write wins" end up with the table.
 
-- **Requirements:** Postgres 14 or newer, and `EXECUTE` on `pg_logical_emit_message(boolean, text, text)` for the
-  Aqueduct role (startup checks both). The role already needs `SELECT` on the published tables.
+- **Requirements:** Postgres 14 or newer, and `EXECUTE` on `pg_logical_emit_message` for the Aqueduct role (startup
+  checks both). On 12 and 13 use a [watermark table](#watermark-table-postgres-12-and-13) instead. The role already
+  needs `SELECT` on the published tables.
 - **Which columns and rows:** the publication's column list and row filter (Postgres 15+) apply to snapshot rows too.
 - **Tables without a primary key** are skipped with a warning, unless `snapshot_key_columns` names a published,
   `NOT NULL`, unique key for them. A key column outside the publication's column list skips the table too.
@@ -367,6 +371,30 @@ overwrites a newer change. A `TRUNCATE` in that window drops the chunk. Rows tha
   of the same row.
 - **`REPLICA IDENTITY USING INDEX`** on a key that is not the primary key: a live delete then does not tell which row
   went, so a chunk with such a delete in its window is read again (with a growing pause, up to 10 s).
+
+#### Watermark table (Postgres 12 and 13)
+
+Logical messages exist from Postgres 14 on. On 12 and 13, or where the role may not call `pg_logical_emit_message`,
+the watermarks can be rows of a small table instead. Create it, add it to the publication and let the Aqueduct role
+write it:
+
+```sql
+CREATE TABLE aqueduct_watermarks (slot text NOT NULL, snapshot_id text NOT NULL,
+    chunk bigint NOT NULL, mark text NOT NULL, PRIMARY KEY (slot, chunk, mark));
+ALTER PUBLICATION aqueduct ADD TABLE aqueduct_watermarks;
+GRANT INSERT, DELETE ON aqueduct_watermarks TO aqueduct;
+```
+
+```toml
+[postgres]
+snapshot = "initial"
+snapshot_watermark_table = "public.aqueduct_watermarks"
+```
+
+Each chunk inserts two rows (low and high, each its own transaction) and deletes the previous chunk's rows. The
+table's changes are never delivered as events, and the table is never snapshotted itself. Its rows carry the slot
+name, so several Aqueduct instances can share one table. Startup refuses the setting when the table is not in the
+publication or the role cannot insert into and delete from it.
 
 #### Starting a snapshot on request
 
