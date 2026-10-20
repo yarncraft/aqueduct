@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 /// A credential that never shows up in `Debug` output (and so not in logs).
+// Parsed once at startup; boxing the Postgres variant would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Secret(String);
@@ -49,6 +51,8 @@ pub struct Config {
 }
 
 /// Which system changes are read from, picked by `type`: postgres or mongodb.
+// Parsed once at startup; boxing the Postgres variant would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceConfig {

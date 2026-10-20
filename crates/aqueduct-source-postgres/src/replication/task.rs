@@ -241,6 +241,11 @@ async fn run(
     let every = every.max(Duration::from_millis(1));
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A new ack is reported within this, so the slot (and the WAL it holds) follows delivery
+    // closely, without one status update per ack.
+    let mut ack_tick = tokio::time::interval(ACK_REPORT_EVERY);
+    ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reported = 0u64;
     // A message read from the socket that waits for room in the channel. While it waits,
     // nothing else is read.
     let mut pending: Option<Replication> = None;
@@ -257,6 +262,16 @@ async fn run(
                 let lsn = *flush.borrow();
                 if let Err(e) = status.send_status(lsn, false).await {
                     break Err(e);
+                }
+                reported = lsn;
+            }
+            _ = ack_tick.tick() => {
+                let lsn = *flush.borrow();
+                if lsn > reported {
+                    if let Err(e) = status.send_status(lsn, false).await {
+                        break Err(e);
+                    }
+                    reported = lsn;
                 }
             }
             permit = budget.clone().acquire_many_owned(want.unwrap_or(0)), if want.is_some() => {
@@ -276,6 +291,7 @@ async fn run(
                         if let Err(e) = status.send_status(lsn, false).await {
                             break Err(e);
                         }
+                        reported = lsn;
                     }
                     pending = Some(msg);
                 }
@@ -303,6 +319,9 @@ async fn run(
         }
     }
 }
+
+/// How soon a new ack is reported to the server.
+const ACK_REPORT_EVERY: Duration = Duration::from_millis(200);
 
 /// How long the last status update after the stream ended may take.
 const FINAL_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
