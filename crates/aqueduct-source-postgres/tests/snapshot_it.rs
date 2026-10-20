@@ -497,6 +497,16 @@ async fn crashes_before_the_first_and_after_the_last_checkpoint() {
     .unwrap();
 }
 
+async fn flushed(db: &Client, slot: &str) -> i64 {
+    db.query_one(
+        "SELECT (confirmed_flush_lsn - '0/0')::int8 FROM pg_replication_slots WHERE slot_name = $1",
+        &[&slot],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
 /// The slot's confirmed position moves while a snapshot runs, so WAL is not pinned (#76).
 #[tokio::test]
 #[ignore = "needs a Postgres server, see the module docs"]
@@ -512,25 +522,12 @@ async fn the_slot_advances_during_the_snapshot() {
     ))
     .await
     .unwrap();
-    let flushed = |db: &Client, slot: String| {
-        let db = db;
-        async move {
-            let row = db
-                .query_one(
-                    "SELECT (confirmed_flush_lsn - '0/0')::int8 FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&slot],
-                )
-                .await
-                .unwrap();
-            row.get::<_, i64>(0)
-        }
-    };
     let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
     s.start(None).await.unwrap();
-    let at_start = flushed(&db, slot.clone()).await;
+    let at_start = flushed(&db, &slot).await;
     let events = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 1000).await;
     assert!(events.len() >= 1000);
-    let mid = flushed(&db, slot.clone()).await;
+    let mid = flushed(&db, &slot).await;
     assert!(
         mid > at_start,
         "the slot advanced mid-snapshot: {at_start} -> {mid}"
