@@ -168,22 +168,31 @@
     </div>
   </section>
 
-  <!-- Tables -->
+  <!-- Tables: how far each table has got (pipeline side from the stream, Kafka side from /api/tables) -->
   <section class="rounded-sm border border-ink-600 bg-ink-800">
-    <div class="flex items-center justify-between border-b border-ink-600 px-4 py-2.5">
-      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Replicated tables</h2>
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Tables · high-water marks</h2>
       <span id="tablecount" class="font-mono text-[11px] text-ink-300">0 tables</span>
+      <span class="ml-auto truncate font-mono text-[11px] text-ink-300">checkpoint <span id="ckpt" class="text-ink-200">–</span></span>
+      <span id="hwmnote" class="max-w-96 truncate font-mono text-[11px] text-ink-500">Kafka offsets: –</span>
     </div>
-    <table class="w-full text-left">
-      <thead>
-        <tr class="border-b border-ink-600 text-[11px] uppercase tracking-widest text-ink-300">
-          <th class="px-4 py-2 font-medium">Relation</th>
-          <th class="px-4 py-2 text-right font-medium">Events</th>
-          <th class="w-1/3 px-4 py-2 font-medium">Share of stream</th>
-        </tr>
-      </thead>
-      <tbody id="tables" class="font-mono text-[12px]"></tbody>
-    </table>
+    <div class="overflow-x-auto">
+      <table class="w-full text-left">
+        <thead>
+          <tr id="hwmhead" class="border-b border-ink-600 text-[11px] uppercase tracking-widest text-ink-300">
+            <th class="px-4 py-2 font-medium"><button type="button" data-sort="table" class="uppercase tracking-widest hover:text-ink-100">Relation<span class="sortmark"></span></button></th>
+            <th class="px-4 py-2 font-medium"><button type="button" data-sort="topic" class="uppercase tracking-widest hover:text-ink-100">Topic<span class="sortmark"></span></button></th>
+            <th class="px-4 py-2 text-right font-medium"><button type="button" data-sort="events" class="uppercase tracking-widest hover:text-ink-100">Events<span class="sortmark"></span></button></th>
+            <th class="w-40 px-4 py-2 font-medium" title="Share of all events, split by operation">Ops</th>
+            <th class="px-4 py-2 font-medium"><button type="button" data-sort="lsn" class="uppercase tracking-widest hover:text-ink-100">Last LSN<span class="sortmark"></span></button></th>
+            <th class="px-4 py-2 text-right font-medium" title="Age of the newest delivered change's commit. Amber: more than 1 min behind the freshest table, red: more than 10 min (only while streaming)."><button type="button" data-sort="commit" class="uppercase tracking-widest hover:text-ink-100">Last commit<span class="sortmark"></span></button></th>
+            <th class="px-4 py-2 text-right font-medium"><button type="button" data-sort="delivered" class="uppercase tracking-widest hover:text-ink-100">Delivered<span class="sortmark"></span></button></th>
+            <th class="px-4 py-2 text-right font-medium" title="Sum over the topic's partitions of the next offset Kafka will assign. A topic shared by several tables shows the whole topic."><button type="button" data-sort="hwm" class="uppercase tracking-widest hover:text-ink-100">Kafka HWM<span class="sortmark"></span></button></th>
+          </tr>
+        </thead>
+        <tbody id="tables" class="font-mono text-[12px]"></tbody>
+      </table>
+    </div>
   </section>
 
   <!-- Last error -->
@@ -373,15 +382,118 @@ function render(d) {
     $('pc-' + k).textContent = total ? (100 * d[k] / total).toFixed(1) + '%' : '–';
   }
 
-  const rows = Object.entries(d.tables).sort((a, b) => b[1] - a[1]);
-  $('tablecount').textContent = rows.length + (rows.length === 1 ? ' table' : ' tables');
-  $('tables').innerHTML = rows.length ? rows.map(([t, n]) =>
-    `<tr class="border-b border-ink-700 last:border-0 hover:bg-ink-700/50"><td class="px-4 py-2 text-ink-100">${esc(t)}</td><td class="px-4 py-2 text-right tabular-nums text-ink-100">${fmt(n)}</td><td class="px-4 py-2"><div class="flex items-center gap-2"><div class="h-1.5 flex-1 rounded-sm bg-ink-700"><div class="h-1.5 rounded-sm bg-blue-d" style="width:${100 * n / d.events_total}%"></div></div><span class="w-12 text-right text-ink-300">${(100 * n / d.events_total).toFixed(1)}%</span></div></td></tr>`).join('')
-    : '<tr><td colspan="3" class="px-4 py-6 text-center text-ink-300">No events received yet</td></tr>';
+  renderTables();
 
   $('errpanel').hidden = !d.last_error;
   if (d.last_error) $('lasterr').textContent = d.last_error;
 }
+
+// ---- Tables · high-water marks ----
+// Pipeline numbers (counts, last LSN, commit and delivery times) come with every stream frame;
+// the topic and its Kafka offsets come from /api/tables, which the server caches for 5 s, so
+// polling it every 5 s costs Kafka one offsets read however many tabs are open.
+const HWM_POLL_MS = 5000;
+// Last-commit tone, only while streaming: a table whose newest change is this far behind the
+// freshest table's turns amber / red. Measured against the freshest table, not the clock, so a
+// database that is idle as a whole is not flagged.
+const BEHIND_AMBER_MS = 60000, BEHIND_RED_MS = 600000;
+let hwm = { tables: {}, error: null, read_ms: null };
+let hwmSort = { key: 'events', desc: true };
+let openTable = null;
+const ago = t => { const a = Math.max(0, Date.now() - t); return a < 1000 ? 'now' : dur(Math.floor(a / 1000)) + ' ago'; };
+const lsnNum = l => { const m = /^([0-9A-F]+)\/([0-9A-F]+)$/i.exec(l || ''); return m ? parseInt(m[1], 16) * 4294967296 + parseInt(m[2], 16) : -1; };
+
+function tableRows(d) {
+  const marks = d.table_marks || {};
+  return Object.keys(marks).map(name => {
+    const m = marks[name], k = hwm.tables[name] || {};
+    return {
+      name, m, ops: (d.table_ops || {})[name] || [0, 0, 0, 0, 0], events: (d.tables || {})[name] || 0,
+      topic: k.topic, kafka: k.kafka || null, error: k.error || null,
+    };
+  });
+}
+
+const SORT_BY = {
+  table: r => r.name, topic: r => r.topic || '', events: r => r.events, lsn: r => lsnNum(r.m.last_lsn),
+  commit: r => r.m.last_commit_ms || 0, delivered: r => r.m.last_delivered_ms || 0, hwm: r => r.kafka ? r.kafka.hwm_total : -1,
+};
+
+function hwmDetail(r) {
+  const k = r.kafka;
+  const parts = k ? k.partitions.map(p => `<span class="mr-4 inline-block"><span class="text-ink-300">p${esc(p.partition)}</span> ${fmt(p.hwm)}</span>`).join('') : `<span class="text-ink-300">${esc(r.error || 'not read yet')}</span>`;
+  const shared = k && k.tables_on_topic > 1 ? ` · shared by ${esc(k.tables_on_topic)} tables, offsets count the whole topic` : '';
+  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="8" class="px-4 py-3 text-[11px]"><div class="mb-2 flex flex-wrap gap-x-6 gap-y-1 text-ink-300"><span>topic <span class="text-ink-100">${esc(r.topic || '–')}</span>${shared}</span><span>commit <span class="text-ink-100">${esc(r.m.last_commit_ms ? isoMs(r.m.last_commit_ms) : '–')}</span></span><span>delivered <span class="text-ink-100">${esc(isoMs(r.m.last_delivered_ms))}</span></span></div><div class="text-ink-100">${parts}</div></td></tr>`;
+}
+
+function renderTables() {
+  const d = lastData;
+  if (!d) return;
+  const rows = tableRows(d);
+  const total = d.events_total || 1;
+  const fresh = Math.max(0, ...rows.map(r => r.m.last_commit_ms || 0));
+  const key = SORT_BY[hwmSort.key];
+  rows.sort((a, b) => { const x = key(a), y = key(b); const c = x < y ? -1 : x > y ? 1 : 0; return hwmSort.desc ? -c : c; });
+  $('tablecount').textContent = rows.length + (rows.length === 1 ? ' table' : ' tables');
+  $('ckpt').textContent = d.checkpoint || '–';
+  $('ckpt').title = d.checkpoint ? 'Last position checkpointed and acked (global, not per table)' : '';
+  for (const b of document.querySelectorAll('#hwmhead [data-sort]')) b.querySelector('.sortmark').textContent = b.dataset.sort === hwmSort.key ? (hwmSort.desc ? ' ▼' : ' ▲') : '';
+  $('tables').innerHTML = rows.length ? rows.map(r => {
+    const m = r.m;
+    const bar = OPS.map((k, i) => r.ops[i] ? `<div class="${OPBAR[k]}" style="width:${100 * r.ops[i] / total}%"></div>` : '').join('');
+    const opsTitle = ['c', 'u', 'd', 't', 'r'].map((c, i) => c + ' ' + fmt(r.ops[i])).join(' · ') + ' · ' + (100 * r.events / total).toFixed(1) + '% of events';
+    const behind = m.last_commit_ms ? fresh - m.last_commit_ms : 0;
+    const tone = d.state !== 'streaming' ? 'text-ink-100' : behind > BEHIND_RED_MS ? 'text-red' : behind > BEHIND_AMBER_MS ? 'text-amber' : 'text-ink-100';
+    const k = r.kafka;
+    const hwmCell = k
+      ? `<span title="${esc(k.partitions.map(p => 'p' + p.partition + ': ' + fmt(p.hwm)).join('\n'))}">${fmt(k.hwm_total)}</span>${k.tables_on_topic > 1 ? `<span class="ml-1 text-ink-500" title="topic shared by ${esc(k.tables_on_topic)} tables">×${esc(k.tables_on_topic)}</span>` : ''}`
+      : `<span class="text-ink-500" title="${esc(r.error || 'not read yet')}">–</span>`;
+    const row = `<tr data-table="${esc(r.name)}" class="cursor-pointer border-b border-ink-700 last:border-0 hover:bg-ink-700/50 ${openTable === r.name ? 'bg-ink-700/50' : ''}">`
+      + `<td class="px-4 py-2 text-ink-100">${esc(r.name)}</td>`
+      + `<td class="max-w-48 truncate px-4 py-2 text-ink-300" title="${esc(r.topic || '')}">${esc(r.topic || '–')}</td>`
+      + `<td class="px-4 py-2 text-right tabular-nums text-ink-100">${fmt(r.events)}</td>`
+      + `<td class="px-4 py-2" title="${esc(opsTitle)}"><div class="flex h-1.5 overflow-hidden rounded-sm bg-ink-700">${bar}</div></td>`
+      + `<td class="px-4 py-2 tabular-nums text-ink-300">${esc(m.last_lsn || '–')}</td>`
+      + `<td class="px-4 py-2 text-right tabular-nums ${tone}" title="${esc(m.last_commit_ms ? isoMs(m.last_commit_ms) : '')}">${m.last_commit_ms ? esc(ago(m.last_commit_ms)) : '–'}</td>`
+      + `<td class="px-4 py-2 text-right tabular-nums text-ink-300" title="${esc(isoMs(m.last_delivered_ms))}">${esc(ago(m.last_delivered_ms))}</td>`
+      + `<td class="px-4 py-2 text-right tabular-nums text-ink-100">${hwmCell}</td></tr>`;
+    return openTable === r.name ? row + hwmDetail(r) : row;
+  }).join('') : '<tr><td colspan="8" class="px-4 py-6 text-center text-ink-300">No events received yet</td></tr>';
+  const failed = rows.filter(r => !r.kafka && r.error);
+  $('hwmnote').textContent = hwm.error ? 'Kafka offsets: ' + hwm.error
+    : rows.length && failed.length === rows.length ? 'Kafka offsets: ' + failed[0].error
+    : hwm.read_ms ? 'Kafka offsets read ' + ago(hwm.read_ms) : 'Kafka offsets: –';
+  $('hwmnote').title = $('hwmnote').textContent;
+}
+
+async function pollTables() {
+  try {
+    const r = await fetch('/api/tables', authInit());
+    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); hwm.error = r.status === 401 ? 'unauthorized' : 'disabled'; renderTables(); return; }
+    if (!r.ok) return;
+    const d = await r.json();
+    const byName = {};
+    for (const t of d.tables) byName[t.table] = t;
+    hwm = { tables: byName, error: null, read_ms: d.kafka_read_ms };
+    renderTables();
+  } catch (_) { /* the connection badge covers outages */ }
+}
+
+$('hwmhead').addEventListener('click', ev => {
+  const b = ev.target.closest('[data-sort]');
+  if (!b) return;
+  const k = b.dataset.sort;
+  hwmSort = hwmSort.key === k ? { key: k, desc: !hwmSort.desc } : { key: k, desc: k !== 'table' && k !== 'topic' && k !== 'lsn' };
+  renderTables();
+});
+$('tables').addEventListener('click', ev => {
+  const tr = ev.target.closest('tr[data-table]');
+  if (!tr) return;
+  openTable = openTable === tr.dataset.table ? null : tr.dataset.table;
+  renderTables();
+});
+const tablesTimer = setInterval(pollTables, HWM_POLL_MS);
+pollTables();
 
 function setConn(live, text) {
   $('conn-dot').className = DOT_BASE + (live ? 'bg-green' : 'bg-red');

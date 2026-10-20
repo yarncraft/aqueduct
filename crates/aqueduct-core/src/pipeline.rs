@@ -178,6 +178,7 @@ async fn drive(
         // the slot's own position wins over an older checkpoint, so nothing is lost; at worst
         // the stream re-reads from the last delivered event, which at-least-once allows.
         store.save(&last).await?;
+        metrics.record_checkpoint(&last);
         source.ack(last).await?;
     }
     sink.flush().await

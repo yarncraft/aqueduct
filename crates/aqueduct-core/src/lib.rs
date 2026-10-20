@@ -17,7 +17,7 @@ pub use control::{
 };
 pub use event::{ChangeEvent, Op, Position};
 pub use metrics::{
-    HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State, OP_SLOTS,
+    HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State, TableMark, OP_SLOTS,
 };
 pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,

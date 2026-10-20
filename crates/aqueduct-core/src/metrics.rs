@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::{ChangeEvent, Op};
+use crate::{ChangeEvent, Op, Position};
 
 /// Per-table op counters: `[insert, update, delete, truncate, read]`.
 pub const OP_SLOTS: usize = 5;
@@ -54,8 +54,10 @@ pub struct Metrics {
     sink_us_total: AtomicU64,
     sink_us_last: AtomicU64,
     sink_us_max: AtomicU64,
-    tables: Mutex<BTreeMap<String, u64>>,
-    table_ops: Mutex<BTreeMap<String, [u64; OP_SLOTS]>>,
+    /// Per `schema.table`: op counts and the newest delivered change. One lock per event.
+    tables: Mutex<BTreeMap<String, TableEntry>>,
+    /// The last position the pipeline checkpointed (global, not per table).
+    checkpoint: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
     /// Slot lag in bytes, or `-1` when unknown (no slot, or the source has none).
     slot_lag_bytes: AtomicI64,
@@ -99,6 +101,10 @@ pub struct Snapshot {
     pub tables: BTreeMap<String, u64>,
     /// Per table counts as `[insert, update, delete, truncate, read]`.
     pub table_ops: BTreeMap<String, [u64; OP_SLOTS]>,
+    /// Per table, the newest delivered change (its high-water mark on the pipeline side).
+    pub table_marks: BTreeMap<String, TableMark>,
+    /// The last position the pipeline checkpointed and acked; `None` before the first batch.
+    pub checkpoint: Option<String>,
     pub last_error: Option<String>,
     /// Replication slot lag in bytes (WAL head minus `confirmed_flush_lsn`); `None` when unknown
     /// or the source has no slot.
@@ -109,6 +115,30 @@ pub struct Snapshot {
     pub heartbeat: Option<HeartbeatSnapshot>,
     /// The running or last snapshot (ADR 0001); `None` before the first.
     pub snapshot: Option<SnapshotStatus>,
+}
+
+/// The newest change delivered for one table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableMark {
+    /// Schema (Postgres) or database (MongoDB); needed to route the table to its topic.
+    pub schema: String,
+    /// Table or collection.
+    pub table: String,
+    /// The change's LSN as `X/Y`; `None` for sources without LSNs (MongoDB).
+    pub last_lsn: Option<String>,
+    /// Commit time of the change, Unix ms; `None` when the source gave none.
+    pub last_commit_ms: Option<i64>,
+    /// When the sink acknowledged it, Unix ms.
+    pub last_delivered_ms: u64,
+}
+
+struct TableEntry {
+    ops: [u64; OP_SLOTS],
+    schema: String,
+    table: String,
+    last_lsn: Option<u64>,
+    last_commit_us: i64,
+    last_delivered_ms: u64,
 }
 
 /// Progress of a snapshot, see [`Metrics::set_snapshot`].
@@ -175,7 +205,7 @@ impl Metrics {
             sink_us_last: AtomicU64::new(0),
             sink_us_max: AtomicU64::new(0),
             tables: Mutex::new(BTreeMap::new()),
-            table_ops: Mutex::new(BTreeMap::new()),
+            checkpoint: Mutex::new(None),
             last_error: Mutex::new(None),
             slot_lag_bytes: AtomicI64::new(-1),
             confirmed_flush_lsn: Mutex::new(None),
@@ -247,29 +277,45 @@ impl Metrics {
         *lock(&self.last_position) = Some(ev.position.to_string());
         self.last_commit_ts_micros
             .store(ev.commit_ts_micros, Relaxed);
-        self.last_event_unix_ms.store(now_ms(), Relaxed);
+        let now = now_ms();
+        self.last_event_unix_ms.store(now, Relaxed);
         let us = sink_time.as_micros() as u64;
         self.sink_us_total.fetch_add(us, Relaxed);
         self.sink_us_last.store(us, Relaxed);
         self.sink_us_max.fetch_max(us, Relaxed);
-        {
-            let mut t = lock(&self.tables);
-            *t.entry(format!("{}.{}", ev.schema, ev.table)).or_default() += 1;
-        }
-        {
-            let slot = match ev.op {
-                Op::Insert => 0,
-                Op::Update => 1,
-                Op::Delete => 2,
-                Op::Truncate => 3,
-                Op::Read => 4,
-                // Unreachable: heartbeats return at the top of `record_event`; the arm only
-                // keeps the match exhaustive.
-                Op::Heartbeat => return,
-            };
-            let mut t = lock(&self.table_ops);
-            t.entry(format!("{}.{}", ev.schema, ev.table)).or_default()[slot] += 1;
-        }
+        let slot = match ev.op {
+            Op::Insert => 0,
+            Op::Update => 1,
+            Op::Delete => 2,
+            Op::Truncate => 3,
+            Op::Read => 4,
+            // Unreachable: heartbeats return at the top of `record_event`; the arm only
+            // keeps the match exhaustive.
+            Op::Heartbeat => return,
+        };
+        let mut t = lock(&self.tables);
+        let e = t
+            .entry(format!("{}.{}", ev.schema, ev.table))
+            .or_insert_with(|| TableEntry {
+                ops: [0; OP_SLOTS],
+                schema: ev.schema.clone(),
+                table: ev.table.clone(),
+                last_lsn: None,
+                last_commit_us: 0,
+                last_delivered_ms: 0,
+            });
+        e.ops[slot] += 1;
+        e.last_lsn = match ev.position {
+            Position::Lsn(l) => Some(l),
+            Position::Text(_) => None,
+        };
+        e.last_commit_us = ev.commit_ts_micros;
+        e.last_delivered_ms = now;
+    }
+
+    /// The pipeline saved and acked `position`.
+    pub fn record_checkpoint(&self, position: &Position) {
+        *lock(&self.checkpoint) = Some(position.to_string());
     }
 
     pub fn record_error(&self, msg: impl Into<String>) {
@@ -282,6 +328,23 @@ impl Metrics {
 
         let ts = self.last_commit_ts_micros.load(Relaxed);
         let last_ms = self.last_event_unix_ms.load(Relaxed);
+        let (mut tables, mut table_ops, mut table_marks) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        for (name, e) in lock(&self.tables).iter() {
+            tables.insert(name.clone(), e.ops.iter().sum());
+            table_ops.insert(name.clone(), e.ops);
+            table_marks.insert(
+                name.clone(),
+                TableMark {
+                    schema: e.schema.clone(),
+                    table: e.table.clone(),
+                    last_lsn: e.last_lsn.map(|l| Position::Lsn(l).to_string()),
+                    last_commit_ms: (e.last_commit_us > 0)
+                        .then(|| e.last_commit_us.div_euclid(1000)),
+                    last_delivered_ms: e.last_delivered_ms,
+                },
+            );
+        }
         Snapshot {
             state: State::from_u8(self.state.load(Relaxed)),
             uptime_secs: self.started.elapsed().as_secs(),
@@ -302,8 +365,10 @@ impl Metrics {
             },
             sink_last_ms: self.sink_us_last.load(Relaxed) as f64 / 1000.0,
             sink_max_ms: self.sink_us_max.load(Relaxed) as f64 / 1000.0,
-            tables: lock(&self.tables).clone(),
-            table_ops: lock(&self.table_ops).clone(),
+            tables,
+            table_ops,
+            table_marks,
+            checkpoint: lock(&self.checkpoint).clone(),
             last_error: lock(&self.last_error).clone(),
             slot_lag_bytes: u64::try_from(self.slot_lag_bytes.load(Relaxed)).ok(),
             confirmed_flush_lsn: lock(&self.confirmed_flush_lsn).clone(),
@@ -373,6 +438,36 @@ mod tests {
         assert!((s.sink_avg_ms - 4.0).abs() < 0.01);
         assert!((s.sink_max_ms - 6.0).abs() < 0.01);
         assert_eq!(s.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn table_marks_follow_the_newest_delivered_change() {
+        let m = Metrics::new();
+        assert!(m.snapshot().table_marks.is_empty());
+        assert_eq!(m.snapshot().checkpoint, None);
+        let mut a = ev(Op::Insert, "a", 0x1_0000_0010);
+        a.commit_ts_micros = 1_700_000_000_123_456;
+        m.record_event(&a, Duration::from_millis(1));
+        m.record_event(&ev(Op::Update, "b", 0x20), Duration::from_millis(1));
+        let mut mongo = ev(Op::Delete, "c", 0);
+        mongo.schema = "shop".into();
+        mongo.table = "or.ders".into();
+        mongo.position = Position::Text("{\"_data\":\"82\"}".into());
+        m.record_event(&mongo, Duration::from_millis(1));
+        m.record_checkpoint(&Position::Lsn(0x20));
+        let s = m.snapshot();
+        let ma = &s.table_marks["public.a"];
+        assert_eq!(ma.last_lsn.as_deref(), Some("1/10"));
+        assert_eq!(ma.last_commit_ms, Some(1_700_000_000_123));
+        assert!(ma.last_delivered_ms > 0);
+        assert_eq!(s.table_marks["public.b"].last_lsn.as_deref(), Some("0/20"));
+        // MongoDB has no LSN; the collection keeps its dots apart from the database.
+        let mc = &s.table_marks["shop.or.ders"];
+        assert_eq!((mc.schema.as_str(), mc.table.as_str()), ("shop", "or.ders"));
+        assert_eq!(mc.last_lsn, None);
+        assert_eq!(s.tables["shop.or.ders"], 1);
+        assert_eq!(s.table_ops["shop.or.ders"], [0, 0, 1, 0, 0]);
+        assert_eq!(s.checkpoint.as_deref(), Some("0/20"));
     }
 
     #[test]

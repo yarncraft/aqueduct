@@ -2,7 +2,7 @@
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
-use aqueduct_sinks::{KafkaSecurity, KafkaSink, RoutePlan};
+use aqueduct_sinks::{KafkaInspector, KafkaSecurity, KafkaSink, RoutePlan};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use serde_json::value::to_raw_value;
@@ -32,6 +32,7 @@ async fn produces_all_events_in_per_table_order() {
     let topic = format!("aqueduct-it-{}", std::process::id());
 
     let router = RoutePlan::new(vec![], Some(topic.clone())).unwrap();
+    let inspector = KafkaInspector::new(brokers.clone(), &router, KafkaSecurity::default());
     let mut sink = KafkaSink::connect(brokers.clone(), router, 3, None, &KafkaSecurity::default())
         .await
         .unwrap();
@@ -97,4 +98,15 @@ async fn produces_all_events_in_per_table_order() {
             "{key} split across partitions"
         );
     }
+
+    // The cockpit's high-water marks: one per partition, summing to every record produced.
+    // A topic the sink cannot write to is never read.
+    let hwms = inspector
+        .high_water_marks(&[topic.clone(), "__consumer_offsets".into()])
+        .await
+        .unwrap();
+    assert_eq!(hwms.keys().collect::<Vec<_>>(), [&topic]);
+    let parts = &hwms[&topic];
+    assert_eq!(parts.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(parts.iter().map(|p| p.1).sum::<i64>(), total as i64);
 }
