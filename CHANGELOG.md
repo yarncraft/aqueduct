@@ -92,6 +92,10 @@ Notable changes to Aqueduct. Newest first.
   `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
   Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
   - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+- **Admin API for snapshots** (#75): `GET`/`POST`/`DELETE /api/snapshot` shows, starts and cancels a Postgres table
+  snapshot (with `snapshot = "on_demand"` or `"initial"`), behind the admin token. Progress is in `/api/metrics`
+  (`snapshot`) and Prometheus (`aqueduct_snapshot_*`). A request is not durable until the first chunk is
+  checkpointed. The admin server now reads a request split over several TCP segments whole (up to 16 KiB).
   - While a snapshot runs the checkpoint file holds JSON (`{"pos": ..., "snap": {...}}`); a version without snapshots
     refuses it. Let a snapshot finish before rolling back, or delete the checkpoint.
 - **Cockpit replication-health tiles** (#54, UI half). Slot lag, last-heartbeat age and skipped heartbeats, read from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. Each tile shows `–` until the server reports the field, so this ships independently of the backend half.
