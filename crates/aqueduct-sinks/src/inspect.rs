@@ -6,7 +6,8 @@ use rskafka::client::{Client, ClientBuilder};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::kafka::{glob_match, KafkaSecurity, TopicRouter};
+use crate::kafka::{glob_match, KafkaSecurity};
+use crate::route::RoutePlan;
 
 /// Most events one inspection returns, however large `limit` is.
 pub const MAX_INSPECT_EVENTS: usize = 500;
@@ -47,10 +48,10 @@ pub struct KafkaInspector {
 }
 
 impl KafkaInspector {
-    pub fn new(brokers: Vec<String>, router: &TopicRouter, security: KafkaSecurity) -> Self {
+    pub fn new(brokers: Vec<String>, plan: &RoutePlan, security: KafkaSecurity) -> Self {
         Self {
             brokers,
-            globs: router.topic_globs(),
+            globs: plan.topic_globs(),
             security,
             client: Mutex::new(None),
         }
