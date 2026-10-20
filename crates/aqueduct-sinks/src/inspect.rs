@@ -25,8 +25,13 @@ pub struct InspectedEvent {
     /// Kafka record timestamp (the source commit time), Unix ms.
     pub timestamp_ms: i64,
     pub key: Option<String>,
-    /// The record value parsed as JSON (a `ChangeEvent`), or the raw text if it is not JSON.
+    /// The record value parsed as JSON, or the raw text if it is not JSON. Usually the change
+    /// event envelope; an outbox payload (a route's `outbox`) is whatever the row held, and a
+    /// tombstone is `null`.
     pub event: serde_json::Value,
+    /// The record headers (`op`, `lsn`, and e.g. `aqueduct-error`, or an outbox record's `id`
+    /// and `type`), as text. They tell the op and position of a value that is not an envelope.
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +218,12 @@ async fn tail(
                     .key
                     .map(|k| String::from_utf8_lossy(&k).into_owned()),
                 event,
+                headers: r
+                    .record
+                    .headers
+                    .into_iter()
+                    .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+                    .collect(),
             });
         }
         next = last + 1;

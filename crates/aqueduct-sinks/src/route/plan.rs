@@ -41,6 +41,50 @@ pub struct KafkaRoute {
     pub topic_fallback: Option<String>,
     /// The only values a content-routed `topic`'s row fields may substitute.
     pub topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`: publish the rows of an outbox table as their own events (ADR 0002 §5).
+    /// The route's `topic` must then be empty: the outbox has its own `topic` template.
+    pub outbox: Option<OutboxSpec>,
+}
+
+/// Debezium's outbox event router defaults, used for every `outbox` key left unset.
+pub const OUTBOX_AGGREGATE_TYPE: &str = "aggregatetype";
+pub const OUTBOX_AGGREGATE_ID: &str = "aggregateid";
+pub const OUTBOX_PAYLOAD: &str = "payload";
+pub const OUTBOX_TOPIC: &str = "outbox.event.{aggregate_type}";
+
+/// A route's `outbox = {...}`: column names of the outbox table and the topic template. Only
+/// inserts are published: key = the `aggregate_id` value, value = the `payload` value, headers
+/// `id` and `type` from those columns when configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboxSpec {
+    /// Column the topic template's `{aggregate_type}` reads.
+    pub aggregate_type: String,
+    /// Column whose value is the record key.
+    pub aggregate_id: String,
+    /// Column whose value is the record value.
+    pub payload: String,
+    /// Topic template over the outbox columns: `{aggregate_type}`, `{schema}`, `{table}`,
+    /// `{after.<col>}` or `{row.<col>}`.
+    pub topic: String,
+    /// Column for the `id` header; no header when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Column for the `type` header; no header when unset.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl Default for OutboxSpec {
+    fn default() -> Self {
+        Self {
+            aggregate_type: OUTBOX_AGGREGATE_TYPE.into(),
+            aggregate_id: OUTBOX_AGGREGATE_ID.into(),
+            payload: OUTBOX_PAYLOAD.into(),
+            topic: OUTBOX_TOPIC.into(),
+            id: None,
+            kind: None,
+        }
+    }
 }
 
 /// One Kafka record, before it is handed to the client. Topic and key decide the partition.
@@ -313,6 +357,103 @@ struct CompiledRoute {
     topic_fallback: Option<String>,
     /// The values a content-routed topic's row fields may take; `None` allows any valid segment.
     topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`; its topic template is `topic`.
+    outbox: Option<Outbox>,
+}
+
+/// A compiled `outbox = {...}`: the spec as configured and the `after.<col>` paths it reads.
+#[derive(Debug, Clone)]
+struct Outbox {
+    spec: OutboxSpec,
+    aggregate_id: FieldRef,
+    payload: FieldRef,
+    id: Option<FieldRef>,
+    kind: Option<FieldRef>,
+}
+
+/// Why an outbox column cannot be used for one row; never holds the value.
+enum OutboxError {
+    /// Missing or `null`.
+    Missing,
+    /// A string with an escape that is not Unicode (a lone surrogate), so it has no UTF-8 form.
+    NotUnicode,
+}
+
+impl Outbox {
+    /// Validates the column names (non-empty, top-level) and the topic template, and compiles
+    /// the template with `{aggregate_type}` read from `after.<aggregate_type>`.
+    fn compile(name: &str, spec: &OutboxSpec) -> Result<(Self, TopicTemplate)> {
+        let bad = |msg: String| Error::Config(format!("sink route `{name}`: `outbox` {msg}"));
+        let field = |key: &str, col: &str| {
+            if col.is_empty() {
+                return Err(bad(format!("`{key}` is an empty column name")));
+            }
+            if col.contains('.') || col.contains('{') || col.contains('}') {
+                return Err(bad(format!(
+                    "`{key}` column `{col}` is not a top-level column name (no dots or braces)"
+                )));
+            }
+            FieldRef::parse(&format!("after.{col}"))
+                .map_err(|e| bad(format!("`{key}` column `{col}`: {e}")))
+        };
+        field("aggregate_type", &spec.aggregate_type)?;
+        let aggregate_id = field("aggregate_id", &spec.aggregate_id)?;
+        let payload = field("payload", &spec.payload)?;
+        let id = spec.id.as_deref().map(|c| field("id", c)).transpose()?;
+        let kind = spec.kind.as_deref().map(|c| field("type", c)).transpose()?;
+        let what = format!("sink route `{name}`: `outbox` `topic`");
+        let rewritten = spec.topic.replace(
+            "{aggregate_type}",
+            &format!("{{after.{}}}", spec.aggregate_type),
+        );
+        let mut topic = parse_topic(&what, &rewritten).map_err(|e| {
+            // Report the template as written, not the rewritten form.
+            Error::Config(e.to_string().replace(&rewritten, &spec.topic))
+        })?;
+        // Only inserts are published, and an insert has no before-image.
+        if let Some(f) = topic
+            .parsed
+            .fields()
+            .find(|f| f.as_str().starts_with("before."))
+        {
+            return Err(bad(format!(
+                "`topic` `{}` reads `{f}`, but only inserts are published and they have no before-image; use `{{aggregate_type}}` or `{{after.<column>}}`",
+                spec.topic
+            )));
+        }
+        topic.raw = spec.topic.clone();
+        Ok((
+            Self {
+                spec: spec.clone(),
+                aggregate_id,
+                payload,
+                id,
+                kind,
+            },
+            topic,
+        ))
+    }
+
+    /// Every row path the outbox reads besides the topic template's, for the unseen-field check.
+    fn fields(&self) -> impl Iterator<Item = &FieldRef> {
+        [&self.aggregate_id, &self.payload]
+            .into_iter()
+            .chain(self.id.as_ref())
+            .chain(self.kind.as_ref())
+    }
+}
+
+/// The text of an outbox column as Kafka gets it: a JSON string's content, unescaped, and any
+/// other value its JSON text as the row holds it (`json`/`jsonb` columns are already JSON in the
+/// row). `null` and a missing column are [`OutboxError::Missing`].
+fn outbox_text(view: &EventView<'_>, f: &FieldRef) -> std::result::Result<String, OutboxError> {
+    let raw = view.raw(f).ok_or(OutboxError::Missing)?;
+    let text = raw.get().trim();
+    match text.as_bytes().first() {
+        None | Some(b'n') => Err(OutboxError::Missing),
+        Some(b'"') => serde_json::from_str::<String>(text).map_err(|_| OutboxError::NotUnicode),
+        Some(_) => Ok(text.to_string()),
+    }
 }
 
 /// A route's `key = [...]`.
@@ -567,6 +708,10 @@ pub struct RouteDescription {
     pub topic_fallback: Option<String>,
     /// The allow-list of a content-routed topic's values; `null` without one.
     pub topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`: the column names and the topic template (also in `topic`); left out
+    /// for other routes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<OutboxSpec>,
     pub counts: RouteCounts,
     pub unseen_fields: Vec<String>,
 }
@@ -875,7 +1020,42 @@ impl RoutePlan {
                 )));
             }
             let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
-            let topic = parse_topic(&format!("sink route `{name}`: `topic`"), &r.topic)?;
+            let (topic, outbox) = match &r.outbox {
+                None => {
+                    if r.topic.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}` has no `topic`; set one (or `outbox`)"
+                        )));
+                    }
+                    let what = format!("sink route `{name}`: `topic`");
+                    (parse_topic(&what, &r.topic)?, None)
+                }
+                Some(spec) => {
+                    // The outbox decides the topic, the key and the value (ADR 0002 §5), so the
+                    // keys that would set them too are refused rather than silently ignored.
+                    // TODO(R6/R7): `format` and the field keys (`include`, `exclude`, `mask`,
+                    // `hash`, `rename`) are refused here too, whichever lands last adds them. That
+                    // refusal is all R6's "no protected column in the outbox `aggregate_id` or
+                    // `topic`" rule needs: an outbox route has no field operations.
+                    if !r.topic.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `topic` and `outbox` are mutually exclusive; set the topic template as `outbox.topic`"
+                        )));
+                    }
+                    if r.key.is_some() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `key` and `outbox` are mutually exclusive; an outbox record is keyed by its `aggregate_id`"
+                        )));
+                    }
+                    if dead_letter_topic.is_none() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}` uses `outbox`, which needs `sink.dead_letter_topic`: outbox rows without an `aggregate_id` or `payload` go there instead of stopping the pipeline"
+                        )));
+                    }
+                    let (outbox, topic) = Outbox::compile(&name, spec)?;
+                    (topic, Some(outbox))
+                }
+            };
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
             fields.push(
                 filter
@@ -883,6 +1063,7 @@ impl RoutePlan {
                     .flat_map(|f| f.fields())
                     .chain(key.iter().flat_map(|k| k.fields.iter()))
                     .chain(topic.parsed.fields())
+                    .chain(outbox.iter().flat_map(Outbox::fields))
                     .cloned()
                     .collect(),
             );
@@ -894,6 +1075,7 @@ impl RoutePlan {
                 key,
                 topic_fallback,
                 topic_values,
+                outbox,
             });
             names.push(name);
         }
@@ -1127,6 +1309,7 @@ impl RoutePlan {
                 topic: topic.to_string(),
                 topic_fallback: r.and_then(|r| r.topic_fallback.clone()),
                 topic_values: r.and_then(|r| r.topic_values().map(<[String]>::to_vec)),
+                outbox: r.and_then(|r| r.outbox.as_ref()).map(|o| o.spec.clone()),
                 counts: self.stats.counts(i),
                 unseen_fields: self.stats.unseen(i),
             }
@@ -1179,7 +1362,11 @@ impl RoutePlan {
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
-                if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op)) {
+                // An outbox publishes inserts only (ADR 0002 §5): updates, deletes, truncates and
+                // snapshot reads of the outbox table are filtered before anything else.
+                if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op))
+                    || (r.outbox.is_some() && event.op != Op::Insert)
+                {
                     self.stats.claimed(&self.stats.filtered, route);
                     return Ok(());
                 }
@@ -1203,22 +1390,16 @@ impl RoutePlan {
                         }
                     }
                 }
-                route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
-                match self.content_topic(route, r, &view) {
-                    Ok((topic, from_row)) => {
-                        if from_row {
-                            content = r
-                                .topic_fallback
-                                .clone()
-                                .map(|fallback| ContentTopic { route, fallback });
-                        }
-                        topic
-                    }
-                    Err(fallback) => {
-                        outcome = &self.stats.fallback;
-                        fallback
-                    }
+                if let Some(outbox) = &r.outbox {
+                    return self.render_outbox(route, r, outbox, &view, now_us, out);
                 }
+                route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
+                let (topic, c, fell_back) = self.route_topic(route, r, &view);
+                content = c;
+                if fell_back {
+                    outcome = &self.stats.fallback;
+                }
+                topic
             }
         };
         let (key, partition_key) = match route_key {
@@ -1241,6 +1422,113 @@ impl RoutePlan {
             headers: Vec::new(),
             content,
         });
+        self.stats.claimed(outcome, route);
+        Ok(())
+    }
+
+    /// The topic of route `r` for this event, the [`ContentTopic`] of a topic chosen from row
+    /// content, and whether the event went to the route's `topic_fallback`.
+    fn route_topic(
+        &self,
+        route: usize,
+        r: &CompiledRoute,
+        view: &EventView<'_>,
+    ) -> (String, Option<ContentTopic>, bool) {
+        match self.content_topic(route, r, view) {
+            Ok((topic, from_row)) => {
+                let content = r
+                    .topic_fallback
+                    .clone()
+                    .filter(|_| from_row)
+                    .map(|fallback| ContentTopic { route, fallback });
+                (topic, content, false)
+            }
+            Err(fallback) => (fallback, None, true),
+        }
+    }
+
+    /// The record for an insert into an outbox table (ADR 0002 §5): topic from the outbox's
+    /// template, key = the `aggregate_id` value, value = the `payload` value, headers `id` and
+    /// `type` when configured and present. A row without an `aggregate_id` or `payload` goes to
+    /// the dead-letter topic, with an `aqueduct-error` header naming the column, never the value.
+    fn render_outbox(
+        &self,
+        route: usize,
+        r: &CompiledRoute,
+        outbox: &Outbox,
+        view: &EventView<'_>,
+        now_us: i64,
+        out: &mut Vec<OutRecord>,
+    ) -> Result<()> {
+        let event = view.event();
+        let spec = &outbox.spec;
+        let required = [
+            ("aggregate_id", &spec.aggregate_id, &outbox.aggregate_id),
+            ("payload", &spec.payload, &outbox.payload),
+        ];
+        let optional = [
+            ("id", spec.id.as_ref(), outbox.id.as_ref()),
+            ("type", spec.kind.as_ref(), outbox.kind.as_ref()),
+        ];
+        let mut texts = Vec::with_capacity(2);
+        let mut headers = Vec::new();
+        let mut failed = None;
+        for (what, col, f) in required {
+            match outbox_text(view, f) {
+                Ok(t) => texts.push(t),
+                Err(e) => {
+                    failed = Some((what, col, e));
+                    break;
+                }
+            }
+        }
+        if failed.is_none() {
+            for (what, col, f) in optional {
+                let (Some(col), Some(f)) = (col, f) else {
+                    continue;
+                };
+                match outbox_text(view, f) {
+                    Ok(t) => headers.push((what, t)),
+                    Err(OutboxError::Missing) => {}
+                    Err(e) => {
+                        failed = Some((what, col, e));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((what, col, e)) = failed {
+            let why = match e {
+                OutboxError::Missing => "is missing or null",
+                OutboxError::NotUnicode => "is a string that is not valid Unicode",
+            };
+            let reason = format!(
+                "route `{}`: outbox `{what}` column `{col}` {why}",
+                self.stats.names[route]
+            );
+            self.dead_letter(route, reason, event, now_us, out)?;
+            self.stats.claimed(&self.stats.errors, route);
+            return Ok(());
+        }
+        let payload = texts.pop().unwrap_or_default();
+        let key = texts.pop().unwrap_or_default();
+        let (topic, content, fell_back) = self.route_topic(route, r, view);
+        out.push(OutRecord {
+            topic,
+            partition_key: key.clone(),
+            key,
+            value: payload,
+            op: op_code(event.op),
+            lsn: event.position.to_checkpoint(),
+            commit_ts_micros: event.commit_ts_micros,
+            headers,
+            content,
+        });
+        let outcome = if fell_back {
+            &self.stats.fallback
+        } else {
+            &self.stats.produced
+        };
         self.stats.claimed(outcome, route);
         Ok(())
     }
@@ -2848,6 +3136,430 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(q.stats().snapshot()[0].unseen_fields, vec!["row.regoin"]);
+    }
+
+    // --- outbox (R8) -----------------------------------------------------------------------------
+
+    fn outbox_spec() -> OutboxSpec {
+        OutboxSpec {
+            topic: "outbox.{aggregate_type}".into(),
+            id: Some("id".into()),
+            kind: Some("type".into()),
+            ..Default::default()
+        }
+    }
+
+    fn outbox_route(spec: OutboxSpec) -> KafkaRoute {
+        KafkaRoute {
+            name: Some("ob".into()),
+            pattern: "public.outbox".into(),
+            topic_fallback: Some("outbox.unknown".into()),
+            outbox: Some(spec),
+            ..Default::default()
+        }
+    }
+
+    fn outbox_plan() -> RoutePlan {
+        plan_with(vec![outbox_route(outbox_spec())])
+    }
+
+    const OUTBOX_ROW: &str = r#"{"id":"0f6e","aggregatetype":"order","aggregateid":"A-1","type":"OrderCreated","payload":{"total":12.50,"items":[1,2]}}"#;
+
+    #[test]
+    fn outbox_publishes_inserts_only() {
+        let p = outbox_plan();
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        // Updates, deletes, truncates and snapshot reads of outbox rows are filtered.
+        for op in [Op::Update, Op::Delete, Op::Truncate, Op::Read] {
+            assert_eq!(
+                outcome(&p, &row("outbox", op, OUTBOX_ROW)),
+                "filtered",
+                "{op:?}"
+            );
+        }
+        // Even a row that would be dead-lettered as an insert.
+        assert_eq!(outcome(&p, &row("outbox", Op::Update, "{}")), "filtered");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.filtered), (6, 1, 5));
+    }
+
+    #[test]
+    fn outbox_key_is_the_raw_aggregate_id_and_value_the_raw_payload() {
+        let p = outbox_plan();
+        let r = p
+            .render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(r.topic, "outbox.order");
+        // A string's content, not the JSON key of the table.
+        assert_eq!(r.key, "A-1");
+        assert_eq!(r.partition_key, r.key);
+        // A `json`/`jsonb` payload is the JSON text as the row holds it.
+        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
+
+        // A text payload is its string content, unescaped; a numeric aggregate id its JSON text.
+        let r = p
+            .render(
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    r#"{"aggregatetype":"order","aggregateid":42,"payload":"say \"hi\"\n é"}"#,
+                ),
+                NOW,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(r.key, "42");
+        assert_eq!(r.value, "say \"hi\"\n é");
+        // An escaped string aggregate id is unescaped too; other values keep their JSON text.
+        for (id, key) in [
+            (r#""a\"bé""#, "a\"bé"),
+            ("1.0e3", "1.0e3"),
+            ("true", "true"),
+            (r#"{"$oid":"6530"}"#, r#"{"$oid":"6530"}"#),
+        ] {
+            let json = format!(r#"{{"aggregatetype":"o","aggregateid":{id},"payload":"{{}}"}}"#);
+            let r = p
+                .render(&row("outbox", Op::Insert, &json), NOW)
+                .unwrap()
+                .remove(0);
+            assert_eq!(r.key, key, "{id}");
+            assert_eq!(r.value, "{}");
+        }
+    }
+
+    #[test]
+    fn outbox_headers_are_id_and_type_when_configured_and_present() {
+        let p = outbox_plan();
+        let headers = |json: &str| {
+            p.render(&row("outbox", Op::Insert, json), NOW)
+                .unwrap()
+                .remove(0)
+                .headers
+        };
+        assert_eq!(
+            headers(OUTBOX_ROW),
+            vec![
+                ("id", "0f6e".to_string()),
+                ("type", "OrderCreated".to_string())
+            ]
+        );
+        // A null or missing header column leaves the header out.
+        assert_eq!(
+            headers(r#"{"aggregatetype":"o","aggregateid":"a","payload":"p","id":7,"type":null}"#),
+            vec![("id", "7".to_string())]
+        );
+        // Without `id` and `type` in the spec there are no extra headers.
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            topic: "outbox.{aggregate_type}".into(),
+            ..Default::default()
+        })]);
+        let r = q
+            .render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert!(r.headers.is_empty());
+        // The sink adds `op` and `lsn` to every record.
+        assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
+    }
+
+    #[test]
+    fn outbox_rows_without_aggregate_id_or_payload_go_to_the_dead_letter_topic() {
+        let p = outbox_plan();
+        let cases = [
+            (
+                r#"{"aggregatetype":"o","payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":null,"payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret"}"#,
+                "`payload` column `payload` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret","payload":null}"#,
+                "`payload` column `payload` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"\ud800","payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is a string that is not valid Unicode",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret","payload":"p","type":"\udc00"}"#,
+                "`type` column `type` is a string that is not valid Unicode",
+            ),
+        ];
+        for (json, why) in cases {
+            let e = row("outbox", Op::Insert, json);
+            let out = p.render(&e, NOW).unwrap();
+            assert_eq!(out.len(), 1, "{json}");
+            let r = &out[0];
+            assert_eq!(r.topic, DLQ, "{json}");
+            assert_eq!(
+                r.key,
+                r#"{"db":"app","schema":"public","table":"outbox","key":null}"#
+            );
+            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+            assert_eq!(r.headers.len(), 1);
+            assert_eq!(r.headers[0].0, "aqueduct-error");
+            assert_eq!(r.headers[0].1, format!("route `ob`: outbox {why}"));
+            assert!(!r.headers[0].1.contains("secret"));
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.errors, c.produced), (6, 6, 0));
+        // A dead-lettered row takes no content-routed topic slot.
+        assert_eq!(p.dynamic_topic_count(), 0);
+    }
+
+    #[test]
+    fn outbox_topic_follows_the_content_routing_rules_and_falls_back() {
+        let mut p = plan_with(vec![KafkaRoute {
+            topic_values: Some(vec!["order".into(), "invoice".into(), "late".into()]),
+            ..outbox_route(outbox_spec())
+        }]);
+        p.set_max_dynamic_topics(2);
+        let r = |agg: &str| {
+            outcome(
+                &p,
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    &format!(r#"{{"aggregatetype":{agg},"aggregateid":"a","payload":"p"}}"#),
+                ),
+            )
+        };
+        assert_eq!(r(r#""order""#), "outbox.order");
+        assert_eq!(r(r#""invoice""#), "outbox.invoice");
+        for bad in [
+            r#"null"#,
+            r#""x.y""#,
+            r#""shipment""#,
+            r#""""#,
+            r#"{"a":1}"#,
+        ] {
+            assert_eq!(r(bad), "outbox.unknown", "{bad}");
+        }
+        assert_eq!(r(r#""late""#), "outbox.unknown", "over max_dynamic_topics");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.produced, c.fallback), (2, 6));
+        // A fallback record is still the outbox record: same key, value and headers.
+        let rec = p
+            .render(
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    r#"{"aggregatetype":null,"aggregateid":"a","payload":"p","id":"e1"}"#,
+                ),
+                NOW,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (rec.topic.as_str(), rec.key.as_str(), rec.value.as_str()),
+            ("outbox.unknown", "a", "p")
+        );
+        assert_eq!(rec.headers, vec![("id", "e1".to_string())]);
+
+        // A template without row fields needs no fallback; `{schema}`, `{table}` and
+        // `{after.<col>}` work too.
+        let q = plan_with(vec![KafkaRoute {
+            topic_fallback: None,
+            ..outbox_route(OutboxSpec {
+                topic: "events.{table}".into(),
+                ..outbox_spec()
+            })
+        }]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "events.outbox"
+        );
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            topic: "ev.{schema}.{after.type}".into(),
+            ..outbox_spec()
+        })]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "ev.public.OrderCreated"
+        );
+    }
+
+    #[test]
+    fn outbox_routes_are_validated_at_startup() {
+        let build = |r: KafkaRoute, dlq: Option<&str>| {
+            RoutePlan::with_dead_letter(vec![r], Some("rest".into()), dlq.map(Into::into))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let ok = outbox_route(outbox_spec());
+        assert_eq!(build(ok.clone(), Some(DLQ)), Ok(()));
+        let spec = |f: fn(&mut OutboxSpec)| {
+            let mut s = outbox_spec();
+            f(&mut s);
+            outbox_route(s)
+        };
+        let cases: Vec<(KafkaRoute, Option<&str>, &str)> = vec![
+            (
+                ok.clone(),
+                None,
+                "uses `outbox`, which needs `sink.dead_letter_topic`",
+            ),
+            (
+                KafkaRoute {
+                    topic: "t".into(),
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`topic` and `outbox` are mutually exclusive",
+            ),
+            (
+                KafkaRoute {
+                    key: Some(vec!["id".into()]),
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`key` and `outbox` are mutually exclusive",
+            ),
+            (
+                spec(|s| s.aggregate_id = String::new()),
+                Some(DLQ),
+                "`aggregate_id` is an empty column name",
+            ),
+            (
+                spec(|s| s.payload = "a.b".into()),
+                Some(DLQ),
+                "`payload` column `a.b` is not a top-level column name",
+            ),
+            (
+                spec(|s| s.aggregate_type = "{x}".into()),
+                Some(DLQ),
+                "`aggregate_type` column `{x}` is not a top-level",
+            ),
+            (
+                spec(|s| s.id = Some(String::new())),
+                Some(DLQ),
+                "`id` is an empty column name",
+            ),
+            (
+                spec(|s| s.kind = Some("t.x".into())),
+                Some(DLQ),
+                "`type` column `t.x`",
+            ),
+            (
+                spec(|s| s.topic = "outbox.{before.kind}".into()),
+                Some(DLQ),
+                "reads `before.kind`, but only inserts are published",
+            ),
+            (
+                spec(|s| s.topic = "outbox.{aggregate_id}".into()),
+                Some(DLQ),
+                "`outbox` `topic` `outbox.{aggregate_id}` is not a valid template",
+            ),
+            // The content-routing rules: a fixed prefix, a fallback, no collisions.
+            (
+                spec(|s| s.topic = "{aggregate_type}".into()),
+                Some(DLQ),
+                "`topic` `{aggregate_type}` reads a row field, so it must start with fixed text",
+            ),
+            (
+                KafkaRoute {
+                    topic_fallback: None,
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`topic` `outbox.{aggregate_type}` reads a row field, so it needs `topic_fallback`",
+            ),
+            (
+                spec(|s| s.topic = "outbox.events".into()),
+                Some(DLQ),
+                "`topic_fallback` is only for a `topic` that reads a row field",
+            ),
+            (
+                spec(|s| s.topic = "bad topic".into()),
+                Some(DLQ),
+                "is not a valid Kafka topic name",
+            ),
+        ];
+        for (r, dlq, want) in cases {
+            let err = build(r, dlq).expect_err(want);
+            assert!(err.contains("sink route `ob`"), "{err}");
+            assert!(err.contains(want), "{err} should contain {want}");
+        }
+        // A topic the template could produce cannot be the dead-letter topic or another route's.
+        let err = build(ok.clone(), Some("outbox.dlq")).unwrap_err();
+        assert!(
+            err.contains("is also a topic events are routed to"),
+            "{err}"
+        );
+        let err = RoutePlan::with_dead_letter(
+            vec![ok.clone(), route("public.x", "outbox.x")],
+            None,
+            Some(DLQ.into()),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("could produce `outbox.x`, which is route `public.x`'s `topic`"),
+            "{err}"
+        );
+        // A fixed topic with no fallback is fine; so are Debezium's defaults.
+        assert_eq!(
+            build(
+                KafkaRoute {
+                    topic_fallback: None,
+                    ..spec(|s| s.topic = "outbox.events".into())
+                },
+                Some(DLQ)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            build(outbox_route(OutboxSpec::default()), Some(DLQ)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn outbox_routes_are_described_inspected_and_watched() {
+        let p = outbox_plan();
+        assert_eq!(
+            p.topic_globs(),
+            vec!["outbox.*", "rest", "outbox.unknown", DLQ]
+        );
+        let d = serde_json::to_value(p.describe()).unwrap();
+        assert_eq!(d["routes"][0]["topic"], "outbox.{aggregate_type}");
+        assert_eq!(d["routes"][0]["topic_fallback"], "outbox.unknown");
+        assert_eq!(
+            d["routes"][0]["outbox"],
+            serde_json::json!({
+                "aggregate_type": "aggregatetype", "aggregate_id": "aggregateid",
+                "payload": "payload", "topic": "outbox.{aggregate_type}",
+                "id": "id", "type": "type"
+            })
+        );
+        // Other routes have no `outbox` key at all.
+        assert!(d["routes"][1].get("outbox").is_none());
+        // Misspelled outbox columns are reported as unseen fields, on inserts only.
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            aggregate_id: "aggregate_id".into(),
+            ..outbox_spec()
+        })]);
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            q.render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+                .unwrap();
+            q.render(&row("outbox", Op::Delete, "{}"), NOW).unwrap();
+        }
+        assert_eq!(
+            q.stats().snapshot()[0].unseen_fields,
+            vec!["after.aggregate_id"]
+        );
     }
 
     // --- golden: byte-identical to the router and record builders this plan replaced ----------

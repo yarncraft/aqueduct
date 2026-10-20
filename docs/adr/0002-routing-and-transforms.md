@@ -358,3 +358,46 @@ Content routing (#82):
   accepted as before. The dead-letter topic's `_` check is R3's and applies always.
 - **Topic names are checked at startup.** Fixed text must be valid topic characters, and braces must be known
   placeholders. Kafka refuses other names, so this only moves a first-send failure to startup.
+
+## As built (R8)
+
+Outbox (#86). Where the code differs from §5 "Outbox", which was written before #138 made events Debezium envelopes
+and keys JSON:
+
+- **Config.** `outbox = { aggregate_type, aggregate_id, payload, topic, id, type }`. Unset keys take Debezium's outbox
+  event router defaults: `aggregatetype`, `aggregateid`, `payload`, topic `outbox.event.{aggregate_type}`. `id` and
+  `type` have no default; without them there is no `id` or `type` header (Debezium's `id` header is opt-in here).
+  Unknown keys inside `outbox` fail startup. Column names are top-level only (no dots), like `key`.
+- **Topic.** The template takes `{aggregate_type}` (read as `after.<aggregate_type column>`), `{schema}`, `{table}`,
+  `{op}`, `{after.<col>}` and `{row.<col>}`; `{before.<col>}` is refused at startup. It is compiled as the route's topic,
+  so all of R4 applies unchanged: fixed prefix, one segment per value, `topic_fallback` required (route-level key, as
+  for any route), `topic_values`, the glob collision checks, refused names and `max_dynamic_topics`. The route-level
+  `topic` must be unset (it is optional in the config for this reason).
+- **Inserts only, including no snapshot rows.** Updates, deletes, truncates and `read` (snapshot) events are filtered
+  before `where` and the unseen-field count. Rows still in the outbox table were published when inserted, so a
+  snapshot would publish them twice; Debezium also ignores every op but create.
+- **Key.** Since #138 table keys are JSON, but the outbox key is the raw `aggregate_id` value, as Debezium and outbox
+  consumers expect: a JSON string's unescaped content as UTF-8, any other value its JSON text as the row holds it (a
+  number `42`, an object such as a MongoDB `ObjectId` compactly). The partition is the FNV-1a hash of that key,
+  overriding `partition_by`.
+- **Value.** The `payload` value with the same rule: `json`/`jsonb` is the JSON text in the row; a text column is its
+  content, not a JSON string literal. A `jsonb` value that is a bare JSON string is indistinguishable from text in the
+  row and is sent as its content too. The value is never an envelope.
+- **Headers.** `op` and `lsn` as on every record, plus `id` and `type` when configured and present (null or missing:
+  no header). These carry row values, an exception to §5 "Headers only ever carry `op`, `lsn` and
+  `aqueduct-hash-key-id`" that the outbox pattern requires.
+- **Dead letters.** A null or missing `aggregate_id` or `payload`, or a string in the key, payload, `id` or `type`
+  column that is not valid Unicode (a lone surrogate escape), sends the envelope to `sink.dead_letter_topic` with the
+  table-only JSON key (R3) and `aqueduct-error` ``route `<r>`: outbox `<key>` column `<col>` is missing or null``. No
+  value is ever in the header or the log. These rows take no content-routing cap slot. `dead_letter_topic` is required
+  as soon as a route uses `outbox`.
+- **Mutually exclusive** with `topic` and `key` on the same route, checked at startup. `format` (R7) and the field keys
+  (R6) are not on main yet; whichever of R6/R7 lands after R8 adds them to the same check (`TODO(R6/R7)` in
+  `RoutePlan::with_dead_letter`). R6's rule "no protected column in the outbox `aggregate_id` or `topic`" then reduces
+  to that exclusion: an outbox route has no field operations, so nothing in it is protected.
+- **Unseen fields.** The outbox columns are registered as `after.<col>` (the topic template's fields as usual), so a
+  misspelled column is reported after 1000 inserts without it.
+- **Visibility.** `/api/routes` has an `outbox` object (the spec as configured) on outbox routes only; `topic` is the
+  template as written. The cockpit's existing `outbox` badge shows it. `/api/events` now returns each record's headers,
+  and the cockpit shows a value that is not an envelope raw, with op and lsn from the headers (§7), instead of an
+  empty row.

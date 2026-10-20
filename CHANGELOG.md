@@ -106,6 +106,17 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Routing: publish outbox-table rows as their own events** (#86, ADR 0002). `outbox = { aggregate_type,
+  aggregate_id, payload, topic, id, type }` on a route turns each insert into the outbox table into one record: topic
+  from a template such as `outbox.{aggregate_type}` (the content-routing rules apply, with `topic_fallback`), key = the
+  raw `aggregate_id` value (a string's content, not the JSON table key; the partition is hashed from it), value = the
+  `payload` column as is (`jsonb` as JSON text, text as its content), headers `id` and `type` from the configured
+  columns besides `op` and `lsn`. Unset keys take Debezium's defaults (`aggregatetype`, `aggregateid`, `payload`,
+  `outbox.event.{aggregate_type}`). Updates, deletes, truncates and snapshot rows of the outbox are filtered. A row
+  without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
+  `aqueduct-error` header naming the column. `outbox` excludes `topic` and `key` on the same route. The route's
+  `topic` key is now optional in the config when `outbox` is set. `/api/routes` shows an `outbox` object, the cockpit
+  an `outbox` badge, and `/api/events` now returns each record's headers and shows non-envelope values raw.
 - **Routing: choose the topic from the row's contents** (#82, ADR 0002). A route's `topic` can read row fields, such as
   `orders.{row.region}`, and also takes `{op}`. Such a template must start with fixed text and needs a fixed
   `topic_fallback`. An optional `topic_values` allow-list limits the values. No fixed topic in the config may match the

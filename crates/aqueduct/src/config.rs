@@ -251,8 +251,10 @@ pub struct KafkaRouteConfig {
     #[serde(rename = "match")]
     pub pattern: String,
     /// Destination topic template: `{schema}`, `{table}`, `{op}` and row fields such as
-    /// `{row.region}` (content routing, which needs `topic_fallback`).
-    pub topic: String,
+    /// `{row.region}` (content routing, which needs `topic_fallback`). Required, except with
+    /// `outbox`, which sets the topic itself.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Where events go whose content-routed `topic` cannot be used (null, missing or disallowed
     /// value, or `max_dynamic_topics` reached). Required when `topic` reads a row field.
     #[serde(default)]
@@ -270,6 +272,47 @@ pub struct KafkaRouteConfig {
     /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
     #[serde(default)]
     pub key: Option<Vec<String>>,
+    /// Publish the rows of an outbox table as their own events: inserts only, key = the
+    /// `aggregate_id` column, value = the `payload` column. Excludes `topic` and `key`.
+    #[serde(default)]
+    pub outbox: Option<OutboxConfig>,
+}
+
+/// `outbox = {...}` on a route. Unset keys take Debezium's outbox event router defaults
+/// (`aqueduct_sinks::OutboxSpec::default`). Unknown keys fail startup, so a misspelled key never
+/// silently falls back to a default column.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxConfig {
+    #[serde(default)]
+    pub aggregate_type: Option<String>,
+    #[serde(default)]
+    pub aggregate_id: Option<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    /// Topic template over the outbox columns, e.g. `outbox.{aggregate_type}`.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Column for the `id` header.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Column for the `type` header.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
+impl OutboxConfig {
+    pub fn spec(&self) -> aqueduct_sinks::OutboxSpec {
+        let d = aqueduct_sinks::OutboxSpec::default();
+        aqueduct_sinks::OutboxSpec {
+            aggregate_type: self.aggregate_type.clone().unwrap_or(d.aggregate_type),
+            aggregate_id: self.aggregate_id.clone().unwrap_or(d.aggregate_id),
+            payload: self.payload.clone().unwrap_or(d.payload),
+            topic: self.topic.clone().unwrap_or(d.topic),
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+        }
+    }
 }
 
 fn default_max_dynamic_topics() -> usize {
