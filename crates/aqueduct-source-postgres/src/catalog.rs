@@ -13,14 +13,57 @@ pub struct PublishedTable {
     pub name: String,
     pub oid: u32,
     /// The columns the publication sends, in table order. This is every column unless the
-    /// publication has a column list (PG15+).
+    /// publication has a column list (PG15+). Generated columns are left out, as pgoutput
+    /// does not send them.
     pub columns: Vec<String>,
+    /// Type OID of each entry of `columns`, for encoding a row exactly as the decoder does.
+    pub column_types: Vec<u32>,
     /// Primary-key columns in key order. Empty when the table has no primary key.
     pub primary_key: Vec<String>,
+    /// SQL type of each primary-key column (`format_type`), for binding keyset cursors.
+    pub primary_key_types: Vec<String>,
+    /// `REPLICA IDENTITY` setting: decides which columns key the table's live events.
+    pub replica_identity: ReplicaIdentity,
+    /// The columns pgoutput flags as key columns, in table order: the primary key under
+    /// `DEFAULT`, the index columns under `USING INDEX`, none under `FULL` or `NOTHING`.
+    pub identity_columns: Vec<String>,
     /// The publication's `WHERE` expression for this table (PG15+), as Postgres prints it.
     pub row_filter: Option<String>,
     /// The planner's row estimate (`reltuples`). `None` until the table has been analyzed.
     pub estimated_rows: Option<u64>,
+}
+
+impl PublishedTable {
+    /// `schema.table` with both parts quoted, safe to splice into SQL.
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name))
+    }
+}
+
+/// `pg_class.relreplident`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdentity {
+    Default,
+    Nothing,
+    Full,
+    Index,
+}
+
+impl ReplicaIdentity {
+    fn from_code(c: &str) -> Result<Self> {
+        match c {
+            "d" => Ok(Self::Default),
+            "n" => Ok(Self::Nothing),
+            "f" => Ok(Self::Full),
+            "i" => Ok(Self::Index),
+            other => Err(Error::Source(format!("unknown relreplident {other:?}"))),
+        }
+    }
+}
+
+/// Quotes an identifier the way `quote_ident` does when quoting is needed, always quoting.
+pub fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// The tables a publication covers, and the server they were read from.
@@ -35,25 +78,47 @@ pub struct Catalog {
 /// Column lists and row filters exist from this version on.
 const PG15: u32 = 150_000;
 
-const PRIMARY_KEY: &str = "COALESCE((SELECT array_agg(a.attname::text ORDER BY k.ord)
+/// `what` of each key column of the index of table `c` matching `filter`, in key order.
+fn index_columns(filter: &str, what: &str) -> String {
+    format!(
+        "COALESCE((SELECT array_agg({what} ORDER BY k.ord)
         FROM pg_index i
         CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-        WHERE i.indrelid = c.oid AND i.indisprimary), ARRAY[]::text[])";
+        WHERE i.indrelid = c.oid AND {filter}), ARRAY[]::text[])"
+    )
+}
 
 fn tables_query(server_version_num: u32) -> String {
-    let (columns, filter) = if server_version_num >= PG15 {
-        ("p.attnames::text[]", "p.rowfilter::text")
-    } else {
+    let (listed, filter) = if server_version_num >= PG15 {
         (
-            "(SELECT array_agg(a.attname::text ORDER BY a.attnum) FROM pg_attribute a
-              WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped)",
-            "NULL::text",
+            "(p.attnames IS NULL OR a.attname = ANY(p.attnames))",
+            "p.rowfilter::text",
+        )
+    } else {
+        ("true", "NULL::text")
+    };
+    // pgoutput never sends generated columns (before PG18), and PG14 has no column lists.
+    let cols = |what: &str| {
+        format!(
+            "(SELECT array_agg({what} ORDER BY a.attnum) FROM pg_attribute a
+              WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                AND a.attgenerated = '' AND {listed})"
         )
     };
+    let (names, types) = (cols("a.attname::text"), cols("a.atttypid"));
+    let pk = index_columns("i.indisprimary", "a.attname::text");
+    let pk_types = index_columns("i.indisprimary", "format_type(a.atttypid, a.atttypmod)");
+    // pgoutput flags identity columns in table order (`logicalrep_write_attrs`).
+    let identity = "COALESCE((SELECT array_agg(a.attname::text ORDER BY a.attnum)
+        FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = c.oid
+          AND ((c.relreplident = 'd' AND i.indisprimary) OR (c.relreplident = 'i' AND i.indisreplident))),
+        ARRAY[]::text[])";
     format!(
-        "SELECT p.schemaname::text, p.tablename::text, c.oid, {columns}, {PRIMARY_KEY}, {filter},
-                c.reltuples::float8
+        "SELECT p.schemaname::text, p.tablename::text, c.oid, COALESCE({names}, ARRAY[]::text[]),
+                COALESCE({types}, ARRAY[]::oid[]), {pk}, {pk_types}, c.relreplident::text,
+                {identity}, {filter}, c.reltuples::float8
          FROM pg_publication_tables p
          JOIN pg_namespace n ON n.nspname = p.schemaname
          JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename
@@ -104,16 +169,22 @@ pub async fn read_catalog(client: &Client, publication: &str) -> Result<Catalog>
         .map_err(err)?;
     let tables = rows
         .iter()
-        .map(|r| PublishedTable {
-            schema: r.get(0),
-            name: r.get(1),
-            oid: r.get(2),
-            columns: r.get(3),
-            primary_key: r.get(4),
-            row_filter: r.get(5),
-            estimated_rows: estimated_rows(r.get(6)),
+        .map(|r| {
+            Ok(PublishedTable {
+                schema: r.get(0),
+                name: r.get(1),
+                oid: r.get(2),
+                columns: r.get(3),
+                column_types: r.get(4),
+                primary_key: r.get(5),
+                primary_key_types: r.get(6),
+                replica_identity: ReplicaIdentity::from_code(r.get(7))?,
+                identity_columns: r.get(8),
+                row_filter: r.get(9),
+                estimated_rows: estimated_rows(r.get(10)),
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(Catalog {
         server_version_num,
         tables,
@@ -131,6 +202,19 @@ mod tests {
         let old = tables_query(140_012);
         assert!(!old.contains("p.attnames") && !old.contains("p.rowfilter"));
         assert!(old.contains("NULL::text"));
+    }
+
+    #[test]
+    fn generated_columns_are_never_listed() {
+        for v in [140_012, 150_000, 170_000] {
+            assert!(tables_query(v).contains("a.attgenerated = ''"), "{v}");
+        }
+    }
+
+    #[test]
+    fn identifiers_are_always_quoted() {
+        assert_eq!(quote_ident("Orders"), "\"Orders\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 
     #[test]
