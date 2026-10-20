@@ -50,6 +50,22 @@ impl Checkpoint {
         }
     }
 
+    /// The checkpoint as shown outside the checkpoint file (metrics, the admin API, the
+    /// cockpit): the stream position, plus `snapshot: <table> <i>/<n>` while a snapshot runs.
+    /// Never `snap.after`: that is the last chunk's primary-key values, i.e. row data.
+    pub fn display(&self) -> String {
+        match &self.snap {
+            None => self.pos.clone(),
+            Some(s) => format!(
+                "{} (snapshot: {} {}/{})",
+                self.pos,
+                s.tables.get(s.table).map_or("?", String::as_str),
+                s.table + 1,
+                s.tables.len()
+            ),
+        }
+    }
+
     /// Accepts the composite JSON and every plain format (decimal LSN, K text, MongoDB resume
     /// token). A MongoDB position is itself a JSON object (`{"_data":"..."}`), so only an object
     /// with a `snap` key is the composite form: any other well-formed JSON is returned as plain
@@ -126,6 +142,19 @@ mod tests {
             c.encode(),
             r#"{"pos":"7","snap":{"id":"s1","tables":["public.a","public.b"],"table":1,"after":["42","x\"y"]}}"#
         );
+    }
+
+    #[test]
+    fn display_shows_the_table_but_never_the_cursor() {
+        let c = Checkpoint {
+            pos: "16/B374D848@16/B374D8E0#2;db=5".into(),
+            snap: Some(snap()),
+        };
+        let d = c.display();
+        assert_eq!(d, "16/B374D848@16/B374D8E0#2;db=5 (snapshot: public.b 2/2)");
+        assert!(!d.contains("42") && !d.contains("x\"y"), "{d}");
+        // Outside a snapshot it is the position as is.
+        assert_eq!(Checkpoint::plain("7").display(), "7");
     }
 
     #[test]

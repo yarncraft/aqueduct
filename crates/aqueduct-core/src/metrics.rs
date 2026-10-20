@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::{ChangeEvent, Op, Position};
+use crate::{ChangeEvent, Checkpoint, Op, Position};
 
 /// Per-table op counters: `[insert, update, delete, truncate, read]`.
 pub const OP_SLOTS: usize = 5;
@@ -14,6 +14,22 @@ pub const OP_SLOTS: usize = 5;
 /// cascade into the pipeline, so recover the guard instead of unwrapping.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A checkpoint as shown outside the checkpoint file: an LSN as `X/Y`, other positions as their
+/// text, and a composite snapshot checkpoint as its stream position plus the table being read,
+/// without the snapshot cursor. Text that is not a composite checkpoint is shown as is.
+pub fn display_checkpoint(position: &Position) -> String {
+    match position {
+        Position::Text(t) if t.trim_start().starts_with('{') && t.contains("\"snap\"") => {
+            match Checkpoint::decode(t) {
+                Ok(c) => c.display(),
+                // Unreadable but snapshot-shaped: show nothing rather than risk the cursor.
+                Err(_) => "(unreadable checkpoint)".into(),
+            }
+        }
+        p => p.to_string(),
+    }
 }
 
 /// Pipeline lifecycle, shown on the admin cockpit.
@@ -313,9 +329,11 @@ impl Metrics {
         e.last_delivered_ms = now;
     }
 
-    /// The pipeline saved and acked `position`.
+    /// The pipeline saved and acked `position`. Only its display form is kept: while a snapshot
+    /// runs the checkpoint also holds the snapshot cursor (the last chunk's primary-key values),
+    /// which must not reach the admin API or the cockpit (see [`Checkpoint::display`]).
     pub fn record_checkpoint(&self, position: &Position) {
-        *lock(&self.checkpoint) = Some(position.to_string());
+        *lock(&self.checkpoint) = Some(display_checkpoint(position));
     }
 
     pub fn record_error(&self, msg: impl Into<String>) {
@@ -468,6 +486,60 @@ mod tests {
         assert_eq!(s.tables["shop.or.ders"], 1);
         assert_eq!(s.table_ops["shop.or.ders"], [0, 0, 1, 0, 0]);
         assert_eq!(s.checkpoint.as_deref(), Some("0/20"));
+    }
+
+    #[test]
+    fn snapshot_cursor_values_never_reach_the_checkpoint_shown() {
+        use crate::SnapState;
+        let m = Metrics::new();
+        // Postgres: K text with its origin, wrapped with snapshot progress.
+        let pg = Checkpoint {
+            pos: "16/B374D848@16/B374D8E0#2;db=5".into(),
+            snap: Some(SnapState {
+                id: "s1".into(),
+                tables: vec!["public.users".into(), "public.orders".into()],
+                table: 0,
+                after: Some(vec!["ada@example.com".into(), "4111".into()]),
+            }),
+        };
+        m.record_checkpoint(&Position::Text(pg.encode()));
+        let shown = m.snapshot().checkpoint.unwrap();
+        assert_eq!(
+            shown,
+            "16/B374D848@16/B374D8E0#2;db=5 (snapshot: public.users 1/2)"
+        );
+        assert!(
+            !shown.contains("ada@") && !shown.contains("4111"),
+            "{shown}"
+        );
+        // MongoDB: a resume token, the cursor an `_id` in extended JSON.
+        let mongo = Checkpoint {
+            pos: r#"{"_data":"8263"}"#.into(),
+            snap: Some(SnapState {
+                id: "s2".into(),
+                tables: vec!["shop.customers".into()],
+                table: 0,
+                after: Some(vec![r#"{"$oid":"6530aa"}"#.into()]),
+            }),
+        };
+        m.record_checkpoint(&Position::Text(mongo.encode()));
+        let shown = m.snapshot().checkpoint.unwrap();
+        assert_eq!(shown, r#"{"_data":"8263"} (snapshot: shop.customers 1/1)"#);
+        assert!(!shown.contains("6530aa"), "{shown}");
+        // Plain positions are shown as before, a resume token byte for byte.
+        m.record_checkpoint(&Position::Text(r#"{"_data":"8263"}"#.into()));
+        assert_eq!(
+            m.snapshot().checkpoint.as_deref(),
+            Some(r#"{"_data":"8263"}"#)
+        );
+        m.record_checkpoint(&Position::Lsn(0x20));
+        assert_eq!(m.snapshot().checkpoint.as_deref(), Some("0/20"));
+        // Snapshot-shaped but malformed: nothing of it is shown.
+        let bad = r#"{"pos":"1","snap":{"after":["secret"]}}"#;
+        assert_eq!(
+            display_checkpoint(&Position::Text(bad.into())),
+            "(unreadable checkpoint)"
+        );
     }
 
     #[test]

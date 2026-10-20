@@ -175,6 +175,11 @@ Notable changes to Aqueduct. Newest first.
 
 ### Changed
 
+- **Snapshots: the cockpit no longer shows primary-key values of the snapshot cursor.** While a snapshot ran, the
+  checkpoint in `/api/metrics`, `/api/stream`, `/api/tables` and the cockpit header was the whole composite
+  checkpoint, including `snap.after`, the last chunk's primary-key values (an email or other personal data when that
+  is the key). It now shows the stream position plus `(snapshot: <table> <i>/<n>)`. The checkpoint file still holds the
+  full value, which resuming needs. No config change.
 - **MongoDB: a restart soon after the first start no longer skips changes** (#77). Without a checkpoint the change
   stream opens at "now", but nothing saved that position until the first event or 30 s heartbeat, so a restart before
   then opened at a later "now" and lost the changes in between. The opening position is now checkpointed before
