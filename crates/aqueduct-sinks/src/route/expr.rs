@@ -304,6 +304,11 @@ impl<'a> EventView<'a> {
         Some(cur)
     }
 
+    /// The raw JSON of a row field as the row holds it; `None` when absent or not a row field.
+    pub fn raw(&self, f: &FieldRef) -> Option<&'a RawValue> {
+        self.lookup(f)
+    }
+
     /// True when the row has the field, even if its value is `null`. Used to count rows that lack a
     /// configured column (ADR 0002 §5, unseen fields).
     pub fn present(&self, f: &FieldRef) -> bool {

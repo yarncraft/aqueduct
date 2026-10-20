@@ -178,6 +178,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         topic: topic.clone(),
         ops: Some(vec!["insert".into()]),
         filter: Some("row.n > 10".into()),
+        key: None,
     };
     let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
     let stats = plan.stats();
@@ -241,5 +242,86 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     assert_eq!(
         (c.matched, c.produced, c.filtered, c.errors),
         (22, 10, 11, 1)
+    );
+}
+
+#[tokio::test]
+async fn route_key_keeps_each_rows_changes_on_one_partition() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let topic = unique("aqueduct-it-key");
+    let route = KafkaRoute {
+        pattern: "public.*".into(),
+        topic: topic.clone(),
+        key: Some(vec!["id".into()]),
+        ..Default::default()
+    };
+    let plan = RoutePlan::new(vec![route], None).unwrap();
+    // `partition_by = "table"` would put every record on one partition; the route key overrides it.
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 4, None, &KafkaSecurity::default())
+        .await
+        .unwrap()
+        .with_partition_by(aqueduct_sinks::PartitionBy::Table);
+    let mut batch = Vec::new();
+    for id in 0..40u64 {
+        let mut ins = ev(2 * id + 1, "orders");
+        ins.after = Some(to_raw_value(&serde_json::json!({ "id": id, "n": 1 })).unwrap());
+        let mut del = ev(2 * id + 2, "orders");
+        del.op = Op::Delete;
+        del.after = None;
+        // A delete's before-image under the default replica identity: the key columns only.
+        del.before = Some(to_raw_value(&serde_json::json!({ "id": id })).unwrap());
+        batch.push(ins);
+        batch.push(del);
+    }
+    sink.send_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    // id -> (partition, op) of each record, in partition order.
+    let mut by_id: std::collections::BTreeMap<u64, Vec<(i32, String)>> = Default::default();
+    for p in 0..4 {
+        let pc = client
+            .partition_client(&topic, p, UnknownTopicHandling::Error)
+            .await
+            .unwrap();
+        let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+        let mut offset = 0;
+        while offset < end {
+            let (recs, _hw) = pc.fetch_records(offset, 1..1_000_000, 1_000).await.unwrap();
+            if recs.is_empty() {
+                break;
+            }
+            for r in recs {
+                offset = r.offset + 1;
+                let k: serde_json::Value = serde_json::from_slice(&r.record.key.unwrap()).unwrap();
+                assert_eq!(k["table"], "orders");
+                let id = k["key"]["id"].as_u64().unwrap();
+                assert_eq!(
+                    k["key"],
+                    serde_json::json!({ "id": id }),
+                    "only the key columns"
+                );
+                let op = String::from_utf8(r.record.headers["op"].clone()).unwrap();
+                by_id.entry(id).or_default().push((p, op));
+            }
+        }
+    }
+    assert_eq!(by_id.len(), 40);
+    for (id, recs) in &by_id {
+        assert_eq!(
+            recs.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            ["c", "d"],
+            "row {id}: insert then delete"
+        );
+        assert_eq!(recs[0].0, recs[1].0, "row {id} split across partitions");
+    }
+    let used: std::collections::HashSet<i32> = by_id.values().map(|r| r[0].0).collect();
+    assert!(
+        used.len() > 1,
+        "rows spread over partitions despite partition_by = table"
     );
 }
