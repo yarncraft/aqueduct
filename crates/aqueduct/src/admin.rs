@@ -183,7 +183,10 @@ struct Request {
 const MAX_REQUEST: usize = 16 * 1024;
 
 fn parse(raw: &str) -> Option<Request> {
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+    let (head, body) = match head_end(raw.as_bytes()) {
+        Some((end, len)) => (&raw[..end], &raw[end + len..]),
+        None => (raw, ""),
+    };
     let mut lines = head.lines();
     let mut first = lines.next()?.split_whitespace();
     let method = first.next()?;
@@ -207,6 +210,20 @@ fn parse(raw: &str) -> Option<Request> {
     })
 }
 
+/// Where the head ends: the offset of the blank line and its length. Bare `\n` line ends are
+/// accepted as well as `\r\n`.
+fn head_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4));
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
 /// `Content-Length` of a request head, 0 when absent.
 fn content_length(head: &str) -> usize {
     head.lines()
@@ -223,9 +240,9 @@ async fn read_request(sock: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::with_capacity(1024);
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        if let Some((end, len)) = head_end(&buf) {
             let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-            let want = end + 4 + content_length(&head);
+            let want = end + len + content_length(&head);
             if want > MAX_REQUEST {
                 return None;
             }
