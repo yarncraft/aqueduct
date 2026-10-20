@@ -78,6 +78,9 @@ async fn main() {
     let inspector = (cfg.inspector && cfg.admin_token.as_deref().is_some_and(|t| !t.is_empty()))
         .then_some(inspector);
     let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone(), inspector);
+    // The sink's plan: it names each table's topic, and its counters are shared (an `Arc`)
+    // with the sink, so the admin server reads what the sink counts.
+    admin.set_router(sink.plan().clone());
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin.clone()));
 

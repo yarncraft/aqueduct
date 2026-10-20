@@ -291,3 +291,32 @@ ships with unit tests, docs, and the bench number from issue 1's harness.
 3. ~~Should exceeding `max_dynamic_topics` fail?~~ Resolved in review: it goes to the fallback, the cap is
    counted from the broker, and the fallback is required (Megatron: failing turns one row into a stall that
    fills the primary's disk).
+
+## As built (R3)
+
+Filter and error policy (#81). Where the code differs from the text above, which was written before #138 changed the
+event format:
+
+- **Dead-letter key.** Since #138 record keys are JSON (`{"db", "schema", "table", "key": {...}}`, MongoDB `db` and
+  `collection`), not `schema.table`. The dead-letter key is that JSON key with `"key": null`: the table only, no row
+  values. The partition is hashed from it.
+- **Times in `where`.** Since #138 `timestamp` values are JSON numbers (microseconds since the epoch) and `date`
+  values JSON numbers (days since the epoch), so number literals compare with them (§3 "Ordering comparisons on
+  timestamps are not supported" no longer holds for these two types). `timestamptz` stays an ISO-8601 string in UTC,
+  so it allows only `==`, `!=` and `in`. Values without a number form (`infinity`, out-of-range dates) stay strings,
+  and a number literal against them is a type error (dead-letter topic).
+- **Unseen fields** are reported only while the field has never been seen in a row that had the row the path reads,
+  so a delete's key-only before-image does not trigger the warning.
+- **Route labels** must be unique, and `default` is reserved for the `sink.topic` fallback.
+
+## As built (R5)
+
+Per-route key (#83):
+
+- **Key format.** Since #138 the record key is JSON, so `key = [...]` does not produce `schema.table:<values joined
+  0x1f>` (§5 "Key"). It produces the usual JSON key with `"key": {"col": value, ...}`: the listed top-level columns
+  of `row` in config order, each value copied as raw JSON, a missing column `null`. The partition is the FNV-1a hash
+  of that whole key (what `partition_by = "key"` hashes), overriding `partition_by` for the route.
+- **Truncates** have no row and get the table-only key (`"key": null`), like dead-letter records.
+- **Validation:** a non-empty list of distinct top-level column names; a dotted path is rejected. The key columns
+  are registered with the unseen-field counter as `row.<column>`, on routes with or without `where`.

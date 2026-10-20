@@ -243,6 +243,10 @@ pub struct KafkaConfig {
     pub partition_by: Option<String>,
     #[serde(default)]
     pub routes: Vec<KafkaRouteConfig>,
+    /// Where events go that a route cannot evaluate (a type error in `where`). Required as soon
+    /// as a route uses `where`; opened (created if missing) at startup.
+    #[serde(default)]
+    pub dead_letter_topic: Option<String>,
     /// Encrypt with TLS and verify the broker certificate.
     #[serde(default)]
     pub tls: bool,
@@ -282,6 +286,16 @@ pub struct KafkaRouteConfig {
     pub pattern: String,
     /// Destination topic; `{schema}` and `{table}` are substituted.
     pub topic: String,
+    /// Only these ops pass: `insert`, `update`, `delete`, `truncate`, `read`. Default: all.
+    #[serde(default)]
+    pub ops: Option<Vec<String>>,
+    /// Predicate over the event (ADR 0002 §3); only events it is true for pass.
+    #[serde(default, rename = "where")]
+    pub filter: Option<String>,
+    /// Top-level columns of the row (`after`, else `before`) that make the record key, in order.
+    /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
+    #[serde(default)]
+    pub key: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {

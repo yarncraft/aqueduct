@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aqueduct_core::{Error, Result};
@@ -42,6 +43,7 @@ pub struct Inspection {
 /// startup and the pipeline never waits on the inspector.
 pub struct KafkaInspector {
     brokers: Vec<String>,
+    router: RoutePlan,
     globs: Vec<String>,
     security: KafkaSecurity,
     client: Mutex<Option<Arc<Client>>>,
@@ -51,6 +53,7 @@ impl KafkaInspector {
     pub fn new(brokers: Vec<String>, plan: &RoutePlan, security: KafkaSecurity) -> Self {
         Self {
             brokers,
+            router: plan.clone(),
             globs: plan.topic_globs(),
             security,
             client: Mutex::new(None),
@@ -71,6 +74,53 @@ impl KafkaInspector {
         );
         *slot = Some(c.clone());
         Ok(c)
+    }
+
+    /// The sink's routes, to tell which topic a table goes to.
+    pub fn router(&self) -> &RoutePlan {
+        &self.router
+    }
+
+    /// The high-water mark (the offset the next record will get) of every partition of each of
+    /// `topics`, sorted by partition. Topics the sink's routes cannot write to, and topics that
+    /// do not exist yet, are left out, so this cannot be used to probe unrelated topics.
+    pub async fn high_water_marks(
+        &self,
+        topics: &[String],
+    ) -> Result<BTreeMap<String, Vec<(i32, i64)>>> {
+        let client = self.client().await?;
+        let listed = client
+            .list_topics()
+            .await
+            .map_err(|e| Error::Sink(format!("kafka list topics: {e}")))?;
+        let wanted: Vec<(String, Vec<i32>)> = listed
+            .into_iter()
+            .filter(|t| topics.contains(&t.name))
+            .filter(|t| self.globs.iter().any(|g| glob_match(g, &t.name)))
+            .map(|t| (t.name, t.partitions.into_iter().collect()))
+            .collect();
+        let reads = wanted.iter().flat_map(|(name, parts)| {
+            let client = &client;
+            parts.iter().map(move |&p| async move {
+                let pc = client
+                    .partition_client(name.as_str(), p, UnknownTopicHandling::Error)
+                    .await
+                    .map_err(|e| Error::Sink(format!("kafka partition client {name}/{p}: {e}")))?;
+                let hwm = pc
+                    .get_offset(OffsetAt::Latest)
+                    .await
+                    .map_err(|e| Error::Sink(format!("kafka offsets {name}/{p}: {e}")))?;
+                Ok::<_, Error>((name.clone(), p, hwm))
+            })
+        });
+        let mut out: BTreeMap<String, Vec<(i32, i64)>> = BTreeMap::new();
+        for (name, p, hwm) in futures::future::try_join_all(reads).await? {
+            out.entry(name).or_default().push((p, hwm));
+        }
+        for parts in out.values_mut() {
+            parts.sort_unstable();
+        }
+        Ok(out)
     }
 
     /// The newest `limit` events (capped at [`MAX_INSPECT_EVENTS`]) across the

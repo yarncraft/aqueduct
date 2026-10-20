@@ -7,6 +7,9 @@
 //! - `GET /api/metrics` JSON snapshot
 //! - `GET /api/events`  recent events read back from Kafka (`?topic=<t>&limit=<n>`)
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
+//! - `GET /api/tables`  per table high-water marks: the newest delivered change and the
+//!   topic's Kafka offsets
+//! - `GET /api/routes`  the compiled route plan with live per-route counts (no row data)
 //! - `GET|POST|DELETE /api/snapshot` state of, start, or cancel a table snapshot (ADR 0001)
 //!
 //! If `admin_token` is configured, `/metrics` and `/api/*` require it as
@@ -26,7 +29,7 @@ use std::time::{Duration, Instant};
 use aqueduct_core::{
     Metrics, Snapshot, SnapshotCommand, SnapshotRequest, SnapshotSender, State, OP_SLOTS,
 };
-use aqueduct_sinks::KafkaInspector;
+use aqueduct_sinks::{KafkaInspector, RouteCount, RoutePlan};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -48,6 +51,10 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_STREAMS: usize = 16;
 /// Identical inspector queries within this window share one Kafka read.
 const INSPECT_CACHE: Duration = Duration::from_secs(2);
+/// `/api/tables` calls within this window share one read of the Kafka offsets, across tabs.
+const HWM_CACHE: Duration = Duration::from_secs(5);
+/// Longest `/api/tables` waits for Kafka; past it the tables are listed without offsets.
+const HWM_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -69,6 +76,22 @@ pub struct Admin {
     inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
     /// Where snapshot requests go; unset for a source without snapshots.
     snapshots: OnceLock<SnapshotSender>,
+    /// The sink's route plan: names each table's topic, and its counters (shared with the
+    /// sink) feed `/api/routes` and the per-route metrics.
+    router: OnceLock<RoutePlan>,
+    /// The last read of the Kafka offsets. A std lock: never held across an await.
+    hwm_cache: Mutex<Option<HwmRead>>,
+    /// Lets one request at a time read the offsets; the others wait and reuse its result.
+    hwm_gate: tokio::sync::Mutex<()>,
+}
+
+/// High-water mark per partition, by topic.
+type Offsets = BTreeMap<String, Vec<(i32, i64)>>;
+
+struct HwmRead {
+    at: Instant,
+    topics: Vec<String>,
+    result: Result<Offsets, String>,
 }
 
 impl Admin {
@@ -86,12 +109,136 @@ impl Admin {
             inspector,
             inspect_cache: tokio::sync::Mutex::new(None),
             snapshots: OnceLock::new(),
+            router: OnceLock::new(),
+            hwm_cache: Mutex::new(None),
+            hwm_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The sink's route plan: names each table's topic on `/api/tables`, and describes the routes
+    /// with their live counts on `/api/routes`, `/api/metrics` and `/metrics`.
+    pub fn set_router(&self, router: RoutePlan) {
+        let _ = self.router.set(router);
+    }
+
+    /// A read of the offsets of `topics` younger than [`HWM_CACHE`], if there is one.
+    fn cached_hwms(&self, topics: &[String]) -> Option<(Instant, Result<Offsets, String>)> {
+        let c = lock(&self.hwm_cache);
+        let c = c.as_ref()?;
+        (c.at.elapsed() < HWM_CACHE && c.topics == topics).then(|| (c.at, c.result.clone()))
+    }
+
+    /// The Kafka high-water marks of `topics` and when they were read, or `None` without an
+    /// inspector. Bounded by [`HWM_TIMEOUT`], so a Kafka outage slows `/api/tables` down but
+    /// never blocks it, and the cache lock is never held while Kafka is read.
+    async fn kafka_hwms(&self, topics: &[String]) -> Option<(Instant, Result<Offsets, String>)> {
+        let inspector = self.inspector.as_ref()?;
+        if let Some(hit) = self.cached_hwms(topics) {
+            return Some(hit);
+        }
+        let began = Instant::now();
+        let read = timeout(HWM_TIMEOUT, async {
+            let _gate = self.hwm_gate.lock().await;
+            // Another request may have read them while this one waited.
+            if let Some(hit) = self.cached_hwms(topics) {
+                return hit;
+            }
+            let read = inspector.high_water_marks(topics).await.map_err(|e| {
+                tracing::warn!(error = %e, "reading kafka offsets failed");
+                e.to_string()
+            });
+            (Instant::now(), read)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let msg = format!("Kafka did not answer within {} s", HWM_TIMEOUT.as_secs());
+            tracing::warn!("reading kafka offsets failed: {msg}");
+            (Instant::now(), Err(msg))
+        });
+        let mut c = lock(&self.hwm_cache);
+        // Keep a read that finished after this one started.
+        if c.as_ref().is_none_or(|c| c.at < began) {
+            *c = Some(HwmRead {
+                at: read.0,
+                topics: topics.to_vec(),
+                result: read.1.clone(),
+            });
+        }
+        Some(read)
+    }
+
+    /// `/api/tables`: per table, the newest delivered change and its topic's Kafka offsets.
+    async fn tables_payload(&self) -> String {
+        let snap = self.metrics.snapshot();
+        let topic_of: BTreeMap<&str, Option<String>> = snap
+            .table_marks
+            .iter()
+            .map(|(name, m)| {
+                let topic = self
+                    .router
+                    .get()
+                    .and_then(|r| r.topic_for(&m.schema, &m.table));
+                (name.as_str(), topic)
+            })
+            .collect();
+        let mut topics: Vec<String> = topic_of.values().flatten().cloned().collect();
+        topics.sort();
+        topics.dedup();
+        let hwms = if topics.is_empty() {
+            None
+        } else {
+            self.kafka_hwms(&topics).await
+        };
+        let tables: Vec<serde_json::Value> = snap
+            .table_marks
+            .iter()
+            .map(|(name, m)| {
+                let ops = snap.table_ops.get(name).copied().unwrap_or_default();
+                let topic = topic_of.get(name.as_str()).cloned().flatten();
+                let (kafka, error) = kafka_entry(&hwms, topic.as_deref(), &topic_of);
+                let mut row = json!({
+                    "table": name,
+                    "topic": topic,
+                    "events": snap.tables.get(name).copied().unwrap_or_default(),
+                    "ops": { "c": ops[0], "u": ops[1], "d": ops[2], "t": ops[3], "r": ops[4] },
+                    "last_lsn": m.last_lsn,
+                    "last_commit_ms": m.last_commit_ms,
+                    "last_delivered_ms": m.last_delivered_ms,
+                    "kafka": kafka,
+                });
+                if let Some(e) = error {
+                    row["error"] = json!(e);
+                }
+                row
+            })
+            .collect();
+        // When the offsets shown were read, as Unix ms.
+        let read_ms = hwms.as_ref().map(|(at, _)| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            now.saturating_sub(at.elapsed().as_millis() as u64)
+        });
+        json!({
+            "state": snap.state,
+            "checkpoint": snap.checkpoint,
+            "inspector": self.inspector.is_some(),
+            "kafka_read_ms": read_ms,
+            "tables": tables,
+        })
+        .to_string()
     }
 
     /// Route `/api/snapshot` requests to the source.
     pub fn set_snapshots(&self, tx: SnapshotSender) {
         let _ = self.snapshots.set(tx);
+    }
+
+    fn route_counts(&self) -> Vec<RouteCount> {
+        self.router
+            .get()
+            .map(|p| p.stats().snapshot())
+            .unwrap_or_default()
     }
 
     /// Sample the throughput once a second.
@@ -151,6 +298,7 @@ impl Admin {
         v["history"] = json!(history);
         v["history_ops"] = json!(*lock(&self.detail));
         v["inspector"] = json!(self.inspector.is_some());
+        v["routes"] = json!(self.route_counts());
         v.to_string()
     }
 
@@ -285,6 +433,44 @@ async fn respond(sock: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     respond_with(sock, status, ctype, "", body).await
 }
 
+/// One table's `kafka` block on `/api/tables`, or why there is none. `topic_of` maps every
+/// table to its topic, to count the tables that share it.
+fn kafka_entry(
+    hwms: &Option<(Instant, Result<Offsets, String>)>,
+    topic: Option<&str>,
+    topic_of: &BTreeMap<&str, Option<String>>,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let Some((_, read)) = hwms else {
+        return (
+            None,
+            Some("Kafka offsets need the inspector: set admin_token and inspector = true".into()),
+        );
+    };
+    let Some(topic) = topic else {
+        return (None, Some("no route sends this table to a topic".into()));
+    };
+    let parts = match read {
+        Err(e) => return (None, Some(e.clone())),
+        Ok(found) => match found.get(topic) {
+            Some(p) => p,
+            None => return (None, Some(format!("topic {topic} not found in Kafka"))),
+        },
+    };
+    let sharing = topic_of
+        .values()
+        .filter(|t| t.as_deref() == Some(topic))
+        .count();
+    let block = json!({
+        "hwm_total": parts.iter().map(|p| p.1).sum::<i64>(),
+        "partitions": parts
+            .iter()
+            .map(|(p, h)| json!({ "partition": p, "hwm": h }))
+            .collect::<Vec<_>>(),
+        "tables_on_topic": sharing,
+    });
+    (Some(block), None)
+}
+
 fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -326,6 +512,24 @@ fn prometheus(s: &Snapshot) -> String {
             "aqueduct_table_events_total{{table=\"{}\"}} {n}",
             escape_label(t)
         );
+    }
+    if s.table_marks.values().any(|m| m.last_commit_ms.is_some()) {
+        metric(
+            &mut o,
+            "aqueduct_table_last_commit_timestamp_seconds",
+            "gauge",
+            "Commit time of the newest change delivered, by table (Unix time).",
+        );
+        for (t, m) in &s.table_marks {
+            if let Some(ms) = m.last_commit_ms {
+                let _ = writeln!(
+                    o,
+                    "aqueduct_table_last_commit_timestamp_seconds{{table=\"{}\"}} {}",
+                    escape_label(t),
+                    ms as f64 / 1000.0
+                );
+            }
+        }
     }
     metric(
         &mut o,
@@ -473,6 +677,50 @@ fn prometheus(s: &Snapshot) -> String {
     o
 }
 
+/// Per-route Prometheus series. `matched` is not exported: it is the sum of the four outcomes.
+fn route_metrics(o: &mut String, routes: &[RouteCount]) {
+    if routes.is_empty() {
+        return;
+    }
+    metric(
+        o,
+        "aqueduct_route_records_total",
+        "counter",
+        "Events a route claimed, by outcome; the sum over outcomes is the route's matched count.",
+    );
+    for r in routes {
+        let route = escape_label(&r.route);
+        let c = r.counts;
+        for (outcome, n) in [
+            ("produced", c.produced),
+            ("filtered", c.filtered),
+            ("fallback", c.fallback),
+            ("errors", c.errors),
+        ] {
+            let _ = writeln!(
+                o,
+                "aqueduct_route_records_total{{route=\"{route}\",outcome=\"{outcome}\"}} {n}"
+            );
+        }
+    }
+    metric(
+        o,
+        "aqueduct_route_field_unseen",
+        "gauge",
+        "1 for a field path a route references that no row has had yet (a typo?).",
+    );
+    for r in routes {
+        for f in &r.unseen_fields {
+            let _ = writeln!(
+                o,
+                "aqueduct_route_field_unseen{{route=\"{}\",field=\"{}\"}} 1",
+                escape_label(&r.route),
+                escape_label(f)
+            );
+        }
+    }
+}
+
 /// How long `/api/snapshot` waits for the source, which answers between batches.
 const SNAPSHOT_REPLY: Duration = Duration::from_secs(30);
 
@@ -595,6 +843,7 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             }
         }
         "/metrics" | "/api/metrics" | "/api/stream" | "/api/events" | "/api/snapshot"
+        | "/api/tables" | "/api/routes"
             if !admin.authorized(&req) =>
         {
             respond_with(
@@ -607,7 +856,8 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             .await
         }
         "/metrics" => {
-            let body = prometheus(&admin.metrics.snapshot());
+            let mut body = prometheus(&admin.metrics.snapshot());
+            route_metrics(&mut body, &admin.route_counts());
             respond(
                 &mut sock,
                 "200 OK",
@@ -617,6 +867,25 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             .await
         }
         "/api/metrics" => respond(&mut sock, "200 OK", "application/json", &admin.payload()).await,
+        "/api/tables" => {
+            let body = admin.tables_payload().await;
+            respond(&mut sock, "200 OK", "application/json", &body).await
+        }
+        "/api/routes" => match admin.router.get() {
+            Some(plan) => {
+                let body = serde_json::to_string(&plan.describe()).unwrap_or_default();
+                respond(&mut sock, "200 OK", "application/json", &body).await
+            }
+            None => {
+                respond(
+                    &mut sock,
+                    "404 Not Found",
+                    "application/json",
+                    r#"{"error":"no route plan"}"#,
+                )
+                .await
+            }
+        },
         "/api/snapshot" => {
             let (status, body) = snapshot_api(&admin, &req).await;
             respond(&mut sock, status, "application/json", &body).await
@@ -764,6 +1033,26 @@ mod tests {
         );
     }
 
+    /// The routing graph reimplements `glob_match` in JS to draw which route claims a table. The page
+    /// asserts its version against the cases in `#globcases` on load; the Rust function must agree.
+    #[test]
+    fn dashboard_glob_cases_agree_with_glob_match() {
+        let cases = DASHBOARD
+            .split("id=\"globcases\">")
+            .nth(1)
+            .and_then(|r| r.split("</script>").next())
+            .expect("#globcases in admin.html");
+        let cases: Vec<(String, String, bool)> = serde_json::from_str(cases).unwrap();
+        assert!(cases.len() >= 9, "{cases:?}");
+        for (pattern, text, want) in cases {
+            assert_eq!(
+                aqueduct_sinks::glob_match(&pattern, &text),
+                want,
+                "{pattern:?} vs {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
@@ -872,6 +1161,133 @@ Authorization: Bearer {token}
         assert!(get(addr, "/api/events").await.starts_with("HTTP/1.1 401"));
     }
 
+    /// A plan with a filtered route, a plain route and the default, after a few events.
+    fn routed_plan() -> RoutePlan {
+        use aqueduct_core::{ChangeEvent, Op, Position};
+        let route = |name: &str, pattern: &str, filter: Option<&str>| aqueduct_sinks::KafkaRoute {
+            name: Some(name.into()),
+            pattern: pattern.into(),
+            topic: format!("{name}.t"),
+            ops: filter.map(|_| vec!["insert".to_string()]),
+            filter: filter.map(Into::into),
+            key: None,
+        };
+        let plan = RoutePlan::with_dead_letter(
+            vec![
+                route(
+                    "paid \"orders\"",
+                    "public.orders",
+                    Some("row.status == 'paid'"),
+                ),
+                route("rest", "public.*", None),
+            ],
+            Some("cdc.{table}".into()),
+            Some("aqueduct.dlq".into()),
+        )
+        .unwrap();
+        let ev = |table: &str, row: &str| ChangeEvent {
+            position: Position::Lsn(1),
+            xid: 1,
+            commit_ts_micros: 0,
+            schema: "public".into(),
+            table: table.into(),
+            op: Op::Insert,
+            before: None,
+            after: serde_json::value::RawValue::from_string(row.into()).ok(),
+            key: None,
+            checkpoint: None,
+        };
+        for (table, row) in [
+            ("orders", r#"{"status":"paid","card":"4111-secret"}"#),
+            ("orders", r#"{"status":"open"}"#),
+            ("orders", r#"{"status":7}"#),
+            ("users", r#"{"id":1}"#),
+        ] {
+            plan.render(&ev(table, row), 0).unwrap();
+        }
+        plan
+    }
+
+    #[tokio::test]
+    async fn routes_api_needs_the_token_and_describes_the_plan() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admin = Admin::new(Arc::new(Metrics::new()), Some("k".into()), None);
+        tokio::spawn(serve(listener, admin.clone()));
+        // Before the plan is set, the route exists but has nothing to show.
+        assert!(get_bearer(addr, "/api/routes", "k")
+            .await
+            .starts_with("HTTP/1.1 404"));
+        admin.set_router(routed_plan());
+
+        let r = get(addr, "/api/routes").await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        assert!(get_bearer(addr, "/api/routes", "wrong")
+            .await
+            .starts_with("HTTP/1.1 401"));
+        let r = get_bearer(addr, "/api/routes", "k").await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(!r.contains("4111-secret"), "no row data: {r}");
+        let body = r.split("\r\n\r\n").nth(1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["default_topic"], "cdc.{table}");
+        assert_eq!(v["dead_letter_topic"], "aqueduct.dlq");
+        assert_eq!(v["partition_by"], "key");
+        let routes = v["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 3);
+        assert_eq!(
+            routes[0],
+            json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
+                   "where": "row.status == 'paid'", "key": null, "topic": "paid \"orders\".t",
+                   "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1},
+                   "unseen_fields": []})
+        );
+        assert_eq!(routes[1]["counts"]["produced"], 1);
+        assert_eq!(routes[2]["route"], "default");
+        assert_eq!(routes[2]["match"], serde_json::Value::Null);
+
+        // /api/metrics carries the flat per-route counters.
+        let r = get_bearer(addr, "/api/metrics", "k").await;
+        let v: serde_json::Value =
+            serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            v["routes"][0],
+            json!({"route": "paid \"orders\"", "matched": 3, "produced": 1, "filtered": 1,
+                   "fallback": 0, "errors": 1, "unseen_fields": []})
+        );
+
+        // Prometheus: one series per route and outcome, label values escaped.
+        let prom = get_bearer(addr, "/metrics", "k").await;
+        for line in [
+            r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="produced"} 1"#,
+            r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="filtered"} 1"#,
+            r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="errors"} 1"#,
+            r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="fallback"} 0"#,
+            r#"aqueduct_route_records_total{route="default",outcome="produced"} 0"#,
+            "# TYPE aqueduct_route_field_unseen gauge",
+        ] {
+            assert!(prom.contains(line), "missing {line}");
+        }
+    }
+
+    #[test]
+    fn unseen_fields_are_exported_with_escaped_labels() {
+        let mut o = String::new();
+        route_metrics(
+            &mut o,
+            &[RouteCount {
+                route: "a\\b".into(),
+                counts: Default::default(),
+                unseen_fields: vec!["row.st\"atus".into()],
+            }],
+        );
+        assert!(o.contains(r#"aqueduct_route_field_unseen{route="a\\b",field="row.st\"atus"} 1"#));
+        // No routes (no plan): no route series at all.
+        let mut o = String::new();
+        route_metrics(&mut o, &[]);
+        assert!(o.is_empty());
+    }
+
     #[tokio::test]
     async fn inspector_is_disabled_without_kafka_inspector() {
         let addr = start(Some("k")).await;
@@ -888,6 +1304,8 @@ Authorization: Bearer {token}
             "/metrics?token=k",
             "/api/stream?token=k",
             "/api/events?token=k",
+            "/api/tables?token=k",
+            "/api/routes?token=k",
         ] {
             assert!(
                 get(addr, path).await.starts_with("HTTP/1.1 401"),
@@ -1088,6 +1506,188 @@ Authorization: Bearer {token}
         assert!(prom.contains("aqueduct_snapshot_rows_total 42"));
         assert!(prom.contains("aqueduct_snapshot_tables_done 1"));
         assert!(prom.contains("aqueduct_snapshot_rows_estimated 100"));
+    }
+
+    fn change(
+        schema: &str,
+        table: &str,
+        op: aqueduct_core::Op,
+        lsn: u64,
+    ) -> aqueduct_core::ChangeEvent {
+        aqueduct_core::ChangeEvent {
+            position: aqueduct_core::Position::Lsn(lsn),
+            xid: 1,
+            commit_ts_micros: 1_700_000_000_250_000,
+            schema: schema.into(),
+            table: table.into(),
+            op,
+            before: None,
+            after: None,
+            key: None,
+            checkpoint: None,
+        }
+    }
+
+    fn json_body(resp: &str) -> serde_json::Value {
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    /// Serves an admin whose sink routes `public.*` to one shared topic and everything else to
+    /// a topic per table, with three tables' events delivered and a checkpoint taken.
+    async fn start_tables(inspector: Option<KafkaInspector>) -> std::net::SocketAddr {
+        use aqueduct_core::{Op, Position};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let admin = Admin::new(metrics.clone(), Some("k".into()), inspector);
+        admin.set_router(router());
+        let d = Duration::from_millis(1);
+        metrics.record_event(&change("public", "a", Op::Insert, 0x10), d);
+        metrics.record_event(&change("public", "a", Op::Update, 0x1_0000_0020), d);
+        metrics.record_event(&change("public", "b", Op::Read, 0x30), d);
+        metrics.record_event(&change("hr", "staff", Op::Delete, 0x40), d);
+        metrics.record_checkpoint(&Position::Lsn(0x40));
+        tokio::spawn(serve(listener, admin));
+        addr
+    }
+
+    fn router() -> RoutePlan {
+        let route = aqueduct_sinks::KafkaRoute {
+            name: None,
+            pattern: "public.*".into(),
+            topic: "cdc.public".into(),
+            ..Default::default()
+        };
+        RoutePlan::new(vec![route], Some("cdc.{schema}.{table}".into())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tables_api_needs_the_token_and_lists_marks_without_kafka() {
+        let addr = start_tables(None).await;
+        assert!(get(addr, "/api/tables").await.starts_with("HTTP/1.1 401"));
+        assert!(get_bearer(addr, "/api/tables", "kk")
+            .await
+            .starts_with("HTTP/1.1 401"));
+        let r = get_bearer(addr, "/api/tables", "k").await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("application/json"),
+            "{r}"
+        );
+        let v = json_body(&r);
+        assert_eq!(v["checkpoint"], "0/40");
+        assert_eq!(v["inspector"], false);
+        assert!(v["kafka_read_ms"].is_null());
+        let tables = v["tables"].as_array().unwrap();
+        let names: Vec<_> = tables
+            .iter()
+            .map(|t| t["table"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["hr.staff", "public.a", "public.b"]);
+        let a = &tables[1];
+        assert_eq!(a["topic"], "cdc.public");
+        assert_eq!(a["events"], 2);
+        assert_eq!(a["ops"], json!({ "c": 1, "u": 1, "d": 0, "t": 0, "r": 0 }));
+        assert_eq!(a["last_lsn"], "1/20");
+        assert_eq!(a["last_commit_ms"], 1_700_000_000_250i64);
+        assert!(a["last_delivered_ms"].as_u64().unwrap() > 0);
+        assert!(a["kafka"].is_null());
+        assert!(a["error"].as_str().unwrap().contains("inspector"), "{a}");
+        assert_eq!(tables[0]["topic"], "cdc.hr.staff");
+        assert_eq!(tables[2]["ops"]["r"], 1);
+    }
+
+    /// Kafka down: `/api/tables` still answers within the timeout with the pipeline's numbers,
+    /// says why the offsets are missing, and the next call reuses the failed read.
+    #[tokio::test]
+    async fn tables_api_answers_without_offsets_while_kafka_is_down() {
+        let dead = KafkaInspector::new(
+            vec!["127.0.0.1:1".into()],
+            &router(),
+            aqueduct_sinks::KafkaSecurity::default(),
+        );
+        let addr = start_tables(Some(dead)).await;
+        let began = Instant::now();
+        let first = tokio::spawn(get_bearer(addr, "/api/tables", "k"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Other routes are not held up while Kafka is read.
+        let other = Instant::now();
+        assert!(get_bearer(addr, "/api/metrics", "k")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert!(other.elapsed() < Duration::from_secs(1));
+        let r = first.await.unwrap();
+        assert!(
+            began.elapsed() < HWM_TIMEOUT + Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let v = json_body(&r);
+        assert_eq!(v["inspector"], true);
+        assert!(v["kafka_read_ms"].as_u64().is_some());
+        for t in v["tables"].as_array().unwrap() {
+            assert!(t["kafka"].is_null(), "{t}");
+            assert!(!t["error"].as_str().unwrap().is_empty(), "{t}");
+            assert!(t["events"].as_u64().unwrap() > 0);
+        }
+        // Within the cache window the failed read is reused rather than retried.
+        let began = Instant::now();
+        let again = get_bearer(addr, "/api/tables", "k").await;
+        assert!(again.starts_with("HTTP/1.1 200") && again.contains("\"kafka\":null"));
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn kafka_entry_sums_partitions_and_counts_sharing_tables() {
+        let mut found = Offsets::new();
+        found.insert("cdc.public".into(), vec![(0, 5), (1, 7)]);
+        let hwms = Some((Instant::now(), Ok(found)));
+        let mut topic_of = BTreeMap::new();
+        topic_of.insert("public.a", Some("cdc.public".to_string()));
+        topic_of.insert("public.b", Some("cdc.public".to_string()));
+        topic_of.insert("hr.x", Some("cdc.hr.x".to_string()));
+        let (k, e) = kafka_entry(&hwms, Some("cdc.public"), &topic_of);
+        assert_eq!(e, None);
+        assert_eq!(
+            k.unwrap(),
+            json!({
+                "hwm_total": 12,
+                "partitions": [{ "partition": 0, "hwm": 5 }, { "partition": 1, "hwm": 7 }],
+                "tables_on_topic": 2,
+            })
+        );
+        let (k, e) = kafka_entry(&hwms, Some("cdc.hr.x"), &topic_of);
+        assert!(k.is_none() && e.unwrap().contains("not found"));
+        let (k, e) = kafka_entry(&hwms, None, &topic_of);
+        assert!(k.is_none() && e.unwrap().contains("no route"));
+        let failed = Some((Instant::now(), Err("boom".to_string())));
+        assert_eq!(
+            kafka_entry(&failed, Some("cdc.public"), &topic_of)
+                .1
+                .as_deref(),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn prometheus_exports_last_commit_per_table() {
+        let m = Metrics::new();
+        assert!(!prometheus(&m.snapshot()).contains("aqueduct_table_last_commit"));
+        m.record_event(
+            &change("public", "we\"ird", aqueduct_core::Op::Insert, 1),
+            Duration::from_millis(1),
+        );
+        let out = prometheus(&m.snapshot());
+        assert!(
+            out.contains(
+                "aqueduct_table_last_commit_timestamp_seconds{table=\"public.we\\\"ird\"} 1700000000.25"
+            ),
+            "{out}"
+        );
     }
 
     #[tokio::test]

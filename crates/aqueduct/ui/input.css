@@ -19,4 +19,10 @@
   --color-red: #e76a6e;
   --color-amber: #ec9a3c;
   --color-violet: #ad7bee;
+
+  /* Routing graph: the dots on an edge with recent traffic flow left to right. */
+  --animate-flow: flow 1s linear infinite;
+  @keyframes flow {
+    to { stroke-dashoffset: -12; }
+  }
 }

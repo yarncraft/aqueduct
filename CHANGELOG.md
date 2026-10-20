@@ -112,10 +112,35 @@ Notable changes to Aqueduct. Newest first.
   so reconnects keep working past the token's one-hour lifetime. Startup refuses an `azure-*` mode without verified
   TLS (`disable`, `prefer`, `require` without `ssl_root_cert`), with a password in the URL, or without the platform's
   environment variables. The image is unchanged. See DEPLOYMENT.md, "Azure managed identity".
+- **Routing: set the Kafka message key per route** (#83, ADR 0002). `key = ["col", ...]` on a `[[sink.routes]]`
+  entry builds the record key from those columns of the row (`after`, else `before`, so deletes key by their
+  before-image): `{"db", "schema", "table", "key": {"col": value, ...}}`, values copied as JSON, a missing column
+  `null`. The partition is hashed from that whole key, overriding `partition_by` for the route. Truncates keep the
+  table-only key. `GET /api/routes` shows each route's `key`. Additive: routes without `key` are unchanged.
+- **Cockpit: a Routing card draws the routing graph** (#87, ADR 0002). Tables on the left, routes in match order
+  (numbered, first match wins) in the middle, topics and the dead-letter topic on the right. Each route shows its
+  `match`, `ops`, `where`, per-route counts (produced, filtered, fallback, errors) with a bar, and an amber warning
+  listing fields its `where` reads that no row has had. Edge width follows the counts and edges with recent traffic
+  animate (static under reduced motion). Hover a table to light up its path, click a route for its details, click a
+  topic to open it in the event inspector. Busy routes collapse to the 6 busiest tables and topics with "+N more".
+  No new server route: it reads `/api/routes`, `/api/tables` and the stream.
+- **Routing: filter events per route and send failures to a dead-letter topic** (#81, ADR 0002). `[[sink.routes]]`
+  takes `ops` (insert, update, delete, truncate, read) and `where`, a typed predicate with SQL-style three-valued
+  logic (an unknown result is filtered). The first matching route owns the event; nothing falls through. Rows a
+  `where` cannot evaluate (a type error) go to the new `[sink] dead_letter_topic` with an `aqueduct-error` header and
+  a table-only key; it is required once a route uses `where` and is opened at startup. Per-route counters
+  (`matched`, `produced`, `filtered`, `fallback`, `errors`) and unseen-field warnings appear in `/api/metrics`, the new
+  `GET /api/routes` (the compiled plan with live counts) and Prometheus (`aqueduct_route_records_total`,
+  `aqueduct_route_field_unseen`). Additive: routes without the new keys behave exactly as before.
 - **Route plan inside the Kafka sink** (#79). Routing now compiles once into a `RoutePlan` with a pure `render` step;
   output (topic, key, partition, value, headers) is unchanged, which a golden test pins. `[[sink.routes]]` accepts an
   optional unique `name` that labels the route in the per-route counters (`matched`, `produced`; shown in a later
   change). `aqueduct-bench --sink render` measures the render cost without a broker.
+- **Cockpit: per-table high-water marks.** The per-table card now shows, for each table, its topic, counts per
+  operation, the newest delivered LSN, how long ago it committed and was delivered (amber/red when it falls behind
+  the freshest table while streaming), and the topic's Kafka high-water mark per partition. New route
+  `GET /api/tables` (Bearer token) and Prometheus series `aqueduct_table_last_commit_timestamp_seconds{table}`;
+  `/api/metrics` and `/api/stream` gain `table_marks` and `checkpoint`. See DEPLOYMENT.md, "Tables · high-water marks".
 - **Postgres snapshots: copy rows that already exist while changes stream** (#74, ADR 0001). New `[postgres]` keys
   `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and
   `snapshot_key_columns`. Copied rows arrive as `"op": "r"`, encoded like an `insert` of the same row. Needs
