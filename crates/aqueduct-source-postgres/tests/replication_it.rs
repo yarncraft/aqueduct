@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use aqueduct_source_postgres::parse_lsn;
 use aqueduct_source_postgres::replication::{
-    AuthMethod, ConnectOptions, Replication, ReplicationClient, StartReplication,
+    AuthMethod, ConnectOptions, Replication, ReplicationClient, ReplicationHandle,
+    StartReplication, StreamOptions,
 };
 use tokio_postgres::NoTls;
 
@@ -267,4 +268,122 @@ async fn a_latin1_database_streams_the_same_utf8_bytes_as_the_peek() {
         "the peek is not UTF-8: {peeked:?}"
     );
     assert_eq!(streamed, peeked, "stream and peek bytes differ");
+}
+
+/// The connection task (#108) against a real walsender: the slot does not move until `ack`,
+/// and then moves exactly to the acked commit end through the task's status updates.
+#[tokio::test]
+#[ignore = "needs a trust-auth Postgres server, see the module docs"]
+async fn the_slot_moves_only_to_what_was_acked() {
+    let addr = std::env::var("AQUEDUCT_TEST_PG_TRUST")
+        .expect("AQUEDUCT_TEST_PG_TRUST must name a trust-auth Postgres, see the module docs");
+    let url = format!("postgres://postgres@{addr}/postgres?sslmode=disable");
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let (table, publication, slot) = (
+        format!("repl_ack_{id}"),
+        format!("aq_repl_ack_{id}"),
+        format!("aq_repl_ack_{id}"),
+    );
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (k int PRIMARY KEY);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+    db.execute(
+        "SELECT pg_create_logical_replication_slot($1::text, 'pgoutput')",
+        &[&slot],
+    )
+    .await
+    .unwrap();
+    let confirmed = || async {
+        let row = db
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap();
+        parse_lsn(&row.get::<_, String>(0)).unwrap()
+    };
+    let initial = confirmed().await;
+
+    let client = ReplicationClient::connect(&url, &ConnectOptions::default())
+        .await
+        .unwrap();
+    let (stream, status) = client
+        .start_replication(&StartReplication {
+            slot: &slot,
+            start_lsn: 0,
+            publication: &publication,
+            logical_messages: false,
+        })
+        .await
+        .unwrap();
+    let mut handle = ReplicationHandle::spawn(
+        stream,
+        status,
+        StreamOptions {
+            buffer_bytes: 1 << 20,
+            status_interval: Duration::from_millis(100),
+        },
+    );
+    db.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
+        .await
+        .unwrap();
+
+    // Commit: tag, flags, commit LSN, end LSN (bytes 10..18), timestamp.
+    let end = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(Replication::XLogData { data, .. }) = handle.recv().await.unwrap() {
+                if data.first() == Some(&b'C') {
+                    break u64::from_be_bytes(data[10..18].try_into().unwrap());
+                }
+            }
+        }
+    })
+    .await
+    .expect("no Commit arrived");
+    assert!(end > initial);
+
+    // Many status updates go out, but none may confirm anything before an ack.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(confirmed().await, initial, "the slot moved without an ack");
+
+    handle.ack(end);
+    let moved = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let now = confirmed().await;
+            if now != initial {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the slot did not move after the ack");
+    assert_eq!(moved, end);
+
+    handle.shutdown().await;
+    for _ in 0..50 {
+        if db
+            .execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
 }
