@@ -10,6 +10,7 @@
 //! Startup must refuse a checkpoint from another cluster, another timeline or another database of
 //! the same cluster, before it looks up or creates the slot, and must accept a checkpoint written
 //! before the check existed.
+mod common;
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Error, Position, Source};
@@ -46,6 +47,7 @@ fn source(db: &str, slot: &str, publication: &str, recreate: bool) -> PostgresSo
 
 fn source_at(url: String, slot: &str, publication: &str, recreate: bool) -> PostgresSource {
     let mut cfg = PostgresSourceConfig::new(url, slot, publication);
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
     cfg.allow_slot_recreate = recreate;
@@ -263,6 +265,7 @@ async fn a_replication_role_without_superuser_runs_the_check() {
     // The opt-out skips the cluster comparison but still records and compares the database.
     let foreign = Position::Text(with_field(&ckpt_text, "sys", "1"));
     let mut cfg = PostgresSourceConfig::new(role_url, &slot, &publication);
+    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.skip_system_check = true;
     let mut s = PostgresSource::new(cfg);

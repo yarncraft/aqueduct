@@ -9,6 +9,7 @@
 //! AQUEDUCT_TEST_PG_WRONG_CA=/path/other.pem  # an unrelated CA
 //! cargo test -p aqueduct-source-postgres --test tls_it -- --ignored
 //! ```
+mod common;
 use aqueduct_core::Source;
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 
@@ -37,6 +38,7 @@ fn source(addr: &str, tag: &str, mode: Option<SslMode>, ca: Option<String>) -> P
     // Tests run in parallel threads of one process: every test needs its own slot.
     let slot = format!("aq_tls_{}_{tag}", std::process::id());
     let mut cfg = PostgresSourceConfig::new(url, slot, "aq_pub");
+    cfg.transport = common::transport();
     cfg.ssl_mode = mode;
     cfg.ssl_root_cert = ca;
     PostgresSource::new(cfg)

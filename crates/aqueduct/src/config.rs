@@ -110,6 +110,13 @@ pub struct PostgresConfig {
     /// 10 to 13, or wherever `pg_logical_emit_message` is not allowed).
     #[serde(default)]
     pub snapshot_watermark_table: Option<String>,
+    /// `poll | stream`: read the slot by polling over SQL (default) or over a replication
+    /// connection (ADR 0003).
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Stream transport: bytes of received messages buffered ahead of the sink. Default 64 MiB.
+    #[serde(default)]
+    pub stream_buffer_bytes: Option<usize>,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -159,6 +166,15 @@ impl PostgresConfig {
             }
         }
         c.snapshot.watermark_table = self.snapshot_watermark_table.clone();
+        if let Some(t) = &self.transport {
+            c.transport = t.parse().map_err(|e| format!("postgres.{e}"))?;
+        }
+        if let Some(n) = self.stream_buffer_bytes {
+            if n < 64 * 1024 {
+                return Err("postgres.stream_buffer_bytes must be at least 65536".into());
+            }
+            c.stream_buffer_bytes = n;
+        }
         Ok(c)
     }
 }
@@ -597,6 +613,17 @@ snapshot_key_columns = { 'public.events' = ['day', 'seq'] }")
             Some("public.aqueduct_watermarks")
         );
         assert!(pg("snapshot_watermark_table = 'aqueduct_watermarks'").is_err());
+        use aqueduct_source_postgres::TransportKind;
+        assert_eq!(pg("").unwrap().transport, TransportKind::Poll);
+        let c = pg("transport = 'stream'
+stream_buffer_bytes = 1048576")
+        .unwrap();
+        assert_eq!(
+            (c.transport, c.stream_buffer_bytes),
+            (TransportKind::Stream, 1_048_576)
+        );
+        assert!(pg("transport = 'copy'").unwrap_err().contains("poll"));
+        assert!(pg("stream_buffer_bytes = 10").is_err());
     }
 
     #[test]
@@ -641,6 +668,8 @@ heartbeat_action_query = 'SELECT 1'")
             snapshot_max_rows_per_sec: None,
             snapshot_key_columns: HashMap::new(),
             snapshot_watermark_table: None,
+            transport: None,
+            stream_buffer_bytes: None,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());

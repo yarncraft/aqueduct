@@ -7,6 +7,7 @@
 //! ```
 //!
 //! Every test makes its own tables, publication and slot, because tests share one server.
+mod common;
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
@@ -82,6 +83,7 @@ impl Fixture {
     fn config(&self, heartbeat: Duration, action: Option<String>) -> PostgresSourceConfig {
         let url = format!("postgres://postgres:aq@{}/postgres", addr());
         let mut cfg = PostgresSourceConfig::new(url, self.slot.clone(), self.publication.clone());
+        cfg.transport = common::transport();
         cfg.ssl_mode = Some(SslMode::Disable);
         cfg.poll_interval = Duration::from_millis(100);
         cfg.heartbeat_interval = Some(heartbeat);
