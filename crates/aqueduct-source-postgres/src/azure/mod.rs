@@ -37,6 +37,8 @@ pub const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/";
 pub const IDENTITY_API_VERSION: &str = "2019-08-01";
 /// A cached token is replaced this long before it expires.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// A token is never cached longer than this, whatever lifetime the endpoint claims.
+pub const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
@@ -282,9 +284,10 @@ impl AzureCredential {
             expires_in_secs = lifetime.as_secs(),
             "got a Microsoft Entra access token for Postgres"
         );
-        *cache = Some(Cached {
+        // `lifetime` is clamped to MAX_LIFETIME; an overflow would only mean "do not cache".
+        *cache = now.checked_add(lifetime).map(|expires_at| Cached {
             token: token.clone(),
-            expires_at: now + lifetime,
+            expires_at,
         });
         Ok(token)
     }
@@ -433,7 +436,8 @@ fn parse_token(
             .or_else(|| seconds(json.get("expires_in"))),
     }
     .ok_or("the token response has no valid expiry (expires_in / expires_on)")?;
-    Ok((AccessToken::new(token), Duration::from_secs(lifetime)))
+    let lifetime = Duration::from_secs(lifetime).min(MAX_LIFETIME);
+    Ok((AccessToken::new(token), lifetime))
 }
 
 #[cfg(test)]
@@ -647,6 +651,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!((t.secret(), life), ("tok", Duration::from_secs(3600)));
+        // An absurd lifetime is clamped instead of overflowing the expiry instant.
+        for body in [
+            format!(r#"{{"access_token":"t","expires_in":{}}}"#, u64::MAX),
+            format!(r#"{{"access_token":"t","expires_in":"{}"}}"#, u64::MAX),
+        ] {
+            let (_, life) = parse_token(wi, 200, body.as_bytes(), 0).unwrap();
+            assert_eq!(life, MAX_LIFETIME);
+            assert!(Instant::now().checked_add(life).is_some());
+        }
+        let (_, life) = parse_token(
+            aca,
+            200,
+            format!(r#"{{"access_token":"t","expires_on":{}}}"#, u64::MAX).as_bytes(),
+            1_700_000_000,
+        )
+        .unwrap();
+        assert_eq!(life, MAX_LIFETIME);
         // Already expired: lifetime zero, so it is never cached.
         let (_, life) =
             parse_token(aca, 200, br#"{"access_token":"t","expires_on":5}"#, 10).unwrap();

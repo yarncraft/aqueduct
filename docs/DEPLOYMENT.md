@@ -154,8 +154,8 @@ certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-
 checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) whether the session is really
 encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning); an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
-With an `azure-*` `auth` the certificate must be verified: startup refuses `disable`, `prefer` and `require` without
-`ssl_root_cert`.
+With an `azure-*` `auth` only `verify-full` is accepted: startup refuses every other `ssl_mode`, also `verify-ca`
+and `require` with `ssl_root_cert`.
 
 ### `[source]` (alternative sources)
 
@@ -611,10 +611,12 @@ event by event. `poll` stays the default.
 ### Azure managed identity
 
 On Azure Database for PostgreSQL (Flexible Server) Aqueduct can sign in with a managed identity instead of a stored
-password: the server accepts a Microsoft Entra access token as the password. Tokens live about an hour, so Aqueduct
-fetches one, caches it until 5 minutes before it expires, and uses a valid one as the password of **every** connection
-it opens: the SQL session and, with `transport = "stream"`, the replication connection. A failed token fetch fails
-that connection like a wrong password would (a source error; the restart applies).
+password: the server accepts a Microsoft Entra access token as the password, so no static database secret is stored
+anywhere. Aqueduct fetches a token, caches it until 5 minutes before the
+expiry the identity endpoint reports (at most 24 hours), and uses a valid one as the password of **every** connection
+it opens: the SQL session and, with `transport = "stream"`, the replication connection. Each start of the source,
+including a restart after an error, uses a cached or fresh token. A failed token fetch fails that connection like a
+wrong password would (a source error; the restart applies).
 
 ```toml
 [postgres]
@@ -626,15 +628,20 @@ auth = "azure-workload-identity"   # or "azure-container-apps"
 
 Fail-closed rules, checked at startup:
 
-- The token only travels over TLS with a verified certificate: `ssl_mode` `verify-full` (the default) or
-  `verify-ca`, or `require` with `ssl_root_cert`. `disable`, `prefer` and plain `require` are refused. Azure's server
-  certificate chains to a public root in the bundled set, so the default `verify-full` works without `ssl_root_cert`.
+- The token only travels over TLS with the certificate chain **and hostname** verified: `ssl_mode = "verify-full"`
+  (the default), with the bundled public roots or an explicit `ssl_root_cert`. Every other mode is refused, including
+  `verify-ca` and `require` with `ssl_root_cert`: without the hostname check, anyone holding a certificate from a
+  trusted CA could intercept the bearer token. The `*.postgres.database.azure.com` certificates chain to public roots
+  (DigiCert Global Root G2, Microsoft RSA Root Certificate Authority 2017) that the bundled set should contain, so the
+  default `verify-full` should work without `ssl_root_cert`; this was not verified against a real server. If the
+  handshake reports an unknown issuer, download Azure's root certificates and point `ssl_root_cert` at them.
 - A URL that also carries a password is refused, and so is a URL without a user.
 - A missing platform variable is refused with its name. Tokens, the federated assertion and `IDENTITY_HEADER` are
   never logged and are redacted from debug output; a token endpoint error shows the HTTP status and the OAuth `error`
   and `error_description` only.
 - The token endpoint is reached over HTTPS with certificate and hostname checks. Plain `http://` is accepted only for
-  a loopback host (the Container Apps identity endpoint).
+  a loopback host (the Container Apps identity endpoint): a name must resolve to loopback addresses only, and
+  Aqueduct connects to those checked addresses.
 
 The server asks for the token as a cleartext password. That is the same rule as for any password: Aqueduct sends it
 only inside TLS, and the replication connection keeps the [ADR 0003 §6](adr/0003-streaming-replication.md) rules
@@ -701,7 +708,10 @@ with the `X-IDENTITY-HEADER` header.
    select * from pgaadauth_create_principal('aqueduct-mi', false, false);
    ```
 
-3. Grant what Aqueduct needs. **`REPLICATION` must be granted to the Entra role itself**, as for a password role:
+3. Grant what Aqueduct needs. **`REPLICATION` must be granted to the Entra role itself**, as for a password role.
+   (Granting `REPLICATION` to a role made by `pgaadauth_create_principal` with `ALTER ROLE` has not been checked
+   against Microsoft's documentation or a real server; if it is refused, see Azure's logical replication docs for
+   the supported way to grant it.)
 
    ```sql
    ALTER ROLE "aqueduct-mi" WITH REPLICATION;

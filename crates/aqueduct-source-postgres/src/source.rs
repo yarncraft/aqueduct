@@ -388,9 +388,9 @@ impl PostgresSourceConfig {
     }
 
     /// Fails closed for managed identity sign-in: the URL must name the identity's role and
-    /// carry no password, and the token is only sent over TLS with a verified certificate
-    /// (`verify-full`, the default, or `verify-ca`, or `require` with `ssl_root_cert`). Errors
-    /// never show the URL.
+    /// carry no password, and the token is only sent under `verify-full` (the default): a
+    /// verified chain without the hostname check would hand the bearer token to anyone with a
+    /// certificate from a trusted CA. Errors never show the URL.
     pub fn check_auth(&self) -> Result<()> {
         let SourceAuth::Azure(cred) = &self.auth else {
             return Ok(());
@@ -410,18 +410,12 @@ impl PostgresSourceConfig {
             )));
         }
         let mode = self.ssl_mode.or(parsed.url_mode).unwrap_or_default();
-        let root = self.ssl_root_cert.is_some() || parsed.url_root_cert.is_some();
-        if mode.verify(root) == aqueduct_tls::Verify::None {
+        if mode != SslMode::VerifyFull {
             return Err(Error::Config(format!(
                 "postgres auth = \"{name}\" sends an access token as the password, so the \
-                 server certificate must be verified; ssl_mode = \"{}\"{} does not. Use \
-                 \"verify-full\" (the default) or \"verify-ca\"",
+                 server certificate and hostname must be verified; ssl_mode = \"{}\" does not. \
+                 Use \"verify-full\" (the default)",
                 mode.as_str(),
-                if mode == SslMode::Require {
-                    " without ssl_root_cert"
-                } else {
-                    ""
-                }
             )));
         }
         Ok(())
@@ -2272,21 +2266,18 @@ mod auth_tests {
     fn azure_auth_needs_verified_tls() {
         for (url, mode, root) in [
             ("postgres://id@db/app", None, None),
-            ("postgres://id@db/app?sslmode=verify-ca", None, None),
+            ("postgres://id@db/app?sslmode=verify-full", None, None),
             (
                 "postgres://id@db/app",
                 Some(SslMode::VerifyFull),
                 Some("/ca.pem"),
             ),
+            ("postgres://id@db/app?sslrootcert=/ca.pem", None, None),
+            // The config override wins over a weaker URL.
             (
-                "postgres://id@db/app?sslmode=require&sslrootcert=/ca.pem",
+                "postgres://id@db/app?sslmode=require",
+                Some(SslMode::VerifyFull),
                 None,
-                None,
-            ),
-            (
-                "postgres://id@db/app",
-                Some(SslMode::Require),
-                Some("/ca.pem"),
             ),
         ] {
             assert!(
@@ -2294,27 +2285,65 @@ mod auth_tests {
                 "{url} {mode:?}"
             );
         }
-        for (url, mode, needle) in [
-            ("postgres://id@db/app?sslmode=disable", None, "\"disable\""),
+        for (url, mode, root, needle) in [
+            (
+                "postgres://id@db/app?sslmode=disable",
+                None,
+                None,
+                "\"disable\"",
+            ),
             (
                 "postgres://id@db/app",
                 Some(SslMode::Disable),
+                None,
                 "\"disable\"",
             ),
-            ("postgres://id@db/app", Some(SslMode::Prefer), "\"prefer\""),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::Prefer),
+                None,
+                "\"prefer\"",
+            ),
             (
                 "postgres://id@db/app?sslmode=require",
                 None,
-                "without ssl_root_cert",
+                None,
+                "\"require\"",
+            ),
+            // A verified chain without the hostname check is not enough, with or without a CA.
+            (
+                "postgres://id@db/app?sslmode=verify-ca",
+                None,
+                None,
+                "\"verify-ca\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::VerifyCa),
+                Some("/ca.pem"),
+                "\"verify-ca\"",
+            ),
+            (
+                "postgres://id@db/app?sslmode=require&sslrootcert=/ca.pem",
+                None,
+                None,
+                "\"require\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::Require),
+                Some("/ca.pem"),
+                "\"require\"",
             ),
             // The config override wins over a verifying URL.
             (
                 "postgres://id@db/app?sslmode=verify-full",
                 Some(SslMode::Disable),
+                None,
                 "\"disable\"",
             ),
         ] {
-            let e = azure(url, mode, None).check_auth().unwrap_err().to_string();
+            let e = azure(url, mode, root).check_auth().unwrap_err().to_string();
             assert!(
                 e.contains(needle) && e.contains("azure-container-apps"),
                 "{url}: {e}"

@@ -835,9 +835,10 @@ ssl_mode = 'disable'",
             ),
             (
                 "auth = 'azure-container-apps'
-ssl_mode = 'require'",
+ssl_mode = 'verify-ca'
+ssl_root_cert = '/ca.pem'",
                 &aca,
-                "without ssl_root_cert",
+                "\"verify-ca\"",
             ),
         ];
         for (extra, env, needle) in cases {
