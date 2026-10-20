@@ -113,7 +113,8 @@ Notable changes to Aqueduct. Newest first.
   route sets `key`, to the primary-key object in the record key, which the partition is then hashed from. The hash
   key comes only from `AQUEDUCT_HASH_KEY` or the new `[sink] hash_key_file` (at least 32 bytes; a `hash_key` in the
   TOML fails startup), and the new `hash_key_id` is sent as the `aqueduct-hash-key-id` header. A `key` column may
-  not be excluded, masked or hashed. A row whose renamed column collides goes to `dead_letter_topic`. `/api/routes`
+  not be excluded, masked, hashed or left out of `include`, and a rename target may not be listed in `mask`, `hash`
+  or `exclude`. A row whose renamed column collides goes to `dead_letter_topic`. `/api/routes`
   lists each route's field operations and the key id, never the key. Additive: routes without these keys are
   unchanged.
 - **Routing: set the Kafka message key per route** (#83, ADR 0002). `key = ["col", ...]` on a `[[sink.routes]]`

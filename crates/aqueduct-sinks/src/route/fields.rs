@@ -142,6 +142,8 @@ pub(crate) enum FieldError {
     RenameCollision { from: String, to: String },
     /// The row (or key) is not a JSON object.
     NotAnObject,
+    /// A string to hash is not valid Unicode (a lone surrogate escape such as `\ud800`).
+    Unhashable { column: String },
 }
 
 impl fmt::Display for FieldError {
@@ -154,6 +156,10 @@ impl fmt::Display for FieldError {
             FieldError::NotAnObject => {
                 f.write_str("field operations: the row is not a JSON object")
             }
+            FieldError::Unhashable { column } => write!(
+                f,
+                "hash `{column}`: the value is a string that is not valid Unicode"
+            ),
         }
     }
 }
@@ -196,7 +202,7 @@ impl FieldOps {
         if spec.is_empty() {
             return Ok(None);
         }
-        if spec.include.is_some() && spec.exclude.is_some() {
+        if spec.include.is_some() && spec.exclude.as_ref().is_some_and(|e| !e.is_empty()) {
             return Err(bad(
                 route,
                 "`include` and `exclude` cannot both be set; list the columns to keep or the ones to drop",
@@ -267,6 +273,22 @@ impl FieldOps {
                     route,
                     format!("`rename` target `{to}` is also an included column"),
                 ));
+            }
+            // Field operations name source columns. Listing the new name would look protected
+            // while the renamed value passes through as is.
+            for (key, list) in [
+                ("mask", &spec.mask[..]),
+                ("hash", &spec.hash[..]),
+                ("exclude", spec.exclude.as_deref().unwrap_or_default()),
+            ] {
+                if list.contains(to) {
+                    return Err(bad(
+                        route,
+                        format!(
+                            "`rename` target `{to}` is in `{key}`, but field operations apply to the original column names, so `{from}` would pass through unprotected; put `{from}` in `{key}` instead"
+                        ),
+                    ));
+                }
             }
             targets.push(to);
         }
@@ -439,15 +461,21 @@ impl<'de> Visitor<'de> for Rewriter<'_, '_, '_> {
                 ValueOp::Keep => out.push_str(text),
                 ValueOp::Mask => out.push_str(mask(text)),
                 ValueOp::Hash => match (canonical(text), self.key) {
-                    (None, _) => out.push_str("null"),
-                    (Some(c), Some(key)) => {
+                    (Err(()), _) => {
+                        *self.error = Some(FieldError::Unhashable {
+                            column: name.into_owned(),
+                        });
+                        return Err(de::Error::custom("unhashable string"));
+                    }
+                    (Ok(None), _) => out.push_str("null"),
+                    (Ok(Some(c)), Some(key)) => {
                         out.push('"');
                         key.digest_hex(c.as_bytes(), out);
                         out.push('"');
                     }
                     // The plan refuses to compile a hashing route without a key; never emit
                     // the value unhashed.
-                    (Some(_), None) => out.push_str("null"),
+                    (Ok(Some(_)), None) => out.push_str("null"),
                 },
             }
         }
@@ -467,15 +495,16 @@ fn mask(text: &str) -> &'static str {
 
 /// The text a value is hashed from; `None` for `null`. A string's unescaped content, a number or
 /// bool as written, an object's or array's compact JSON (whitespace outside strings removed, key
-/// order and escapes as written).
-fn canonical(text: &str) -> Option<Cow<'_, str>> {
+/// order and escapes as written). `Err` for a string that does not decode to valid Unicode (a lone
+/// surrogate escape), which must not silently become `null`.
+fn canonical(text: &str) -> std::result::Result<Option<Cow<'_, str>>, ()> {
     let t = text.trim();
-    match t.as_bytes().first() {
+    Ok(match t.as_bytes().first() {
         None | Some(b'n') => None,
-        Some(b'"') => serde_json::from_str::<Name>(t).ok().map(|n| n.0),
+        Some(b'"') => Some(serde_json::from_str::<Name>(t).map_err(|_| ())?.0),
         Some(b'{' | b'[') => Some(compact(t)),
         Some(_) => Some(Cow::Borrowed(t)),
-    }
+    })
 }
 
 /// `text` (valid JSON) without whitespace outside strings.
@@ -711,9 +740,8 @@ mod tests {
                 to: "b".into()
             })
         );
-        // An excluded target does not collide.
-        let s2 = spec(None, Some(&["b"]), &[], &[], &[("a", "b")]);
-        assert_eq!(run(&s2, r#"{"a":1,"b":2}"#).unwrap(), r#"{"b":1}"#);
+        // A target listed in `exclude` (or `mask`, `hash`) is rejected at startup: the operations
+        // name source columns, so `a`'s value would pass through as `b` (see validation test).
         // Without renames (the dead-letter value), nothing collides.
         let ops = FieldOps::compile("r", &s).unwrap().unwrap();
         let mut out = String::new();
@@ -729,6 +757,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!e.contains("secret") && !e.contains("other"), "{e}");
+    }
+
+    #[test]
+    fn a_string_that_is_not_valid_unicode_is_a_row_error_not_null() {
+        let s = spec(None, None, &[], &["s"], &[]);
+        let e = run(&s, r#"{"s":"\ud800"}"#).unwrap_err();
+        assert_eq!(e, FieldError::Unhashable { column: "s".into() });
+        assert_eq!(
+            e.to_string(),
+            "hash `s`: the value is a string that is not valid Unicode"
+        );
+        // A valid surrogate pair hashes like the character it encodes.
+        assert_eq!(
+            run(&s, r#"{"s":"\ud83d\ude00"}"#).unwrap(),
+            run(&s, "{\"s\":\"\u{1f600}\"}").unwrap()
+        );
+        // Masking does not decode the string, so it still masks.
+        let m = spec(None, None, &["s"], &[], &[]);
+        assert_eq!(run(&m, r#"{"s":"\ud800"}"#).unwrap(), r#"{"s":"***"}"#);
     }
 
     #[test]
@@ -748,6 +795,19 @@ mod tests {
                 "cannot both be set",
             ),
             (spec(Some(&[]), None, &[], &[], &[]), "`include` is empty"),
+            // A rename target in mask, hash or exclude would leave the renamed value unprotected.
+            (
+                spec(None, None, &[], &["x"], &[("email", "x")]),
+                "`rename` target `x` is in `hash`, but field operations apply to the original column names, so `email` would pass through unprotected; put `email` in `hash` instead",
+            ),
+            (
+                spec(None, None, &["x"], &[], &[("email", "x")]),
+                "`rename` target `x` is in `mask`",
+            ),
+            (
+                spec(None, Some(&["x"]), &[], &[], &[("email", "x")]),
+                "`rename` target `x` is in `exclude`",
+            ),
             (
                 spec(None, Some(&["a.b"]), &[], &[], &[]),
                 "top-level column names only",
@@ -807,6 +867,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // An empty `exclude` is no exclusion, also next to `include`.
+        let both = spec(Some(&["a"]), Some(&[]), &[], &[], &[]);
+        assert_eq!(run(&both, r#"{"a":1,"b":2}"#).unwrap(), r#"{"a":1}"#);
     }
 
     #[test]

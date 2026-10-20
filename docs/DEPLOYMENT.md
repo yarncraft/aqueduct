@@ -242,8 +242,8 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error) or whose `rename` collides with an existing column. Required as soon as a route uses `where`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY`, not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
-| `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key |
+| `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
+| `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
 | `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
@@ -412,15 +412,26 @@ rename = { cust_id = "customer_id" }
   `{"$oid":"..."}`). `null` stays `null`. So the same value hashes to the same digest in every table, topic and
   source, and consumers can join on it: a Postgres `int4 42`, a MongoDB `Int32`/`Int64` `42` and the string `"42"`
   all give one digest. **A MongoDB double is written `42.0` and hashes differently from the integer `42`**, so
-  hash identifiers stored as integers or strings in MongoDB, not as doubles.
+  hash identifiers stored as integers or strings in MongoDB, not as doubles. Edge cases of the canonical text:
+  - Only the top-level string is unescaped. Inside an object or array, escapes stay as the source wrote them, so
+    `{"n":"\u00e9"}` and `{"n":"é"}` hash differently (each source writes its own values consistently).
+  - Numbers are not normalised: `-0` and `0`, `1e2` and `100`, `42.0` and `42` all differ.
+  - The text carries no type: `true` and the string `"true"` give the same digest, as do the object `{"a":1}` and
+    the string `"{\"a\":1}"`, and the number `42` and the string `"42"`.
+  - A string that is not valid Unicode (a lone surrogate escape such as `"\ud800"`) cannot be hashed: the event goes
+    to `dead_letter_topic` with `before` and `after` set to `null`, and the header names the column.
 - **`rename`** maps old column names to new ones. A target may not be another renamed column, another target, or a
-  column listed in `include`. Without `include` the columns are only known when rows arrive, so a row that already
+  column listed in `include`. The other operations name the **original** columns: a target listed in `mask`, `hash`
+  or `exclude` fails startup (`rename = { email = "x" }` with `hash = ["x"]` would hash nothing and pass the email
+  through as `x`), so list the source column (`hash = ["email"]`) instead. Without `include` the columns are only known when rows arrive, so a row that already
   has a column named like a target goes to `dead_letter_topic` (value: the operations applied without the renames;
   header `aqueduct-error`: ``route `customers`: rename `cust_id` to `customer_id`: the row already has a column
   `customer_id` ``), which is then required. With `include`, collisions are ruled out at startup.
-- **Names** are top-level columns only. A dotted path (`address.city`) fails startup: nested MongoDB fields cannot be
+- **Names** are top-level columns only and **case-sensitive**: `Email` does not match a column `email`, which matters
+  for MongoDB, where field names are not folded. A misspelt or wrongly cased name is reported as an unseen field
+  (below). A dotted path (`address.city`) fails startup: nested MongoDB fields cannot be
   addressed, but a whole nested value can be dropped, masked, hashed or renamed through its top-level column. Other
-  startup errors: `include` together with `exclude`, an empty `include`, a column both masked and hashed, a column
+  startup errors: `include` together with a non-empty `exclude` (an empty `exclude` is no exclusion), an empty `include`, a column both masked and hashed, a column
   masked, hashed or renamed that `exclude` drops or `include` leaves out.
 - **The record key.** Without `key = [...]`, the record key's `"key"` object holds the primary-key columns, so the
   route's operations are applied to it too: excluded or not-included columns are removed (an object left empty
@@ -429,11 +440,12 @@ rename = { cust_id = "customer_id" }
   still keeps each row on one partition. If every key column is removed, the table's rows share one partition.
   With `key = [...]`, a key column may not be excluded, masked, hashed or left out of `include` (startup error), so
   no protected value reaches the key; a renamed column may key the route and keeps its original name there.
-- **Hash key.** Read from the `AQUEDUCT_HASH_KEY` environment variable or the file `sink.hash_key_file` (one trailing
-  newline is ignored), never from the TOML: a `hash_key` key in the config fails startup. Setting both also fails.
+- **Hash key.** Read from the `AQUEDUCT_HASH_KEY` environment variable or the file `sink.hash_key_file`, never from
+  the TOML. One trailing newline (`\n` or `\r\n`) is ignored in both, so the same secret gives the same digests from
+  either: a `hash_key` key in the config fails startup. Setting both also fails.
   The key must be at least 32 bytes (`openssl rand -hex 32` gives 64); it is required as soon as a route uses `hash`,
   redacted from debug output and never logged. **`hash_key_id`** (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with
-  a key and is sent as the header `aqueduct-hash-key-id` on every record of a route that hashes, dead-letter records
+  a key, fails startup without one, and is sent as the header `aqueduct-hash-key-id` on every record of a route that hashes, dead-letter records
   included. It is shown in `/api/routes`; the key never is.
 - **Rotating the key.** A new key changes every digest. Generate a new key, give it a new `hash_key_id`, and restart.
   Consumers join or deduplicate per `aqueduct-hash-key-id`: digests under different ids are not comparable. Records

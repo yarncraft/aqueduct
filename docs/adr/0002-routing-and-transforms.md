@@ -340,14 +340,22 @@ Field operations (#84). Where the code differs from the text above:
   `rename` without `include`) with an `aqueduct-error` header naming the columns, never values. Its dead-letter
   value has the other operations applied under the original names.
 - **Also rejected at startup:** an empty `include`; a column both masked and hashed; a column masked, hashed or
-  renamed that `exclude` drops or `include` leaves out (the operation would have no effect).
+  renamed that `exclude` drops or `include` leaves out (the operation would have no effect); a rename target listed
+  in `mask`, `hash` or `exclude` (the operations name original columns, so the renamed value would pass through
+  unprotected). `exclude = []` next to `include` is allowed, like an empty `exclude` alone.
+- **A string that cannot be hashed** (not valid Unicode, e.g. a lone `\ud800` escape) is a row error and goes to the
+  dead-letter topic with `before`/`after` null; it never becomes `null` silently.
+- **Later slices:** R7 (`deletes = "row"` and tombstones) must use the rewritten before-image and key, and R8 (outbox)
+  must reject a protected `aggregate_id` or `topic` column; `TODO(R7)` and `TODO(R8)` mark the place in
+  `RoutePlan::build`.
 - **Dead-letter values** get the route's field operations (§5a), with the `aqueduct-hash-key-id` header when the
   route hashes. A row that is not a JSON object cannot be rewritten; its dead-letter value has `before`/`after`
   `null` rather than the unprotected row.
 - **Canonical hash input** for objects and arrays is the JSON as the source wrote it with whitespace outside strings
   removed (key order and escapes kept), not a re-serialisation.
-- **Hash key.** `AQUEDUCT_HASH_KEY` or `sink.hash_key_file` (one trailing newline trimmed), not both; at least 32
-  bytes; `sink.hash_key_id` (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with a key.
+- **Hash key.** `AQUEDUCT_HASH_KEY` or `sink.hash_key_file` (one trailing newline trimmed from either), not both; at
+  least 32 bytes; `sink.hash_key_id` (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with a key and an error without
+  one.
 - **Unseen fields:** every column a field operation names is watched as `row.<column>`. Since R5, `observe` runs on
   every route, with or without `where`.
 - **Content routing (R4) is not merged yet.** Its side of "no row data may bypass the field operations" (topic

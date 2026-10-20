@@ -502,6 +502,11 @@ impl RoutePlan {
                 }
                 // TODO(R4): topic templates and `topic_values` (#82) need the same check against
                 // `f.protection()`; whichever of R4/R6 lands last adds it.
+                // TODO(R7): `format = "row"` with `deletes = "row"` must emit the rewritten
+                // before-image (`rewrite_rows`), and envelope `tombstones` must reuse the record's
+                // rewritten key (`rewrite_key` or the route key), never `event.key` as is.
+                // TODO(R8): the outbox `aggregate_id` (the record key) and `topic` columns must be
+                // rejected when `f.protection()` is `Some`, as `key` is above.
             }
             let mut watched: Vec<FieldRef> = filter
                 .iter()
@@ -1850,6 +1855,36 @@ mod tests {
         assert_eq!(r.headers[0].0, "aqueduct-error");
         assert_eq!(r.headers[1], (HASH_KEY_ID_HEADER, "k1".to_string()));
         assert_eq!(json(&r.key)["key"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_unhashable_string_goes_to_the_dead_letter_topic_without_the_row() {
+        let p = fields_plan(vec![with_fields(
+            "h",
+            "public.users",
+            FieldSpec {
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+        )]);
+        let e = row(
+            "users",
+            Op::Insert,
+            r#"{"email":"\ud800secret","card":"4111"}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            r.headers[0],
+            (
+                "aqueduct-error",
+                "route `h`: hash `email`: the value is a string that is not valid Unicode"
+                    .to_string()
+            )
+        );
+        let v = json(&r.value);
+        assert_eq!(v["after"], serde_json::Value::Null);
+        assert!(!r.value.contains("secret") && !r.value.contains("4111"));
     }
 
     #[test]

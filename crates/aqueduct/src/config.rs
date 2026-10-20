@@ -265,18 +265,25 @@ impl KafkaConfig {
             }
             (Some(v), None) => v.into_bytes(),
             (None, Some(path)) => {
-                let mut b =
-                    std::fs::read(path).map_err(|e| format!("sink.hash_key_file {path}: {e}"))?;
-                if b.ends_with(b"\n") {
-                    b.pop();
-                    if b.ends_with(b"\r") {
-                        b.pop();
-                    }
-                }
-                b
+                std::fs::read(path).map_err(|e| format!("sink.hash_key_file {path}: {e}"))?
+            }
+            (None, None) if self.hash_key_id.is_some() => {
+                return Err(
+                    "sink.hash_key_id is set but there is no hash key; set AQUEDUCT_HASH_KEY or sink.hash_key_file, or remove hash_key_id"
+                        .into(),
+                )
             }
             (None, None) => return Ok(None),
         };
+        // The same secret gives the same digests from the environment or a file: one trailing
+        // newline (`\n` or `\r\n`, as `echo` or an editor leaves it) is not part of the key.
+        let mut secret = secret;
+        if secret.ends_with(b"\n") {
+            secret.pop();
+            if secret.ends_with(b"\r") {
+                secret.pop();
+            }
+        }
         let id = self.hash_key_id.as_deref().ok_or(
             "sink.hash_key_id is required with a hash key: a short label consumers see in the aqueduct-hash-key-id header, changed whenever the key is",
         )?;
@@ -622,6 +629,12 @@ admin_insecure_no_auth = true",
             .hash_key(Some(String::new()))
             .unwrap()
             .is_none());
+        // A key id without a key fails closed.
+        let e = sink_cfg("hash_key_id = 'k1'").hash_key(None).unwrap_err();
+        assert!(
+            e.contains("sink.hash_key_id is set but there is no hash key"),
+            "{e}"
+        );
 
         // From the environment, with its id.
         let c = sink_cfg("hash_key_id = 'k1'");
@@ -657,6 +670,36 @@ admin_insecure_no_auth = true",
         };
         let ok = file("ok", &format!("{KEY}\n"));
         assert!(ok.hash_key(None).unwrap().is_some());
+        // A trailing newline is trimmed from the environment too: the same secret gives the same
+        // digest either way, and `{KEY}\n` with a 31-byte key is still too short.
+        let env_nl = c.hash_key(Some(format!("{KEY}\r\n"))).unwrap().unwrap();
+        let file_key = ok.hash_key(None).unwrap().unwrap();
+        let digest = |k: &aqueduct_sinks::HashKey| {
+            let mut p = aqueduct_sinks::RoutePlan::build(
+                vec![aqueduct_sinks::KafkaRoute {
+                    pattern: "*".into(),
+                    topic: "t".into(),
+                    fields: aqueduct_sinks::FieldSpec {
+                        hash: vec!["e".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                None,
+                None,
+                Some(k.clone()),
+            )
+            .unwrap();
+            p.set_source(aqueduct_sinks::SourceInfo::default());
+            let mut ev = aqueduct_core::ChangeEvent::heartbeat(aqueduct_core::Position::Lsn(1), 0);
+            ev.op = aqueduct_core::Op::Insert;
+            ev.schema = "s".into();
+            ev.table = "t".into();
+            ev.after = serde_json::value::RawValue::from_string(r#"{"e":"a@b.c"}"#.into()).ok();
+            p.render(&ev, 0).unwrap().remove(0).value
+        };
+        assert_eq!(digest(&env_nl), digest(&file_key));
+        assert!(c.hash_key(Some(format!("{}\n", &KEY[..31]))).is_err());
         let e = file("short", &format!("{}\r\n", &KEY[..31]))
             .hash_key(None)
             .unwrap_err();
