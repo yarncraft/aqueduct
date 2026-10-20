@@ -477,7 +477,12 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     assert!(ev.after.as_ref().unwrap().get().contains("after-window"));
 
     // The slot kept moving through the replay window although nothing was acked, but not past
-    // the unacked event.
+    // the unacked event. The stream transport confirms with its next status update, so allow
+    // a moment.
+    let until = Instant::now() + Duration::from_secs(5);
+    while f.confirmed().await <= checkpoint && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
         f.confirmed().await > checkpoint,
         "the slot did not move through the replay window"
