@@ -13,6 +13,8 @@ Postgres (logical slot, pgoutput) --> Aqueduct --> Kafka
 
 1. Aqueduct opens a plain SQL connection and creates a logical replication slot (`pgoutput`) if it does not exist.
 2. It polls the slot (every 500 ms when idle) for whole committed transactions and decodes them into row-level events.
+   With `transport = "stream"` it instead receives them over a replication connection as they commit; see
+   [Streaming transport](#streaming-transport).
 3. Each event is produced to Kafka. Only after the sink succeeds does Aqueduct write the checkpoint and advance the slot to that transaction's commit LSN.
 4. On restart it resumes from the slot and the checkpoint. A crash between "sink succeeded" and "checkpoint written" replays at most that event, so **delivery is at-least-once**: consumers must tolerate duplicates (use `lsn` plus the row key to deduplicate).
 
@@ -136,6 +138,8 @@ topic = "cdc.{schema}.{table}"
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
 | `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
+| `transport` | `poll` | `poll` reads the slot with SQL peeks every `poll_interval`; `stream` receives changes over a replication connection as they commit. See [Streaming transport](#streaming-transport) |
+| `stream_buffer_bytes` | `67108864` (64 MiB) | Stream transport: received messages buffered ahead of the sink before reading pauses |
 | `snapshot` | `never` | `never`, `on_demand` or `initial`. Copies rows that already exist; see [Snapshots](#snapshots). Anything but `never` needs Postgres 14+, or `snapshot_watermark_table` |
 | `snapshot_chunk_size` | `1024` | Rows per snapshot chunk |
 | `snapshot_max_rows_per_sec` | unset | Upper bound on snapshot rows read per second. Unset is unthrottled |
@@ -335,6 +339,32 @@ by default, one per interval); route or ignore that topic downstream. Monitor th
 The `heartbeat` object is absent for sources without heartbeats (MongoDB). Heartbeats are not events: they are not counted in `events_total`
 and never reach the sink. `/metrics` has `aqueduct_slot_lag_bytes`, `aqueduct_heartbeat_skipped_total` and
 `aqueduct_heartbeat_last_timestamp_seconds`; each is left out while its value is unknown.
+
+### Streaming transport
+
+`transport = "stream"` reads the slot over a replication connection (`START_REPLICATION`, the protocol
+`pg_recvlogical` uses) instead of polling it with SQL. Changes arrive as they commit, nothing is decoded twice, and
+the idle 500 ms poll goes away. The events, their keys and the checkpoint are the same as with `poll`: both
+transports feed the same decoder, and the integration suite runs in both modes, including a test that compares them
+event by event. `poll` stays the default.
+
+- **Connection:** the same URL, TLS settings and password rules as the SQL connection (`verify-full` by default;
+  cleartext and md5 refused over plaintext to a remote host; SCRAM channel binding is never given up once offered).
+  The SQL connection stays open for slot management, heartbeats and snapshots. Startup refuses a replication
+  connection that reaches another cluster than the SQL connection.
+- **Server:** each instance uses one more walsender, so `max_wal_senders` must exceed the number of logical
+  replication connections. `pg_hba.conf` needs a line that allows the role on **the database** (logical replication
+  connections match the database name, not the `replication` keyword), e.g.
+  `host app aqueduct 10.0.0.0/8 scram-sha-256`. The role already has `REPLICATION`.
+- **Poolers:** a replication connection cannot go through PgBouncer or other transaction poolers; point the URL at
+  Postgres directly.
+- **Progress:** the slot is confirmed by status updates, sent within 200 ms of an acknowledgement and at least every
+  `wal_sender_timeout / 3` (at most 10 s), also while the sink holds up reading, so a slow sink does not drop the
+  connection.
+- **Memory:** at most `stream_buffer_bytes` of received messages plus one batch of events are held; a one-million-row
+  transaction is streamed with a few MiB.
+- **Failures:** a broken connection is a source error, and the restart resumes from the checkpoint (duplicates only).
+  If a previous connection still holds the slot, startup retries for up to 15 s.
 
 ### Snapshots
 

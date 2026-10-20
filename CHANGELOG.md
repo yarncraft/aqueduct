@@ -95,6 +95,11 @@ Notable changes to Aqueduct. Newest first.
   `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
   Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
   - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+- **Postgres streaming transport** (#109, ADR 0003): `[postgres] transport = "stream"` receives changes over a
+  replication connection as they commit instead of polling the slot every 500 ms. Same events, keys and checkpoints
+  as `poll`, which stays the default. Needs one more walsender per instance (`max_wal_senders`), a `pg_hba.conf` line
+  for the role on the database, and a direct connection (no pooler). `stream_buffer_bytes` (64 MiB) bounds what is
+  buffered ahead of the sink. See DEPLOYMENT.md, "Streaming transport".
 - **Snapshots on Postgres 12 and 13** (#92): new `[postgres] snapshot_watermark_table` names a published table whose
   rows carry the watermarks instead of logical messages (Postgres 14+). See DEPLOYMENT.md, "Watermark table".
 - **Cockpit snapshot card** (#78): progress of the running or last snapshot, skipped tables and a Cancel button. Snapshot
