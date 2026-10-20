@@ -165,6 +165,8 @@ pub async fn run(url: &str, transport: TransportKind, dir: &Path) {
     let mut src = source(url, &name, &name, transport);
     let (took, _) = pipeline_until(&mut src, rows, dir).await;
     let throughput = rows as f64 / took.as_secs_f64();
+    // Shadowing would keep it (and its replication connection) alive.
+    drop(src);
 
     // Latency on an idle stream: the source is driven directly so nothing batches the wait.
     let mut src = source(url, &name, &name, transport);
