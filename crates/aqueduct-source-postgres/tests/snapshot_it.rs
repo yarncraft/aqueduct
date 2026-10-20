@@ -541,3 +541,53 @@ async fn the_slot_advances_during_the_snapshot() {
     .await
     .unwrap();
 }
+
+/// A table without a primary key is skipped, unless `snapshot_key_columns` names a key (#91).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn key_columns_let_a_table_without_primary_key_be_copied() {
+    let db = connect().await;
+    let skipped = unique("snap_nopk_skip");
+    let keyed = unique("snap_nopk_key");
+    let publication = unique("snap_nopk_pub");
+    let slot = unique("snap_nopk");
+    db.batch_execute(&format!(
+        "CREATE TABLE {skipped} (id int);
+         CREATE TABLE {keyed} (day date NOT NULL, seq int NOT NULL, id int NOT NULL, UNIQUE (day, seq));
+         ALTER TABLE {keyed} REPLICA IDENTITY FULL;
+         INSERT INTO {skipped} SELECT generate_series(1, 5);
+         INSERT INTO {keyed} SELECT DATE '2024-01-01' + g / 10, g % 10, g FROM generate_series(1, 95) g;
+         CREATE PUBLICATION {publication} FOR TABLE {skipped}, {keyed};"
+    ))
+    .await
+    .unwrap();
+    let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.poll_interval = Duration::from_millis(50);
+    cfg.snapshot = SnapshotConfig {
+        mode: SnapshotMode::Initial,
+        chunk_size: 7,
+        key_columns: [(format!("public.{keyed}"), vec!["day".into(), "seq".into()])]
+            .into_iter()
+            .collect(),
+        ..SnapshotConfig::default()
+    };
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+    let events = collect(&mut s, Duration::from_secs(3), |_| false).await;
+    assert!(events.iter().all(|e| e.table != skipped), "no key: skipped");
+    let mut ids: Vec<i64> = events
+        .iter()
+        .filter(|e| e.op == Op::Read && e.table == keyed)
+        .map(|e| after(e)["id"].as_i64().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, (1..=95).collect::<Vec<_>>());
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {skipped}, {keyed};"
+    ))
+    .await
+    .unwrap();
+}
