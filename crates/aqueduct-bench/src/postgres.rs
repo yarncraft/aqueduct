@@ -138,11 +138,16 @@ pub async fn run(url: &str, transport: TransportKind, dir: &Path) {
     let db = sql(url).await;
     db.batch_execute(&format!(
         "CREATE TABLE {name} (id bigint PRIMARY KEY, v text);
-         CREATE PUBLICATION {name} FOR TABLE {name};
-         SELECT pg_create_logical_replication_slot('{name}', 'pgoutput');"
+         CREATE PUBLICATION {name} FOR TABLE {name};"
     ))
     .await
     .expect("set up the bench table");
+    // Its own statement: a slot cannot be created in a transaction that wrote.
+    db.batch_execute(&format!(
+        "SELECT pg_create_logical_replication_slot('{name}', 'pgoutput')"
+    ))
+    .await
+    .expect("create the bench slot");
 
     // Throughput.
     let mut id = 0u64;
