@@ -48,8 +48,9 @@ pub(crate) fn proto(msg: impl Into<String>) -> Error {
 /// A backend message, as far as a replication session cares about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// `R`: authentication request or result; the code is 0 for `AuthenticationOk`.
-    Auth(i32),
+    /// `R`: authentication request or result; the code is 0 for `AuthenticationOk`. `data` is
+    /// the rest of the body (md5 salt, SASL mechanisms or SASL data).
+    Auth { code: i32, data: Bytes },
     /// `S`: runtime parameter report.
     ParameterStatus,
     /// `K`: cancellation key data.
@@ -249,7 +250,10 @@ pub fn parse_backend(tag: u8, body: Bytes) -> Result<Backend> {
     }
     let mut c = Cursor::new(&body);
     Ok(match tag {
-        b'R' => Backend::Auth(c.i32()?),
+        b'R' => Backend::Auth {
+            code: c.i32()?,
+            data: body.slice(4..),
+        },
         b'S' => Backend::ParameterStatus,
         b'K' => Backend::BackendKeyData,
         b'Z' => Backend::ReadyForQuery,

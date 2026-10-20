@@ -3,23 +3,26 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_postgres::config::Host;
 
+use super::auth::{self, AuthContext, AuthMethod};
 use super::frame::{
     self, copy_data, lsn_text, pg_micros, proto, query, quote_ident, quote_literal, reject_nul,
     startup_message, status_update, terminate, Backend, FrameReader, Replication,
 };
+use super::secure;
 use crate::source::parse_lsn;
+use crate::SslMode;
 
 fn err(msg: impl Into<String>) -> Error {
     Error::Source(format!("replication connection: {}", msg.into()))
 }
 
-/// The byte stream under a replication session: TCP today, TLS over TCP later, an in-memory
-/// pipe in tests.
+/// The byte stream under a replication session: TCP, TLS over TCP, or an in-memory pipe in
+/// tests.
 pub(crate) trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 pub(crate) type BoxIo = Box<dyn Io>;
 
-type Reader = FrameReader<ReadHalf<BoxIo>>;
+pub(super) type FrameRead = FrameReader<ReadHalf<BoxIo>>;
 
 /// What `IDENTIFY_SYSTEM` returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,30 +34,52 @@ pub struct SystemInfo {
     pub database: Option<String>,
 }
 
-/// Where to connect, validated. Fails closed while the client cannot do TLS: any `sslmode`
-/// other than `disable` and any non-loopback host is refused before a socket is opened.
-#[derive(Debug, PartialEq, Eq)]
+/// TLS settings that override the URL's `sslmode` and `sslrootcert`, as
+/// [`crate::PostgresSourceConfig`]'s `ssl_mode` and `ssl_root_cert` do for the SQL connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    pub ssl_mode: Option<SslMode>,
+    pub ssl_root_cert: Option<String>,
+}
+
+/// Where and how to connect, validated before a socket is opened.
 struct Target {
     host: String,
     port: u16,
     user: String,
+    password: Option<Vec<u8>>,
     database: String,
+    mode: SslMode,
+    root_cert: Option<String>,
+    /// Loopback host: plaintext and password methods are acceptable there.
+    local: bool,
     application_name: Option<String>,
     /// Command-line options for the backend (`options=-c ...`), as the SQL connection sends.
     options: Option<String>,
     connect_timeout: Option<std::time::Duration>,
 }
 
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the password.
+        f.debug_struct("Target")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("database", &self.database)
+            .field("mode", &self.mode)
+            .field("root_cert", &self.root_cert)
+            .field("local", &self.local)
+            .finish()
+    }
+}
+
 impl Target {
-    fn parse(url: &str) -> Result<Self> {
+    fn parse(url: &str, opts: &ConnectOptions) -> Result<Self> {
         let parsed = crate::tls::parse(url)?;
-        let mode = parsed.url_mode.unwrap_or_default();
-        if mode != crate::SslMode::Disable {
-            return Err(Error::Config(format!(
-                "streaming replication cannot use TLS yet, so it refuses sslmode={mode:?}; \
-                 only sslmode=disable on a loopback host is accepted"
-            )));
-        }
+        let mode = opts.ssl_mode.or(parsed.url_mode).unwrap_or_default();
+        let root_cert = opts.ssl_root_cert.clone().or(parsed.url_root_cert);
         let cfg = parsed.config;
         // `hostaddr` makes the SQL connection dial that address instead of `host`. This client
         // does not implement it, and dialing `host` instead would reach a different server than
@@ -62,12 +87,6 @@ impl Target {
         if !cfg.get_hostaddrs().is_empty() {
             return Err(Error::Config(
                 "streaming replication does not support hostaddr in the postgres url; use host"
-                    .into(),
-            ));
-        }
-        if !crate::tls::is_local(&cfg) {
-            return Err(Error::Config(
-                "streaming replication cannot use TLS yet, so it refuses a non-loopback host"
                     .into(),
             ));
         }
@@ -111,7 +130,11 @@ impl Target {
             host,
             port,
             user,
+            password: cfg.get_password().map(<[u8]>::to_vec),
             database,
+            mode,
+            root_cert,
+            local: crate::tls::is_local(&cfg),
             application_name,
             options,
             connect_timeout: cfg.get_connect_timeout().copied(),
@@ -168,19 +191,25 @@ impl StartReplication<'_> {
     }
 }
 
-/// One logical replication session before streaming starts: startup is done, replication
-/// commands can run. Plaintext TCP to a loopback host with trust authentication only.
+/// One logical replication session before streaming starts: TLS and authentication are done,
+/// replication commands can run.
 pub struct ReplicationClient {
-    reader: Reader,
+    reader: FrameRead,
     writer: StatusSender,
+    encrypted: bool,
+    auth: AuthMethod,
 }
 
 impl ReplicationClient {
-    /// Connects and completes startup. `url` is the same URL as the SQL connection; it must name
-    /// exactly one TCP host. The server must accept the user without a password (`trust`):
-    /// password authentication and TLS are not part of this slice and are refused with an error.
-    pub async fn connect(url: &str) -> Result<Self> {
-        let target = Target::parse(url)?;
+    /// Connects, negotiates TLS, authenticates and completes startup.
+    ///
+    /// `url` is the same URL as the SQL connection and must name exactly one TCP host. TLS
+    /// follows the same `sslmode` semantics as the SQL connection (default `verify-full`), and
+    /// the same fail-closed rule: plaintext to a non-loopback host only with an explicit
+    /// `sslmode=disable`. Cleartext and md5 passwords are never sent in plaintext to a
+    /// non-loopback host. See the `auth` module for the SCRAM rules.
+    pub async fn connect(url: &str, opts: &ConnectOptions) -> Result<Self> {
+        let target = Target::parse(url, opts)?;
         match target.connect_timeout {
             Some(t) => tokio::time::timeout(t, Self::connect_to(&target))
                 .await
@@ -195,7 +224,18 @@ impl ReplicationClient {
             .await
             .map_err(|e| err(format!("connecting to {host}:{port}: {e}")))?;
         tcp.set_nodelay(true).ok();
-        let mut c = Self::from_io(Box::new(tcp));
+        let negotiated =
+            secure::negotiate(tcp, host, target.mode, target.root_cert.as_deref()).await?;
+        // The same policy as the SQL connection, checked before the startup message carries
+        // the user name and before any password is sent.
+        crate::tls::check_negotiated(
+            target.mode,
+            negotiated.encrypted,
+            target.local,
+            target.root_cert.is_some(),
+        )?;
+        let mut c = Self::from_io(negotiated.io);
+        c.encrypted = negotiated.encrypted;
         c.writer
             .send(&startup_message(
                 &target.user,
@@ -203,23 +243,27 @@ impl ReplicationClient {
                 &target.startup_extras(),
             ))
             .await?;
-        loop {
-            match c.reader.read().await? {
-                Backend::Auth(0) => c.reader.set_authenticated(),
-                Backend::Auth(code) => {
-                    return Err(err(format!(
-                        "server requested authentication method {code}; only trust \
-                         authentication is supported yet"
-                    )))
-                }
-                Backend::ParameterStatus | Backend::BackendKeyData | Backend::Notice => {}
-                Backend::ReadyForQuery => return Ok(c),
-                Backend::Error { code, message } => {
-                    return Err(err(format!("startup failed: {message} ({code})")))
-                }
-                other => return Err(proto(format!("unexpected {other:?} during startup"))),
-            }
-        }
+        let ctx = AuthContext {
+            user: &target.user,
+            password: target.password.as_deref(),
+            mode: target.mode,
+            encrypted: negotiated.encrypted,
+            local: target.local,
+            cert_hash: negotiated.cert_hash,
+            cert_algorithm: negotiated.cert_algorithm,
+        };
+        c.auth = auth::authenticate(&mut c.reader, &mut c.writer, &ctx).await?;
+        Ok(c)
+    }
+
+    /// Whether the session runs over TLS.
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// How the session authenticated.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth
     }
 
     fn from_io(io: BoxIo) -> Self {
@@ -227,6 +271,8 @@ impl ReplicationClient {
         ReplicationClient {
             reader: FrameReader::new(r),
             writer: StatusSender { io: w },
+            encrypted: false,
+            auth: AuthMethod::Trust,
         }
     }
 
@@ -328,7 +374,7 @@ impl ReplicationClient {
 
 /// The receiving direction of a streaming session.
 pub struct ReplicationStream {
-    reader: Reader,
+    reader: FrameRead,
     ended: bool,
 }
 
@@ -379,7 +425,7 @@ pub struct StatusSender {
 }
 
 impl StatusSender {
-    async fn send(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(super) async fn send(&mut self, bytes: &[u8]) -> Result<()> {
         self.io
             .write_all(bytes)
             .await
@@ -442,46 +488,58 @@ mod tests {
         wire(b'd', &k)
     }
 
+    fn target(url: &str) -> Result<Target> {
+        Target::parse(url, &ConnectOptions::default())
+    }
+
     #[test]
-    fn plaintext_loopback_is_the_only_target() {
-        let t = Target::parse("postgres://u@localhost:5436/d?sslmode=disable").unwrap();
+    fn target_takes_tls_settings_from_the_url_or_the_overrides() {
+        let t = target("postgres://u:secret@localhost:5436/d?sslmode=require&sslrootcert=/ca.pem")
+            .unwrap();
         assert_eq!(
             (t.host.as_str(), t.port, t.database.as_str()),
             ("localhost", 5436, "d")
         );
-        assert!(Target::parse("postgres://u@127.0.0.1/d?sslmode=disable").is_ok());
+        assert_eq!(t.mode, SslMode::Require);
+        assert_eq!(t.root_cert.as_deref(), Some("/ca.pem"));
+        assert_eq!(t.password.as_deref(), Some(&b"secret"[..]));
+        assert!(t.local);
+        // No sslmode means verify-full.
+        assert_eq!(
+            target("postgres://u@db.example.com/d").unwrap().mode,
+            SslMode::VerifyFull
+        );
+        assert!(!target("postgres://u@db.example.com/d").unwrap().local);
+        // Config overrides win over the URL, as for the SQL connection.
+        let opts = ConnectOptions {
+            ssl_mode: Some(SslMode::VerifyCa),
+            ssl_root_cert: Some("/other.pem".into()),
+        };
+        let t = Target::parse("postgres://u@localhost/d?sslmode=disable", &opts).unwrap();
+        assert_eq!(t.mode, SslMode::VerifyCa);
+        assert_eq!(t.root_cert.as_deref(), Some("/other.pem"));
     }
 
     #[test]
-    fn any_tls_mode_is_refused_until_tls_exists() {
-        // No sslmode means verify-full, which this client cannot honour.
-        for url in [
-            "postgres://u@localhost/d",
-            "postgres://u@localhost/d?sslmode=prefer",
-            "postgres://u@localhost/d?sslmode=require",
-            "postgres://u@localhost/d?sslmode=verify-ca",
-            "postgres://u@localhost/d?sslmode=verify-full",
-        ] {
-            let e = Target::parse(url).unwrap_err().to_string();
-            assert!(e.contains("cannot use TLS yet"), "{url}: {e}");
-            assert!(e.contains("; only sslmode=disable"), "{url}: {e}");
-        }
+    fn password_is_never_in_debug_output() {
+        let t = target("postgres://u:hunter2@localhost/d").unwrap();
+        let shown = format!("{t:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]
-    fn non_loopback_hosts_are_refused_even_with_sslmode_disable() {
-        for url in [
-            "postgres://u@db.example.com/d?sslmode=disable",
-            "postgres://u@10.0.0.5/d?sslmode=disable",
-            "postgres://u@localhost,db.example.com/d?sslmode=disable",
-        ] {
-            assert!(Target::parse(url).is_err(), "{url}");
-        }
+    fn multi_host_and_unix_socket_urls_are_refused() {
+        let e = target("postgres://u@localhost,db.example.com/d")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("multi-host"), "{e}");
+        assert!(target("host=/var/run/postgresql user=u").is_err());
     }
 
     #[test]
     fn application_name_and_options_reach_the_startup_message() {
-        let t = Target::parse(
+        let t = target(
             "postgres://u@localhost/d?sslmode=disable&application_name=aq&options=-c%20statement_timeout%3D0",
         )
         .unwrap();
@@ -492,7 +550,7 @@ mod tests {
                 ("options", "-c statement_timeout=0")
             ]
         );
-        let t = Target::parse("postgres://u@localhost/d?sslmode=disable").unwrap();
+        let t = target("postgres://u@localhost/d?sslmode=disable").unwrap();
         assert!(t.startup_extras().is_empty());
     }
 
@@ -500,7 +558,7 @@ mod tests {
     fn hostaddr_is_refused() {
         // The SQL connection would dial 10.0.0.5; dialing localhost instead would reach another
         // server.
-        let e = Target::parse("host=localhost hostaddr=10.0.0.5 user=u sslmode=disable")
+        let e = target("host=localhost hostaddr=10.0.0.5 user=u sslmode=disable")
             .unwrap_err()
             .to_string();
         assert!(e.contains("hostaddr"), "{e}");
@@ -508,7 +566,7 @@ mod tests {
 
     #[test]
     fn nul_in_user_or_database_is_refused() {
-        assert!(Target::parse("postgres://u@localhost/d%00x?sslmode=disable").is_err());
+        assert!(target("postgres://u@localhost/d%00x?sslmode=disable").is_err());
     }
 
     #[test]
@@ -614,5 +672,262 @@ mod tests {
         assert_eq!(msg[38], 1);
         assert!(!reading.is_finished());
         reading.abort();
+    }
+}
+
+/// The connection handshake against scripted servers on loopback: TLS negotiation answers and
+/// the authentication exchange, including servers that misbehave.
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use std::future::Future;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    async fn server<F, Fut>(script: F) -> (u16, tokio::task::JoinHandle<()>)
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            script(s).await;
+        });
+        (port, h)
+    }
+
+    /// An untagged message: `SSLRequest` or the startup message.
+    async fn read_untagged(s: &mut TcpStream) -> Vec<u8> {
+        let len = s.read_i32().await.unwrap() as usize;
+        let mut body = vec![0; len - 4];
+        s.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    async fn read_msg(s: &mut TcpStream) -> (u8, Vec<u8>) {
+        let tag = s.read_u8().await.unwrap();
+        (tag, read_untagged(s).await)
+    }
+
+    fn msg(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend(((body.len() + 4) as i32).to_be_bytes());
+        m.extend(body);
+        m
+    }
+
+    fn auth(code: i32, data: &[u8]) -> Vec<u8> {
+        let mut b = code.to_be_bytes().to_vec();
+        b.extend(data);
+        msg(b'R', &b)
+    }
+
+    fn ok_and_ready() -> Vec<u8> {
+        let mut m = auth(0, b"");
+        m.extend(msg(b'Z', b"I"));
+        m
+    }
+
+    async fn connect(url: String) -> Result<ReplicationClient> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            ReplicationClient::connect(&url, &ConnectOptions::default()),
+        )
+        .await
+        .expect("connect hung")
+    }
+
+    #[tokio::test]
+    async fn plaintext_after_the_tls_answer_never_reaches_the_protocol() {
+        // CVE-2021-23214: a server (or someone on the path) answers `S` and appends a
+        // plaintext AuthenticationOk + ReadyForQuery. Those bytes must go to the TLS handshake,
+        // which rejects them, not be read as a successful startup.
+        let (port, _h) = server(|mut s| async move {
+            assert_eq!(read_untagged(&mut s).await, 80877103i32.to_be_bytes());
+            let mut answer = b"S".to_vec();
+            answer.extend(ok_and_ready());
+            s.write_all(&answer).await.unwrap();
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink).await;
+        })
+        .await;
+        let e = connect(format!("postgres://u@127.0.0.1:{port}/d?sslmode=require"))
+            .await
+            .err()
+            .expect("must not connect")
+            .to_string();
+        assert!(e.contains("TLS handshake"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_server_without_tls_is_refused_unless_prefer() {
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let (port, _h) = server(|mut s| async move {
+                read_untagged(&mut s).await;
+                s.write_all(b"N").await.unwrap();
+            })
+            .await;
+            let e = connect(format!("postgres://u@localhost:{port}/d?sslmode={mode}"))
+                .await
+                .err()
+                .expect("must not connect")
+                .to_string();
+            assert!(e.contains("server does not support TLS"), "{mode}: {e}");
+        }
+        // prefer continues in plaintext (loopback, so the policy allows it).
+        let (port, h) = server(|mut s| async move {
+            read_untagged(&mut s).await;
+            s.write_all(b"N").await.unwrap();
+            let startup = read_untagged(&mut s).await;
+            assert!(startup.ends_with(b"replication\0database\0client_encoding\0UTF8\0\0"));
+            s.write_all(&ok_and_ready()).await.unwrap();
+        })
+        .await;
+        let c = connect(format!("postgres://u@localhost:{port}/d?sslmode=prefer"))
+            .await
+            .unwrap();
+        assert!(!c.encrypted());
+        assert_eq!(c.auth_method(), AuthMethod::Trust);
+        h.await.unwrap();
+    }
+
+    /// Runs a SCRAM exchange up to the client-final message, then `finish` decides the end.
+    async fn scram_server(
+        finish: impl FnOnce(TcpStream) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    ) -> u16 {
+        let (port, _h) = server(|mut s| async move {
+            read_untagged(&mut s).await; // startup
+            s.write_all(&auth(10, b"SCRAM-SHA-256\0\0")).await.unwrap();
+            let (tag, body) = read_msg(&mut s).await;
+            assert_eq!(tag, b'p');
+            assert!(body.starts_with(b"SCRAM-SHA-256\0"));
+            let first = String::from_utf8(body[14 + 4..].to_vec()).unwrap();
+            assert!(
+                first.starts_with("n,,"),
+                "plaintext session must not claim binding"
+            );
+            let nonce = first.split("r=").nth(1).unwrap().to_string();
+            let server_first = format!("r={nonce}srvnonce,s=c2FsdA==,i=4096");
+            s.write_all(&auth(11, server_first.as_bytes()))
+                .await
+                .unwrap();
+            let (tag, _client_final) = read_msg(&mut s).await;
+            assert_eq!(tag, b'p');
+            finish(s).await;
+        })
+        .await;
+        port
+    }
+
+    #[tokio::test]
+    async fn a_wrong_scram_server_signature_is_rejected() {
+        // The server does not know the password, so it cannot produce the right signature.
+        let port = scram_server(|mut s| {
+            Box::pin(async move {
+                let wrong = format!("v={}=", "A".repeat(43));
+                s.write_all(&auth(12, wrong.as_bytes())).await.unwrap();
+                s.write_all(&ok_and_ready()).await.unwrap();
+            })
+        })
+        .await;
+        let e = connect(format!(
+            "postgres://u:pw@localhost:{port}/d?sslmode=disable"
+        ))
+        .await
+        .err()
+        .expect("must not connect")
+        .to_string();
+        assert!(e.contains("signature does not verify"), "{e}");
+        assert!(!e.contains("pw@"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn authentication_ok_that_skips_the_scram_proof_is_rejected() {
+        let port = scram_server(|mut s| {
+            Box::pin(async move {
+                s.write_all(&ok_and_ready()).await.unwrap();
+            })
+        })
+        .await;
+        let e = connect(format!(
+            "postgres://u:pw@localhost:{port}/d?sslmode=disable"
+        ))
+        .await
+        .err()
+        .expect("must not connect")
+        .to_string();
+        assert!(e.contains("without proving"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn md5_and_cleartext_send_the_expected_password_on_loopback() {
+        let salt = [1u8, 2, 3, 4];
+        let (port, h) = server(move |mut s| async move {
+            read_untagged(&mut s).await;
+            s.write_all(&auth(5, &salt)).await.unwrap();
+            let (tag, body) = read_msg(&mut s).await;
+            assert_eq!(tag, b'p');
+            let mut expected =
+                postgres_protocol::authentication::md5_hash(b"u", b"pw", salt).into_bytes();
+            expected.push(0);
+            assert_eq!(body, expected);
+            s.write_all(&ok_and_ready()).await.unwrap();
+        })
+        .await;
+        let c = connect(format!(
+            "postgres://u:pw@localhost:{port}/d?sslmode=disable"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(c.auth_method(), AuthMethod::Md5);
+        h.await.unwrap();
+
+        let (port, h) = server(|mut s| async move {
+            read_untagged(&mut s).await;
+            s.write_all(&auth(3, b"")).await.unwrap();
+            assert_eq!(read_msg(&mut s).await, (b'p', b"pw\0".to_vec()));
+            s.write_all(&ok_and_ready()).await.unwrap();
+        })
+        .await;
+        let c = connect(format!(
+            "postgres://u:pw@127.0.0.1:{port}/d?sslmode=disable"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(c.auth_method(), AuthMethod::Cleartext);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_methods_and_missing_passwords_fail_clearly() {
+        let (port, _h) = server(|mut s| async move {
+            read_untagged(&mut s).await;
+            s.write_all(&auth(7, b"")).await.unwrap();
+        })
+        .await;
+        let e = connect(format!(
+            "postgres://u:pw@localhost:{port}/d?sslmode=disable"
+        ))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("GSSAPI"), "{e}");
+
+        let (port, _h) = server(|mut s| async move {
+            read_untagged(&mut s).await;
+            s.write_all(&auth(3, b"")).await.unwrap();
+        })
+        .await;
+        let e = connect(format!("postgres://u@localhost:{port}/d?sslmode=disable"))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("has none"), "{e}");
     }
 }
