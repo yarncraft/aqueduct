@@ -18,16 +18,22 @@ Notable changes to Aqueduct. Newest first.
   - **Rollback is not supported.** An older binary refuses the new checkpoint (`not a Postgres LSN`) and will not
     start. To go back, delete the checkpoint file; the slot's `confirmed_flush_lsn` then decides where it resumes.
   - Rows already lost by earlier versions are not recovered by this fix; re-snapshot or backfill the affected tables.
-- **Postgres: a checkpoint from another cluster or database is refused at startup (#63).** Checkpoints now record the
-  cluster's `system_identifier` and the database OID (`;sys=<id>;db=<oid>` after the key). Startup fails if either
-  differs from the server's, for example after re-pointing the URL at another cluster or database. It does **not**
-  detect a restore or PITR of the same cluster. See DEPLOYMENT.md, "Checkpoint origin check".
-  - Upgrade: existing checkpoints have no origin; they are accepted and the next checkpoint records it.
-  - The Aqueduct role must be able to call `pg_control_system()` (a plain `LOGIN REPLICATION` role could call it in our tests on
-    PG 14, 16 and 17). Where a managed service refuses it, startup fails; set `checkpoint_skip_system_check = true` under
-    `[postgres]` to run without the check.
+- **Postgres: a checkpoint from another cluster, database or timeline is refused at startup (#63).** Checkpoints now
+  record the cluster's `system_identifier`, the database OID and the timeline (`;sys=<id>;db=<oid>;tli=<n>` after the
+  key). Startup fails if the cluster or database differs (a re-pointed URL, a rebuilt primary, a major-version
+  `pg_upgrade`), and also after a failover or PITR of the same cluster (a new timeline), because changes may have been
+  lost; the error says "restored, recovered to a point in time (PITR) or failed over" and how to resync. See
+  DEPLOYMENT.md, "Checkpoint origin check".
+  - Upgrade: existing checkpoints lack these fields; they are accepted with a warning and the next checkpoint records
+    them.
+  - The Aqueduct role must be able to call `pg_control_system()` and `pg_control_checkpoint()`; a plain
+    `LOGIN REPLICATION` role can. Where a managed service refuses them, startup fails; set
+    `checkpoint_skip_system_check = true` under `[postgres]` to skip the cluster and timeline comparison.
+  - After a planned switchover you have verified, delete only the `;tli=` field from the checkpoint file.
+  - A slot with the configured name that belongs to another database (or is a physical slot) is now refused instead
+    of used.
   - Rollback: a version before this one refuses the new checkpoint (`not a Postgres checkpoint`) and will not start.
-    To go back, remove the `;sys=...;db=...` suffix from the checkpoint file, or delete the file.
+    To go back, remove the `;sys=...` suffix from the checkpoint file, or delete the file.
 - **Postgres TLS defaults to `verify-full`** (#12, PR #14). With no `ssl_mode` and no `sslmode=` in the URL, Aqueduct
   now requires TLS and verifies the server certificate and hostname. A Postgres server without TLS fails at startup,
   **including on localhost** (verify-full never falls back to plaintext). To upgrade:

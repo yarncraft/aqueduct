@@ -6,9 +6,10 @@
 //! cargo test -p aqueduct-source-postgres --test origin_it -- --ignored
 //! ```
 //!
-//! A checkpoint records the cluster's `system_identifier` and the database OID. Startup must refuse
-//! a checkpoint from another cluster or another database of the same cluster, before it looks up or
-//! creates the slot, and must accept a checkpoint written before the check existed.
+//! A checkpoint records the cluster's `system_identifier`, its timeline and the database OID.
+//! Startup must refuse a checkpoint from another cluster, another timeline or another database of
+//! the same cluster, before it looks up or creates the slot, and must accept a checkpoint written
+//! before the check existed.
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Error, Position, Source};
@@ -40,7 +41,11 @@ fn unique(prefix: &str) -> String {
 }
 
 fn source(db: &str, slot: &str, publication: &str, recreate: bool) -> PostgresSource {
-    let mut cfg = PostgresSourceConfig::new(url(db), slot, publication);
+    source_at(url(db), slot, publication, recreate)
+}
+
+fn source_at(url: String, slot: &str, publication: &str, recreate: bool) -> PostgresSource {
+    let mut cfg = PostgresSourceConfig::new(url, slot, publication);
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
     cfg.allow_slot_recreate = recreate;
@@ -130,19 +135,21 @@ async fn checkpoint_from_another_cluster_or_database_is_refused_before_the_slot(
     let ev = next_event(&mut s).await.expect("the insert");
     let ckpt = ev.checkpoint.expect("postgres events carry a checkpoint");
     let ckpt_text = text(&ckpt).to_string();
-    let (sys, oid): (String, i64) = {
+    let (sys, oid, tli): (String, i64, i64) = {
         let row = db
             .query_one(
-                "SELECT s.system_identifier::text, d.oid::int8 FROM pg_control_system() s, \
+                "SELECT s.system_identifier::text, d.oid::int8, c.timeline_id::int8 \
+                 FROM pg_control_system() s, pg_control_checkpoint() c, \
                  pg_database d WHERE d.datname = current_database()",
                 &[],
             )
             .await
             .unwrap();
-        (row.get(0), row.get(1))
+        (row.get(0), row.get(1), row.get(2))
     };
     assert_eq!(field(&ckpt_text, "sys"), sys, "{ckpt_text}");
     assert_eq!(field(&ckpt_text, "db"), oid.to_string(), "{ckpt_text}");
+    assert_eq!(field(&ckpt_text, "tli"), tli.to_string(), "{ckpt_text}");
     s.ack(ckpt.clone()).await.unwrap();
     drop(s);
 
@@ -166,6 +173,17 @@ async fn checkpoint_from_another_cluster_or_database_is_refused_before_the_slot(
             "recreate={recreate}: a slot was created on the wrong cluster"
         );
     }
+
+    // Same cluster, another timeline (a promotion or PITR since): refused with the resync advice.
+    let promoted = Position::Text(with_field(&ckpt_text, "tli", &(tli + 1).to_string()));
+    let mut s = source("postgres", &fresh_slot, &publication, true);
+    let err = s.start(Some(promoted)).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Checkpoint(m) if m.contains("failed over") && m.contains("may never reach Kafka")),
+        "{err}"
+    );
+    drop(s);
+    assert!(!slot_exists(&db, &fresh_slot).await);
 
     // Another database of the same cluster: refused.
     let other_db = unique("aq_or_db");
@@ -200,6 +218,54 @@ async fn checkpoint_from_another_cluster_or_database_is_refused_before_the_slot(
         .unwrap();
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}
+
+/// The origin check needs no superuser: a plain `LOGIN REPLICATION` role reads the cluster and
+/// timeline, and with `checkpoint_skip_system_check` a foreign `sys` is not compared.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn a_replication_role_without_superuser_runs_the_check() {
+    let db = connect("postgres").await;
+    let role = unique("aq_or_role");
+    let table = unique("origin_role");
+    let publication = unique("aq_or_role_pub");
+    let slot = unique("aq_or_role");
+    db.batch_execute(&format!(
+        "CREATE ROLE {role} LOGIN REPLICATION PASSWORD 'pw';
+         CREATE TABLE {table} (k int PRIMARY KEY);
+         GRANT SELECT ON {table} TO {role};
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+    let role_url = format!("postgres://{role}:pw@{}/postgres", addr());
+
+    let mut s = source_at(role_url.clone(), &slot, &publication, false);
+    s.start(None).await.unwrap();
+    db.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
+        .await
+        .unwrap();
+    let ev = next_event(&mut s).await.expect("the insert");
+    let ckpt_text = text(&ev.checkpoint.expect("checkpoint")).to_string();
+    assert!(field(&ckpt_text, "sys").parse::<u64>().is_ok(), "{ckpt_text}");
+    assert!(field(&ckpt_text, "tli").parse::<u32>().is_ok(), "{ckpt_text}");
+    drop(s);
+
+    // The opt-out skips the cluster comparison but still records and compares the database.
+    let foreign = Position::Text(with_field(&ckpt_text, "sys", "1"));
+    let mut cfg = PostgresSourceConfig::new(role_url, &slot, &publication);
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.skip_system_check = true;
+    let mut s = PostgresSource::new(cfg);
+    s.start(Some(foreign)).await.unwrap();
+    drop(s);
+
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}; DROP ROLE {role};"
     ))
     .await
     .unwrap();
