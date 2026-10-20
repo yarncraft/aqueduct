@@ -88,8 +88,9 @@ pub struct PostgresConfig {
     /// Optional SQL run before each heartbeat, e.g. an upsert into a small published table.
     #[serde(default)]
     pub heartbeat_action_query: Option<String>,
-    /// Do not record or check which cluster and database a checkpoint belongs to. Only for servers
-    /// that refuse `pg_control_system()`. Default: check, and fail at startup if it cannot be read.
+    /// Do not read, record or check the cluster's `system_identifier`. Only for servers that refuse
+    /// `pg_control_system()`. The database check stays on. Default: check, and fail at startup if
+    /// it cannot be read.
     #[serde(default)]
     pub checkpoint_skip_system_check: bool,
 }
@@ -114,7 +115,7 @@ impl PostgresConfig {
             .heartbeat_action_query
             .clone()
             .filter(|q| !q.trim().is_empty());
-        c.skip_origin_check = self.checkpoint_skip_system_check;
+        c.skip_system_check = self.checkpoint_skip_system_check;
         Ok(c)
     }
 }
