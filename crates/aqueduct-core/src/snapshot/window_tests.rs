@@ -15,7 +15,7 @@ fn rows(keys: &[&str]) -> Vec<ChunkRow<u32>> {
 fn keys(o: Outcome<u32>) -> Vec<String> {
     match o {
         Outcome::Emit { rows, .. } => rows.into_iter().map(|r| r.key).collect(),
-        Outcome::None => panic!("expected Emit"),
+        Outcome::None | Outcome::Retry => panic!("expected Emit"),
     }
 }
 
@@ -258,4 +258,45 @@ fn emit_names_the_last_row_read_even_when_none_survive() {
             last_key: None
         }
     );
+}
+
+#[test]
+fn an_unknown_live_key_in_the_window_retries_the_chunk() {
+    let mut w = Window::new();
+    w.expect(1, T).unwrap();
+    w.set_chunk(rows(&["1", "2"])).unwrap();
+    w.live_unknown(T); // before the window: ignored
+    w.mark(Mark::Low(1)).unwrap();
+    w.live_unknown("public.other"); // another table: ignored
+    w.live_key(T, "1");
+    w.live_unknown(T);
+    assert_eq!(w.mark(Mark::High(1)).unwrap(), Outcome::Retry);
+    assert_eq!(w.in_flight(), None, "a retry closes the window");
+}
+
+#[test]
+fn a_truncate_wins_over_an_unknown_key() {
+    let mut w = Window::new();
+    w.expect(1, T).unwrap();
+    w.set_chunk(rows(&["1", "2"])).unwrap();
+    w.mark(Mark::Low(1)).unwrap();
+    w.live_unknown(T);
+    w.live_truncate(T);
+    assert_eq!(
+        w.mark(Mark::High(1)).unwrap(),
+        Outcome::Emit {
+            rows: Vec::new(),
+            last_key: Some("2".into())
+        }
+    );
+}
+
+#[test]
+fn an_unknown_key_outside_the_window_changes_nothing() {
+    let mut w = Window::new();
+    w.expect(1, T).unwrap();
+    w.set_chunk(rows(&["1", "2"])).unwrap();
+    w.live_unknown(T);
+    w.mark(Mark::Low(1)).unwrap();
+    assert_eq!(keys(w.mark(Mark::High(1)).unwrap()), ["1", "2"]);
 }

@@ -18,6 +18,8 @@ pub struct PublishedTable {
     pub columns: Vec<String>,
     /// Type OID of each entry of `columns`, for encoding a row exactly as the decoder does.
     pub column_types: Vec<u32>,
+    /// SQL type of each entry of `columns` (`format_type`), for binding keyset cursors.
+    pub column_type_names: Vec<String>,
     /// Primary-key columns in key order. Empty when the table has no primary key.
     pub primary_key: Vec<String>,
     /// SQL type of each primary-key column (`format_type`), for binding keyset cursors.
@@ -107,6 +109,7 @@ fn tables_query(server_version_num: u32) -> String {
         )
     };
     let (names, types) = (cols("a.attname::text"), cols("a.atttypid"));
+    let type_names = cols("format_type(a.atttypid, a.atttypmod)");
     let pk = index_columns("i.indisprimary", "a.attname::text");
     let pk_types = index_columns("i.indisprimary", "format_type(a.atttypid, a.atttypmod)");
     // pgoutput flags identity columns in table order (`logicalrep_write_attrs`).
@@ -118,7 +121,8 @@ fn tables_query(server_version_num: u32) -> String {
     format!(
         "SELECT p.schemaname::text, p.tablename::text, c.oid, COALESCE({names}, ARRAY[]::text[]),
                 COALESCE({types}, ARRAY[]::oid[]), {pk}, {pk_types}, c.relreplident::text,
-                {identity}, {filter}, c.reltuples::float8
+                {identity}, {filter}, c.reltuples::float8,
+                COALESCE({type_names}, ARRAY[]::text[])
          FROM pg_publication_tables p
          JOIN pg_namespace n ON n.nspname = p.schemaname
          JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename
@@ -182,6 +186,7 @@ pub async fn read_catalog(client: &Client, publication: &str) -> Result<Catalog>
                 identity_columns: r.get(8),
                 row_filter: r.get(9),
                 estimated_rows: estimated_rows(r.get(10)),
+                column_type_names: r.get(11),
             })
         })
         .collect::<Result<_>>()?;

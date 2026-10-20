@@ -7,8 +7,11 @@
 
 pub mod catalog;
 pub mod decoder;
+pub mod snapshot;
 mod source;
 mod tls;
+pub mod transport;
 
+pub use snapshot::{SnapshotConfig, SnapshotMode};
 pub use source::{parse_lsn, PostgresSource, PostgresSourceConfig, DEFAULT_HEARTBEAT_INTERVAL};
 pub use tls::SslMode;

@@ -160,6 +160,10 @@ async fn reads_types_replica_identity_and_skips_generated_columns() {
         "generated `g` is not sent"
     );
     assert_eq!(t.column_types, vec![20, 1700, 25]);
+    assert_eq!(
+        t.column_type_names,
+        strs(&["bigint", "numeric(10,2)", "text"])
+    );
     assert_eq!(t.primary_key_types, strs(&["bigint"]));
     assert_eq!(t.replica_identity, ReplicaIdentity::Default);
     assert_eq!(t.identity_columns, strs(&["Id"]));

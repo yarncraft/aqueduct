@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -93,6 +94,18 @@ pub struct PostgresConfig {
     /// it cannot be read.
     #[serde(default)]
     pub checkpoint_skip_system_check: bool,
+    /// `never | on_demand | initial`: whether existing rows are copied (ADR 0001). Default never.
+    #[serde(default)]
+    pub snapshot: Option<String>,
+    /// Rows per snapshot chunk. Default 1024.
+    #[serde(default)]
+    pub snapshot_chunk_size: Option<u32>,
+    /// Upper bound on snapshot rows read per second. Default unthrottled.
+    #[serde(default)]
+    pub snapshot_max_rows_per_sec: Option<u32>,
+    /// Snapshot key columns for tables without a primary key, by `schema.table`.
+    #[serde(default)]
+    pub snapshot_key_columns: HashMap<String, Vec<String>>,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -116,6 +129,24 @@ impl PostgresConfig {
             .clone()
             .filter(|q| !q.trim().is_empty());
         c.skip_system_check = self.checkpoint_skip_system_check;
+        if let Some(mode) = &self.snapshot {
+            c.snapshot.mode = mode.parse().map_err(|e| format!("postgres.{e}"))?;
+        }
+        if let Some(n) = self.snapshot_chunk_size {
+            if n == 0 {
+                return Err("postgres.snapshot_chunk_size must be at least 1".into());
+            }
+            c.snapshot.chunk_size = n;
+        }
+        c.snapshot.max_rows_per_sec = self.snapshot_max_rows_per_sec.filter(|n| *n > 0);
+        for (table, cols) in &self.snapshot_key_columns {
+            if !table.contains('.') || cols.is_empty() {
+                return Err(format!(
+                    "postgres.snapshot_key_columns: {table:?} needs the form \"schema.table\" and at least one column"
+                ));
+            }
+        }
+        c.snapshot.key_columns = self.snapshot_key_columns.clone();
         Ok(c)
     }
 }
@@ -522,6 +553,35 @@ type='redis'
     }
 
     #[test]
+    fn snapshot_settings_default_off_and_parse() {
+        use aqueduct_source_postgres::SnapshotMode;
+        let pg = |extra: &str| -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
+            toml::from_str::<PostgresConfig>(&format!(
+                "url = 'postgres://u@db/app'
+ssl_mode = 'disable'
+{extra}"
+            ))
+            .unwrap()
+            .source_config()
+        };
+        let c = pg("").unwrap();
+        assert_eq!(c.snapshot.mode, SnapshotMode::Never);
+        assert_eq!(c.snapshot.chunk_size, 1024);
+        let c = pg("snapshot = 'initial'
+snapshot_chunk_size = 10
+snapshot_max_rows_per_sec = 500
+snapshot_key_columns = { 'public.events' = ['day', 'seq'] }")
+        .unwrap();
+        assert_eq!(c.snapshot.mode, SnapshotMode::Initial);
+        assert_eq!(c.snapshot.chunk_size, 10);
+        assert_eq!(c.snapshot.max_rows_per_sec, Some(500));
+        assert_eq!(c.snapshot.key_columns["public.events"], ["day", "seq"]);
+        assert!(pg("snapshot = 'always'").unwrap_err().contains("on_demand"));
+        assert!(pg("snapshot_chunk_size = 0").is_err());
+        assert!(pg("snapshot_key_columns = { events = ['a'] }").is_err());
+    }
+
+    #[test]
     fn heartbeat_defaults_and_overrides() {
         let pg = |extra: &str| -> PostgresConfig {
             toml::from_str(&format!(
@@ -558,6 +618,10 @@ heartbeat_action_query = 'SELECT 1'")
             heartbeat_interval_secs: 10,
             heartbeat_action_query: None,
             checkpoint_skip_system_check: false,
+            snapshot: None,
+            snapshot_chunk_size: None,
+            snapshot_max_rows_per_sec: None,
+            snapshot_key_columns: HashMap::new(),
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());
