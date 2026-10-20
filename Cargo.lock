@@ -62,9 +62,11 @@ version = "0.1.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-sinks",
+ "aqueduct-source-postgres",
  "async-trait",
  "serde_json",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

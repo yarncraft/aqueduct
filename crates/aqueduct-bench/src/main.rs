@@ -8,11 +8,15 @@
 //!       [--sink null|kafka] [--profile simple|industrial] [--dir PATH]
 //!       [--brokers HOST:PORT] [--partitions N]
 //!
+//! With `--source postgres --pg-url URL [--transport poll|stream]` it instead measures the
+//! Postgres source against a real server; see `postgres.rs`.
+//!
 //! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), then sends,
 //! flushes, checkpoints and acks once per batch, so the source hands out its events through
 //! `try_next` the way the real sources do.
 
 mod industrial;
+mod postgres;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -143,6 +147,14 @@ async fn main() {
     let sink_kind = arg("--sink").unwrap_or_else(|| "null".into());
     let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| ".bench-out".into()));
     std::fs::create_dir_all(&dir).unwrap();
+    if arg("--source").as_deref() == Some("postgres") {
+        let url = arg("--pg-url").expect("--pg-url is required with --source postgres");
+        let transport = arg("--transport")
+            .unwrap_or_else(|| "poll".into())
+            .parse()
+            .unwrap();
+        return postgres::run(&url, transport, &dir).await;
+    }
 
     let template = ChangeEvent {
         position: Position::Lsn(0),
