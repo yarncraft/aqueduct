@@ -104,6 +104,9 @@ Notable changes to Aqueduct. Newest first.
   - While a MongoDB snapshot runs the checkpoint file holds JSON (`{"pos": <resume token>, "snap": {...}}`); a
     version without MongoDB snapshots cannot resume from it. Let the snapshot finish before rolling back, or delete
     the checkpoint.
+  - An older Aqueduct watching the same whole database (no `collections` list) forwards the inserts and deletes of
+    `aqueduct_watermarks` as ordinary events. Upgrade every instance on that database first, or give the old ones a
+    `collections` list.
 - **Snapshots on Postgres 12 and 13** (#92): new `[postgres] snapshot_watermark_table` names a published table whose
   rows carry the watermarks instead of logical messages (Postgres 14+). See DEPLOYMENT.md, "Watermark table".
 - **Cockpit snapshot card** (#78): progress of the running or last snapshot, skipped tables and a Cancel button. Snapshot

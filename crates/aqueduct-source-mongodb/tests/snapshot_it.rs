@@ -509,3 +509,96 @@ async fn never_copies_nothing() {
 
     client.database(&db).drop().await.unwrap();
 }
+
+/// A chunk read that fails every time (here: a cursor that cannot be parsed) does not crash-loop
+/// the source: after a few attempts the collection is skipped with the reason, the snapshot moves
+/// on, and live changes keep flowing.
+#[tokio::test]
+#[ignore]
+async fn a_chunk_that_always_fails_skips_its_collection() {
+    let db = db_name("failing");
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    populate(&client, &db, "bad", 10).await;
+    populate(&client, &db, "good", 10).await;
+    let mut c = cfg(&db, SnapshotMode::OnDemand, 5);
+    c.collections = vec!["bad".into(), "good".into()];
+
+    // A checkpoint whose snapshot cursor for `bad` is garbage.
+    let mut first = Driver::start(c.clone(), None).await;
+    first.step().await;
+    let Some(Position::Text(tok)) = first.checkpoint.clone() else {
+        panic!("no start checkpoint")
+    };
+    drop(first);
+    let composite = Checkpoint {
+        pos: tok,
+        snap: Some(aqueduct_core::SnapState {
+            id: "s1".into(),
+            tables: vec![format!("{db}.bad"), format!("{db}.good")],
+            table: 0,
+            after: Some(vec!["{not json".into()]),
+        }),
+    }
+    .encode();
+    let mut d = Driver::start(c, Some(Position::Text(composite))).await;
+    d.until("the snapshot finished", |d| {
+        d.snapshot_state().as_deref() == Some("finished")
+    })
+    .await;
+    let st = d.metrics.snapshot().snapshot.unwrap();
+    assert_eq!(st.skipped.len(), 1, "{st:?}");
+    assert_eq!(st.skipped[0].table, format!("{db}.bad"));
+    assert!(st.skipped[0].reason.contains("chunk read failed"), "{st:?}");
+    assert!(d
+        .events
+        .iter()
+        .all(|e| e.table != "bad" || e.op != Op::Read));
+    assert_eq!(
+        d.events
+            .iter()
+            .filter(|e| e.table == "good" && e.op == Op::Read)
+            .count(),
+        10
+    );
+    d.sync(&client, &db, "bad").await;
+
+    client.database(&db).drop().await.unwrap();
+}
+
+/// An existing TTL index on `{at: 1}` under another name is accepted; a non-TTL index there is
+/// reported as a conflict, not as a missing privilege.
+#[tokio::test]
+#[ignore]
+async fn an_existing_watermark_index_is_accepted_or_reported() {
+    use mongodb::options::IndexOptions;
+    use mongodb::IndexModel;
+    let db = db_name("ttl");
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let wm = client
+        .database(&db)
+        .collection::<Document>("aqueduct_watermarks");
+    let index = |ttl: Option<u64>| {
+        IndexModel::builder()
+            .keys(doc! {"at": 1})
+            .options(
+                IndexOptions::builder()
+                    .name("theirs".to_string())
+                    .expire_after(ttl.map(Duration::from_secs))
+                    .build(),
+            )
+            .build()
+    };
+    wm.create_index(index(Some(60))).await.unwrap();
+    let mut src = MongoSource::new(cfg(&db, SnapshotMode::OnDemand, 10));
+    src.start(None).await.unwrap();
+    drop(src);
+
+    wm.drop_index("theirs").await.unwrap();
+    wm.create_index(index(None)).await.unwrap();
+    let mut src = MongoSource::new(cfg(&db, SnapshotMode::OnDemand, 10));
+    let err = src.start(None).await.unwrap_err().to_string();
+    assert!(err.contains("conflicts"), "{err}");
+    assert!(!err.contains("privileges"), "{err}");
+
+    client.database(&db).drop().await.unwrap();
+}

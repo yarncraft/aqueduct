@@ -5,8 +5,12 @@
 //! chunk, inserts a high watermark, and hands the chunk to the shared [`Window`]. Live changes of
 //! the collection between the watermarks remove the documents they touch; at the high watermark
 //! the surviving documents are emitted as `read` events. Documents are encoded by the same
-//! [`map_event`] as live inserts, so a `read` event's `after` and Kafka key are byte-identical to
-//! an `insert` of the same document.
+//! [`map_event`] as live inserts, so a `read` event's `after` is byte-identical to an `insert` of
+//! the same document. Its Kafka key is the `documentKey` the stream would send: `{_id}`, or on a
+//! sharded collection (seen through `mongos`) the shard key fields from `config.collections` in key
+//! order, then `_id`. The shard key is read best effort: without access to `config.collections`,
+//! a sharded collection's `read` rows are keyed by `_id` alone and may land on another partition
+//! than its live changes with `partition_by = "key"` (a warning says so).
 //!
 //! **Consistency.** Both watermarks are written with `w: majority` and the chunk is read with
 //! `readConcern: majority` on the primary, all in one causally consistent session. So the read
@@ -23,6 +27,11 @@
 //! canonical extended JSON, which keeps the BSON type). If that document was deleted and an equal
 //! `_id` of another numeric type inserted, it is kept: a duplicate at worst, never a loss.
 //!
+//! **Failures.** A chunk read the server refuses (a command or write-concern error, a write
+//! concern timeout) is retried with a growing pause; after [`MAX_CHUNK_FAILURES`] in a row the
+//! collection is skipped with the error as the reason, so one collection cannot crash-loop the
+//! whole source. Connection errors still fail the source, as for live reads.
+//!
 //! The engine does no streaming itself: `MongoSource` feeds it the live changes and watermarks it
 //! reads and asks it for the next chunk when none is in flight.
 
@@ -32,7 +41,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqueduct_core::{ChunkRow, Mark, Outcome, SkippedTable, SnapState, SnapshotStatus, Window};
 use aqueduct_core::{Error, Result};
 use mongodb::bson::{doc, Bson, DateTime, Document};
-use mongodb::options::{Hint, ReadConcern, ReadPreference, SelectionCriteria, WriteConcern};
+use mongodb::options::{
+    Acknowledgment, Hint, ReadConcern, ReadPreference, SelectionCriteria, WriteConcern,
+};
 use mongodb::{Client, ClientSession};
 use serde_json::value::{to_raw_value, RawValue};
 use serde_json::Value;
@@ -47,6 +58,55 @@ pub const WATERMARK_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Name of the TTL index on [`WATERMARK_COLLECTION`].
 pub const TTL_INDEX: &str = "aqueduct_ttl";
+
+/// A watermark write waits this long for a majority, then the chunk counts as failed.
+pub const WATERMARK_WTIMEOUT: Duration = Duration::from_secs(30);
+
+/// A chunk read is cut off after this long, then the chunk counts as failed.
+pub const CHUNK_MAX_TIME: Duration = Duration::from_secs(60);
+
+/// Consecutive failed chunk reads of one collection before it is skipped.
+pub const MAX_CHUNK_FAILURES: u32 = 3;
+
+/// The write concern of watermark inserts: majority, so the chunk read that follows sees them,
+/// bounded so an unreachable majority fails the chunk instead of stalling the stream.
+pub fn watermark_write_concern() -> WriteConcern {
+    WriteConcern::builder()
+        .w(Acknowledgment::Majority)
+        .w_timeout(WATERMARK_WTIMEOUT)
+        .build()
+}
+
+/// Why a chunk could not be read.
+#[derive(Debug)]
+pub enum ChunkError {
+    /// The server or the data refused it (counts toward skipping the collection).
+    Failed(String),
+    /// Anything else (connection, server selection): fails the source like a live read would.
+    Fatal(Error),
+}
+
+/// Sorts a driver error: what the server answered about this request is a chunk failure;
+/// trouble reaching the server is fatal.
+pub fn chunk_error(e: mongodb::error::Error) -> ChunkError {
+    use mongodb::error::ErrorKind;
+    match *e.kind {
+        ErrorKind::Command(_)
+        | ErrorKind::Write(_)
+        | ErrorKind::InvalidArgument { .. }
+        | ErrorKind::BsonDeserialization(_) => ChunkError::Failed(e.to_string()),
+        _ => ChunkError::Fatal(src_err(e)),
+    }
+}
+
+/// What a failed chunk did to the snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The chunk is read again after a pause.
+    Retry,
+    /// The collection was skipped; `state` is the new progress, `None` when nothing is left.
+    Skipped { state: Option<SnapState> },
+}
 
 fn src_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Source(e.to_string())
@@ -117,18 +177,51 @@ pub struct ReadRow {
     pub commit_ts_micros: i64,
 }
 
+/// The value at a dotted path of `doc`.
+fn path<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
+    let mut parts = path.split('.');
+    let mut cur = doc.get(parts.next()?)?;
+    for p in parts {
+        cur = cur.as_document()?.get(p)?;
+    }
+    Some(cur)
+}
+
+/// The `documentKey` the change stream sends for `doc`: the shard key fields in key order (a
+/// missing one is left out), then `_id` unless the shard key holds it. `{_id}` when unsharded.
+pub fn document_key(doc: &Document, shard_key: &[String]) -> Option<Document> {
+    let id = doc.get("_id")?.clone();
+    let mut key = Document::new();
+    for f in shard_key {
+        if f == "_id" {
+            key.insert("_id", id.clone());
+        } else if let Some(v) = path(doc, f) {
+            key.insert(f.clone(), v.clone());
+        }
+    }
+    if !key.contains_key("_id") {
+        key.insert("_id", id);
+    }
+    Some(key)
+}
+
 /// Encodes `doc` of `db.coll` exactly as the stream encodes an insert of it: the same synthesized
-/// change event goes through [`map_event`], and the key is the `documentKey` JSON.
-pub fn read_row(db: &str, coll: &str, doc: &Document, commit_ts_micros: i64) -> Result<ReadRow> {
-    let id = doc
-        .get("_id")
-        .cloned()
+/// change event goes through [`map_event`], and the key is the `documentKey` JSON (`shard_key`
+/// is the collection's shard key pattern, empty when unsharded).
+pub fn read_row(
+    db: &str,
+    coll: &str,
+    doc: &Document,
+    shard_key: &[String],
+    commit_ts_micros: i64,
+) -> Result<ReadRow> {
+    let key = document_key(doc, shard_key)
         .ok_or_else(|| Error::Source(format!("document of {db}.{coll} without _id")))?;
     let change = doc! {
         "operationType": "insert",
         "ns": {"db": db, "coll": coll},
         "fullDocument": doc.clone(),
-        "documentKey": {"_id": id},
+        "documentKey": key,
     };
     let ev = Bson::Document(change).into_relaxed_extjson();
     let m = map_event(&ev).ok_or_else(|| Error::Source("cannot encode snapshot row".into()))?;
@@ -175,6 +268,8 @@ pub struct Catalog {
     pub kinds: HashMap<String, String>,
     /// `estimatedDocumentCount` by table id, where read.
     pub estimates: HashMap<String, u64>,
+    /// Shard key field names in key order by collection name, for sharded collections.
+    pub shard_keys: HashMap<String, Vec<String>>,
 }
 
 impl Catalog {
@@ -229,6 +324,9 @@ pub struct Engine {
     in_flight: Option<u64>,
     /// Consecutive retries of the current chunk, for the backoff.
     retries: u32,
+    /// Consecutive failed reads of the current collection's chunk.
+    failures: u32,
+    shard_keys: HashMap<String, Vec<String>>,
     chunk_size: u32,
     max_rows_per_sec: Option<u32>,
     not_before: Instant,
@@ -295,6 +393,8 @@ impl Engine {
             next_chunk: random_u64() >> 1,
             in_flight: None,
             retries: 0,
+            failures: 0,
+            shard_keys: catalog.shard_keys.clone(),
             chunk_size: chunk_size.max(1),
             max_rows_per_sec: max_rows_per_sec.filter(|n| *n > 0),
             not_before: Instant::now(),
@@ -374,9 +474,12 @@ impl Engine {
                 continue;
             }
             match catalog.check(&id) {
-                Ok(_) => {
+                Ok(coll) => {
                     if let Some(n) = catalog.estimates.get(&id) {
                         self.estimates.insert(id.clone(), *n);
+                    }
+                    if let Some(k) = catalog.shard_keys.get(&coll) {
+                        self.shard_keys.insert(coll, k.clone());
                     }
                     self.state.tables.push(id);
                 }
@@ -403,7 +506,7 @@ impl Engine {
         session: &mut ClientSession,
         chunk: u64,
         high: bool,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), ChunkError> {
         client
             .database(&self.database)
             .collection::<Document>(WATERMARK_COLLECTION)
@@ -411,34 +514,80 @@ impl Engine {
                 "_id": Watermark::id(&self.state.id, chunk, high),
                 "at": DateTime::now(),
             })
-            .write_concern(WriteConcern::majority())
+            .write_concern(watermark_write_concern())
             .session(&mut *session)
             .await
-            .map_err(src_err)?;
+            .map_err(chunk_error)?;
         Ok(())
     }
 
     /// Reads the next chunk between a low and a high watermark (see the module docs for why the
-    /// read sees exactly what the window needs).
-    pub async fn start_chunk(&mut self, client: &Client) -> Result<()> {
+    /// read sees exactly what the window needs). On an error nothing stays in flight; the source
+    /// reports a [`ChunkError::Failed`] to [`Engine::chunk_failed`].
+    pub async fn start_chunk(&mut self, client: &Client) -> std::result::Result<(), ChunkError> {
         let id = self.next_chunk;
         self.next_chunk += 1;
         let table = self.state.tables[self.state.table].clone();
         self.window
             .expect(id, &table)
-            .map_err(|e| Error::Source(format!("snapshot window: {e}")))?;
+            .map_err(|e| ChunkError::Fatal(Error::Source(format!("snapshot window: {e}"))))?;
         self.in_flight = Some(id);
+        let read = self.read_chunk(client, id, &table).await;
+        if read.is_err() {
+            self.window = Window::new();
+            self.in_flight = None;
+        }
+        read
+    }
+
+    /// After a failed chunk read: pause and read it again, or skip the collection once it failed
+    /// [`MAX_CHUNK_FAILURES`] times in a row. Also returns the failed chunk's watermark ids.
+    pub fn chunk_failed(&mut self, why: &str) -> (Failure, Vec<String>) {
+        let chunk = self.next_chunk - 1;
+        let watermarks = vec![
+            Watermark::id(&self.state.id, chunk, false),
+            Watermark::id(&self.state.id, chunk, true),
+        ];
+        self.failures += 1;
+        let table = self.state.tables[self.state.table].clone();
+        if self.failures < MAX_CHUNK_FAILURES {
+            let wait = Duration::from_secs(1u64 << self.failures);
+            self.not_before = Instant::now() + wait;
+            tracing::warn!(table = %table, error = %why, attempt = self.failures, "snapshot chunk read failed; retrying");
+            return (Failure::Retry, watermarks);
+        }
+        tracing::warn!(table = %table, error = %why, "snapshot chunk read failed {} times; skipping this collection", self.failures);
+        self.failures = 0;
+        self.skipped
+            .push((table, format!("chunk read failed: {why}")));
+        // Out of the list, so a restart does not try it again; the index now names the next one.
+        self.state.tables.remove(self.state.table);
+        self.state.after = None;
+        let state = (self.state.table < self.state.tables.len()).then(|| self.state.clone());
+        (Failure::Skipped { state }, watermarks)
+    }
+
+    async fn read_chunk(
+        &mut self,
+        client: &Client,
+        id: u64,
+        table: &str,
+    ) -> std::result::Result<(), ChunkError> {
         let mut session = client
             .start_session()
             .causal_consistency(true)
             .await
-            .map_err(src_err)?;
+            .map_err(chunk_error)?;
         self.write_watermark(client, &mut session, id, false)
             .await?;
 
         let coll = self.collection();
+        let shard_key = self.shard_keys.get(&coll).cloned().unwrap_or_default();
         let after = match self.state.after.as_ref().and_then(|a| a.first()) {
-            Some(k) => Some((k.clone(), parse_key(k)?)),
+            Some(k) => Some((
+                k.clone(),
+                parse_key(k).map_err(|e| ChunkError::Failed(e.to_string()))?,
+            )),
             None => None,
         };
         // One more than a chunk when `min` (inclusive) may return the cursor document itself.
@@ -452,20 +601,21 @@ impl Engine {
             .sort(doc! {"_id": 1})
             .limit(i64::from(limit))
             .batch_size(limit)
+            .max_time(CHUNK_MAX_TIME)
             .read_concern(ReadConcern::majority())
             .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary));
         if let Some((_, b)) = &after {
             find = find.min(doc! {"_id": b.clone()});
         }
-        let mut cursor = find.session(&mut session).await.map_err(src_err)?;
+        let mut cursor = find.session(&mut session).await.map_err(chunk_error)?;
         let ts = now_micros() as i64;
         let mut chunk = Vec::new();
         while let Some(d) = cursor.next(&mut session).await {
-            let d = d.map_err(src_err)?;
+            let d = d.map_err(chunk_error)?;
             let key = d
                 .get("_id")
                 .map(window_key)
-                .ok_or_else(|| Error::Source(format!("document of {table} without _id")))?;
+                .ok_or_else(|| ChunkError::Failed(format!("document of {table} without _id")))?;
             if chunk.is_empty() && after.as_ref().is_some_and(|(k, _)| *k == key) {
                 continue;
             }
@@ -474,15 +624,17 @@ impl Engine {
             }
             chunk.push(ChunkRow {
                 key,
-                row: read_row(&self.database, &coll, &d, ts)?,
+                row: read_row(&self.database, &coll, &d, &shard_key, ts)
+                    .map_err(|e| ChunkError::Failed(e.to_string()))?,
             });
         }
         drop(cursor);
         let n = chunk.len() as u64;
         self.window
             .set_chunk(chunk)
-            .map_err(|e| Error::Source(format!("snapshot window: {e}")))?;
+            .map_err(|e| ChunkError::Fatal(Error::Source(format!("snapshot window: {e}"))))?;
         self.write_watermark(client, &mut session, id, true).await?;
+        self.failures = 0;
         if let Some(rate) = self.max_rows_per_sec {
             self.not_before = Instant::now() + Duration::from_secs_f64(n as f64 / f64::from(rate));
         }
@@ -580,6 +732,7 @@ mod tests {
             ]
             .into(),
             estimates: [("app.users".to_string(), 7)].into(),
+            shard_keys: Default::default(),
         }
     }
 
@@ -638,7 +791,7 @@ mod tests {
     #[test]
     fn read_rows_are_encoded_like_live_inserts() {
         let d = doc! {"_id": 5_i64, "n": "a", "when": DateTime::from_millis(0), "z": 1.5};
-        let r = read_row("app", "users", &d, 9).unwrap();
+        let r = read_row("app", "users", &d, &[], 9).unwrap();
         let change = doc! {"_id": {"_data": "82"}, "operationType": "insert",
         "ns": {"db": "app", "coll": "users"}, "fullDocument": d.clone(),
         "documentKey": {"_id": 5_i64}};
@@ -647,7 +800,53 @@ mod tests {
         assert_eq!(r.key, live.key);
         assert_eq!((r.schema.as_str(), r.table.as_str()), ("app", "users"));
         assert_eq!(r.commit_ts_micros, 9);
-        assert!(read_row("app", "users", &doc! {"n": 1}, 0).is_err());
+        assert!(read_row("app", "users", &doc! {"n": 1}, &[], 0).is_err());
+    }
+
+    #[test]
+    fn sharded_document_keys_follow_the_shard_key() {
+        let d = doc! {"_id": 5, "region": "eu", "a": {"b": 2}, "n": 1};
+        let key = |k: &[&str]| {
+            let k: Vec<String> = k.iter().map(|s| s.to_string()).collect();
+            Bson::Document(document_key(&d, &k).unwrap())
+                .into_relaxed_extjson()
+                .to_string()
+        };
+        assert_eq!(key(&[]), r#"{"_id":5}"#);
+        assert_eq!(key(&["region"]), r#"{"region":"eu","_id":5}"#);
+        assert_eq!(key(&["a.b", "_id"]), r#"{"a.b":2,"_id":5}"#);
+        assert_eq!(key(&["missing", "region"]), r#"{"region":"eu","_id":5}"#);
+        let r = read_row("app", "u", &d, &["region".to_string()], 0).unwrap();
+        assert_eq!(r.key.as_deref(), Some(r#"{"region":"eu","_id":5}"#));
+    }
+
+    #[test]
+    fn failing_chunks_retry_then_skip_the_collection() {
+        let mut e = Engine::new(state(&["app.users", "app.orders"]), &catalog(), 10, None).unwrap();
+        e.state.after = Some(vec!["7".into()]);
+        for _ in 1..MAX_CHUNK_FAILURES {
+            e.next_chunk += 1;
+            assert_eq!(e.chunk_failed("boom").0, Failure::Retry);
+            assert!(!e.due(), "pauses before the next attempt");
+        }
+        e.next_chunk += 1;
+        let (f, ids) = e.chunk_failed("boom");
+        let Failure::Skipped { state: Some(st) } = f else {
+            panic!("expected a skip, got {f:?}");
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            (st.tables.clone(), st.table, st.after),
+            (vec!["app.orders".to_string()], 0, None)
+        );
+        let status = e.status("running");
+        assert_eq!(status.skipped[0].table, "app.users");
+        assert!(status.skipped[0].reason.contains("boom"));
+        for _ in 0..MAX_CHUNK_FAILURES {
+            e.next_chunk += 1;
+            e.chunk_failed("again");
+        }
+        assert!(e.state().tables.is_empty());
     }
 
     #[test]

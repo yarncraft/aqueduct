@@ -447,22 +447,34 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 - **Watermarks:** around each chunk Aqueduct inserts two small documents into `<database>.aqueduct_watermarks`
   (`_id` `"<snapshot id>:<chunk>:low|high"`, field `at`), which the change stream sees like any write. The source
   recognises them and never forwards them, deletes each pair when its chunk closes and the rest when the snapshot
-  ends, and a TTL index `aqueduct_ttl` (24 h on `at`) removes any a crash leaves behind. The role needs `insert`,
-  `remove` and `createIndex` on that collection, and startup fails with a clear error without them. Chunk numbers
-  start at a random value, so documents another client inserts there cannot close a chunk early.
+  ends, and a TTL index `aqueduct_ttl` (24 h on `at`) removes any a crash leaves behind (an existing TTL index on
+  `{at: 1}` under another name is used instead; any other index on `{at: 1}` fails startup as a conflict). The role
+  needs `insert`, `remove` and `createIndex` on that collection, and startup fails with a clear error without them.
+  Chunk numbers start at a random value, so documents another client inserts there cannot close a chunk early.
 - **Consistency:** the watermarks are written with `w: majority` and the chunk is read on the primary with
   `readConcern: majority`, in one causally consistent session, so the read sees everything up to the low watermark
   and finishes before the high one is written. Any change the read may have missed is then a live event between the
-  two, and it replaces the chunk's copy of that document.
+  two, and it replaces the chunk's copy of that document. Startup runs such a read once, so a deployment that
+  refuses it (for example a primary-secondary-arbiter set on MongoDB 4.4 or older with majority reads off) fails
+  there.
+- **Failures:** a watermark write waits at most 30 s for a majority and a chunk read at most 60 s. A chunk the server
+  refuses or that times out is read again after 2 s, then 4 s; on the third failure in a row the collection is
+  skipped (`skipped` in the status, reason `chunk read failed: ...`, and a WARN) and the snapshot goes on with the
+  next one, while live changes keep flowing. Connection errors still stop the source, as for live reads.
 - **Chunks** follow the `_id` index (`hint({_id: 1})` with `min` set to the last `_id` read, skipping that document),
   so collections whose `_id`s mix BSON types (numbers, strings, ObjectIds, ...) are copied whole, in MongoDB's
   cross-type sort order. A `{_id: {$gt: ...}}` query would stop at the first type.
 - **Rows** are encoded exactly like a live `insert` of the same document (same `after`, same Kafka key from the
-  `documentKey`). On a sharded collection the live `documentKey` also holds the shard key, so with
-  `partition_by = "key"` a `read` row may land on another partition than the document's later changes.
+  `documentKey`). Through `mongos`, a sharded collection's `documentKey` holds the shard key fields and then `_id`;
+  Aqueduct reads the shard key from `config.collections` (needs `find` on it) and builds the same key. If it cannot
+  read it, it logs a warning, and `read` rows of sharded collections are keyed by `_id` alone, so with
+  `partition_by = "key"` they may land on another partition than the document's later changes. Sharded clusters are
+  not covered by Aqueduct's tests.
 - **In the window:** an insert, update, replace or delete of a document in the chunk drops the chunk's copy of it; a
-  drop or rename of the collection (or a dropped database) drops the whole chunk; a change without a `documentKey._id`
-  makes the chunk be read again.
+  drop or rename of the collection, a rename of another collection onto it, or a dropped database drops the whole
+  chunk; a change without a `documentKey._id` makes the chunk be read again. With a `collections` list, the change
+  stream also asks for renames into a watched collection and `dropDatabase` for this (neither is forwarded).
+- **Admin requests** while a cancelled snapshot finishes its last chunk get `409` ("try again in a moment").
 - **Checkpoint:** while a snapshot runs, the checkpoint file holds `{"pos": <resume token>, "snap": {...}}`; the last
   `_id` is kept as canonical extended JSON, so its BSON type survives a restart.
 

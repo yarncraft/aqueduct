@@ -1,8 +1,8 @@
 use crate::config::{MongoConfig, SnapshotMode};
 use crate::mapping::{map_event, Mapped};
 use crate::snapshot::{
-    new_snapshot_id, table_id, window_key, Catalog, Closed, Engine, Live, Watermark, TTL_INDEX,
-    WATERMARK_COLLECTION, WATERMARK_TTL,
+    new_snapshot_id, table_id, window_key, Catalog, ChunkError, Closed, Engine, Failure, Live,
+    Watermark, TTL_INDEX, WATERMARK_COLLECTION, WATERMARK_TTL,
 };
 use aqueduct_core::{ChangeEvent, Error, Metrics, Op, Position, Result, Source};
 use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, SnapshotStatus};
@@ -11,7 +11,10 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Bson, DateTime, Document};
 use mongodb::change_stream::event::ResumeToken;
 use mongodb::change_stream::ChangeStream;
-use mongodb::options::{FullDocumentBeforeChangeType, FullDocumentType, IndexOptions};
+use mongodb::options::{
+    FullDocumentBeforeChangeType, FullDocumentType, Hint, IndexOptions, ReadConcern,
+    ReadPreference, SelectionCriteria,
+};
 use mongodb::{Client, IndexModel};
 use serde_json::value::to_raw_value;
 use serde_json::{Map, Value};
@@ -223,10 +226,15 @@ impl MongoSource {
             return Err(format!("cannot snapshot: {}", refused.join(", ")));
         }
         if let Some(e) = self.snapshot.as_mut() {
-            if !e.cancelled() {
-                e.append(tables, &catalog);
-                return Ok(e.id().to_owned());
+            // A cancelled snapshot still exists only while its last chunk is in flight.
+            if e.cancelled() {
+                return Err(
+                    "a cancelled snapshot is finishing its last chunk; try again in a moment"
+                        .into(),
+                );
             }
+            e.append(tables, &catalog);
+            return Ok(e.id().to_owned());
         }
         let id = new_snapshot_id();
         let state = SnapState {
@@ -263,6 +271,27 @@ impl MongoSource {
             self.queue_progress();
         }
         Ok(id)
+    }
+
+    /// A chunk read the server refused: retried, or after several failures its collection is
+    /// skipped and the new progress saved.
+    fn chunk_failed(&mut self, why: &str) {
+        let Some(e) = self.snapshot.as_mut() else {
+            return;
+        };
+        let (failure, watermarks) = e.chunk_failed(why);
+        self.cleanup.push(Cleanup::Ids(watermarks));
+        match failure {
+            Failure::Retry => {}
+            Failure::Skipped { state: Some(_) } => {
+                self.queue_progress();
+                self.publish_status();
+            }
+            Failure::Skipped { state: None } => {
+                self.end_snapshot();
+                self.queue_progress();
+            }
+        }
     }
 
     /// Forgets the running snapshot, keeping its final status for the admin API.
@@ -445,12 +474,33 @@ impl MongoSource {
                     .build(),
             )
             .build();
-        coll.create_index(ttl).await.map_err(hint)?;
+        if let Err(e) = coll.create_index(ttl).await {
+            accept_existing_ttl(&coll, e, cfg).await?;
+        }
         let probe = format!("probe:{}", new_snapshot_id());
         coll.insert_one(doc! {"_id": &probe, "at": DateTime::now()})
             .await
             .map_err(hint)?;
         coll.delete_one(doc! {"_id": &probe}).await.map_err(hint)?;
+        // The chunk read's shape, on this collection: a server that refuses it (no majority read
+        // concern on an old PSA set, `min` refused) fails here, not in a crash loop later.
+        let read = async {
+            let mut cursor = coll
+                .find(doc! {})
+                .hint(Hint::Keys(doc! {"_id": 1}))
+                .min(doc! {"_id": ""})
+                .limit(1)
+                .read_concern(ReadConcern::majority())
+                .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+                .await?;
+            cursor.try_next().await
+        };
+        read.await.map_err(|e| {
+            Error::Config(format!(
+                "snapshots read chunks with hint({{_id: 1}}), min and readConcern \"majority\" on \
+                 the primary, and this deployment refuses that: {e}. Set source.snapshot = \"never\""
+            ))
+        })?;
         Ok(())
     }
 
@@ -529,7 +579,25 @@ async fn load_catalog(client: Client, cfg: &MongoConfig, tables: &[String]) -> R
             })
             .collect(),
         estimates: Default::default(),
+        shard_keys: Default::default(),
     };
+    // Through mongos, live documentKeys carry the shard key: read it so `read` rows match.
+    let mongos = db
+        .run_command(doc! {"hello": 1})
+        .await
+        .ok()
+        .is_some_and(|h| h.get_str("msg") == Ok("isdbgrid"));
+    if mongos {
+        match shard_keys(&client, &cfg.database).await {
+            Ok(k) => cat.shard_keys = k,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "cannot read config.collections; snapshot rows of sharded collections are keyed by \
+                 _id alone and, with partition_by = \"key\", may land on another partition than \
+                 their live changes"
+            ),
+        }
+    }
     for t in tables {
         if let Ok(coll) = cat.check(t) {
             // Telemetry only: a failure leaves the estimate unknown.
@@ -543,6 +611,77 @@ async fn load_catalog(client: Client, cfg: &MongoConfig, tables: &[String]) -> R
         }
     }
     Ok(cat)
+}
+
+/// Shard key field names, in key order, of the database's sharded collections.
+async fn shard_keys(
+    client: &Client,
+    database: &str,
+) -> mongodb::error::Result<std::collections::HashMap<String, Vec<String>>> {
+    let prefix = format!("{database}.");
+    let docs: Vec<Document> = client
+        .database("config")
+        .collection::<Document>("collections")
+        .find(doc! {"_id": {"$regex": format!("^{database}\\.")}})
+        .await?
+        .try_collect()
+        .await?;
+    Ok(docs
+        .into_iter()
+        .filter(|d| !d.get_bool("dropped").unwrap_or(false))
+        .filter_map(|d| {
+            let coll = d.get_str("_id").ok()?.strip_prefix(&prefix)?.to_owned();
+            let key = d.get_document("key").ok()?.keys().cloned().collect();
+            Some((coll, key))
+        })
+        .collect())
+}
+
+/// `create_index` of the TTL index failed. An index of the same name or on `{at: 1}` that already
+/// expires documents is fine (an older Aqueduct or an operator made it); any other conflict is
+/// reported as such, not as a missing privilege.
+async fn accept_existing_ttl(
+    coll: &mongodb::Collection<Document>,
+    e: mongodb::error::Error,
+    cfg: &MongoConfig,
+) -> Result<()> {
+    let code = match *e.kind {
+        mongodb::error::ErrorKind::Command(ref c) => Some(c.code),
+        _ => None,
+    };
+    if !matches!(code, Some(85 | 86)) {
+        return Err(Error::Config(format!(
+            "source.snapshot = {:?} writes watermarks into {}.{WATERMARK_COLLECTION}, which needs \
+             the insert, remove and createIndex privileges on that collection: {e}. Grant them, \
+             or set source.snapshot = \"never\"",
+            cfg.snapshot, cfg.database
+        )));
+    }
+    let indexes: Vec<IndexModel> = coll
+        .list_indexes()
+        .await
+        .map_err(src_err)?
+        .try_collect()
+        .await
+        .map_err(src_err)?;
+    let ttl = indexes.iter().find(|i| {
+        i.keys == doc! {"at": 1} && i.options.as_ref().is_some_and(|o| o.expire_after.is_some())
+    });
+    match ttl {
+        Some(i) => {
+            tracing::info!(
+                index = ?i.options.as_ref().and_then(|o| o.name.clone()),
+                "using the existing TTL index of the watermark collection"
+            );
+            Ok(())
+        }
+        None => Err(Error::Config(format!(
+            "{}.{WATERMARK_COLLECTION} has an index that conflicts with Aqueduct's TTL index \
+             {TTL_INDEX:?} ({{at: 1}}, expireAfterSeconds): {e}. Drop that index, or make it a TTL \
+             index on {{at: 1}}",
+            cfg.database
+        ))),
+    }
 }
 
 fn src_err<E: std::fmt::Display>(e: E) -> Error {
@@ -634,7 +773,17 @@ impl Source for MongoSource {
             if self.cfg.snapshot != SnapshotMode::Never {
                 colls.push(WATERMARK_COLLECTION.to_owned());
             }
-            pipeline.push(doc! {"$match": {"ns.coll": {"$in": colls}}});
+            if self.cfg.snapshot == SnapshotMode::Never {
+                pipeline.push(doc! {"$match": {"ns.coll": {"$in": colls}}});
+            } else {
+                // A rename into a watched collection and a dropped database void a snapshot
+                // chunk, so they must reach the source (neither is forwarded).
+                pipeline.push(doc! {"$match": {"$or": [
+                    {"ns.coll": {"$in": colls}},
+                    {"to.coll": {"$in": self.cfg.collections.clone()}},
+                    {"operationType": "dropDatabase"},
+                ]}});
+            }
         }
         let mut watch = db
             .watch()
@@ -676,10 +825,19 @@ impl Source for MongoSource {
             }
             // The next chunk starts only when everything before it is handed on, so memory stays
             // at one chunk.
+            let mut failed = None;
             if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_ref()) {
                 if e.due() {
-                    e.start_chunk(c).await?;
+                    match e.start_chunk(c).await {
+                        Ok(()) => {}
+                        Err(ChunkError::Fatal(err)) => return Err(err),
+                        Err(ChunkError::Failed(why)) => failed = Some(why),
+                    }
                 }
+            }
+            if let Some(why) = failed {
+                self.chunk_failed(&why);
+                continue;
             }
             let stream = self
                 .stream
@@ -852,7 +1010,8 @@ mod tests {
         let before = src.snapshot.as_ref().unwrap().state().clone();
         let mut after = before.clone();
         after.after = Some(vec!["2".into()]);
-        let row = |k: &str| crate::snapshot::read_row("app", "u", &doc! {"_id": k}, 0).unwrap();
+        let row =
+            |k: &str| crate::snapshot::read_row("app", "u", &doc! {"_id": k}, &[], 0).unwrap();
         src.queue_closed(
             Closed {
                 rows: vec![row("1"), row("2")],
