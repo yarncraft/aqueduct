@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{Metrics, Snapshot, State};
+use aqueduct_core::{Metrics, Snapshot, State, OP_SLOTS};
 use aqueduct_sinks::KafkaInspector;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,8 +59,8 @@ pub struct Admin {
     token: Option<String>,
     /// Events/second, one sample per second, oldest first.
     history: Mutex<VecDeque<f64>>,
-    /// Per table `[insert, update, delete, truncate]` events/second, aligned with `history`.
-    detail: Mutex<BTreeMap<String, VecDeque<[u64; 4]>>>,
+    /// Per table `[insert, update, delete, truncate, read]` events/second, aligned with `history`.
+    detail: Mutex<BTreeMap<String, VecDeque<[u64; OP_SLOTS]>>>,
     streams: AtomicUsize,
     inspector: Option<KafkaInspector>,
     inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
@@ -87,40 +87,48 @@ impl Admin {
     pub async fn sample_forever(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last = self.metrics.events_total();
-        let mut last_ops: BTreeMap<String, [u64; 4]> = BTreeMap::new();
+        let mut last_ops: BTreeMap<String, [u64; OP_SLOTS]> = BTreeMap::new();
         loop {
             tick.tick().await;
             let now = self.metrics.events_total();
             let ops = self.metrics.snapshot().table_ops;
-            {
-                let mut h = lock(&self.history);
-                if h.len() == HISTORY_LEN {
-                    h.pop_front();
-                }
-                h.push_back(now.saturating_sub(last) as f64);
-                let len = h.len();
-                let mut d = lock(&self.detail);
-                for (t, c) in &ops {
-                    let prev = last_ops.get(t).copied().unwrap_or_default();
-                    let mut delta = [0u64; 4];
-                    for i in 0..4 {
-                        delta[i] = c[i].saturating_sub(prev[i]);
-                    }
-                    let series = d.entry(t.clone()).or_default();
-                    // A table seen for the first time is zero-filled back to the window start.
-                    while series.len() + 1 < len {
-                        series.push_back([0; 4]);
-                    }
-                    series.push_back(delta);
-                }
-                for series in d.values_mut() {
-                    while series.len() > HISTORY_LEN {
-                        series.pop_front();
-                    }
-                }
-            }
+            self.record_sample(now.saturating_sub(last) as f64, &ops, &last_ops);
             last_ops = ops;
             last = now;
+        }
+    }
+
+    /// Adds one second's sample: the total rate and the per-table per-op deltas since `last_ops`.
+    fn record_sample(
+        &self,
+        rate: f64,
+        ops: &BTreeMap<String, [u64; OP_SLOTS]>,
+        last_ops: &BTreeMap<String, [u64; OP_SLOTS]>,
+    ) {
+        let mut h = lock(&self.history);
+        if h.len() == HISTORY_LEN {
+            h.pop_front();
+        }
+        h.push_back(rate);
+        let len = h.len();
+        let mut d = lock(&self.detail);
+        for (t, c) in ops {
+            let prev = last_ops.get(t).copied().unwrap_or_default();
+            let mut delta = [0u64; OP_SLOTS];
+            for (i, slot) in delta.iter_mut().enumerate() {
+                *slot = c[i].saturating_sub(prev[i]);
+            }
+            let series = d.entry(t.clone()).or_default();
+            // A table seen for the first time is zero-filled back to the window start.
+            while series.len() + 1 < len {
+                series.push_back([0; OP_SLOTS]);
+            }
+            series.push_back(delta);
+        }
+        for series in d.values_mut() {
+            while series.len() > HISTORY_LEN {
+                series.pop_front();
+            }
         }
     }
 
@@ -227,6 +235,7 @@ fn prometheus(s: &Snapshot) -> String {
         ("update", s.updates),
         ("delete", s.deletes),
         ("truncate", s.truncates),
+        ("read", s.reads),
     ] {
         let _ = writeln!(o, "aqueduct_events_total{{op=\"{op}\"}} {n}");
     }
@@ -507,6 +516,21 @@ pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_carries_every_op_slot_including_reads() {
+        let admin = Admin::new(Arc::new(Metrics::new()), None, None);
+        let mut ops = BTreeMap::new();
+        ops.insert("public.t".to_string(), [3, 2, 1, 4, 5]);
+        admin.record_sample(15.0, &ops, &BTreeMap::new());
+        // The second tick sees only the increase since the first.
+        let mut next = ops.clone();
+        next.insert("public.t".to_string(), [4, 2, 1, 4, 9]);
+        admin.record_sample(5.0, &next, &ops);
+        let d = lock(&admin.detail);
+        let series: Vec<_> = d["public.t"].iter().copied().collect();
+        assert_eq!(series, vec![[3, 2, 1, 4, 5], [1, 0, 0, 0, 4]]);
+    }
 
     /// Every element the dashboard script looks up by id must exist in the HTML,
     /// otherwise the script throws on load and every handler after it is dead.

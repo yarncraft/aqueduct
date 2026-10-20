@@ -91,8 +91,65 @@ pub enum Message {
     Truncate {
         relations: Vec<u32>,
     },
-    /// Origin / Type / logical messages: nothing we emit.
+    /// A logical decoding message (`pg_logical_emit_message`). Only sent when the peek asks for
+    /// `messages`. `lsn` is the message's own position.
+    Logical(Logical),
+    /// Origin / Type messages: nothing we emit.
     Ignored,
+}
+
+/// The prefix of the messages Aqueduct emits into its own stream (snapshot watermarks).
+pub const WATERMARK_PREFIX: &str = "aqueduct";
+
+/// A decoded `M` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Logical {
+    /// Emitted inside a transaction, so it is decoded in commit order with the data.
+    pub transactional: bool,
+    pub lsn: u64,
+    pub prefix: String,
+    pub content: Vec<u8>,
+}
+
+/// Which end of a snapshot chunk a watermark marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Low,
+    High,
+}
+
+/// A snapshot watermark: `pg_logical_emit_message(true, 'aqueduct', '{"slot":..,"snapshot_id":..,"chunk":..,"mark":..}')`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watermark {
+    pub slot: String,
+    pub snapshot_id: String,
+    pub chunk: u64,
+    pub mark: Mark,
+}
+
+impl Logical {
+    /// The watermark this message carries for `slot`. `None` for any other prefix, for another
+    /// slot's watermark (several Aqueduct instances can share a database), for a payload that is
+    /// not a watermark, and for a non-transactional message: watermarks must arrive in commit order.
+    pub fn watermark_for(&self, slot: &str) -> Option<Watermark> {
+        if !self.transactional || self.prefix != WATERMARK_PREFIX {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_slice(&self.content).ok()?;
+        if v.get("slot")?.as_str()? != slot {
+            return None;
+        }
+        Some(Watermark {
+            slot: slot.to_owned(),
+            snapshot_id: v.get("snapshot_id")?.as_str()?.to_owned(),
+            chunk: v.get("chunk")?.as_u64()?,
+            mark: match v.get("mark")?.as_str()? {
+                "low" => Mark::Low,
+                "high" => Mark::High,
+                _ => return None,
+            },
+        })
+    }
 }
 
 /// Microseconds between the Unix epoch and the Postgres epoch (2000-01-01).
@@ -265,7 +322,20 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             }
             Message::Truncate { relations }
         }
-        b'O' | b'Y' | b'M' => Message::Ignored,
+        b'M' => {
+            // Protocol v1 has no xid here; it only exists for streamed transactions (v2+).
+            let flags = r.u8()?;
+            let lsn = r.u64()?;
+            let prefix = r.cstr()?;
+            let len = r.count32()?;
+            Message::Logical(Logical {
+                transactional: flags & 1 == 1,
+                lsn,
+                prefix,
+                content: r.take(len)?.to_vec(),
+            })
+        }
+        b'O' | b'Y' => Message::Ignored,
         other => return Err(DecodeError::UnknownTag(other)),
     })
 }
@@ -770,5 +840,115 @@ mod tests {
                 assert!(decode(&full[..cut]).is_err(), "cut at {cut}");
             }
         }
+    }
+
+    fn logical_bytes(flags: u8, lsn: u64, prefix: &str, content: &[u8]) -> Vec<u8> {
+        let mut b = vec![b'M', flags];
+        b.extend(lsn.to_be_bytes());
+        b.extend(prefix.as_bytes());
+        b.push(0);
+        b.extend((content.len() as i32).to_be_bytes());
+        b.extend(content);
+        b
+    }
+
+    fn logical(flags: u8, prefix: &str, content: &str) -> Logical {
+        match decode(&logical_bytes(
+            flags,
+            0x016B_37A8,
+            prefix,
+            content.as_bytes(),
+        ))
+        .unwrap()
+        {
+            Message::Logical(l) => l,
+            other => panic!("not a logical message: {other:?}"),
+        }
+    }
+
+    const LOW: &str = r#"{"slot":"s1","snapshot_id":"snap-7","chunk":3,"mark":"low"}"#;
+
+    #[test]
+    fn transactional_message_is_decoded() {
+        let l = logical(1, "aqueduct", LOW);
+        assert!(l.transactional);
+        assert_eq!(l.lsn, 0x016B_37A8);
+        assert_eq!(l.prefix, "aqueduct");
+        assert_eq!(l.content, LOW.as_bytes());
+        assert_eq!(
+            l.watermark_for("s1"),
+            Some(Watermark {
+                slot: "s1".into(),
+                snapshot_id: "snap-7".into(),
+                chunk: 3,
+                mark: Mark::Low
+            })
+        );
+    }
+
+    #[test]
+    fn high_mark_is_decoded() {
+        let l = logical(
+            1,
+            "aqueduct",
+            r#"{"slot":"s1","snapshot_id":"x","chunk":0,"mark":"high"}"#,
+        );
+        assert_eq!(l.watermark_for("s1").map(|w| w.mark), Some(Mark::High));
+    }
+
+    #[test]
+    fn non_transactional_message_is_decoded_but_is_not_a_watermark() {
+        let l = logical(0, "aqueduct", LOW);
+        assert!(!l.transactional);
+        assert_eq!(l.watermark_for("s1"), None);
+    }
+
+    #[test]
+    fn foreign_prefix_is_not_a_watermark() {
+        assert_eq!(logical(1, "wal2json", LOW).watermark_for("s1"), None);
+        assert_eq!(logical(1, "aqueduct2", LOW).watermark_for("s1"), None);
+    }
+
+    #[test]
+    fn foreign_slot_is_not_a_watermark() {
+        assert_eq!(logical(1, "aqueduct", LOW).watermark_for("other"), None);
+    }
+
+    #[test]
+    fn malformed_payloads_are_not_watermarks() {
+        for body in [
+            "",
+            "not json",
+            "{}",
+            r#"{"slot":"s1","snapshot_id":"x","chunk":-1,"mark":"low"}"#,
+            r#"{"slot":"s1","snapshot_id":"x","chunk":1,"mark":"middle"}"#,
+            r#"{"slot":"s1","snapshot_id":7,"chunk":1,"mark":"low"}"#,
+        ] {
+            assert_eq!(
+                logical(1, "aqueduct", body).watermark_for("s1"),
+                None,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_or_oversized_message_is_an_error() {
+        let full = logical_bytes(1, 1, "aqueduct", LOW.as_bytes());
+        for n in 1..full.len() {
+            assert!(decode(&full[..n]).is_err(), "{n} bytes");
+        }
+        let mut b = logical_bytes(1, 1, "aqueduct", b"");
+        let at = b.len() - 4;
+        b[at..].copy_from_slice(&i32::MAX.to_be_bytes());
+        assert_eq!(decode(&b), Err(DecodeError::Eof));
+        b[at..].copy_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(decode(&b), Err(DecodeError::NegativeLength(-1)));
+    }
+
+    #[test]
+    fn origin_and_type_messages_are_still_ignored() {
+        assert_eq!(decode(b"O"), Ok(Message::Ignored));
+        assert_eq!(decode(b"Y"), Ok(Message::Ignored));
     }
 }

@@ -252,6 +252,7 @@ fn op_name(op: Op) -> &'static str {
         Op::Update => "update",
         Op::Delete => "delete",
         Op::Truncate => "truncate",
+        Op::Read => "read",
         Op::Heartbeat => "heartbeat",
     }
 }
@@ -1128,6 +1129,7 @@ mod tests {
             before: before.and_then(|s| RawValue::from_string(s.into()).ok()),
             after: after.and_then(|s| RawValue::from_string(s.into()).ok()),
             key: None,
+            checkpoint: None,
         }
     }
 

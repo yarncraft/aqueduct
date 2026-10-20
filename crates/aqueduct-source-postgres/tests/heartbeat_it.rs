@@ -276,7 +276,13 @@ async fn heartbeat_never_confirms_past_an_unacked_event() {
     }
 
     // After the ack the slot is free to move on.
-    s.ack(ev.position.clone()).await.unwrap();
+    s.ack(
+        ev.checkpoint
+            .clone()
+            .expect("postgres events carry a checkpoint"),
+    )
+    .await
+    .unwrap();
     let target = f.wal().await;
     f.drive_until_confirmed(&mut s, target).await;
     f.cleanup(s).await;
@@ -409,7 +415,12 @@ async fn capped_replay_window_does_not_skip_later_rows() {
         );
     }
     // Pretend the checkpoint for the last old event was saved just before a crash.
-    let checkpoint = lsn(&last_old.unwrap());
+    let last_old = last_old.unwrap();
+    let checkpoint = lsn(&last_old);
+    let checkpoint_key = last_old
+        .checkpoint
+        .clone()
+        .expect("postgres events carry a checkpoint");
     drop(first);
     let behind = f.confirmed().await;
     assert!(
@@ -423,7 +434,7 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     // Restart with the checkpoint ahead of the slot. With 3 rows per transaction and
     // `batch_size = 4`, one peek covers about one transaction, so the window spans many peeks.
     let mut s = f.source_capped(4);
-    s.start(Some(Position::Lsn(checkpoint))).await.unwrap();
+    s.start(Some(checkpoint_key)).await.unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let ev = loop {
@@ -456,7 +467,13 @@ async fn capped_replay_window_does_not_skip_later_rows() {
     );
 
     // After the ack the slot moves past the delivered row and catches up to the end of the WAL.
-    s.ack(ev.position.clone()).await.unwrap();
+    s.ack(
+        ev.checkpoint
+            .clone()
+            .expect("postgres events carry a checkpoint"),
+    )
+    .await
+    .unwrap();
     f.drive_until_confirmed(&mut s, lsn(&ev) + 1).await;
     let target = f.wal().await;
     f.drive_until_confirmed(&mut s, target).await;

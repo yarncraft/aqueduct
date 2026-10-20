@@ -156,6 +156,7 @@ async fn main() {
             to_raw_value(&serde_json::json!({"id": 1, "data": "x".repeat(payload)})).unwrap(),
         ),
         key: None,
+        checkpoint: None,
     };
     let profile = arg("--profile").unwrap_or_else(|| "simple".into());
     let pool = if profile == "industrial" {

@@ -51,6 +51,9 @@ pub enum Op {
     Update,
     Delete,
     Truncate,
+    /// A row read by a snapshot, not a change. `before` is null and `after` is the full row; it
+    /// reaches consumers as `"read"` in the JSON and in the Kafka `op` header (ADR 0001).
+    Read,
     /// Carries only a position, no row. A source emits it to move the checkpoint while it
     /// has nothing to deliver (idle or filtered stream). The pipeline checkpoints it but
     /// never hands it to a sink or counts it in metrics.
@@ -70,6 +73,7 @@ impl ChangeEvent {
             before: None,
             after: None,
             key: None,
+            checkpoint: None,
         }
     }
 }
@@ -99,4 +103,55 @@ pub struct ChangeEvent {
     /// and unchanged-TOAST key columns.
     #[serde(skip)]
     pub key: Option<String>,
+    /// What the pipeline saves and acks after delivering this event, when it differs from
+    /// `position`. A source whose `position` is not unique or not ordered across the stream
+    /// (Postgres: change LSNs are not commit-ordered) puts its resume key here. Not serialised.
+    #[serde(skip)]
+    pub checkpoint: Option<Position>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(op: Op) -> ChangeEvent {
+        ChangeEvent {
+            position: Position::Lsn(42),
+            xid: 7,
+            commit_ts_micros: 1_700_000_000_000_000,
+            schema: "public".into(),
+            table: "t".into(),
+            op,
+            before: None,
+            after: RawValue::from_string(r#"{"id":1}"#.into()).ok(),
+            key: Some("1".into()),
+            checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn existing_ops_serialise_exactly_as_before() {
+        // Pinned wire format: adding `Read` must not change a byte of the others.
+        for (op, name) in [
+            (Op::Insert, "insert"),
+            (Op::Update, "update"),
+            (Op::Delete, "delete"),
+            (Op::Truncate, "truncate"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&event(op)).unwrap(),
+                format!(
+                    r#"{{"lsn":42,"xid":7,"commit_ts_micros":1700000000000000,"schema":"public","table":"t","op":"{name}","before":null,"after":{{"id":1}}}}"#
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn read_is_serialised_as_read_and_round_trips() {
+        let json = serde_json::to_string(&event(Op::Read)).unwrap();
+        assert!(json.contains(r#""op":"read""#), "{json}");
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.op, Op::Read);
+    }
 }

@@ -9,10 +9,12 @@
 mod event;
 mod metrics;
 mod pipeline;
+mod snapshot;
 
 pub use event::{ChangeEvent, Op, Position};
-pub use metrics::{HeartbeatSnapshot, Metrics, Snapshot, State};
+pub use metrics::{HeartbeatSnapshot, Metrics, Snapshot, State, OP_SLOTS};
 pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,
     MAX_BATCH,
 };
+pub use snapshot::{Checkpoint, ChunkId, ChunkRow, Mark, Outcome, SnapState, Window, WindowError};

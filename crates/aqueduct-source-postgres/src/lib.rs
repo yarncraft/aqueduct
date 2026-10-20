@@ -5,6 +5,7 @@
 //! implements [`aqueduct_core::Source`].
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod catalog;
 pub mod decoder;
 pub mod replication;
 mod source;

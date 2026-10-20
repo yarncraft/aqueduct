@@ -18,6 +18,7 @@ fn ev(n: u64, table: &str) -> ChangeEvent {
         before: None,
         after: Some(to_raw_value(&serde_json::json!({ "n": n })).unwrap()),
         key: None,
+        checkpoint: None,
     }
 }
 

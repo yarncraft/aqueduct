@@ -23,6 +23,7 @@ Chaos scenarios that exercise the cases below live in `scripts/chaos/` (`scripts
 | State volume full | Checkpoint or file-sink write fails, pipeline stops without acknowledging; slot is not advanced | Free space; the process recovers on its own |
 | Checkpoint file deleted | Slot position is authoritative; replay limited to un-advanced transactions | None |
 | Checkpoint file corrupt (unparseable) | Startup fails with a checkpoint error, crash loop | Delete the file (replay from slot) and restart |
+| Rolled back to a version older than the commit-order key (#94): the older binary refuses the new checkpoint (`not a Postgres LSN`) and crash-loops | Startup fails with a checkpoint error | Delete the checkpoint file (section "Corrupt checkpoint") and accept a replay from the slot |
 | Replication slot dropped, checkpoint present | With the `feat/hardening` guard: refuses to start. Without it: a new slot is created from "now" and the gap is silent | Section 4 |
 | Two instances on one slot | Both poll and advance; events split or duplicated | Never do this; one instance per slot |
 
@@ -107,7 +108,7 @@ re-syncing consumers from the database, then starting a fresh stream.
 - Procedure after an unsynced failover:
   1. Keep Aqueduct stopped (the guard refuses to start without the slot, which is what you want).
   2. Promote, point `AQUEDUCT_PG_URL` at the new primary. Confirm the publication exists (publications replicate physically).
-  3. Decide the recovery point: last delivered change = the value in the checkpoint file (`cat /var/lib/aqueduct/checkpoint`, decimal LSN) or the newest event at the sink.
+  3. Decide the recovery point: last delivered change = the value in the checkpoint file (`cat /var/lib/aqueduct/checkpoint`, `<commit>@<change>#<ord>`, decimal LSNs; older versions wrote a plain LSN) or the newest event at the sink.
   4. Re-sync consumers for rows changed since then (`updated_at > ...` backfill, or full table reload), then reset the slot (section 2) and start.
   5. Make consumers idempotent on key during the overlap.
 

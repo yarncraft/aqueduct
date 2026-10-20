@@ -133,6 +133,7 @@ fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
         before: raw(before)?,
         after: raw(after)?,
         key: ev.get("documentKey").map(Value::to_string),
+        checkpoint: None,
     }))
 }
 
