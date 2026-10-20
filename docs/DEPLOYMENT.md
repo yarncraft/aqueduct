@@ -416,7 +416,9 @@ The card shows, per table (or collection) that has delivered events since the pr
 | Delivered | How long ago the sink acknowledged it |
 | Kafka HWM | Sum over the topic's partitions of the next offset Kafka will assign; click the row for each partition. A topic several tables share shows `×N` and the whole topic's offsets |
 
-The header shows the last checkpointed position, which is global, not per table. Pipeline numbers refresh every second
+The header shows the last checkpointed position, which is global, not per table. While a snapshot runs it is the
+stream position followed by `(snapshot: <table> <i>/<n>)`; the snapshot cursor (the last chunk's primary-key values)
+stays in the checkpoint file and is never shown. Pipeline numbers refresh every second
 with the stream. Kafka offsets come from `GET /api/tables`, polled every 5 s: one offsets request per partition of
 the routed topics (no records are read), with the inspector's connection and TLS/SASL settings, shared across tabs
 for 5 s and abandoned after 3 s, so a Kafka outage leaves the column empty (the reason is in the card header and the

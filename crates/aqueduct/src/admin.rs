@@ -1562,6 +1562,37 @@ Authorization: Bearer {token}
     }
 
     #[tokio::test]
+    async fn the_snapshot_cursor_is_never_shown_as_the_checkpoint() {
+        use aqueduct_core::{Checkpoint, Position, SnapState};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let admin = Admin::new(metrics.clone(), Some("k".into()), None);
+        admin.set_router(router());
+        let ckpt = Checkpoint {
+            pos: "16/B374D848@16/B374D8E0#2;db=5".into(),
+            snap: Some(SnapState {
+                id: "s1".into(),
+                tables: vec!["public.users".into(), "public.orders".into()],
+                table: 1,
+                after: Some(vec!["ada@example.com".into()]),
+            }),
+        };
+        metrics.record_checkpoint(&Position::Text(ckpt.encode()));
+        tokio::spawn(serve(listener, admin));
+        let want = "16/B374D848@16/B374D8E0#2;db=5 (snapshot: public.orders 2/2)";
+        for path in ["/api/tables", "/api/metrics"] {
+            let r = get_bearer(addr, path, "k").await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+            assert!(
+                !r.contains("ada@example.com"),
+                "{path} leaks the cursor: {r}"
+            );
+            assert_eq!(json_body(&r)["checkpoint"], want, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn tables_api_needs_the_token_and_lists_marks_without_kafka() {
         let addr = start_tables(None).await;
         assert!(get(addr, "/api/tables").await.starts_with("HTTP/1.1 401"));
