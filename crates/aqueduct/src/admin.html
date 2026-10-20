@@ -400,7 +400,12 @@ let paused = false;
 let openId = null;
 
 const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
-const rel = e => (e.event.schema || '?') + '.' + (e.event.table || '?');
+// Events use Debezium's envelope: op letters, and the table and position in `source`.
+const OP_NAME = { c: 'insert', u: 'update', d: 'delete', t: 'truncate', r: 'read' };
+const opOf = ev => OP_NAME[ev.op] || ev.op;
+const src = ev => ev.source || {};
+const rel = e => (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
+const isoMs = ms => { const d = new Date(ms); return isNaN(d) ? '–' : d.toISOString(); };
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
 const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v) ?? ''; return t.length > 28 ? t.slice(0, 27) + '…' : t; };
 const summary = ev => {
@@ -420,18 +425,18 @@ function side(title, row, other) {
 
 function detail(e) {
   const ev = e.event;
-  const isUpd = ev.op === 'update';
-  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${esc(ev.xid ?? '–')}</span><span>commit ${esc(new Date(ev.commit_ts_micros / 1000).toISOString())}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
+  const isUpd = opOf(ev) === 'update';
+  return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${esc(src(ev).txId ?? '–')}</span><span>commit ${esc(isoMs(src(ev).ts_ms))}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
 }
 
 function renderEvents() {
   const q = $('evsearch').value.trim().toLowerCase();
   const op = $('evop').value, tb = $('evtable').value;
-  const rows = evs.filter(e => (!op || e.event.op === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
+  const rows = evs.filter(e => (!op || opOf(e.event) === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
   $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
     const ev = e.event, id = evid(e);
-    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[ev.op] || ''}">${esc(ev.op || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(ev.lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
+    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[opOf(ev)] || ''}">${esc(opOf(ev) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(src(ev).lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
     return openId === id ? row + detail(e) : row;
   }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events in Kafka yet'}</td></tr>`;
 }

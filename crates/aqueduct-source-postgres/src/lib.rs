@@ -18,3 +18,14 @@ pub use source::{
     parse_lsn, PostgresSource, PostgresSourceConfig, TransportKind, DEFAULT_HEARTBEAT_INTERVAL,
 };
 pub use tls::SslMode;
+
+/// The database a connection URL names (libpq's default: the user name), for the `db` in every
+/// record's `source` block and key.
+pub fn database_name(url: &str) -> Option<String> {
+    let parsed = tls::parse(url).ok()?;
+    parsed
+        .config
+        .get_dbname()
+        .or(parsed.config.get_user())
+        .map(str::to_owned)
+}

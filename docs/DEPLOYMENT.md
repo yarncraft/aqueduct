@@ -53,7 +53,8 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;   -- full "before" image
 -- default identity (primary key) gives only the key columns in "before"
 ```
 
-Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key. If you use `partition_by = "key"` on the sink, prefer a key: `FULL` tables are keyed `schema.table`, so they get per-table order but no spread across partitions (see [Kafka sink](#kafka-sink)). Running `ALTER TABLE ... REPLICA IDENTITY` on a table that is already streaming re-keys all its rows at once, so consumers can see one reorder window at that moment.
+Tables without a primary key and with the default identity reject `UPDATE`/`DELETE` once they are published; set `REPLICA IDENTITY FULL` or add a key. Records are keyed by the primary key (see [Kafka sink](#kafka-sink)), so give tables one: a table without a
+primary key has a null key and all its rows share one partition.
 
 The publication must exist before Aqueduct starts. The slot is created automatically.
 
@@ -197,8 +198,34 @@ snapshot = "never"                  # or "on_demand" / "initial", see "Snapshots
 
 ### `[sink]`
 
-Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts_micros`, `schema`, `table`,
-`op` (`insert`/`update`/`delete`/`truncate`), `before`, `after`.
+Kafka is the only sink. Each event is one JSON object in the shape of Debezium's change event (without the schema part, as with
+`schemas.enable=false`):
+
+```json
+{
+  "before": {"id": 6320, "status": "running", "updated_at": "2026-10-20T13:23:46.322279Z"},
+  "after":  {"id": 6320, "status": "idle",    "updated_at": "2026-10-20T13:23:46.992107Z"},
+  "source": {"version": "0.1.0", "connector": "postgresql", "ts_ms": 1792502627001, "ts_us": 1792502627001627,
+             "snapshot": "false", "db": "app", "schema": "public", "table": "assets", "txId": 215319, "lsn": 286771792},
+  "op": "u", "ts_ms": 1792502627093, "ts_us": 1792502627093140
+}
+```
+
+- `op`: `c` insert, `u` update, `d` delete, `t` truncate, `r` a row a snapshot read (`source.snapshot` is then
+  `incremental`, otherwise `false`).
+- `source.ts_ms`/`ts_us`: the commit time; the top-level `ts_ms`/`ts_us`: when Aqueduct produced the record.
+  `source.lsn` is the change's WAL position, `txId` the transaction. MongoDB events carry `db` and `collection` instead
+  of `schema`, `table`, `txId` and `lsn`.
+- Values as Debezium encodes them by default: `timestamptz` an ISO-8601 string in UTC
+  (`"2026-10-20T13:23:46.992107Z"`), `timestamp` microseconds since the epoch, `date` days since the epoch. Numbers
+  and booleans are JSON numbers and booleans, `json`/`jsonb` are embedded, everything else is Postgres's text output
+  (including `numeric`, which stays exact, and `time`). An unchanged TOASTed column is left out of `after`.
+- Record key: the primary key as a JSON object plus where the row lives,
+  `{"db": "app", "schema": "public", "table": "assets", "key": {"id": 6320}}` (MongoDB:
+  `{"db": "shop", "collection": "orders", "key": {"_id": ...}}`, the `documentKey`). `key` is `null` for a table
+  without a primary key and for a truncate. Headers: `op` (the letter) and `lsn`. Record timestamp: the commit time.
+
+Delivery is at-least-once, so consumers should tolerate duplicates.
 
 #### Kafka sink
 
@@ -208,7 +235,7 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `topic` | unset | Fallback topic for events no route matches. May use `{schema}` and `{table}` |
 | `partitions` | `1` | Partition count used when Aqueduct has to create a topic |
 | `replication_factor` | `3`, or `1` if the cluster has fewer than 3 brokers (logged as a warning) | Replicas used when Aqueduct has to create a topic. Existing topics are not changed. Must be at least 1. An explicit value the broker rejects (more replicas than brokers) is an error, at startup for the default topic and on first send for routed or templated topics; only the unset default falls back, and it falls back to 1, not to the broker count, so on a 2-broker cluster set `replication_factor = 2` yourself. Set it explicitly in production |
-| `partition_by` | `table` | `table`: record key `schema.table`, total order per table. `key`: record key `schema.table:<replica-identity columns>` (MongoDB: `documentKey`), a table spreads over partitions. See the ordering caveats below |
+| `partition_by` | `key` | What the partition is hashed from. `key`: the whole record key (table and primary key), so each row's changes stay ordered and a table spreads over partitions, as with Debezium. `table`: only the table, for total order per table. The record key itself is the same either way |
 | `tls` | `false` | Encrypt with TLS and verify the broker certificate and hostname (rustls). Set it for any non-local cluster |
 | `tls_ca_file` | unset | PEM CA bundle for brokers with a private CA |
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
@@ -216,14 +243,13 @@ Kafka is the only sink. Every event is one JSON object: `lsn`, `xid`, `commit_ts
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins |
 
-Records: key `schema.table` (or `schema.table:<replica-identity columns>` with `partition_by = "key"`), value the JSON event, headers `op` and `lsn`, timestamp = commit time. The partition is a
-stable FNV-1a hash of the key. With the default `table`, all of a table's changes stay ordered. With `key`, a row's changes
-stay ordered **only while its identity columns never change**: use a primary key or `REPLICA IDENTITY USING INDEX` on
-immutable columns. Tables with `REPLICA IDENTITY FULL` (every column is part of the key, so any update would move the
-row) are keyed `schema.table` even in `key` mode, so they keep per-table order only; an update of a key column still
-moves the row with any other identity. `TRUNCATE` (and
-any table without an identity) is keyed `schema.table`, so it is not ordered against that table's row events; do not
-use it as a barrier in `key` mode. A produce is acknowledged by the broker before the
+Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
+hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
+an update of a primary-key column moves the row to the key's new partition. The primary key comes from the catalog,
+so tables with `REPLICA IDENTITY FULL` are keyed by it like any other. Rows of a table without a primary key, and
+every `TRUNCATE`, have `"key": null`, so they share the table's partition and a truncate is not ordered against the
+rows on other partitions; do not use it as a barrier. With `partition_by = "table"`, all of a table's changes stay
+ordered. A produce is acknowledged by the broker before the
 checkpoint moves. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
 fails the pipeline instead of being silently dropped. Topics are created on first use, so pre-create them (with the
 replication factor and retention you want) in production.
@@ -390,7 +416,7 @@ Each table is copied in chunks of `snapshot_chunk_size` rows, in primary-key ord
 two watermarks into the WAL with `pg_logical_emit_message` and reads the chunk between them. A live insert, update or
 delete of a row while its chunk is in flight replaces the chunk's copy of that row, so a snapshot row never
 overwrites a newer change. A `TRUNCATE` in that window drops the chunk. Rows that already exist arrive as events with
-`"op": "read"` (Kafka header `op: read`), `before` null and `after` the full row, encoded byte for byte like an
+`"op": "r"` and `"source": {"snapshot": "incremental"}` (Kafka header `op: r`), `before` null and `after` the full row, encoded byte for byte like an
 `insert` of the same row and keyed the same way, so they land on the row's partition. Consumers that apply events
 "last write wins" end up with the table.
 
@@ -497,8 +523,8 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 - **Rows** are encoded exactly like a live `insert` of the same document (same `after`, same Kafka key from the
   `documentKey`). Through `mongos`, a sharded collection's `documentKey` holds the shard key fields and then `_id`;
   Aqueduct reads the shard key from `config.collections` (needs `find` on it) and builds the same key. If it cannot
-  read it, it logs a warning, and `read` rows of sharded collections are keyed by `_id` alone, so with
-  `partition_by = "key"` they may land on another partition than the document's later changes. Sharded clusters are
+  read it, it logs a warning, and `read` rows of sharded collections are keyed by `_id` alone, so they may land on
+  another partition than the document's later changes. Sharded clusters are
   not covered by Aqueduct's tests.
 - **In the window:** an insert, update, replace or delete of a document in the chunk drops the chunk's copy of it; a
   drop or rename of the collection, a rename of another collection onto it, or a dropped database drops the whole

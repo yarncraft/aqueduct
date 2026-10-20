@@ -50,9 +50,12 @@ On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\ca
   `transport = "stream"` the source opens its own replication connection from the same URL (`replication/`, hand-written
   on `postgres-protocol`, same TLS and auth rules); poll stays the default and is kept permanently. Keys are assigned
   in one place (`source.rs::apply`) for both transports.
-- Kafka: record key is `schema.table` (default `partition_by = "table"`, per-table ordering) or `schema.table:<identity>`
-  (`partition_by = "key"`); partition is a stable FNV-1a hash of the key (`kafka.rs::record_key`). The identity part is the
-  replica-identity columns joined with `0x1f`, binary datums hex (`decoder.rs::key`), or the MongoDB `documentKey` JSON; under `REPLICA IDENTITY FULL` `decoder.rs::key` returns `None` (the whole row would be the key), so those tables use `schema.table`; `key` mode otherwise only orders per row while identity columns are immutable. Truncates use `schema.table`.
+- Kafka: events are Debezium-style envelopes (`lib.rs::encode`: `before`/`after`/`source`/`op` letters/`ts_ms`,
+  `timestamptz` ISO-8601 UTC, `timestamp` epoch µs, `date` epoch days, from `DateStyle = ISO` text). The record key is
+  JSON `{"db","schema","table","key":{<primary key>}}` (MongoDB `{"db","collection","key":<documentKey>}`), built by
+  `lib.rs::record_key`; the primary key comes from the catalog (`decoder.rs::key`, identity columns only as a fallback),
+  `null` without one and for truncates. Partition = stable FNV-1a hash of the whole key (default `partition_by = "key"`,
+  per-row order) or of `schema.table` (`"table"`, per-table order).
 - Rows are sensitive. The event inspector exposes row data over HTTP; keep it behind `admin_token`
   and never log tokens.
 - **Fail closed**: the admin server refuses a non-loopback `health_addr` without `admin_token` (`Config::check_admin_exposure`,

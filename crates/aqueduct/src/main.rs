@@ -60,7 +60,14 @@ async fn main() {
         }
     };
     let metrics = Arc::new(aqueduct_core::Metrics::new());
-    let (mut sink, inspector) = match sink::build(&cfg.sink).await {
+    // Named in every record's `source` block and key.
+    let source_info = match &source_cfg {
+        config::SourceConfig::Postgres(p) => aqueduct_sinks::SourceInfo::Postgres {
+            db: aqueduct_source_postgres::database_name(&p.url).unwrap_or_default(),
+        },
+        config::SourceConfig::Mongodb(_) => aqueduct_sinks::SourceInfo::Mongodb,
+    };
+    let (mut sink, inspector) = match sink::build(&cfg.sink, source_info).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "failed to build sink");

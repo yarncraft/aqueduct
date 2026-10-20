@@ -116,6 +116,8 @@ struct Plan {
     key_in_old: bool,
     row_filter: Option<String>,
     estimated_rows: Option<u64>,
+    /// The table's primary key, which keys `read` rows exactly as live events are keyed.
+    primary_key: Vec<String>,
 }
 
 impl Plan {
@@ -196,6 +198,7 @@ impl Plan {
             key_in_old,
             row_filter: t.row_filter.clone(),
             estimated_rows: t.estimated_rows,
+            primary_key: t.primary_key.clone(),
         })
     }
 
@@ -636,7 +639,9 @@ impl Engine {
                     schema: plan.schema.clone(),
                     table: plan.name.clone(),
                     row: cache.row(plan.relation.id, &tuple).map_err(dec)?,
-                    key: cache.key(plan.relation.id, &tuple).map_err(dec)?,
+                    key: cache
+                        .key(plan.relation.id, &tuple, Some(&plan.primary_key))
+                        .map_err(dec)?,
                 },
             });
         }
