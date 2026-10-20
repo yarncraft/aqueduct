@@ -5,4 +5,7 @@
 pub mod expr;
 mod plan;
 
-pub use plan::{KafkaRoute, OutRecord, RouteCount, RoutePlan, RouteStats};
+pub use plan::{
+    KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan, RouteStats,
+    RoutesDescription, UNSEEN_FIELD_ROWS,
+};

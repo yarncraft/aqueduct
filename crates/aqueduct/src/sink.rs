@@ -14,9 +14,11 @@ fn plan(cfg: &KafkaConfig) -> Result<RoutePlan> {
             name: r.name.clone(),
             pattern: r.pattern.clone(),
             topic: r.topic.clone(),
+            ops: r.ops.clone(),
+            filter: r.filter.clone(),
         })
         .collect();
-    RoutePlan::new(routes, cfg.topic.clone())
+    RoutePlan::with_dead_letter(routes, cfg.topic.clone(), cfg.dead_letter_topic.clone())
 }
 
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
@@ -62,4 +64,62 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     .with_partition_by(by)
     .with_source(source);
     Ok((sink, inspector))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kafka(toml_text: &str) -> KafkaConfig {
+        toml::from_str(&format!("brokers = ['b:9092']\n{toml_text}")).unwrap()
+    }
+
+    #[test]
+    fn route_filters_come_from_the_config_and_are_validated() {
+        let cfg = kafka(
+            "topic = 'rest'
+dead_letter_topic = 'aqueduct.dlq'
+[[routes]]
+name = 'paid'
+match = 'public.orders'
+ops = ['insert', 'update']
+where = \"row.status == 'paid'\"
+topic = 'orders'
+",
+        );
+        let d = plan(&cfg).unwrap().describe();
+        assert_eq!(d.dead_letter_topic.as_deref(), Some("aqueduct.dlq"));
+        assert_eq!(d.routes[0].ops, Some(vec!["insert", "update"]));
+        assert_eq!(d.routes[0].filter.as_deref(), Some("row.status == 'paid'"));
+
+        // `where` without a dead-letter topic, and a syntax error, fail naming the route.
+        let err = |text: &str| plan(&kafka(text)).unwrap_err().to_string();
+        let e = err("[[routes]]
+name = 'paid'
+match = 'public.orders'
+where = \"row.status == 'paid'\"
+topic = 'orders'
+");
+        assert!(
+            e.contains("route `paid`") && e.contains("dead_letter_topic"),
+            "{e}"
+        );
+        let e = err("dead_letter_topic = 'dlq'
+[[routes]]
+name = 'paid'
+match = 'public.orders'
+where = 'row.status =='
+topic = 'orders'
+");
+        assert!(e.contains("route `paid`: invalid `where`"), "{e}");
+        let e = err("[[routes]]
+match = 'public.orders'
+ops = ['upsert']
+topic = 'orders'
+");
+        assert!(
+            e.contains("route `public.orders`: unknown op `upsert`"),
+            "{e}"
+        );
+    }
 }

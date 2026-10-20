@@ -112,6 +112,16 @@ impl std::str::FromStr for PartitionBy {
     }
 }
 
+impl PartitionBy {
+    /// The config spelling: `key` or `table`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Key => "key",
+        }
+    }
+}
+
 /// `*` matches any run of characters (including none and dots); everything else is literal.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
@@ -134,6 +144,9 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Replicas for auto-created topics when `replication_factor` is not configured.
 pub const DEFAULT_REPLICATION_FACTOR: i16 = 3;
+
+/// Metadata reads after creating a topic before it counts as not available (200 ms apart).
+const CREATE_LIST_ATTEMPTS: u32 = 15;
 
 /// What to do after the first attempt to create a missing topic.
 #[derive(Debug, PartialEq, Eq)]
@@ -212,7 +225,19 @@ impl KafkaSink {
         {
             sink.open_topic(&t).await?;
         }
+        // The dead-letter topic is opened (created if missing) now, so a missing or unusable one
+        // fails startup instead of the first batch with a row that cannot be evaluated.
+        if let Some(t) = sink.plan.dead_letter_topic().map(str::to_string) {
+            sink.open_topic(&t)
+                .await
+                .map_err(|e| Error::Sink(format!("sink.dead_letter_topic {t}: {e}")))?;
+        }
         Ok(sink)
+    }
+
+    /// The route plan, e.g. to share its counters and description with the admin server.
+    pub fn plan(&self) -> &RoutePlan {
+        &self.plan
     }
 
     /// Choose how records are partitioned (default: by key).
@@ -267,12 +292,22 @@ impl KafkaSink {
                 )));
             }
         }
-        let listed = self
-            .client
-            .list_topics()
-            .await
-            .map_err(|e| err("list topics", &e))?;
-        find(listed).ok_or_else(|| Error::Sink(format!("kafka topic {topic} not available")))
+        // A new topic can take a moment to show up in the metadata of the broker we ask, so
+        // re-list a few times before giving up (startup opens the dead-letter topic this way).
+        for attempt in 0..CREATE_LIST_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let listed = self
+                .client
+                .list_topics()
+                .await
+                .map_err(|e| err("list topics", &e))?;
+            if let Some(ids) = find(listed) {
+                return Ok(ids);
+            }
+        }
+        Err(Error::Sink(format!("kafka topic {topic} not available")))
     }
 
     async fn open_topic(&mut self, topic: &str) -> Result<()> {
@@ -321,6 +356,9 @@ fn record(out: OutRecord) -> Record {
     let mut headers = BTreeMap::new();
     headers.insert("op".to_string(), out.op.as_bytes().to_vec());
     headers.insert("lsn".to_string(), out.lsn.into_bytes());
+    for (name, value) in out.headers {
+        headers.insert(name.to_string(), value.into_bytes());
+    }
     let timestamp = chrono::DateTime::from_timestamp_micros(out.commit_ts_micros)
         .unwrap_or_else(chrono::Utc::now);
     Record {
@@ -484,6 +522,29 @@ mod tests {
         assert_eq!(r.headers["op"], b"c");
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
         assert_eq!(v["source"]["table"], "users");
+        assert_eq!(r.headers.len(), 2, "only op and lsn on a normal record");
+    }
+
+    #[test]
+    fn dead_letter_record_has_the_error_header() {
+        let route = crate::KafkaRoute {
+            pattern: "public.*".into(),
+            topic: "t".into(),
+            filter: Some("row.name > 1".into()),
+            ..Default::default()
+        };
+        let mut plan = RoutePlan::with_dead_letter(vec![route], None, Some("dlq".into())).unwrap();
+        plan.set_source(pg());
+        let r = record(plan.render(&crate::sample(), 0).unwrap().remove(0));
+        assert_eq!(
+            r.headers["aqueduct-error"],
+            b"route `public.*`: where `row.name > 1`: type error: `row.name` is not a finite number"
+        );
+        assert_eq!(r.headers["op"], b"c");
+        assert_eq!(
+            r.key.as_deref(),
+            Some(&br#"{"db":"app","schema":"public","table":"users","key":null}"#[..])
+        );
     }
 
     #[test]

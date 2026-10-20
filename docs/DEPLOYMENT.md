@@ -241,7 +241,8 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_mechanism` | unset | `plain`, `scram-sha-256` or `scram-sha-512`. Needs username and password; `plain` should only be used with `tls` |
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match` |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -268,11 +269,92 @@ match = "*.audit_*"
 topic = "audit"
 ```
 
+#### Filtering events per route
+
+A route can drop events before they reach Kafka with `ops` and `where`. Both are checked after `match`, on the
+original event:
+
+```toml
+[sink]
+brokers = ["kafka:9092"]
+topic = "cdc.{schema}.{table}"
+dead_letter_topic = "aqueduct.dead-letter"   # required once any route uses `where`
+
+[[sink.routes]]
+name = "paid-orders"
+match = "public.orders"
+ops = ["insert", "update", "delete"]
+where = "row.status == 'paid' or op == 'delete'"
+topic = "orders-paid"
+```
+
+- **The first matching route owns the event.** If its `ops` or `where` drops the event, or `where` fails on it, the
+  event does not fall through to a later route or to `topic`.
+- **`ops`** lists the operations that pass: `insert`, `update`, `delete`, `truncate`, `read` (snapshot rows). Unset,
+  every op passes. An unknown name or an empty list fails startup.
+- **`where`** is a predicate. Only events it is definitely true for pass; false and unknown are filtered. A syntax
+  error fails startup with a message naming the route.
+  - Fields: `op` (`insert`, `update`, `delete`, `truncate`, `read`), `schema`, `table`, `before.<column>`,
+    `after.<column>` and `row.<column>` (`after` if the event has it, else `before`, so a delete reads its
+    before-image). A dotted path reads a nested MongoDB field: `after.address.city`.
+  - Operators: `==` `!=` `<` `<=` `>` `>=`, `in [..]`, `is null`, `is not null`, `and`, `or`, `not` and parentheses.
+    Literals: `'strings'` (a quote inside is written `''`), numbers, `true` and `false`. Test for null with `is null`;
+    `== null` is rejected at startup. No functions, arithmetic or regular expressions. At most 4 KiB and 32 levels of
+    nesting.
+  - Comparisons are typed by the literal. A number literal compares exactly (decimal, not floating point) against a
+    JSON number or a string holding a decimal (`numeric` columns arrive as strings). A string literal allows only
+    `==`, `!=` and `in`; ordering a string (`row.name < 'm'`) is rejected at startup. A boolean literal matches a JSON
+    boolean only.
+  - Times: `timestamp` columns are microseconds since the epoch and `date` columns days since the epoch, both JSON
+    numbers, so they compare with number literals (`row.created_at >= 1767225600000000`). `timestamptz` is an ISO-8601
+    string in UTC, so it allows only `==`, `!=` and `in`.
+  - **Three-valued logic, as in SQL.** A missing field is null, and any comparison with null is *unknown*. Unknown
+    propagates: `not unknown` is unknown, `false and unknown` is false, `true or unknown` is true. An event whose
+    `where` ends unknown is filtered. So `not (row.region == 'eu')` drops rows whose `region` is null or missing;
+    write `row.region is null or not (row.region == 'eu')` to keep them. Unchanged TOAST columns are left out of
+    Postgres updates and read as null too. A `TRUNCATE` has no row, so only a `where` that tests `op`, `schema` or
+    `table` can pass it.
+- **Rows leaving the filter.** `where` sees only the event's own row. An update `status: paid -> refunded` under
+  `where = "row.status == 'paid'"` is dropped, so the topic keeps the row as `paid` and consumers never learn that it
+  left the filter. Include such transitions in the predicate (for example `op == 'delete'`) or route them to another
+  topic if consumers need them.
+- **Type errors go to the dead-letter topic.** A comparison of a mistyped value (`row.amount > 10` on a row where
+  `amount` is `'abc'`, `NaN` or a JSON object) is a type error. It wins over true, false and unknown with no
+  short-circuit, so `not (...)` cannot let a mistyped row through. The event is produced to
+  `sink.dead_letter_topic` instead: value = the event (the same envelope), key = the record key with `"key": null`
+  (the table only, no row values), partitioned by that key, headers `op`, `lsn` and `aqueduct-error`. The
+  `aqueduct-error` header names the route, the expression and the field with the type it should have, never the value,
+  for example ``route `paid-orders`: where `row.amount > 10`: type error: `row.amount` is not a finite number``. The
+  first one per route is logged as a warning. The batch is acknowledged as usual once the dead-letter record is
+  written too, so one bad row never stops the pipeline or pins the replication slot.
+- **`dead_letter_topic`** is required as soon as any route has `where`. It must be a valid topic name, must not start
+  with `_`, and must not be a topic events are routed to (a route's or `topic`'s name, or a name a `{schema}`/`{table}`
+  template could produce). It is opened at startup and created if missing (with `partitions` and
+  `replication_factor`), so a dead-letter topic that cannot be created or read fails startup. Pre-create it with the
+  retention you want. Write permission (ACLs) is only exercised by the first dead-letter record; a refused write fails
+  that batch, which is retried and never acknowledged. The event inspector also reads the dead-letter topic.
+- **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
+  everything. Aqueduct counts, per route and field path in `where`, the rows that had the row the path reads (an
+  insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
+  warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
+  reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
+
+Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
+`fallback` (reserved for content routing; always 0 for now) or `errors`. They appear in `/api/metrics` (`routes`),
+`/api/routes` and Prometheus:
+
+| Series | Meaning |
+|--------|---------|
+| `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
+| `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
+
+`route` is the route's `name`, else its `match`; events no route claims are counted under `default`.
+
 ## 4. Admin cockpit
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, a per-operation breakdown, per-table high-water marks and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -315,6 +397,25 @@ without it the column shows `–`.
 `kafka` is `null` with an `error` string when the offsets could not be read (inspector off, Kafka unreachable or slow,
 topic missing). Counts and marks start from zero when the process restarts. Prometheus has the commit time per table
 as `aqueduct_table_last_commit_timestamp_seconds{table="schema.table"}`; Kafka offsets are not exported there.
+
+### Routing plan
+
+`GET /api/routes` describes the compiled routing for the cockpit's routing graph: each route in match order, then
+the `sink.topic` fallback as a route named `default` with `"match": null`, with live counts. It never contains row data.
+Later routing options add keys to each route, so readers should ignore keys they do not know.
+
+```json
+{"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
+ "routes": [
+   {"route": "paid-orders", "match": "public.orders", "ops": ["insert", "update", "delete"],
+    "where": "row.status == 'paid' or op == 'delete'", "topic": "orders-paid",
+    "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1}, "unseen_fields": []},
+   {"route": "default", "match": null, "ops": null, "where": null, "topic": "cdc.{schema}.{table}",
+    "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0}, "unseen_fields": []}]}
+```
+
+`/api/metrics` and `/api/stream` carry the same counts flat, as
+`routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "unseen_fields"}]`.
 
 ## 5. Operating Aqueduct
 
