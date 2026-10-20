@@ -8,7 +8,7 @@ use serde_json::value::RawValue;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use aqueduct_core::{Checkpoint, SnapState};
+use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, SnapshotStatus};
 
 use crate::catalog::read_catalog;
 use crate::decoder::{Message, RelationCache};
@@ -352,6 +352,10 @@ pub struct PostgresSource {
     transport: Option<Box<dyn Transport>>,
     /// The running snapshot, if any.
     snapshot: Option<Engine>,
+    /// Snapshot requests from the admin API.
+    control: Option<SnapshotReceiver>,
+    /// Status of the last snapshot that ended, kept for the admin API.
+    last_status: Option<SnapshotStatus>,
     buffer: VecDeque<ChangeEvent>,
     /// Highest key already queued; later peeks skip changes at or below it.
     emitted: Key,
@@ -388,6 +392,8 @@ impl PostgresSource {
             client: None,
             transport: None,
             snapshot: None,
+            control: None,
+            last_status: None,
             buffer: VecDeque::new(),
             emitted: Key::default(),
             acked: 0,
@@ -451,6 +457,128 @@ impl PostgresSource {
             timeline: Some(timeline),
             database,
         })
+    }
+
+    /// Take snapshot requests (start, cancel) from the admin API.
+    pub fn with_snapshot_control(mut self, control: SnapshotReceiver) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Reports the running or last snapshot to the metrics.
+    fn publish_status(&self) {
+        if let Some(m) = &self.metrics {
+            let status = match &self.snapshot {
+                Some(e) => Some(e.status("running")),
+                None => self.last_status.clone(),
+            };
+            m.set_snapshot(status);
+        }
+    }
+
+    /// Answers the admin API's snapshot requests. Runs between batches, never while a chunk is
+    /// half set up.
+    async fn handle_requests(&mut self) -> Result<()> {
+        loop {
+            let Some(req) = self.control.as_mut().and_then(|c| c.try_recv().ok()) else {
+                return Ok(());
+            };
+            let answer = match req.command {
+                SnapshotCommand::Start(tables) => self.request_snapshot(tables).await,
+                SnapshotCommand::Cancel => self.cancel_snapshot(),
+            };
+            let _ = req.reply.send(answer);
+            self.publish_status();
+        }
+    }
+
+    /// Starts a snapshot of `tables`, or appends them to the running one. The answer is the
+    /// snapshot id. The request is durable only once an event carrying the snapshot is
+    /// checkpointed; a crash before that forgets it.
+    async fn request_snapshot(
+        &mut self,
+        tables: Vec<String>,
+    ) -> std::result::Result<String, String> {
+        if self.cfg.snapshot.mode == SnapshotMode::Never {
+            return Err(
+                "snapshots are off; set postgres.snapshot = \"on_demand\" or \"initial\"".into(),
+            );
+        }
+        let client = self.client().map_err(|e| e.to_string())?;
+        let catalog = read_catalog(client, &self.cfg.publication)
+            .await
+            .map_err(|e| e.to_string())?;
+        let published: Vec<String> = catalog
+            .tables
+            .iter()
+            .map(|t| table_id(&t.schema, &t.name))
+            .collect();
+        let unknown: Vec<&str> = tables
+            .iter()
+            .filter(|t| !published.contains(t))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "not in publication {:?}: {}",
+                self.cfg.publication,
+                unknown.join(", ")
+            ));
+        }
+        if let Some(e) = self.snapshot.as_mut() {
+            if !e.cancelled() {
+                e.append(tables, &catalog, &self.cfg.snapshot);
+                return Ok(e.id().to_owned());
+            }
+        }
+        let id = new_snapshot_id();
+        let state = SnapState {
+            id: id.clone(),
+            tables,
+            table: 0,
+            after: None,
+        };
+        match Engine::new(&self.cfg.slot, state, &catalog, &self.cfg.snapshot) {
+            Some(e) => {
+                tracing::info!(snapshot = %id, tables = e.state().tables.len(), "snapshot requested");
+                self.snapshot = Some(e);
+                Ok(id)
+            }
+            None => Err("none of these tables can be snapshotted (see the log for why)".into()),
+        }
+    }
+
+    /// Stops the running snapshot after the chunk in flight.
+    fn cancel_snapshot(&mut self) -> std::result::Result<String, String> {
+        let Some(e) = self.snapshot.as_mut() else {
+            return Err("no snapshot is running".into());
+        };
+        e.cancel();
+        let id = e.id().to_owned();
+        if !e.in_flight() {
+            // Nothing in flight: end now, and return the checkpoint to the plain form.
+            let checkpoint = self.checkpoint_text(self.emitted, None);
+            let mut hb = ChangeEvent::heartbeat(Position::Lsn(self.emitted.change), 0);
+            hb.checkpoint = Some(Position::Text(checkpoint));
+            self.buffer.push_back(hb);
+            self.end_snapshot();
+        }
+        Ok(id)
+    }
+
+    /// Forgets the running snapshot, keeping its final status for the admin API.
+    fn end_snapshot(&mut self) {
+        if let Some(e) = self.snapshot.take() {
+            let state = if e.cancelled() {
+                "cancelled"
+            } else {
+                "finished"
+            };
+            let st = e.status(state);
+            tracing::info!(snapshot = %st.id, rows = st.rows, "snapshot {state}");
+            self.last_status = Some(st);
+        }
+        self.publish_status();
     }
 
     /// Report heartbeats and slot lag to `metrics`.
@@ -629,13 +757,18 @@ impl PostgresSource {
     /// the last row the new progress. A chunk without rows saves its progress with a heartbeat.
     fn queue_closed(
         &mut self,
-        closed: Closed,
+        mut closed: Closed,
         before: SnapState,
         lsn: u64,
         keys: &mut TxKeys,
         xid: u32,
         ts: i64,
     ) {
+        // A cancelled snapshot ends with this chunk: its rows are delivered, then the checkpoint
+        // returns to the plain form.
+        if self.snapshot.as_ref().is_some_and(|e| e.cancelled()) {
+            closed.state = None;
+        }
         let n = closed.rows.len();
         for (i, r) in closed.rows.into_iter().enumerate() {
             let key = keys.next(lsn);
@@ -668,11 +801,9 @@ impl PostgresSource {
             self.buffer.push_back(hb);
         }
         if closed.state.is_none() {
-            if let Some(e) = &self.snapshot {
-                let st = e.status();
-                tracing::info!(snapshot = %st.id, rows = st.rows, "snapshot finished");
-            }
-            self.snapshot = None;
+            self.end_snapshot();
+        } else {
+            self.publish_status();
         }
     }
 
@@ -946,6 +1077,7 @@ impl PostgresSource {
                 None => tracing::info!(snapshot = %id, "nothing to snapshot"),
             }
         }
+        self.publish_status();
         Ok(())
     }
 }
@@ -1090,6 +1222,10 @@ impl Source for PostgresSource {
 
     async fn next(&mut self) -> Result<Option<ChangeEvent>> {
         loop {
+            if let Some(ev) = self.buffer.pop_front() {
+                return Ok(Some(ev));
+            }
+            self.handle_requests().await?;
             if let Some(ev) = self.buffer.pop_front() {
                 return Ok(Some(ev));
             }

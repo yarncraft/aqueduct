@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aqueduct_core::{ChunkRow, Mark, Outcome, SnapState, Window};
+use aqueduct_core::{ChunkRow, Mark, Outcome, SkippedTable, SnapState, SnapshotStatus, Window};
 use aqueduct_core::{Error, Result};
 use serde_json::value::RawValue;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -291,17 +291,6 @@ pub struct Closed {
     pub state: Option<SnapState>,
 }
 
-/// Progress the admin API and metrics show.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Status {
-    pub id: String,
-    pub tables: Vec<String>,
-    pub table: usize,
-    pub rows: u64,
-    pub estimated_rows: Option<u64>,
-    pub skipped: Vec<(String, String)>,
-}
-
 /// A running snapshot.
 pub struct Engine {
     slot: String,
@@ -323,6 +312,8 @@ pub struct Engine {
     not_before: Instant,
     rows: u64,
     skipped: Vec<(String, String)>,
+    /// Stop after the chunk in flight (admin `DELETE /api/snapshot`).
+    cancelled: bool,
 }
 
 fn now_micros() -> u64 {
@@ -402,6 +393,7 @@ impl Engine {
             not_before: Instant::now(),
             rows: 0,
             skipped,
+            cancelled: false,
         })
     }
 
@@ -414,25 +406,58 @@ impl Engine {
         self.in_flight.is_some()
     }
 
-    pub fn status(&self) -> Status {
-        Status {
+    /// Progress for the admin API and metrics, in the state `state` (`running`, `finished`,
+    /// `cancelled`).
+    pub fn status(&self, state: &str) -> SnapshotStatus {
+        let running = state == "running";
+        SnapshotStatus {
             id: self.state.id.clone(),
+            state: state.to_owned(),
             tables: self.state.tables.clone(),
-            table: self.state.table,
+            tables_done: if state == "finished" {
+                self.state.tables.len()
+            } else {
+                self.state.table
+            },
+            table: running
+                .then(|| self.state.tables.get(self.state.table).cloned())
+                .flatten(),
             rows: self.rows,
-            estimated_rows: self
+            rows_estimated: self
                 .state
                 .tables
                 .iter()
                 .map(|t| self.plans.get(t).and_then(|p| p.estimated_rows))
                 .sum(),
-            skipped: self.skipped.clone(),
+            skipped: self
+                .skipped
+                .iter()
+                .map(|(table, reason)| SkippedTable {
+                    table: table.clone(),
+                    reason: reason.clone(),
+                })
+                .collect(),
         }
     }
 
-    /// Whether the next chunk may start now: none in flight and the throttle allows it.
+    /// Whether the next chunk may start now: none in flight, not cancelled, and the throttle
+    /// allows it.
     pub fn due(&self) -> bool {
-        self.in_flight.is_none() && Instant::now() >= self.not_before
+        self.in_flight.is_none() && !self.cancelled && Instant::now() >= self.not_before
+    }
+
+    /// Stops the snapshot once the chunk in flight (if any) is closed.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// The snapshot id.
+    pub fn id(&self) -> &str {
+        &self.state.id
     }
 
     /// Appends tables to the running snapshot (an admin request while one runs).
@@ -797,7 +822,7 @@ mod tests {
         assert_eq!(e.state().tables, ["public.Orders", "public.z"]);
         assert_eq!(e.state().table, 0);
         assert_eq!(e.state().after, Some(vec!["k".into(), "1".into()]));
-        assert_eq!(e.status().skipped.len(), 1);
+        assert_eq!(e.status("running").skipped.len(), 1);
         // Nothing usable left: no engine.
         assert!(Engine::new(
             "slot",
@@ -971,7 +996,8 @@ mod tests {
         let closed = e.mark(&wm(id, decoder::Mark::High)).unwrap().unwrap();
         assert!(closed.rows.is_empty());
         assert!(closed.state.is_none(), "finished");
-        assert_eq!(e.status().rows, 1);
+        assert_eq!(e.status("finished").rows, 1);
+        assert_eq!(e.status("finished").tables_done, 1);
     }
 
     #[test]

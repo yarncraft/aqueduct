@@ -591,3 +591,106 @@ async fn key_columns_let_a_table_without_primary_key_be_copied() {
     .await
     .unwrap();
 }
+
+/// Sends one admin request to the source and waits for its answer while driving it.
+async fn request(
+    s: &mut PostgresSource,
+    tx: &aqueduct_core::SnapshotSender,
+    command: aqueduct_core::SnapshotCommand,
+) -> Result<String, String> {
+    let (reply, mut answer) = tokio::sync::oneshot::channel();
+    tx.send(aqueduct_core::SnapshotRequest { command, reply })
+        .await
+        .unwrap();
+    // The source answers between batches: keep taking (and acking) events until it does.
+    loop {
+        if let Ok(a) = answer.try_recv() {
+            return a;
+        }
+        if let Ok(Ok(Some(ev))) = tokio::time::timeout(Duration::from_millis(200), s.next()).await {
+            if let Some(c) = ev.checkpoint.clone() {
+                s.ack(c).await.unwrap();
+            }
+        }
+    }
+}
+
+/// `on_demand`: nothing is copied until requested; a request names published tables; a cancel
+/// stops after the chunk in flight and returns the checkpoint to the plain form (#75).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn on_demand_requests_start_and_cancel() {
+    use aqueduct_core::SnapshotCommand;
+    let db = connect().await;
+    let table = unique("snap_req");
+    let publication = unique("snap_req_pub");
+    let slot = unique("snap_req");
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY);
+         INSERT INTO {table} SELECT generate_series(1, 5000);
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+    let (tx, rx) = aqueduct_core::snapshot_channel();
+    let mut s = source(&slot, &publication, SnapshotMode::OnDemand, 50).with_snapshot_control(rx);
+    s.start(None).await.unwrap();
+    assert!(
+        collect(&mut s, Duration::from_secs(1), |_| false)
+            .await
+            .is_empty(),
+        "on_demand copies nothing by itself"
+    );
+
+    let err = request(
+        &mut s,
+        &tx,
+        SnapshotCommand::Start(vec!["public.nope".into()]),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("not in publication"), "{err}");
+    let err = request(&mut s, &tx, SnapshotCommand::Cancel)
+        .await
+        .unwrap_err();
+    assert!(err.contains("no snapshot is running"), "{err}");
+
+    let id = request(
+        &mut s,
+        &tx,
+        SnapshotCommand::Start(vec![format!("public.{table}")]),
+    )
+    .await
+    .unwrap();
+    assert!(id.starts_with('s'), "{id}");
+    let some = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 200).await;
+    assert!(some.iter().all(|e| e.op == Op::Read));
+    assert_eq!(
+        request(&mut s, &tx, SnapshotCommand::Cancel).await,
+        Ok(id.clone())
+    );
+    // At most the chunk in flight still arrives, then nothing more is copied.
+    let rest = collect(&mut s, Duration::from_secs(2), |_| false).await;
+    assert!(rest.len() <= 50, "{} rows after the cancel", rest.len());
+    db.execute(&format!("INSERT INTO {table} VALUES (9999)"), &[])
+        .await
+        .unwrap();
+    let tail = collect(&mut s, Duration::from_secs(5), |e| {
+        e.iter().any(|e| e.op == Op::Insert)
+    })
+    .await;
+    let Some(Position::Text(t)) = &tail.last().unwrap().checkpoint else {
+        panic!("text checkpoint")
+    };
+    assert!(
+        !t.contains("snap"),
+        "the cancelled snapshot left the checkpoint: {t}"
+    );
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}

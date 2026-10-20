@@ -231,7 +231,7 @@ topic = "audit"
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, per-operation and per-table breakdowns and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka).
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -366,7 +366,38 @@ overwrites a newer change. A `TRUNCATE` in that window drops the chunk. Rows tha
 - **Ordering:** a row's snapshot copy can arrive after a live change of another row, but never after a newer change
   of the same row.
 - **`REPLICA IDENTITY USING INDEX`** on a key that is not the primary key: a live delete then does not tell which row
-  went, so a chunk with such a delete in its window is read again.
+  went, so a chunk with such a delete in its window is read again (with a growing pause, up to 10 s).
+
+#### Starting a snapshot on request
+
+With `snapshot = "on_demand"` (or `"initial"`), the admin API starts, inspects and cancels snapshots. It needs the admin
+token like every `/api/*` route.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -X POST http://host:8080/api/snapshot \
+     -d '{"tables": ["public.orders", "public.customers"]}'
+# 202 {"id":"s1792…","state":"running","durable":false,"note":"…"}
+curl -H "Authorization: Bearer $TOKEN" http://host:8080/api/snapshot           # progress
+curl -H "Authorization: Bearer $TOKEN" -X DELETE http://host:8080/api/snapshot # cancel
+```
+
+| Request | Answer |
+|---|---|
+| `POST` with tables while none runs | `202`, a new snapshot of those tables |
+| `POST` while one runs | `202` with the running snapshot's id; the tables are appended to it |
+| `POST` naming a table outside the publication, or with `snapshot = "never"` | `409` with the reason |
+| `POST` with a body that is not `{"tables": ["schema.table", ...]}` | `400` |
+| `DELETE` | `202`; the snapshot stops after the chunk in flight, its rows are still delivered. `409` when none runs |
+| `GET` | the running or last snapshot: `id`, `state` (`running`, `finished`, `cancelled`), `tables`, `tables_done`, `table`, `rows`, `rows_estimated`, `skipped`; `{"state":"idle"}` before the first |
+
+**A request is not durable until the first chunk is checkpointed.** If Aqueduct restarts before then, the request is
+forgotten; send it again. After that, the snapshot resumes from its checkpoint like an initial one. The source answers
+requests between batches, so a reply can take as long as one Kafka round trip (`504` after 30 s).
+
+The same progress is in `/api/metrics` and `/api/stream` (`snapshot`), and in Prometheus as
+`aqueduct_snapshot_running`, `aqueduct_snapshot_rows_total`, `aqueduct_snapshot_tables_total`,
+`aqueduct_snapshot_tables_done` and `aqueduct_snapshot_rows_estimated` (each absent before the first snapshot). `rows`
+counts this process only: after a restart it starts again from 0.
 
 ## 6. Troubleshooting
 

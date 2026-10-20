@@ -28,7 +28,7 @@ flowchart LR
         SINK["Kafka sink<br/>topic router · partition = FNV-1a(record key)<br/>key: schema.table, or schema.table:identity with partition_by = key"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
-        ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz"]
+        ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
         INS["Event inspector"]
     end
 
@@ -43,6 +43,7 @@ flowchart LR
     PIPE -. "ack(position)" .-> SRC
     SRC -. "slot advance (Postgres)" .-> PG
     PIPE --> MET --> ADM
+    ADM -. "snapshot start / cancel" .-> SRC
     K -- "read back recent events" --> INS --> ADM
     U -- "Bearer for /api/* and /metrics<br/>/, /healthz, /readyz are open" --> ADM
 ```
@@ -221,6 +222,7 @@ before/after diff and Copy JSON).
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
+| `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres, `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
 Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start without `admin_token`, unless
 `admin_insecure_no_auth = true` (logged as a warning). With a token, `/metrics` and `/api/*` need `Authorization: Bearer <token>`

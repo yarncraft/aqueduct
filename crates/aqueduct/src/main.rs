@@ -72,13 +72,19 @@ async fn main() {
         .then_some(inspector);
     let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone(), inspector);
     tokio::spawn(admin.clone().sample_forever());
-    tokio::spawn(admin::serve(listener, admin));
+    tokio::spawn(admin::serve(listener, admin.clone()));
 
     let mut source: Box<dyn aqueduct_core::Source> = match source_cfg {
         config::SourceConfig::Postgres(p) => match p.source_config() {
-            Ok(c) => Box::new(
-                aqueduct_source_postgres::PostgresSource::new(c).with_metrics(metrics.clone()),
-            ),
+            Ok(c) => {
+                let (tx, rx) = aqueduct_core::snapshot_channel();
+                admin.set_snapshots(tx);
+                Box::new(
+                    aqueduct_source_postgres::PostgresSource::new(c)
+                        .with_metrics(metrics.clone())
+                        .with_snapshot_control(rx),
+                )
+            }
             Err(e) => {
                 tracing::error!(error = %e, "invalid postgres config");
                 std::process::exit(1);
