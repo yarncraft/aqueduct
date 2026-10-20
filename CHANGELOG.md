@@ -6,6 +6,9 @@ Notable changes to Aqueduct. Newest first.
 
 ### Breaking changes and upgrade notes
 
+- **The supported Postgres versions are 12 and newer**, not 10 as the docs said. Postgres 10 has no
+  `pg_replication_slot_advance`, and on 11 repeated slot peeks over one connection fail with
+  `out of relcache_callback_list slots`; neither ever worked. Nothing changes on 12 and newer.
 - **Auto-created Kafka topics use replication factor 3** (#56). They used to be created with factor 1, so one broker
   loss meant data loss. New `replication_factor` under `[sink]` sets it explicitly. Unset, Aqueduct tries 3 and, if the
   cluster has fewer than 3 brokers, creates the topic with 1 and logs a warning. Topics that already exist are never
@@ -101,6 +104,10 @@ Notable changes to Aqueduct. Newest first.
   - While a MongoDB snapshot runs the checkpoint file holds JSON (`{"pos": <resume token>, "snap": {...}}`); a
     version without MongoDB snapshots cannot resume from it. Let the snapshot finish before rolling back, or delete
     the checkpoint.
+- **Snapshots on Postgres 12 and 13** (#92): new `[postgres] snapshot_watermark_table` names a published table whose
+  rows carry the watermarks instead of logical messages (Postgres 14+). See DEPLOYMENT.md, "Watermark table".
+- **Cockpit snapshot card** (#78): progress of the running or last snapshot, skipped tables and a Cancel button. Snapshot
+  rows count as `READ` in the operations bar, the per-op event-rate chart and the inspector's op filter.
 - **Admin API for snapshots** (#75): `GET`/`POST`/`DELETE /api/snapshot` shows, starts and cancels a Postgres table
   snapshot (with `snapshot = "on_demand"` or `"initial"`), behind the admin token. Progress is in `/api/metrics`
   (`snapshot`) and Prometheus (`aqueduct_snapshot_*`). A request is not durable until the first chunk is

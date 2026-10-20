@@ -59,7 +59,14 @@ pub struct SnapshotConfig {
     /// Key columns per `schema.table` for tables without a primary key (#91). They must be
     /// published, `NOT NULL` and unique together.
     pub key_columns: HashMap<String, Vec<String>>,
+    /// `schema.table` of a published table that carries the watermarks as rows instead of
+    /// logical messages (#92), so snapshots work on Postgres 10 to 13. See [`WATERMARK_TABLE_DDL`].
+    pub watermark_table: Option<String>,
 }
+
+/// The watermark table [`SnapshotConfig::watermark_table`] names, as DEPLOYMENT.md documents it.
+pub const WATERMARK_TABLE_DDL: &str = "(slot text NOT NULL, snapshot_id text NOT NULL, \
+     chunk bigint NOT NULL, mark text NOT NULL, PRIMARY KEY (slot, chunk, mark))";
 
 /// Default for [`SnapshotConfig::chunk_size`].
 pub const DEFAULT_CHUNK_SIZE: u32 = 1024;
@@ -71,6 +78,7 @@ impl Default for SnapshotConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_rows_per_sec: None,
             key_columns: HashMap::new(),
+            watermark_table: None,
         }
     }
 }
@@ -246,6 +254,38 @@ impl Plan {
     }
 }
 
+/// `schema.table` as a quoted SQL name.
+fn quote_table(id: &str) -> String {
+    match id.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(id),
+    }
+}
+
+/// The watermark a row of the watermark table carries, if it is this slot's (#92).
+pub fn table_watermark(rel: &Relation, tuple: &Tuple, slot: &str) -> Option<decoder::Watermark> {
+    let text = |name: &str| {
+        let i = rel.columns.iter().position(|c| c.name == name)?;
+        match tuple.get(i)? {
+            Datum::Text(s) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    if text("slot")? != slot {
+        return None;
+    }
+    Some(decoder::Watermark {
+        slot: slot.to_owned(),
+        snapshot_id: text("snapshot_id")?,
+        chunk: text("chunk")?.parse::<i64>().ok()?.try_into().ok()?,
+        mark: match text("mark")?.as_str() {
+            "low" => decoder::Mark::Low,
+            "high" => decoder::Mark::High,
+            _ => return None,
+        },
+    })
+}
+
 /// `s` as an SQL string literal. The escape-string form keeps backslashes literal whatever
 /// `standard_conforming_strings` says.
 fn quote_literal(s: &str) -> String {
@@ -294,6 +334,8 @@ pub struct Closed {
 /// A running snapshot.
 pub struct Engine {
     slot: String,
+    /// `schema.table` quoted for SQL when watermarks are rows of a table (#92).
+    watermark_table: Option<String>,
     state: SnapState,
     plans: HashMap<String, Plan>,
     window: Window<ReadRow>,
@@ -357,6 +399,9 @@ impl Engine {
         for (i, id) in state.tables.iter().enumerate() {
             let plan = match by_id.get(id) {
                 None => Err("not in the publication".to_string()),
+                Some(_) if cfg.watermark_table.as_deref() == Some(id.as_str()) => {
+                    Err("it is the watermark table".to_string())
+                }
                 Some(t) => Plan::new(t, cfg.key_columns.get(id)),
             };
             match plan {
@@ -381,6 +426,7 @@ impl Engine {
         state.table = new_index?;
         Some(Self {
             slot: slot.to_owned(),
+            watermark_table: cfg.watermark_table.as_deref().map(quote_table),
             state,
             plans,
             window: Window::new(),
@@ -493,6 +539,21 @@ impl Engine {
     }
 
     async fn emit_watermark(&self, client: &Client, chunk: u64, mark: &str) -> Result<()> {
+        if let Some(table) = &self.watermark_table {
+            // Its own transaction, like the logical message: the row is decoded in commit order.
+            let chunk =
+                i64::try_from(chunk).map_err(|_| Error::Source("chunk id overflow".into()))?;
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (slot, snapshot_id, chunk, mark) VALUES ($1, $2, $3, $4)"
+                    ),
+                    &[&self.slot, &self.state.id, &chunk, &mark],
+                )
+                .await
+                .map_err(crate::source::src_err)?;
+            return Ok(());
+        }
         let payload = serde_json::json!({
             "slot": self.slot,
             "snapshot_id": self.state.id,
@@ -521,6 +582,13 @@ impl Engine {
             .expect(id, &table)
             .map_err(|e| Error::Source(format!("snapshot window: {e}")))?;
         self.in_flight = Some(id);
+        if let Some(t) = &self.watermark_table {
+            // Only one chunk is in flight, so the rows of earlier chunks are no longer needed.
+            client
+                .execute(&format!("DELETE FROM {t} WHERE slot = $1"), &[&self.slot])
+                .await
+                .map_err(crate::source::src_err)?;
+        }
         self.emit_watermark(client, id, "low").await?;
 
         let plan = self.plan()?;

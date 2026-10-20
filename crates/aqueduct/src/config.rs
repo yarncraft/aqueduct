@@ -106,6 +106,10 @@ pub struct PostgresConfig {
     /// Snapshot key columns for tables without a primary key, by `schema.table`.
     #[serde(default)]
     pub snapshot_key_columns: HashMap<String, Vec<String>>,
+    /// `schema.table` of a published table that carries snapshot watermarks as rows (Postgres
+    /// 10 to 13, or wherever `pg_logical_emit_message` is not allowed).
+    #[serde(default)]
+    pub snapshot_watermark_table: Option<String>,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -147,6 +151,14 @@ impl PostgresConfig {
             }
         }
         c.snapshot.key_columns = self.snapshot_key_columns.clone();
+        if let Some(t) = self.snapshot_watermark_table.as_deref() {
+            if t.split('.').count() != 2 || t.split('.').any(str::is_empty) {
+                return Err(format!(
+                    "postgres.snapshot_watermark_table: {t:?} needs the form \"schema.table\""
+                ));
+            }
+        }
+        c.snapshot.watermark_table = self.snapshot_watermark_table.clone();
         Ok(c)
     }
 }
@@ -603,6 +615,12 @@ snapshot_key_columns = { 'public.events' = ['day', 'seq'] }")
         assert!(pg("snapshot = 'always'").unwrap_err().contains("on_demand"));
         assert!(pg("snapshot_chunk_size = 0").is_err());
         assert!(pg("snapshot_key_columns = { events = ['a'] }").is_err());
+        let c = pg("snapshot_watermark_table = 'public.aqueduct_watermarks'").unwrap();
+        assert_eq!(
+            c.snapshot.watermark_table.as_deref(),
+            Some("public.aqueduct_watermarks")
+        );
+        assert!(pg("snapshot_watermark_table = 'aqueduct_watermarks'").is_err());
     }
 
     #[test]
@@ -646,6 +664,7 @@ heartbeat_action_query = 'SELECT 1'")
             snapshot_chunk_size: None,
             snapshot_max_rows_per_sec: None,
             snapshot_key_columns: HashMap::new(),
+            snapshot_watermark_table: None,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());

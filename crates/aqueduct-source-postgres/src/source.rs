@@ -13,7 +13,7 @@ use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, Sn
 use crate::catalog::read_catalog;
 use crate::decoder::{Message, RelationCache};
 use crate::snapshot::{
-    new_snapshot_id, table_id, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
+    new_snapshot_id, table_id, table_watermark, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
     MIN_SERVER_VERSION,
 };
 use crate::tls::{self, SslMode};
@@ -515,7 +515,9 @@ impl PostgresSource {
             .collect();
         let unknown: Vec<&str> = tables
             .iter()
-            .filter(|t| !published.contains(t))
+            .filter(|t| {
+                !published.contains(t) || self.cfg.snapshot.watermark_table.as_ref() == Some(t)
+            })
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
@@ -884,6 +886,34 @@ impl PostgresSource {
         Ok(())
     }
 
+    /// Whether `(schema, table)` is the watermark table (#92): its rows are never events.
+    fn is_watermark_table(&self, (schema, table): &(String, String)) -> bool {
+        self.cfg
+            .snapshot
+            .watermark_table
+            .as_deref()
+            .is_some_and(|w| w == table_id(schema, table))
+    }
+
+    /// A watermark of this slot at `lsn`, from a logical message or a watermark-table row.
+    fn on_watermark(
+        &mut self,
+        wm: &crate::decoder::Watermark,
+        lsn: u64,
+        keys: &mut TxKeys,
+        xid: u32,
+        ts: i64,
+    ) -> Result<()> {
+        let Some(e) = self.snapshot.as_mut() else {
+            return Ok(());
+        };
+        let before = e.state().clone();
+        if let Some(closed) = e.mark(wm)? {
+            self.queue_closed(closed, before, lsn, keys, xid, ts);
+        }
+        Ok(())
+    }
+
     /// Turns decoded messages into queued events. This is the one place where changes get their
     /// [`Key`], for every transport.
     fn apply(&mut self, messages: Vec<(u64, Message)>) -> Result<()> {
@@ -921,6 +951,12 @@ impl PostgresSource {
                 Message::Insert { relation, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
+                    if self.is_watermark_table(&name) {
+                        if let Some(wm) = table_watermark(r, &new, &self.cfg.slot) {
+                            self.on_watermark(&wm, lsn, &mut keys, xid, ts)?;
+                        }
+                        continue;
+                    }
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let row_key = cache.key(relation, &new).map_err(dec)?;
                     let key = keys.next(lsn);
@@ -934,6 +970,9 @@ impl PostgresSource {
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
+                    if self.is_watermark_table(&name) {
+                        continue;
+                    }
                     let row_key = cache
                         .key_with_old(relation, &new, old.as_ref())
                         .map_err(dec)?;
@@ -961,6 +1000,9 @@ impl PostgresSource {
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
+                    if self.is_watermark_table(&name) {
+                        continue;
+                    }
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
                     let row_key = cache.key(relation, &old).map_err(dec)?;
                     let key = keys.next(lsn);
@@ -975,6 +1017,9 @@ impl PostgresSource {
                     for rel_id in relations {
                         let r = cache.get(rel_id).map_err(dec)?;
                         let name = (r.schema.clone(), r.name.clone());
+                        if self.is_watermark_table(&name) {
+                            continue;
+                        }
                         let key = keys.next(lsn);
                         let id = table_id(&name.0, &name.1);
                         if self.queue(key, xid, ts, name, Op::Truncate, None, None, None) {
@@ -997,14 +1042,8 @@ impl PostgresSource {
                 Message::Logical(l) => {
                     // Watermarks of this slot close snapshot chunks; any other message (another
                     // slot's, another tool's, a non-transactional one) is not ours.
-                    let (Some(wm), Some(e)) =
-                        (l.watermark_for(&self.cfg.slot), self.snapshot.as_mut())
-                    else {
-                        continue;
-                    };
-                    let before = e.state().clone();
-                    if let Some(closed) = e.mark(&wm)? {
-                        self.queue_closed(closed, before, l.lsn, &mut keys, xid, ts);
+                    if let Some(wm) = l.watermark_for(&self.cfg.slot) {
+                        self.on_watermark(&wm, l.lsn, &mut keys, xid, ts)?;
                     }
                 }
                 Message::Ignored => {}
@@ -1029,30 +1068,68 @@ impl PostgresSource {
             return Ok(());
         }
         let catalog = read_catalog(self.client()?, &self.cfg.publication).await?;
-        if catalog.server_version_num < MIN_SERVER_VERSION {
-            return Err(Error::Config(format!(
-                "postgres.snapshot = {:?} needs Postgres 14 or newer for its watermarks; this server is {}",
-                cfg.mode, catalog.server_version_num
-            )));
+        match &cfg.watermark_table {
+            Some(table) => {
+                // #92: watermarks are rows of a published table, for servers without (or instead
+                // of) logical messages. It must be published and writable.
+                if !catalog
+                    .tables
+                    .iter()
+                    .any(|t| &table_id(&t.schema, &t.name) == table)
+                {
+                    return Err(Error::Config(format!(
+                        "postgres.snapshot_watermark_table {table:?} is not in publication {:?}; \
+                         create it as {table} {} and add it to the publication",
+                        self.cfg.publication,
+                        crate::snapshot::WATERMARK_TABLE_DDL
+                    )));
+                }
+                let allowed: bool = self
+                    .client()?
+                    .query_one(
+                        "SELECT has_table_privilege($1::text, 'INSERT') AND has_table_privilege($1::text, 'DELETE')",
+                        &[table],
+                    )
+                    .await
+                    .map_err(src_err)?
+                    .get(0);
+                if !allowed {
+                    return Err(Error::Config(format!(
+                        "snapshots write watermarks into {table}; grant INSERT and DELETE on it to the Aqueduct role"
+                    )));
+                }
+            }
+            None => {
+                if catalog.server_version_num < MIN_SERVER_VERSION {
+                    return Err(Error::Config(format!(
+                        "postgres.snapshot = {:?} needs Postgres 14 or newer for its watermarks (this \
+                         server is {}); on older servers set postgres.snapshot_watermark_table",
+                        cfg.mode, catalog.server_version_num
+                    )));
+                }
+                let allowed: bool = self
+                    .client()?
+                    .query_one(
+                        // By OID, not signature: PG17 added a fourth argument (`flush`).
+                        "SELECT COALESCE(bool_or(has_function_privilege(p.oid, 'EXECUTE')), false) \
+                         FROM pg_proc p WHERE p.proname = 'pg_logical_emit_message' \
+                         AND p.pronamespace = 'pg_catalog'::regnamespace \
+                         AND p.proargtypes[1] = 'text'::regtype",
+                        &[],
+                    )
+                    .await
+                    .map_err(src_err)?
+                    .get(0);
+                if !allowed {
+                    return Err(Error::Config(
+                        "snapshots write watermarks with pg_logical_emit_message(); grant EXECUTE on it \
+                         to the Aqueduct role, or set postgres.snapshot = \"never\""
+                            .into(),
+                    ));
+                }
+                self.cfg.logical_messages = true;
+            }
         }
-        let allowed: bool = self
-            .client()?
-            .query_one(
-                // By OID, not signature: PG17 added a fourth argument (`flush`).
-                "SELECT COALESCE(bool_or(has_function_privilege(p.oid, 'EXECUTE')), false)                  FROM pg_proc p WHERE p.proname = 'pg_logical_emit_message'                  AND p.pronamespace = 'pg_catalog'::regnamespace AND p.proargtypes[1] = 'text'::regtype",
-                &[],
-            )
-            .await
-            .map_err(src_err)?
-            .get(0);
-        if !allowed {
-            return Err(Error::Config(
-                "snapshots write watermarks with pg_logical_emit_message(); grant EXECUTE on it to \
-                 the Aqueduct role, or set postgres.snapshot = \"never\""
-                    .into(),
-            ));
-        }
-        self.cfg.logical_messages = true;
         let state = match resume {
             Some(s) => Some(s),
             None if first_start && cfg.mode == SnapshotMode::Initial => Some(SnapState {
@@ -1061,6 +1138,7 @@ impl PostgresSource {
                     .tables
                     .iter()
                     .map(|t| table_id(&t.schema, &t.name))
+                    .filter(|t| cfg.watermark_table.as_ref() != Some(t))
                     .collect(),
                 table: 0,
                 after: None,

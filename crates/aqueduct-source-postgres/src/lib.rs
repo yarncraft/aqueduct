@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod decoder;
+pub mod replication;
 pub mod snapshot;
 mod source;
 mod tls;

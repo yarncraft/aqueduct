@@ -759,7 +759,7 @@ mod tests {
         );
         assert_eq!(
             DASHBOARD.matches("class=\"rateop").count(),
-            4,
+            OP_SLOTS,
             "one checkbox per op"
         );
     }

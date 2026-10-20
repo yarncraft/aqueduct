@@ -694,3 +694,68 @@ async fn on_demand_requests_start_and_cancel() {
     .await
     .unwrap();
 }
+
+/// #92: with `snapshot_watermark_table` the watermarks are rows of a published table, so
+/// snapshots work without logical messages (Postgres 10 to 13). The table's rows never reach the
+/// sink, and the snapshot is complete under live writes.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn a_watermark_table_replaces_logical_messages() {
+    let db = connect().await;
+    let table = unique("snap_wmt");
+    let marks = unique("snap_wmt_marks");
+    let publication = unique("snap_wmt_pub");
+    let slot = unique("snap_wmt");
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, v text NOT NULL);
+         INSERT INTO {table} SELECT g, 'v' FROM generate_series(1, 1500) g;
+         CREATE TABLE {marks} {};
+         CREATE PUBLICATION {publication} FOR TABLE {table}, {marks};",
+        aqueduct_source_postgres::snapshot::WATERMARK_TABLE_DDL
+    ))
+    .await
+    .unwrap();
+    let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.poll_interval = Duration::from_millis(50);
+    cfg.snapshot = SnapshotConfig {
+        mode: SnapshotMode::Initial,
+        chunk_size: 100,
+        watermark_table: Some(format!("public.{marks}")),
+        ..SnapshotConfig::default()
+    };
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+    let writer = {
+        let table = table.clone();
+        tokio::spawn(async move {
+            let db = connect().await;
+            for i in 0..30 {
+                db.batch_execute(&format!(
+                    "UPDATE {table} SET v = 'new' WHERE id = {}; DELETE FROM {table} WHERE id = {};",
+                    1 + i * 47,
+                    2 + i * 47
+                ))
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let mut events = collect(&mut s, Duration::from_secs(5), |_| false).await;
+    writer.await.unwrap();
+    events.extend(collect(&mut s, Duration::from_secs(3), |_| false).await);
+    assert!(
+        events.iter().all(|e| e.table != marks),
+        "watermark rows are never events"
+    );
+    assert!(events.iter().filter(|e| e.op == Op::Read).count() >= 1400);
+    assert_eq!(fold(&events, &table), table_rows(&db, &table).await);
+    drop(s);
+    drop_slot(&db, &slot).await;
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}, {marks};"
+    ))
+    .await
+    .unwrap();
+}

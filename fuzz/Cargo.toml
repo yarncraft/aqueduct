@@ -1,0 +1,46 @@
+# cargo-fuzz targets for the Postgres replication protocol parser (ADR 0003). They need nightly,
+# so they are outside the workspace and `cargo test`; the same entry points run on stable as
+# bounded randomized unit tests in `replication::frame`. From the repository root:
+#
+#   cargo install cargo-fuzz --locked
+#   cargo +nightly fuzz run backend_frames -- -max_total_time=60 -max_len=1048576
+#   cargo +nightly fuzz run copy_data -- -max_total_time=60
+#   cargo +nightly fuzz run stream_task -- -max_total_time=60
+[package]
+name = "aqueduct-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aqueduct-source-postgres = { path = "../crates/aqueduct-source-postgres" }
+bytes = "1"
+libfuzzer-sys = "0.4"
+
+# Not part of the main workspace: cargo-fuzz needs nightly and its own build flags.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "backend_frames"
+path = "fuzz_targets/backend_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "copy_data"
+path = "fuzz_targets/copy_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_task"
+path = "fuzz_targets/stream_task.rs"
+test = false
+doc = false
+bench = false
