@@ -14,6 +14,9 @@ use crate::{encode, op_code, record_key, table_key, SourceInfo};
 /// seen, before the field is reported as unseen (warn-once log, metric, cockpit).
 pub const UNSEEN_FIELD_ROWS: u64 = 1000;
 
+/// The label of the `sink.topic` fallback in route stats; no route may use it.
+const DEFAULT_ROUTE: &str = "default";
+
 /// The ops a route's `ops` list may name, in the order the docs give them.
 const OPS: [Op; 5] = [Op::Insert, Op::Update, Op::Delete, Op::Truncate, Op::Read];
 
@@ -177,8 +180,12 @@ impl RouteStats {
         }
     }
 
-    fn bump(counter: &[AtomicU64], route: usize) {
-        counter[route].fetch_add(1, Ordering::Relaxed);
+    /// Counts an event `route` claimed under `outcome`, together with `matched`. Called only
+    /// once the outcome is final (the record is rendered), so an encode error never leaves
+    /// `matched` above the sum of the outcomes.
+    fn claimed(&self, outcome: &[AtomicU64], route: usize) {
+        self.matched[route].fetch_add(1, Ordering::Relaxed);
+        outcome[route].fetch_add(1, Ordering::Relaxed);
     }
 
     fn counts(&self, i: usize) -> RouteCounts {
@@ -343,8 +350,26 @@ impl RoutePlan {
             if name.is_empty() {
                 return Err(Error::Config("sink route `name` must not be empty".into()));
             }
-            if r.name.is_some() && names.contains(&name) {
-                return Err(Error::Config(format!("duplicate sink route name `{name}`")));
+            // Labels key the per-route counters and Prometheus series, so they must be unique,
+            // and `default` is the `sink.topic` fallback's.
+            if name == DEFAULT_ROUTE {
+                return Err(Error::Config(format!(
+                    "sink route label `{DEFAULT_ROUTE}` is reserved for the `sink.topic` fallback; give the route another `name`"
+                )));
+            }
+            if let Some(i) = names.iter().position(|n| *n == name) {
+                let earlier = &routes[i];
+                return Err(Error::Config(
+                    if r.name.is_none() && earlier.name.is_none() {
+                        format!(
+                            "two sink routes have `match = \"{name}\"`: the second can never match (the first claims every event it would); remove it"
+                        )
+                    } else {
+                        format!(
+                            "duplicate sink route label `{name}` (a route's `name`, or its `match` when it has no name); labels must be unique"
+                        )
+                    },
+                ));
             }
             let ops = r.ops.as_deref().map(|o| parse_ops(&name, o)).transpose()?;
             let filter = r
@@ -371,7 +396,7 @@ impl RoutePlan {
             names.push(name);
         }
         if default.is_some() {
-            names.push("default".into());
+            names.push(DEFAULT_ROUTE.into());
         }
         let default = default.as_deref().map(TopicTemplate::new);
         if let Some(dlq) = &dead_letter_topic {
@@ -520,10 +545,9 @@ impl RoutePlan {
                 event.schema, event.table
             ))
         })?;
-        RouteStats::bump(&self.stats.matched, route);
         if let Some(r) = self.routes.get(route) {
             if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op)) {
-                RouteStats::bump(&self.stats.filtered, route);
+                self.stats.claimed(&self.stats.filtered, route);
                 return Ok(());
             }
             if let Some(filter) = &r.filter {
@@ -532,7 +556,7 @@ impl RoutePlan {
                 match filter.eval(&view) {
                     Ok(Tri::True) => {}
                     Ok(Tri::False | Tri::Unknown) => {
-                        RouteStats::bump(&self.stats.filtered, route);
+                        self.stats.claimed(&self.stats.filtered, route);
                         return Ok(());
                     }
                     Err(e) => {
@@ -542,7 +566,7 @@ impl RoutePlan {
                             filter.source()
                         );
                         self.dead_letter(route, reason, event, now_us, out)?;
-                        RouteStats::bump(&self.stats.errors, route);
+                        self.stats.claimed(&self.stats.errors, route);
                         return Ok(());
                     }
                 }
@@ -559,7 +583,7 @@ impl RoutePlan {
             commit_ts_micros: event.commit_ts_micros,
             headers: Vec::new(),
         });
-        RouteStats::bump(&self.stats.produced, route);
+        self.stats.claimed(&self.stats.produced, route);
         Ok(())
     }
 
@@ -580,14 +604,6 @@ impl RoutePlan {
                 "{reason}, and no sink.dead_letter_topic is configured"
             ))
         })?;
-        if !self.stats.error_logged[route].swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                route = %self.stats.names[route],
-                topic = %topic,
-                error = %reason,
-                "an event could not be evaluated and went to the dead-letter topic; later ones are only counted under errors"
-            );
-        }
         let key = table_key(event, &self.source);
         // R6 (field operations) must apply the route's include/exclude, mask, hash and rename to
         // this value before it is produced, so the dead-letter topic never holds data the route
@@ -601,8 +617,16 @@ impl RoutePlan {
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
-            headers: vec![("aqueduct-error", reason)],
+            headers: vec![("aqueduct-error", reason.clone())],
         });
+        if !self.stats.error_logged[route].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                route = %self.stats.names[route],
+                topic = %out.last().map_or("", |r| r.topic.as_str()),
+                error = %reason,
+                "an event could not be evaluated and went to the dead-letter topic; later ones are only counted under errors"
+            );
+        }
         Ok(())
     }
 
@@ -689,8 +713,38 @@ mod tests {
         assert!(
             RoutePlan::new(vec![named("x", "a.*", "t"), named("x", "b.*", "u")], None).is_err()
         );
-        // Unnamed routes label by pattern; a repeated pattern is allowed (the second never matches).
-        assert!(RoutePlan::new(vec![route("a.*", "t"), route("a.*", "u")], None).is_ok());
+        let err = |routes: Vec<KafkaRoute>, default: Option<&str>| {
+            RoutePlan::new(routes, default.map(Into::into))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+        // Unnamed routes label by pattern: the same `match` twice can never reach the second.
+        let e = err(vec![route("a.*", "t"), route("a.*", "u")], None);
+        assert!(e.contains("the second can never match"), "{e}");
+        // A name may not collide with another route's pattern label, in either order.
+        for routes in [
+            vec![route("a.*", "t"), named("a.*", "b.*", "u")],
+            vec![named("a.*", "b.*", "u"), route("a.*", "t")],
+        ] {
+            let e = err(routes, None);
+            assert!(e.contains("duplicate sink route label `a.*`"), "{e}");
+        }
+        // `default` is the `sink.topic` fallback's label, with or without a `sink.topic`.
+        for default in [None, Some("rest")] {
+            let e = err(vec![named("default", "a.*", "t")], default);
+            assert!(e.contains("reserved"), "{e}");
+            let e = err(vec![route("default", "t")], default);
+            assert!(e.contains("reserved"), "{e}");
+        }
+        // Distinct labels are fine, and every Prometheus series is unique.
+        let p = RoutePlan::new(
+            vec![named("x", "a.*", "t"), route("a.*", "u"), route("b.*", "v")],
+            Some("rest".into()),
+        )
+        .unwrap();
+        let labels: Vec<String> = p.stats().snapshot().into_iter().map(|c| c.route).collect();
+        assert_eq!(labels, ["x", "a.*", "b.*", "default"]);
     }
 
     #[test]

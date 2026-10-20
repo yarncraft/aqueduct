@@ -151,26 +151,50 @@ const CREATE_LIST_ATTEMPTS: u32 = 15;
 /// What to do after the first attempt to create a missing topic.
 #[derive(Debug, PartialEq, Eq)]
 enum AfterCreate {
-    Done,
+    /// The topic exists now (or a concurrent create won): wait for it in the metadata.
+    Created,
+    /// Too few brokers for the default factor: try again with 1.
     FallBack,
+    /// The broker refused the configured factor.
     Reject,
+    /// Any other failure (no permission, invalid config, broker down): report it.
+    Failed,
 }
 
-/// `configured` is the operator's `replication_factor`; `error` is the broker's protocol error,
-/// if any. Other failures (including `TopicAlreadyExists` races) are left to the re-list, which is
-/// authoritative. Only an unset factor falls back; an explicit one the broker rejects is an error.
-fn after_create(configured: Option<i16>, error: Option<&ProtocolError>) -> AfterCreate {
-    match (error, configured) {
-        (Some(ProtocolError::InvalidReplicationFactor), None) => AfterCreate::FallBack,
-        (Some(ProtocolError::InvalidReplicationFactor), Some(_)) => AfterCreate::Reject,
-        _ => AfterCreate::Done,
+/// What a create-topic request returned, reduced to what [`after_create`] decides on.
+#[derive(Debug, Clone, Copy)]
+enum CreateOutcome<'a> {
+    Ok,
+    Protocol(&'a ProtocolError),
+    /// Not a broker answer (connection, timeout, ...).
+    Other,
+}
+
+fn create_outcome(outcome: &std::result::Result<(), ClientError>) -> CreateOutcome<'_> {
+    match outcome {
+        Ok(()) => CreateOutcome::Ok,
+        Err(ClientError::ServerError { protocol_error, .. }) => {
+            CreateOutcome::Protocol(protocol_error)
+        }
+        Err(_) => CreateOutcome::Other,
     }
 }
 
-fn protocol_error(outcome: &std::result::Result<(), ClientError>) -> Option<&ProtocolError> {
-    match outcome {
-        Err(ClientError::ServerError { protocol_error, .. }) => Some(protocol_error),
-        _ => None,
+/// `configured` is the operator's `replication_factor`. Only a success or a `TopicAlreadyExists`
+/// race goes on to the re-list; every other error is reported as the broker gave it. Only an unset
+/// factor falls back; an explicit one the broker rejects is an error.
+fn after_create(configured: Option<i16>, outcome: CreateOutcome<'_>) -> AfterCreate {
+    match (outcome, configured) {
+        (CreateOutcome::Ok | CreateOutcome::Protocol(ProtocolError::TopicAlreadyExists), _) => {
+            AfterCreate::Created
+        }
+        (CreateOutcome::Protocol(ProtocolError::InvalidReplicationFactor), None) => {
+            AfterCreate::FallBack
+        }
+        (CreateOutcome::Protocol(ProtocolError::InvalidReplicationFactor), Some(_)) => {
+            AfterCreate::Reject
+        }
+        _ => AfterCreate::Failed,
     }
 }
 
@@ -271,25 +295,36 @@ impl KafkaSink {
             .client
             .controller_client()
             .map_err(|e| err("controller", &e))?;
-        // Ignore "already exists" races; the re-list below is authoritative.
         let create = |rf: i16| ctrl.create_topic(topic, self.new_topic_partitions, rf, 5_000);
+        let failed = |e: &ClientError| err(&format!("create topic {topic}"), e);
         let first = self
             .replication_factor
             .unwrap_or(DEFAULT_REPLICATION_FACTOR);
         let outcome = create(first).await;
-        match after_create(self.replication_factor, protocol_error(&outcome)) {
-            AfterCreate::Done => {}
+        match after_create(self.replication_factor, create_outcome(&outcome)) {
+            AfterCreate::Created => {}
             AfterCreate::FallBack => {
                 tracing::warn!(
                     topic,
                     "cluster has fewer than {DEFAULT_REPLICATION_FACTOR} brokers; creating topic with replication factor 1, set `replication_factor` to choose"
                 );
-                let _ = create(1).await;
+                let retry = create(1).await;
+                // The fallback is an explicit factor of 1: anything but success fails.
+                if after_create(Some(1), create_outcome(&retry)) != AfterCreate::Created {
+                    if let Err(e) = &retry {
+                        return Err(failed(e));
+                    }
+                }
             }
             AfterCreate::Reject => {
                 return Err(Error::Sink(format!(
                     "kafka broker rejected replication_factor = {first} for topic {topic} (fewer than {first} brokers?)"
                 )));
+            }
+            AfterCreate::Failed => {
+                if let Err(e) = &outcome {
+                    return Err(failed(e));
+                }
             }
         }
         // A new topic can take a moment to show up in the metadata of the broker we ask, so
@@ -420,14 +455,39 @@ mod tests {
 
     #[test]
     fn replication_factor_fallback_only_when_unset() {
+        use CreateOutcome::{Ok as Created, Protocol};
         let bad = ProtocolError::InvalidReplicationFactor;
         let exists = ProtocolError::TopicAlreadyExists;
-        assert_eq!(after_create(None, Some(&bad)), AfterCreate::FallBack);
-        assert_eq!(after_create(Some(3), Some(&bad)), AfterCreate::Reject);
+        assert_eq!(after_create(None, Protocol(&bad)), AfterCreate::FallBack);
+        assert_eq!(after_create(Some(3), Protocol(&bad)), AfterCreate::Reject);
         for cfg in [None, Some(1), Some(3)] {
-            assert_eq!(after_create(cfg, None), AfterCreate::Done);
-            assert_eq!(after_create(cfg, Some(&exists)), AfterCreate::Done);
+            assert_eq!(after_create(cfg, Created), AfterCreate::Created);
+            assert_eq!(after_create(cfg, Protocol(&exists)), AfterCreate::Created);
         }
+    }
+
+    #[test]
+    fn create_errors_are_reported_not_hidden_by_the_re_list() {
+        use CreateOutcome::{Other, Protocol};
+        for e in [
+            ProtocolError::TopicAuthorizationFailed,
+            ProtocolError::ClusterAuthorizationFailed,
+            ProtocolError::InvalidTopicException,
+            ProtocolError::PolicyViolation,
+            ProtocolError::RequestTimedOut,
+        ] {
+            for cfg in [None, Some(1), Some(3)] {
+                assert_eq!(
+                    after_create(cfg, Protocol(&e)),
+                    AfterCreate::Failed,
+                    "{e:?}"
+                );
+            }
+        }
+        assert_eq!(after_create(None, Other), AfterCreate::Failed);
+        // The fallback create(1) is judged as an explicit factor: a refusal is an error too.
+        let bad = ProtocolError::InvalidReplicationFactor;
+        assert_eq!(after_create(Some(1), Protocol(&bad)), AfterCreate::Reject);
     }
 
     #[test]

@@ -307,7 +307,9 @@ topic = "orders-paid"
     boolean only.
   - Times: `timestamp` columns are microseconds since the epoch and `date` columns days since the epoch, both JSON
     numbers, so they compare with number literals (`row.created_at >= 1767225600000000`). `timestamptz` is an ISO-8601
-    string in UTC, so it allows only `==`, `!=` and `in`.
+    string in UTC, so it allows only `==`, `!=` and `in`. Values that have no number form (`infinity`, `-infinity`,
+    dates outside the representable range) stay strings, so a number literal compared with one of them is a type
+    error and the event goes to the dead-letter topic.
   - **Three-valued logic, as in SQL.** A missing field is null, and any comparison with null is *unknown*. Unknown
     propagates: `not unknown` is unknown, `false and unknown` is false, `true or unknown` is true. An event whose
     `where` ends unknown is filtered. So `not (row.region == 'eu')` drops rows whose `region` is null or missing;
@@ -331,8 +333,12 @@ topic = "orders-paid"
   with `_`, and must not be a topic events are routed to (a route's or `topic`'s name, or a name a `{schema}`/`{table}`
   template could produce). It is opened at startup and created if missing (with `partitions` and
   `replication_factor`), so a dead-letter topic that cannot be created or read fails startup. Pre-create it with the
-  retention you want. Write permission (ACLs) is only exercised by the first dead-letter record; a refused write fails
-  that batch, which is retried and never acknowledged. The event inspector also reads the dead-letter topic.
+  retention you want. The event inspector also reads the dead-letter topic.
+- **Check the dead-letter topic's write ACL before you enable `where`.** Startup can only check that the topic exists;
+  write permission is first used by the first dead-letter record. If the broker refuses that write, the batch fails,
+  nothing is acknowledged and the process exits. After a restart it reads the same row again and fails again, so it
+  crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
+  the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
   everything. Aqueduct counts, per route and field path in `where`, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
@@ -348,7 +354,10 @@ Per-route counters: every event a route claims counts as `matched`, then as exac
 | `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
 
-`route` is the route's `name`, else its `match`; events no route claims are counted under `default`.
+`route` is the route's `name`, else its `match`; `default` is reserved and cannot be used as a name. Events no route
+claims are counted under `default` when `sink.topic` is set; without `sink.topic` such an event is an error that stops
+the pipeline. Route labels must be unique: two routes with the same `name`, a `name` equal to another route's `match`,
+or two unnamed routes with the same `match` (the second could never match) fail startup.
 
 ## 4. Admin cockpit
 
@@ -382,6 +391,10 @@ the routed topics (no records are read), with the inspector's connection and TLS
 for 5 s and abandoned after 3 s, so a Kafka outage leaves the column empty (the reason is in the card header and the
 cell's tooltip) but never blocks the cockpit. Offsets need the inspector (`admin_token` and `inspector = true`);
 without it the column shows `–`.
+
+Events and Delivered count every event the source delivered for the table, including events a route filtered
+(`ops`, `where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
+recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
 
 `GET /api/tables` (Bearer token) returns:
 
