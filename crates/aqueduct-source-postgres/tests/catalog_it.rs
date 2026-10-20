@@ -1,5 +1,5 @@
-//! Catalog reads against a real Postgres (S2, #71). Needs a plaintext PG15+ server with
-//! user postgres / password aq (column lists and row filters do not exist before 15):
+//! Catalog reads against a real Postgres (S2, #71). Needs a plaintext PG14+ server with
+//! user postgres / password aq. Column lists and row filters need PG15:
 //!
 //! ```text
 //! AQUEDUCT_TEST_PG_PLAIN=localhost:5434
@@ -42,6 +42,15 @@ fn strs(v: &[&str]) -> Vec<String> {
 #[ignore]
 async fn reads_column_list_row_filter_and_primary_keys() {
     let db = connect().await;
+    let version: String = db
+        .query_one("SHOW server_version_num", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version.parse::<u32>().unwrap() < 150_000 {
+        eprintln!("column lists and row filters need PG15; this server is {version}");
+        return;
+    }
     let id = unique("full");
     let listed = format!("{id}_listed");
     let filtered = format!("{id}_filtered");
@@ -115,6 +124,67 @@ async fn reads_column_list_row_filter_and_primary_keys() {
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication};
          DROP TABLE {listed}, {filtered}, {nopk}, {composite}, {hidden};"
+    ))
+    .await
+    .unwrap();
+}
+
+/// What the snapshot engine needs to encode rows and keys like the decoder. Runs on PG14 too.
+#[tokio::test]
+#[ignore]
+async fn reads_types_replica_identity_and_skips_generated_columns() {
+    use aqueduct_source_postgres::catalog::ReplicaIdentity;
+    let db = connect().await;
+    let id = unique("ident");
+    let mixed = format!("{id}_Mixed Case");
+    let full = format!("{id}_full");
+    let index = format!("{id}_index");
+    let publication = format!("{id}_pub");
+    db.batch_execute(&format!(
+        "CREATE TABLE \"{mixed}\" (\"Id\" bigint PRIMARY KEY, n numeric(10,2), g int GENERATED ALWAYS AS (1) STORED, t text);
+         CREATE TABLE {full} (id int PRIMARY KEY, v text);
+         ALTER TABLE {full} REPLICA IDENTITY FULL;
+         CREATE TABLE {index} (id int PRIMARY KEY, b int NOT NULL, a int NOT NULL);
+         CREATE UNIQUE INDEX {index}_ab ON {index} (a, b);
+         ALTER TABLE {index} REPLICA IDENTITY USING INDEX {index}_ab;
+         CREATE PUBLICATION {publication} FOR TABLE \"{mixed}\", {full}, {index};"
+    ))
+    .await
+    .unwrap();
+
+    let catalog = read_catalog(&db, &publication).await.unwrap();
+    let t = table(&catalog.tables, &mixed);
+    assert_eq!(
+        t.columns,
+        strs(&["Id", "n", "t"]),
+        "generated `g` is not sent"
+    );
+    assert_eq!(t.column_types, vec![20, 1700, 25]);
+    assert_eq!(t.primary_key_types, strs(&["bigint"]));
+    assert_eq!(t.replica_identity, ReplicaIdentity::Default);
+    assert_eq!(t.identity_columns, strs(&["Id"]));
+    assert_eq!(t.qualified_name(), format!("\"public\".\"{mixed}\""));
+    // The quoted name must work in a query.
+    db.query(&format!("SELECT count(*) FROM {}", t.qualified_name()), &[])
+        .await
+        .unwrap();
+
+    let t = table(&catalog.tables, &full);
+    assert_eq!(t.replica_identity, ReplicaIdentity::Full);
+    assert!(t.identity_columns.is_empty());
+    assert_eq!(t.primary_key, strs(&["id"]));
+
+    let t = table(&catalog.tables, &index);
+    assert_eq!(t.replica_identity, ReplicaIdentity::Index);
+    assert_eq!(
+        t.identity_columns,
+        strs(&["b", "a"]),
+        "table order, not index order"
+    );
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication};
+         DROP TABLE \"{mixed}\", {full}, {index};"
     ))
     .await
     .unwrap();
