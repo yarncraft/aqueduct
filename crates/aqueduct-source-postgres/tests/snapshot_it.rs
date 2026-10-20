@@ -530,7 +530,13 @@ async fn the_slot_advances_during_the_snapshot() {
     let at_start = flushed(&db, &slot).await;
     let events = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 1000).await;
     assert!(events.len() >= 1000);
-    let mid = flushed(&db, &slot).await;
+    // The stream transport confirms with its next status update, a moment after the acks.
+    let mut mid = flushed(&db, &slot).await;
+    let until = Instant::now() + Duration::from_secs(3);
+    while mid <= at_start && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mid = flushed(&db, &slot).await;
+    }
     assert!(
         mid > at_start,
         "the slot advanced mid-snapshot: {at_start} -> {mid}"
