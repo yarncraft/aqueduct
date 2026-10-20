@@ -569,7 +569,13 @@ async fn plain_lsn_checkpoint_restart_loses_no_rows_and_acks_advance_the_slot() 
         last = e.checkpoint;
     }
     s.ack(last.expect("events arrived")).await.unwrap();
-    let after = confirmed().await;
+    // The stream transport confirms with its next status update, a moment later.
+    let mut after = confirmed().await;
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while after <= before && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = confirmed().await;
+    }
 
     drop(s);
     drop_slot(&db, &slot).await;
