@@ -7,6 +7,7 @@
 //! - `GET /api/metrics` JSON snapshot
 //! - `GET /api/events`  recent events read back from Kafka (`?topic=<t>&limit=<n>`)
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
+//! - `GET|POST|DELETE /api/snapshot` state of, start, or cancel a table snapshot (ADR 0001)
 //!
 //! If `admin_token` is configured, `/metrics` and `/api/*` require it as
 //! `Authorization: Bearer <token>`. A `?token=` query parameter is never accepted: URLs leak
@@ -19,10 +20,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{Metrics, Snapshot, State, OP_SLOTS};
+use aqueduct_core::{
+    Metrics, Snapshot, SnapshotCommand, SnapshotRequest, SnapshotSender, State, OP_SLOTS,
+};
 use aqueduct_sinks::KafkaInspector;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +67,8 @@ pub struct Admin {
     streams: AtomicUsize,
     inspector: Option<KafkaInspector>,
     inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
+    /// Where snapshot requests go; unset for a source without snapshots.
+    snapshots: OnceLock<SnapshotSender>,
 }
 
 impl Admin {
@@ -80,7 +85,13 @@ impl Admin {
             streams: AtomicUsize::new(0),
             inspector,
             inspect_cache: tokio::sync::Mutex::new(None),
+            snapshots: OnceLock::new(),
         })
+    }
+
+    /// Route `/api/snapshot` requests to the source.
+    pub fn set_snapshots(&self, tx: SnapshotSender) {
+        let _ = self.snapshots.set(tx);
     }
 
     /// Sample the throughput once a second.
@@ -161,15 +172,22 @@ fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 struct Request {
+    method: String,
     path: String,
     bearer: Option<String>,
     query: String,
+    body: String,
 }
 
+/// Largest request (head and body) the server reads.
+const MAX_REQUEST: usize = 16 * 1024;
+
 fn parse(raw: &str) -> Option<Request> {
-    let mut lines = raw.lines();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+    let mut lines = head.lines();
     let mut first = lines.next()?.split_whitespace();
-    if first.next()? != "GET" {
+    let method = first.next()?;
+    if !matches!(method, "GET" | "POST" | "DELETE") {
         return None;
     }
     let target = first.next()?;
@@ -181,10 +199,50 @@ fn parse(raw: &str) -> Option<Request> {
             .flatten()
     });
     Some(Request {
+        method: method.to_string(),
         path: path.to_string(),
         bearer,
         query: query.to_string(),
+        body: body.to_string(),
     })
+}
+
+/// `Content-Length` of a request head, 0 when absent.
+fn content_length(head: &str) -> usize {
+    head.lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Reads one request: the head up to the blank line, then `Content-Length` bytes of body, all
+/// within [`READ_TIMEOUT`] and [`MAX_REQUEST`]. A request split over several TCP segments is
+/// read whole. `None` for a timeout, a closed socket or an oversized request.
+async fn read_request(sock: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(1024);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let want = end + 4 + content_length(&head);
+            if want > MAX_REQUEST {
+                return None;
+            }
+            if buf.len() >= want {
+                buf.truncate(want);
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+        } else if buf.len() >= MAX_REQUEST {
+            return None;
+        }
+        let mut chunk = [0u8; 4096];
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match timeout(left, sock.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => return None,
+        }
+    }
 }
 
 async fn send(sock: &mut TcpStream, bytes: &[u8]) -> bool {
@@ -303,6 +361,46 @@ fn prometheus(s: &Snapshot) -> String {
         );
         let _ = writeln!(o, "aqueduct_slot_lag_bytes {lag}");
     }
+    if let Some(st) = &s.snapshot {
+        for (name, kind, help, value) in [
+            (
+                "aqueduct_snapshot_running",
+                "gauge",
+                "1 while a table snapshot runs.",
+                u64::from(st.state == "running"),
+            ),
+            (
+                "aqueduct_snapshot_rows_total",
+                "counter",
+                "Rows copied by the current or last snapshot in this process.",
+                st.rows,
+            ),
+            (
+                "aqueduct_snapshot_tables_total",
+                "gauge",
+                "Tables in the current or last snapshot.",
+                st.tables.len() as u64,
+            ),
+            (
+                "aqueduct_snapshot_tables_done",
+                "gauge",
+                "Tables of the current or last snapshot fully copied.",
+                st.tables_done as u64,
+            ),
+        ] {
+            metric(&mut o, name, kind, help);
+            let _ = writeln!(o, "{name} {value}");
+        }
+        if let Some(n) = st.rows_estimated {
+            metric(
+                &mut o,
+                "aqueduct_snapshot_rows_estimated",
+                "gauge",
+                "Planner estimate of the rows the snapshot copies.",
+            );
+            let _ = writeln!(o, "aqueduct_snapshot_rows_estimated {n}");
+        }
+    }
     if let Some(hb) = &s.heartbeat {
         metric(
             &mut o,
@@ -358,13 +456,92 @@ fn prometheus(s: &Snapshot) -> String {
     o
 }
 
-async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
-    let mut buf = [0u8; 4096];
-    let n = match timeout(READ_TIMEOUT, sock.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return,
+/// How long `/api/snapshot` waits for the source, which answers between batches.
+const SNAPSHOT_REPLY: Duration = Duration::from_secs(30);
+
+const NOT_DURABLE: &str = "the request survives a restart only once the first chunk is \
+    checkpointed; if Aqueduct restarts before that, send it again";
+
+/// `GET` the running or last snapshot, `POST {"tables": ["schema.table", ...]}` to start one
+/// (or add tables to the running one), `DELETE` to cancel after the chunk in flight.
+async fn snapshot_api(admin: &Admin, req: &Request) -> (&'static str, String) {
+    let err = |status, msg: &str| (status, json!({ "error": msg }).to_string());
+    if req.method == "GET" {
+        let body = match admin.metrics.snapshot().snapshot {
+            Some(st) => serde_json::to_string(&st).unwrap_or_default(),
+            None => json!({ "state": "idle" }).to_string(),
+        };
+        return ("200 OK", body);
+    }
+    let Some(tx) = admin.snapshots.get() else {
+        return err(
+            "501 Not Implemented",
+            "this source does not support snapshots",
+        );
     };
-    let Some(req) = parse(&String::from_utf8_lossy(&buf[..n])) else {
+    let command = match req.method.as_str() {
+        "POST" => {
+            let tables = serde_json::from_str::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| {
+                    v.get("tables")?
+                        .as_array()?
+                        .iter()
+                        .map(|t| t.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<String>>>()
+                });
+            match tables {
+                Some(t) if !t.is_empty() && t.iter().all(|t| t.contains('.')) => {
+                    SnapshotCommand::Start(t)
+                }
+                _ => {
+                    return err(
+                        "400 Bad Request",
+                        r#"expected {"tables": ["schema.table", ...]}"#,
+                    )
+                }
+            }
+        }
+        _ => SnapshotCommand::Cancel,
+    };
+    let start = matches!(command, SnapshotCommand::Start(_));
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if tx.try_send(SnapshotRequest { command, reply }).is_err() {
+        return err(
+            "503 Service Unavailable",
+            "the source is not taking requests",
+        );
+    }
+    match timeout(SNAPSHOT_REPLY, answer).await {
+        Ok(Ok(Ok(id))) if start => (
+            "202 Accepted",
+            json!({ "id": id, "state": "running", "durable": false, "note": NOT_DURABLE })
+                .to_string(),
+        ),
+        Ok(Ok(Ok(id))) => (
+            "202 Accepted",
+            json!({ "id": id, "state": "cancelling" }).to_string(),
+        ),
+        Ok(Ok(Err(msg))) => err("409 Conflict", &msg),
+        Ok(Err(_)) => err("503 Service Unavailable", "the source stopped"),
+        Err(_) => err("504 Gateway Timeout", "the source did not answer in time"),
+    }
+}
+
+async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
+    let Some(raw) = read_request(&mut sock).await else {
+        return;
+    };
+    let Some(req) = parse(&raw) else {
+        return respond(
+            &mut sock,
+            "405 Method Not Allowed",
+            "text/plain",
+            "GET, POST or DELETE only",
+        )
+        .await;
+    };
+    if req.method != "GET" && req.path != "/api/snapshot" {
         return respond(
             &mut sock,
             "405 Method Not Allowed",
@@ -372,7 +549,7 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             "GET only",
         )
         .await;
-    };
+    }
     match req.path.as_str() {
         "/" | "/index.html" => {
             let extra = format!("content-security-policy: {CSP}\r\n");
@@ -400,7 +577,9 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
                 .await
             }
         }
-        "/metrics" | "/api/metrics" | "/api/stream" | "/api/events" if !admin.authorized(&req) => {
+        "/metrics" | "/api/metrics" | "/api/stream" | "/api/events" | "/api/snapshot"
+            if !admin.authorized(&req) =>
+        {
             respond_with(
                 &mut sock,
                 "401 Unauthorized",
@@ -421,6 +600,10 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             .await
         }
         "/api/metrics" => respond(&mut sock, "200 OK", "application/json", &admin.payload()).await,
+        "/api/snapshot" => {
+            let (status, body) = snapshot_api(&admin, &req).await;
+            respond(&mut sock, status, "application/json", &body).await
+        }
         "/api/events" => {
             let Some(inspector) = &admin.inspector else {
                 return respond(
@@ -573,7 +756,10 @@ mod tests {
         );
         let r = parse("GET /api/metrics HTTP/1.1\r\nAuthorization: Bearer s3\r\n\r\n").unwrap();
         assert_eq!(r.bearer.as_deref(), Some("s3"));
-        assert!(parse("POST / HTTP/1.1\r\n\r\n").is_none());
+        assert!(parse("PUT / HTTP/1.1\r\n\r\n").is_none());
+        let r = parse("POST /api/snapshot HTTP/1.1\r\ncontent-length: 2\r\n\r\n{}").unwrap();
+        assert_eq!((r.method.as_str(), r.body.as_str()), ("POST", "{}"));
+        assert_eq!(content_length("POST / HTTP/1.1\r\nContent-Length: 12"), 12);
     }
 
     #[test]
@@ -732,5 +918,177 @@ Authorization: Bearer {token}
         assert!(v.get("events_per_sec").is_some());
         // Unauthenticated stream is refused.
         assert!(get(addr, "/api/stream").await.starts_with("HTTP/1.1 401"));
+    }
+
+    async fn request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: x\r\nAuthorization: Bearer {token}\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        // Split the request in two writes, as a client may: the server must read it whole.
+        let (a, b) = req.split_at(req.len() / 2);
+        c.write_all(a.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        c.write_all(b.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    /// A stand-in source: starts accept `public.*` tables, a cancel works only after a start.
+    fn fake_source(admin: &Admin) {
+        let (tx, mut rx) = aqueduct_core::snapshot_channel();
+        admin.set_snapshots(tx);
+        tokio::spawn(async move {
+            let mut running = false;
+            while let Some(req) = rx.recv().await {
+                let answer = match req.command {
+                    SnapshotCommand::Start(t) if t.iter().all(|t| t.starts_with("public.")) => {
+                        running = true;
+                        Ok("s1".to_string())
+                    }
+                    SnapshotCommand::Start(t) => {
+                        Err(format!("not in publication: {}", t.join(", ")))
+                    }
+                    SnapshotCommand::Cancel if running => {
+                        running = false;
+                        Ok("s1".to_string())
+                    }
+                    SnapshotCommand::Cancel => Err("no snapshot is running".to_string()),
+                };
+                let _ = req.reply.send(answer);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn snapshot_api_needs_the_token_and_validates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let admin = Admin::new(metrics.clone(), Some("k".into()), None);
+        tokio::spawn(serve(listener, admin.clone()));
+
+        // No source with snapshots yet: refused, but only after the token check.
+        for m in ["GET", "POST", "DELETE"] {
+            let r = request(addr, m, "/api/snapshot", "wrong", "").await;
+            assert!(r.starts_with("HTTP/1.1 401"), "{m}: {r}");
+        }
+        let r = request(
+            addr,
+            "POST",
+            "/api/snapshot",
+            "k",
+            r#"{"tables":["public.a"]}"#,
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 501"), "{r}");
+        // Other paths stay GET only.
+        assert!(request(addr, "POST", "/api/metrics", "k", "")
+            .await
+            .starts_with("HTTP/1.1 405"));
+
+        fake_source(&admin);
+        let r = request(addr, "GET", "/api/snapshot", "k", "").await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains(r#""state":"idle""#),
+            "{r}"
+        );
+        for bad in [
+            "",
+            "{}",
+            r#"{"tables":[]}"#,
+            r#"{"tables":["nodot"]}"#,
+            r#"{"tables":[1]}"#,
+        ] {
+            let r = request(addr, "POST", "/api/snapshot", "k", bad).await;
+            assert!(r.starts_with("HTTP/1.1 400"), "{bad}: {r}");
+        }
+        let r = request(
+            addr,
+            "POST",
+            "/api/snapshot",
+            "k",
+            r#"{"tables":["other.x"]}"#,
+        )
+        .await;
+        assert!(
+            r.starts_with("HTTP/1.1 409") && r.contains("not in publication"),
+            "{r}"
+        );
+        let r = request(addr, "DELETE", "/api/snapshot", "k", "").await;
+        assert!(
+            r.starts_with("HTTP/1.1 409") && r.contains("no snapshot is running"),
+            "{r}"
+        );
+        let r = request(
+            addr,
+            "POST",
+            "/api/snapshot",
+            "k",
+            r#"{"tables":["public.a","public.b"]}"#,
+        )
+        .await;
+        assert!(
+            r.starts_with("HTTP/1.1 202") && r.contains(r#""id":"s1""#),
+            "{r}"
+        );
+        assert!(
+            r.contains(r#""durable":false"#),
+            "the API says a request is not durable yet: {r}"
+        );
+        let r = request(addr, "DELETE", "/api/snapshot", "k", "").await;
+        assert!(
+            r.starts_with("HTTP/1.1 202") && r.contains("cancelling"),
+            "{r}"
+        );
+
+        // The status the source reports is what GET returns, and what Prometheus exports.
+        metrics.set_snapshot(Some(aqueduct_core::SnapshotStatus {
+            id: "s1".into(),
+            state: "running".into(),
+            tables: vec!["public.a".into(), "public.b".into()],
+            tables_done: 1,
+            table: Some("public.b".into()),
+            rows: 42,
+            rows_estimated: Some(100),
+            skipped: vec![],
+        }));
+        let r = request(addr, "GET", "/api/snapshot", "k", "").await;
+        assert!(
+            r.contains(r#""rows":42"#) && r.contains(r#""table":"public.b""#),
+            "{r}"
+        );
+        let prom = prometheus(&metrics.snapshot());
+        assert!(prom.contains("aqueduct_snapshot_running 1"));
+        assert!(prom.contains("aqueduct_snapshot_rows_total 42"));
+        assert!(prom.contains("aqueduct_snapshot_tables_done 1"));
+        assert!(prom.contains("aqueduct_snapshot_rows_estimated 100"));
+    }
+
+    #[tokio::test]
+    async fn oversized_requests_are_dropped() {
+        let addr = start(Some("k")).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let big = "x".repeat(MAX_REQUEST);
+        let _ = c
+            .write_all(
+                format!(
+                    "POST /api/snapshot HTTP/1.1\r\ncontent-length: {}\r\n\r\n{big}",
+                    big.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out).await;
+        assert!(out.is_empty(), "{out}");
     }
 }

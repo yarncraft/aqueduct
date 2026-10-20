@@ -68,6 +68,8 @@ pub struct Metrics {
     hb_last_ms: AtomicU64,
     hb_skipped: AtomicU64,
     hb_skip_reason: Mutex<Option<String>>,
+    /// The running or last snapshot, as the source reports it.
+    snapshot: Mutex<Option<SnapshotStatus>>,
 }
 
 impl Default for Metrics {
@@ -105,6 +107,34 @@ pub struct Snapshot {
     /// Omitted when the source does not report heartbeat state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<HeartbeatSnapshot>,
+    /// The running or last snapshot (ADR 0001); `None` before the first.
+    pub snapshot: Option<SnapshotStatus>,
+}
+
+/// Progress of a snapshot, see [`Metrics::set_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SnapshotStatus {
+    pub id: String,
+    /// `running`, `finished` or `cancelled`.
+    pub state: String,
+    /// `schema.table` of every table to copy, in order.
+    pub tables: Vec<String>,
+    /// Tables fully copied.
+    pub tables_done: usize,
+    /// The table being copied, `None` when not running.
+    pub table: Option<String>,
+    /// Rows emitted so far by this process (a restart counts again from 0).
+    pub rows: u64,
+    /// Planner estimate of all rows to copy; `None` when a table was never analyzed.
+    pub rows_estimated: Option<u64>,
+    /// Tables left out and why.
+    pub skipped: Vec<SkippedTable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedTable {
+    pub table: String,
+    pub reason: String,
 }
 
 /// Idle-heartbeat state of a source, see [`Metrics::heartbeat_configured`].
@@ -154,10 +184,16 @@ impl Metrics {
             hb_last_ms: AtomicU64::new(0),
             hb_skipped: AtomicU64::new(0),
             hb_skip_reason: Mutex::new(None),
+            snapshot: Mutex::new(None),
         }
     }
 
     /// Record the replication slot's lag; `None` clears it.
+    /// A source with snapshots reports their progress here whenever it changes.
+    pub fn set_snapshot(&self, status: Option<SnapshotStatus>) {
+        *lock(&self.snapshot) = status;
+    }
+
     pub fn set_slot(&self, lag_bytes: Option<u64>, confirmed_flush_lsn: Option<String>) {
         self.slot_lag_bytes.store(
             lag_bytes.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX)),
@@ -281,6 +317,7 @@ impl Metrics {
                     last_skip_reason: lock(&self.hb_skip_reason).clone(),
                 }
             }),
+            snapshot: lock(&self.snapshot).clone(),
         }
     }
 }
