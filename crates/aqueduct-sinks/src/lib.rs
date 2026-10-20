@@ -9,7 +9,10 @@ pub mod route;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
-pub use route::{KafkaRoute, OutRecord, RouteCount, RoutePlan, RouteStats};
+pub use route::{
+    KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan, RouteStats,
+    RoutesDescription,
+};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
@@ -148,6 +151,16 @@ pub fn record_key(event: &ChangeEvent, info: &SourceInfo) -> String {
         .as_deref()
         .filter(|k| k.trim_start().starts_with('{'))
         .unwrap_or("null");
+    key_json(event, info, key)
+}
+
+/// The record key with `"key": null`: only where the row lives, no row data. Dead-letter records
+/// use it, so the dead-letter topic's keys never carry primary-key values.
+pub fn table_key(event: &ChangeEvent, info: &SourceInfo) -> String {
+    key_json(event, info, "null")
+}
+
+fn key_json(event: &ChangeEvent, info: &SourceInfo, key: &str) -> String {
     let s = |v: &str| serde_json::to_string(v).unwrap_or_default();
     match info {
         SourceInfo::Postgres { db } => format!(
@@ -274,6 +287,15 @@ mod tests {
         assert_eq!(
             record_key(&e, &SourceInfo::Mongodb),
             r#"{"db":"shop","collection":"or\"ders","key":{"_id":{"$oid":"6530"}}}"#
+        );
+        // The dead-letter key names the table only, never the row's key.
+        assert_eq!(
+            table_key(&e, &SourceInfo::Mongodb),
+            r#"{"db":"shop","collection":"or\"ders","key":null}"#
+        );
+        assert_eq!(
+            table_key(&sample(), &pg),
+            r#"{"db":"app","schema":"public","table":"users","key":null}"#
         );
     }
 }

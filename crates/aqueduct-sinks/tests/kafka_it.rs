@@ -2,7 +2,7 @@
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
-use aqueduct_sinks::{KafkaInspector, KafkaSecurity, KafkaSink, RoutePlan};
+use aqueduct_sinks::{KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, RoutePlan};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use serde_json::value::to_raw_value;
@@ -22,6 +22,15 @@ fn ev(n: u64, table: &str) -> ChangeEvent {
     }
 }
 
+/// A topic name no earlier run used: the process id alone repeats in containers (often 1).
+fn unique(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
 #[tokio::test]
 async fn produces_all_events_in_per_table_order() {
     let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
@@ -29,7 +38,7 @@ async fn produces_all_events_in_per_table_order() {
         return;
     };
     let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
-    let topic = format!("aqueduct-it-{}", std::process::id());
+    let topic = unique("aqueduct-it");
 
     let router = RoutePlan::new(vec![], Some(topic.clone())).unwrap();
     let inspector = KafkaInspector::new(brokers.clone(), &router, KafkaSecurity::default());
@@ -109,4 +118,128 @@ async fn produces_all_events_in_per_table_order() {
     let parts = &hwms[&topic];
     assert_eq!(parts.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2]);
     assert_eq!(parts.iter().map(|p| p.1).sum::<i64>(), total as i64);
+}
+
+/// Every record of `topic` across its partitions: (key, headers, value).
+async fn read_all(
+    client: &rskafka::client::Client,
+    topic: &str,
+) -> Vec<(
+    String,
+    std::collections::BTreeMap<String, Vec<u8>>,
+    serde_json::Value,
+)> {
+    let parts = client
+        .list_topics()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == topic)
+        .unwrap_or_else(|| panic!("topic {topic} does not exist"))
+        .partitions;
+    let mut out = Vec::new();
+    for p in parts {
+        let pc = client
+            .partition_client(topic, p, UnknownTopicHandling::Error)
+            .await
+            .unwrap();
+        let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+        let mut offset = 0;
+        while offset < end {
+            let (recs, _hw) = pc.fetch_records(offset, 1..1_000_000, 1_000).await.unwrap();
+            if recs.is_empty() {
+                break;
+            }
+            for r in recs {
+                offset = r.offset + 1;
+                out.push((
+                    String::from_utf8(r.record.key.unwrap()).unwrap(),
+                    r.record.headers,
+                    serde_json::from_slice(&r.record.value.unwrap()).unwrap(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let topic = unique("aqueduct-it-filter");
+    let dlq = unique("aqueduct-it-dlq");
+    let route = KafkaRoute {
+        name: Some("big".into()),
+        pattern: "public.*".into(),
+        topic: topic.clone(),
+        ops: Some(vec!["insert".into()]),
+        filter: Some("row.n > 10".into()),
+    };
+    let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
+    let stats = plan.stats();
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 2, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    // The dead-letter topic is created at connect, before any row needs it.
+    assert!(
+        client
+            .list_topics()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.name == dlq),
+        "dead-letter topic opened at startup"
+    );
+
+    let mut batch: Vec<ChangeEvent> = (1..=20).map(|n| ev(n, "orders")).collect();
+    let mut bad = ev(21, "orders");
+    bad.after = Some(to_raw_value(&serde_json::json!({ "n": "not-a-number" })).unwrap());
+    bad.key = Some(r#"{"id":21}"#.into());
+    batch.push(bad);
+    let mut update = ev(22, "orders");
+    update.op = Op::Update;
+    batch.push(update);
+    // One batch, acked as a whole: the dead-letter record is produced before send_batch returns.
+    sink.send_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+
+    let kept = read_all(&client, &topic).await;
+    let mut ns: Vec<u64> = kept
+        .iter()
+        .map(|(_, _, v)| v["after"]["n"].as_u64().unwrap())
+        .collect();
+    ns.sort_unstable();
+    assert_eq!(
+        ns,
+        (11..=20).collect::<Vec<_>>(),
+        "rows with n <= 10 and the update are filtered"
+    );
+
+    let dead = read_all(&client, &dlq).await;
+    assert_eq!(dead.len(), 1, "one type-error row");
+    let (key, headers, value) = &dead[0];
+    assert_eq!(
+        String::from_utf8(headers["aqueduct-error"].clone()).unwrap(),
+        "route `big`: where `row.n > 10`: type error: `row.n` is not a finite number"
+    );
+    assert_eq!(headers["op"], b"c");
+    assert_eq!(headers["lsn"], b"21");
+    let k: serde_json::Value = serde_json::from_str(key).unwrap();
+    assert_eq!(k["table"], "orders");
+    assert_eq!(k["key"], serde_json::Value::Null, "no row data in the key");
+    assert_eq!(
+        value["after"]["n"], "not-a-number",
+        "the value is the envelope"
+    );
+
+    let c = stats.snapshot()[0].counts;
+    assert_eq!(
+        (c.matched, c.produced, c.filtered, c.errors),
+        (22, 10, 11, 1)
+    );
 }

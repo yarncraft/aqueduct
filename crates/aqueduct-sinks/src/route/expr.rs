@@ -246,7 +246,8 @@ pub struct EventView<'a> {
     after: OnceCell<Option<Object<'a>>>,
 }
 
-fn op_name(op: Op) -> &'static str {
+/// The name an `op` has in expressions and in route `ops` lists.
+pub(crate) fn op_name(op: Op) -> &'static str {
     match op {
         Op::Insert => "insert",
         Op::Update => "update",
@@ -309,6 +310,18 @@ impl<'a> EventView<'a> {
         match f.source {
             Source::Op | Source::Schema | Source::Table => true,
             _ => self.lookup(f).is_some(),
+        }
+    }
+
+    /// True when the event carries the row `f` reads (`before`, `after`, or either for `row`).
+    /// False for `op`, `schema` and `table`. A field can only be missing from a row that exists, so
+    /// the unseen-field check skips events without it (an insert has no `before`, a truncate no row).
+    pub fn has_row(&self, f: &FieldRef) -> bool {
+        match f.source {
+            Source::Before => self.ev.before.is_some(),
+            Source::After => self.ev.after.is_some(),
+            Source::Row => self.ev.after.is_some() || self.ev.before.is_some(),
+            Source::Op | Source::Schema | Source::Table => false,
         }
     }
 

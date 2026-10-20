@@ -106,6 +106,14 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Routing: filter events per route and send failures to a dead-letter topic** (#81, ADR 0002). `[[sink.routes]]`
+  takes `ops` (insert, update, delete, truncate, read) and `where`, a typed predicate with SQL-style three-valued
+  logic (an unknown result is filtered). The first matching route owns the event; nothing falls through. Rows a
+  `where` cannot evaluate (a type error) go to the new `[sink] dead_letter_topic` with an `aqueduct-error` header and
+  a table-only key; it is required once a route uses `where` and is opened at startup. Per-route counters
+  (`matched`, `produced`, `filtered`, `fallback`, `errors`) and unseen-field warnings appear in `/api/metrics`, the new
+  `GET /api/routes` (the compiled plan with live counts) and Prometheus (`aqueduct_route_records_total`,
+  `aqueduct_route_field_unseen`). Additive: routes without the new keys behave exactly as before.
 - **Route plan inside the Kafka sink** (#79). Routing now compiles once into a `RoutePlan` with a pure `render` step;
   output (topic, key, partition, value, headers) is unchanged, which a golden test pins. `[[sink.routes]]` accepts an
   optional unique `name` that labels the route in the per-route counters (`matched`, `produced`; shown in a later

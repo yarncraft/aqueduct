@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>Debezium-style envelope · topic router<br/>key: table + primary key (JSON) · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic<br/>Debezium-style envelope<br/>key: table + primary key (JSON) · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -40,6 +40,8 @@ flowchart LR
     MG -- "watch (changes + watermarks)" --> SRC
     SRC -- "snapshot chunks (_id index scan) + watermark inserts" --> MG
     SRC --> PIPE --> SINK --> K
+    SINK -. "type errors: dead-letter topic" .-> K
+    SINK -. "route plan + counts (/api/routes)" .-> ADM
     PIPE -- "save position" --> CK
     PIPE -. "ack(position)" .-> SRC
     SRC -. "slot advance (Postgres)" .-> PG
@@ -223,6 +225,22 @@ match = "*.audit_*"                   # any schema, tables starting with audit_
 topic = "audit"
 ```
 
+A route can also filter what it claims with `ops` and a `where` expression (SQL-style three-valued logic; a field
+that is null or missing makes a comparison unknown, and unknown is filtered). Rows the expression cannot evaluate
+(a type error) go to `dead_letter_topic` with an `aqueduct-error` header instead of stopping the pipeline. The first
+matching route owns the event: nothing falls through. See DEPLOYMENT.md, "Filtering events per route".
+
+```toml
+[sink]
+dead_letter_topic = "aqueduct.dead-letter"  # required once a route uses `where`
+
+[[sink.routes]]
+match = "public.orders"
+ops = ["insert", "update", "delete"]
+where = "row.status == 'paid' or op == 'delete'"
+topic = "orders-paid"
+```
+
 ### MongoDB source
 
 ```toml
@@ -258,6 +276,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
+| `GET /api/routes` | The compiled route plan (match, ops, where, topic per route, plus `default`) with live per-route counts and unseen fields; no row data |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
