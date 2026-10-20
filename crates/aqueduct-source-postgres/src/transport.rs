@@ -122,6 +122,10 @@ pub struct StreamTransport {
     batch: usize,
     /// How long a fetch waits for the first message.
     wait: std::time::Duration,
+    /// WAL end of the last keepalive with no data after it, across fetches: everything that
+    /// committed before it has been received. The server sends one when it is idle and our
+    /// confirmed position is behind; the heartbeat's own fetch is often empty.
+    caught_up: Option<u64>,
 }
 
 impl StreamTransport {
@@ -130,6 +134,7 @@ impl StreamTransport {
             handle,
             batch,
             wait,
+            caught_up: None,
         }
     }
 }
@@ -142,24 +147,23 @@ fn ended() -> Error {
 impl Transport for StreamTransport {
     async fn fetch(&mut self) -> Result<Fetched> {
         let mut messages = Vec::new();
-        let mut caught_up = None;
         let mut next = match tokio::time::timeout(self.wait, self.handle.recv()).await {
             Ok(m) => m?.ok_or_else(ended)?,
             Err(_) => {
                 return Ok(Fetched {
                     messages,
                     drained: false,
-                    caught_up,
+                    caught_up: self.caught_up,
                 })
             }
         };
         loop {
             match next {
-                Replication::Keepalive { wal_end, .. } => caught_up = Some(wal_end),
+                Replication::Keepalive { wal_end, .. } => self.caught_up = Some(wal_end),
                 Replication::XLogData {
                     wal_start, data, ..
                 } => {
-                    caught_up = None;
+                    self.caught_up = None;
                     let msg = decode(&data).map_err(|e| {
                         Error::Source(format!(
                             "pgoutput decode at {}: {e}",
@@ -181,7 +185,7 @@ impl Transport for StreamTransport {
         Ok(Fetched {
             messages,
             drained: false,
-            caught_up,
+            caught_up: self.caught_up,
         })
     }
 
