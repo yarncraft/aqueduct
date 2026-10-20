@@ -996,6 +996,20 @@ impl PostgresSource {
     }
 
     async fn poll(&mut self) -> Result<()> {
+        if self.cfg.transport == TransportKind::Stream {
+            // The fetch waits for data, so the heartbeat runs after it: a heartbeat started
+            // before a fetch that is then cancelled would never finish. The order does not
+            // matter here: a keepalive at W proves receipt of everything committed below W,
+            // whenever the WAL position is read.
+            self.refresh_slot_stats().await;
+            let fetched = self.transport()?.fetch().await?;
+            self.apply(fetched.messages)?;
+            if let Some(wal) = self.heartbeat_begin().await? {
+                let drained = fetched.caught_up.is_some_and(|w| w >= wal);
+                self.heartbeat_end(wal, drained).await?;
+            }
+            return Ok(());
+        }
         let heartbeat_wal = self.heartbeat_begin().await?;
         self.refresh_slot_stats().await;
         let fetched = self.transport()?.fetch().await?;
