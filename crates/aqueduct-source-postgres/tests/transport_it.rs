@@ -340,6 +340,7 @@ async fn a_million_row_transaction_streams_in_bounded_memory() {
     .await
     .unwrap();
     let baseline = rss_bytes();
+    assert!(baseline > 0, "VmRSS not readable");
     let mut peak = baseline;
     let mut n = 0u64;
     let mut last = None;
@@ -354,7 +355,7 @@ async fn a_million_row_transaction_streams_in_bounded_memory() {
         if ev.op == Op::Insert {
             n += 1;
             last = ev.checkpoint;
-            if n % 1000 == 0 {
+            if n.is_multiple_of(1000) {
                 s.ack(last.clone().unwrap()).await.unwrap();
                 peak = peak.max(rss_bytes());
             }
@@ -362,7 +363,11 @@ async fn a_million_row_transaction_streams_in_bounded_memory() {
     }
     s.ack(last.unwrap()).await.unwrap();
     let grown = peak.saturating_sub(baseline);
-    eprintln!("RSS grew by {} MiB over 1M rows", grown >> 20);
+    eprintln!(
+        "RSS {} MiB at the start, peak {} MiB over 1M rows",
+        baseline >> 20,
+        peak >> 20
+    );
     assert!(grown < 256 << 20, "RSS grew by {} MiB", grown >> 20);
     drop(s);
     drop_slot(&db, &slot).await;
