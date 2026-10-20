@@ -446,6 +446,7 @@ async fn capped_replay_window_does_not_skip_later_rows() {
         .clone()
         .expect("postgres events carry a checkpoint");
     drop(first);
+    f.released().await;
     let behind = f.confirmed().await;
     assert!(
         behind < checkpoint,

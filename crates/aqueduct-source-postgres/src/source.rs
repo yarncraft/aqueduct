@@ -425,6 +425,9 @@ pub struct PostgresSource {
     origin: Option<Origin>,
 }
 
+/// How long the stream transport waits for a slot another connection still holds.
+const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
+
 /// How often the slot lag is read from `pg_replication_slots`.
 const SLOT_STATS_EVERY: Duration = Duration::from_secs(5);
 
@@ -644,33 +647,45 @@ impl PostgresSource {
             .await
             .map_err(src_err)?
             .get(0);
-        let mut client = ReplicationClient::connect(
-            &self.cfg.url,
-            &ConnectOptions {
-                ssl_mode: self.cfg.ssl_mode,
-                ssl_root_cert: self.cfg.ssl_root_cert.clone(),
-            },
-        )
-        .await?;
-        let encrypted = client.encrypted();
-        let system = client.identify_system().await?;
-        if let Some(sys) = self.origin.and_then(|o| o.system) {
-            if system.system_id != sys.to_string() {
-                return Err(Error::Config(format!(
-                    "the replication connection reached cluster {}, the SQL connection cluster {sys}; \
-                     point the URL at one server",
-                    system.system_id
-                )));
-            }
-        }
-        let (stream, status) = client
-            .start_replication(&StartReplication {
-                slot: &self.cfg.slot,
-                start_lsn: 0,
-                publication: &self.cfg.publication,
-                logical_messages: self.cfg.logical_messages,
-            })
+        // A previous process's walsender can hold the slot for a moment after it went away
+        // (55006, "slot is active"): try again for a while before giving up.
+        let deadline = Instant::now() + SLOT_BUSY_RETRY;
+        let (encrypted, stream, status) = loop {
+            let mut client = ReplicationClient::connect(
+                &self.cfg.url,
+                &ConnectOptions {
+                    ssl_mode: self.cfg.ssl_mode,
+                    ssl_root_cert: self.cfg.ssl_root_cert.clone(),
+                },
+            )
             .await?;
+            let encrypted = client.encrypted();
+            let system = client.identify_system().await?;
+            if let Some(sys) = self.origin.and_then(|o| o.system) {
+                if system.system_id != sys.to_string() {
+                    return Err(Error::Config(format!(
+                        "the replication connection reached cluster {}, the SQL connection cluster {sys};                          point the URL at one server",
+                        system.system_id
+                    )));
+                }
+            }
+            let started = client
+                .start_replication(&StartReplication {
+                    slot: &self.cfg.slot,
+                    start_lsn: 0,
+                    publication: &self.cfg.publication,
+                    logical_messages: self.cfg.logical_messages,
+                })
+                .await;
+            match started {
+                Ok((stream, status)) => break (encrypted, stream, status),
+                Err(e) if e.to_string().contains("(55006)") && Instant::now() < deadline => {
+                    tracing::info!(slot = %self.cfg.slot, "slot still held by a previous connection; retrying");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let opts = StreamOptions {
             buffer_bytes: self.cfg.stream_buffer_bytes,
             status_interval: status_interval(timeout_ms),
