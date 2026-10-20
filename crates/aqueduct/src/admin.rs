@@ -1033,6 +1033,26 @@ mod tests {
         );
     }
 
+    /// The routing graph reimplements `glob_match` in JS to draw which route claims a table. The page
+    /// asserts its version against the cases in `#globcases` on load; the Rust function must agree.
+    #[test]
+    fn dashboard_glob_cases_agree_with_glob_match() {
+        let cases = DASHBOARD
+            .split("id=\"globcases\">")
+            .nth(1)
+            .and_then(|r| r.split("</script>").next())
+            .expect("#globcases in admin.html");
+        let cases: Vec<(String, String, bool)> = serde_json::from_str(cases).unwrap();
+        assert!(cases.len() >= 9, "{cases:?}");
+        for (pattern, text, want) in cases {
+            assert_eq!(
+                aqueduct_sinks::glob_match(&pattern, &text),
+                want,
+                "{pattern:?} vs {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
