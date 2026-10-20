@@ -382,7 +382,8 @@ pub fn reject_nul(what: &str, value: &str) -> Result<()> {
 ///
 /// `client_encoding=UTF8` is always sent, as tokio-postgres does for the SQL connection:
 /// pgoutput converts text values to the client encoding, so without it a LATIN1 or SQL_ASCII
-/// database would stream different bytes than poll mode's peek returns. `extra` carries the
+/// database would stream different bytes than poll mode's peek returns. `DateStyle=ISO` matches
+/// what the source sets on its SQL connection, whose time output it parses. `extra` carries the
 /// URL's `application_name` and `options`.
 pub fn startup_message(user: &str, database: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     let mut body = Vec::new();
@@ -392,6 +393,7 @@ pub fn startup_message(user: &str, database: &str, extra: &[(&str, &str)]) -> Ve
         ("database", database),
         ("replication", "database"),
         ("client_encoding", "UTF8"),
+        ("DateStyle", "ISO"),
     ];
     for (k, v) in fixed.iter().chain(extra) {
         body.extend_from_slice(k.as_bytes());
@@ -826,14 +828,16 @@ mod tests {
         assert_eq!(&s[4..8], &196_608i32.to_be_bytes());
         assert_eq!(
             &s[8..],
-            b"user\0u\0database\0d\0replication\0database\0client_encoding\0UTF8\0\0"
+            b"user\0u\0database\0d\0replication\0database\0client_encoding\0UTF8\0DateStyle\0ISO\0\0"
         );
         let s = startup_message(
             "u",
             "d",
             &[("application_name", "aq"), ("options", "-c x=1")],
         );
-        assert!(s.ends_with(b"client_encoding\0UTF8\0application_name\0aq\0options\0-c x=1\0\0"));
+        assert!(s.ends_with(
+            b"client_encoding\0UTF8\0DateStyle\0ISO\0application_name\0aq\0options\0-c x=1\0\0"
+        ));
         assert_eq!(query("X"), b"Q\0\0\0\x06X\0");
         let u = status_update(0x0102, 4, true);
         assert_eq!(u.len(), 34);

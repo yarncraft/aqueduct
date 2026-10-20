@@ -63,9 +63,14 @@ async fn produces_all_events_in_per_table_order() {
                     .unwrap()
                     .parse()
                     .unwrap();
-                let back: ChangeEvent = serde_json::from_slice(&r.record.value.unwrap()).unwrap();
-                assert_eq!(back.position, Position::Lsn(lsn));
-                seen.push((key, lsn, p.to_string()));
+                let back: serde_json::Value =
+                    serde_json::from_slice(&r.record.value.unwrap()).unwrap();
+                assert_eq!(back["source"]["lsn"], lsn, "Debezium-style envelope");
+                assert_eq!(back["op"], "c");
+                let k: serde_json::Value = serde_json::from_str(&key).unwrap();
+                let table = format!("{}.{}", k["schema"].as_str().unwrap(), k["table"].as_str().unwrap());
+                assert_eq!(k["key"], serde_json::Value::Null, "no primary key in these events");
+                seen.push((table, lsn, p.to_string()));
             }
         }
     }

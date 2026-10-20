@@ -388,55 +388,80 @@ impl RelationCache {
         RawValue::from_string(out).map_err(|_| DecodeError::Json)
     }
 
-    /// Replica-identity key values of `tuple` joined with the unit separator (0x1f), or `None` when the table
-    /// has no key columns or uses `REPLICA IDENTITY FULL` (where every column is flagged, so the key would
-    /// be the whole row and move on every update), or when a key column was not sent (unchanged TOAST) and the update carries no old value for it.
-    /// `None` means "fall back to the table key", not "no primary key". Used to partition by primary key.
-    pub fn key(&self, id: u32, tuple: &Tuple) -> Result<Option<String>, DecodeError> {
-        self.key_with_old(id, tuple, None)
+    /// The row's key as a JSON object `{"column": value, ...}` (Debezium's record key), values
+    /// encoded as in [`row`](Self::row): the primary-key columns `pk` (from the catalog), or, when
+    /// those are unknown or not all in the tuple, the replica-identity columns pgoutput flags
+    /// (never under `REPLICA IDENTITY FULL`, where every column is flagged). `None` when neither
+    /// gives a complete key, for example a table without a primary key.
+    pub fn key(
+        &self,
+        id: u32,
+        tuple: &Tuple,
+        pk: Option<&[String]>,
+    ) -> Result<Option<String>, DecodeError> {
+        self.key_with_old(id, tuple, None, pk)
     }
 
-    /// Like [`key`](Self::key), but a key column the new tuple did not send (unchanged TOAST) is taken from
-    /// the `old` key/old-row tuple of an update when that has it. Postgres sends the old key whenever an
-    /// identity column is stored externally, so the row keeps the key its insert had.
+    /// Like [`key`](Self::key), but a key column the new tuple did not send (unchanged TOAST) is
+    /// taken from the `old` tuple of an update when that has it. Postgres sends the old key
+    /// whenever an identity column is stored externally, so the row keeps the key its insert had.
     pub fn key_with_old(
         &self,
         id: u32,
         tuple: &Tuple,
         old: Option<&Tuple>,
+        pk: Option<&[String]>,
     ) -> Result<Option<String>, DecodeError> {
         let rel = self.get(id)?;
+        let by_pk: Option<Vec<usize>> = pk.filter(|p| !p.is_empty()).and_then(|p| {
+            p.iter()
+                .map(|n| rel.columns.iter().position(|c| &c.name == n))
+                .collect()
+        });
+        if let Some(k) = by_pk.and_then(|idx| key_object(rel, &idx, tuple, old)) {
+            return Ok(Some(k));
+        }
         if rel.identity_full() {
             return Ok(None);
         }
-        let mut out = String::new();
-        let mut any = false;
-        for (i, (col, datum)) in rel.columns.iter().zip(tuple).enumerate() {
-            if !col.key {
-                continue;
-            }
-            let datum = match (datum, old.and_then(|o| o.get(i))) {
-                (Datum::Unchanged, Some(o)) => o,
-                _ => datum,
-            };
-            if any {
-                out.push('\u{1f}');
-            }
-            any = true;
-            match datum {
-                Datum::Text(s) => out.push_str(s),
-                Datum::Binary(b) => {
-                    for x in b {
-                        let _ = write!(out, "{x:02x}");
-                    }
-                }
-                Datum::Null => {}
-                // Unsent and no old value: a different key than the insert had, so use the table key.
-                Datum::Unchanged => return Ok(None),
-            }
+        let flagged: Vec<usize> = (0..rel.columns.len())
+            .filter(|&i| rel.columns[i].key)
+            .collect();
+        if flagged.is_empty() {
+            return Ok(None);
         }
-        Ok(any.then_some(out))
+        Ok(key_object(rel, &flagged, tuple, old))
     }
+}
+
+/// `{"column": value, ...}` for the columns at `idx`, or `None` if one of them has no value
+/// (NULL, or unchanged TOAST without an old value).
+fn key_object(rel: &Relation, idx: &[usize], tuple: &Tuple, old: Option<&Tuple>) -> Option<String> {
+    let mut out = String::from("{");
+    for (n, &i) in idx.iter().enumerate() {
+        let datum = match (tuple.get(i)?, old.and_then(|o| o.get(i))) {
+            (Datum::Unchanged, Some(o)) => o,
+            (d, _) => d,
+        };
+        if n > 0 {
+            out.push(',');
+        }
+        push_json_str(&mut out, &rel.columns[i].name);
+        out.push(':');
+        match datum {
+            Datum::Text(s) => push_text(&mut out, rel.columns[i].type_oid, s),
+            Datum::Binary(b) => {
+                out.push('"');
+                for x in b {
+                    let _ = write!(out, "{x:02x}");
+                }
+                out.push('"');
+            }
+            Datum::Null | Datum::Unchanged => return None,
+        }
+    }
+    out.push('}');
+    Some(out)
 }
 
 /// Append `s` as a JSON string literal.
@@ -467,7 +492,11 @@ fn push_json_str(out: &mut String, s: &str) {
 }
 
 /// Append Postgres text output as JSON using well-known type OIDs; anything
-/// unrecognised becomes a string.
+/// unrecognised becomes a string. Time types follow Debezium's defaults: `timestamptz` as an
+/// ISO-8601 string in UTC (`ZonedTimestamp`), `timestamp` as microseconds since the epoch
+/// (`MicroTimestamp`), `date` as days since the epoch (`Date`). The text must be in
+/// `DateStyle = ISO`, which the source sets on its connections; `infinity` and other values that
+/// do not parse stay strings.
 fn push_text(out: &mut String, oid: u32, s: &str) {
     match oid {
         16 => out.push_str(if s == "t" { "true" } else { "false" }),
@@ -484,7 +513,199 @@ fn push_text(out: &mut String, oid: u32, s: &str) {
             None => push_json_str(out, s), // NaN / Infinity
         },
         114 | 3802 if !s.trim().is_empty() => out.push_str(s),
+        1082 => match time::date_days(s) {
+            Some(d) => {
+                let _ = write!(out, "{d}");
+            }
+            None => push_json_str(out, s),
+        },
+        1114 => match time::timestamp_micros(s) {
+            Some(us) => {
+                let _ = write!(out, "{us}");
+            }
+            None => push_json_str(out, s),
+        },
+        1184 => match time::timestamptz_iso(s) {
+            Some(iso) => push_json_str(out, &iso),
+            None => push_json_str(out, s),
+        },
         _ => push_json_str(out, s),
+    }
+}
+
+/// Postgres `DateStyle = ISO` text to Debezium's encodings. Proleptic Gregorian, astronomical
+/// years (1 BC is year 0).
+mod time {
+    /// Days from 1970-01-01 to `y-m-d` (Howard Hinnant's `days_from_civil`).
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// The inverse of [`days_from_civil`].
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        (y, m, d)
+    }
+
+    /// `YYYY-MM-DD` with an optional ` BC`, as days since the epoch.
+    fn date(s: &str) -> Option<i64> {
+        let (s, bc) = match s.strip_suffix(" BC") {
+            Some(s) => (s, true),
+            None => (s, false),
+        };
+        let mut it = s.splitn(3, '-');
+        let y: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next()?.parse().ok()?;
+        let d: i64 = it.next()?.parse().ok()?;
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        Some(days_from_civil(if bc { 1 - y } else { y }, m, d))
+    }
+
+    /// `HH:MM:SS[.ffffff]` as microseconds since midnight.
+    fn time_of_day(s: &str) -> Option<i64> {
+        let mut it = s.splitn(3, ':');
+        let h: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next()?.parse().ok()?;
+        let rest = it.next()?;
+        let (sec, frac) = rest.split_once('.').unwrap_or((rest, ""));
+        let sec: i64 = sec.parse().ok()?;
+        if frac.len() > 6 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let us: i64 = if frac.is_empty() {
+            0
+        } else {
+            format!("{frac:0<6}").parse().ok()?
+        };
+        Some(((h * 60 + m) * 60 + sec) * 1_000_000 + us)
+    }
+
+    pub fn date_days(s: &str) -> Option<i64> {
+        date(s)
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS[.ffffff][ BC]` as microseconds since the epoch.
+    pub fn timestamp_micros(s: &str) -> Option<i64> {
+        let (s, bc) = match s.strip_suffix(" BC") {
+            Some(s) => (s, " BC"),
+            None => (s, ""),
+        };
+        let (d, t) = s.split_once(' ')?;
+        let days = date(&format!("{d}{bc}"))?;
+        Some(days * 86_400_000_000 + time_of_day(t)?)
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]][ BC]` as ISO-8601 in UTC,
+    /// `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` (fraction without trailing zeros, as Java prints it).
+    pub fn timestamptz_iso(s: &str) -> Option<String> {
+        let (s, bc) = match s.strip_suffix(" BC") {
+            Some(s) => (s, " BC"),
+            None => (s, ""),
+        };
+        let (d, rest) = s.split_once(' ')?;
+        let at = rest.rfind(['+', '-'])?;
+        let (t, off) = rest.split_at(at);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let mut parts = off[1..].split(':');
+        let oh: i64 = parts.next()?.parse().ok()?;
+        let om: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
+        let os: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
+        let local = date(&format!("{d}{bc}"))? * 86_400_000_000 + time_of_day(t)?;
+        let utc = local - sign * (oh * 3600 + om * 60 + os) * 1_000_000;
+        let (days, us) = (
+            utc.div_euclid(86_400_000_000),
+            utc.rem_euclid(86_400_000_000),
+        );
+        let (y, m, dd) = civil_from_days(days);
+        let (secs, frac) = (us / 1_000_000, us % 1_000_000);
+        let year = if (0..=9999).contains(&y) {
+            format!("{y:04}")
+        } else {
+            format!("{y:+05}")
+        };
+        let mut iso = format!(
+            "{year}-{m:02}-{dd:02}T{:02}:{:02}:{:02}",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        );
+        if frac > 0 {
+            let f = format!("{frac:06}");
+            iso.push('.');
+            iso.push_str(f.trim_end_matches('0'));
+        }
+        iso.push('Z');
+        Some(iso)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn dates_count_days_from_the_epoch() {
+            assert_eq!(date_days("1970-01-01"), Some(0));
+            assert_eq!(date_days("1970-01-02"), Some(1));
+            assert_eq!(date_days("1969-12-31"), Some(-1));
+            assert_eq!(date_days("2026-10-20"), Some(20_746));
+            assert_eq!(date_days("2000-02-29"), Some(11_016));
+            // 1 BC is year 0 (astronomical), a leap year.
+            assert_eq!(date_days("0001-12-31 BC"), Some(days_from_civil(0, 12, 31)));
+            assert_eq!(date_days("infinity"), None);
+            assert_eq!(date_days("2026-13-01"), None);
+        }
+
+        #[test]
+        fn timestamps_count_microseconds_from_the_epoch() {
+            assert_eq!(timestamp_micros("1970-01-01 00:00:00"), Some(0));
+            assert_eq!(timestamp_micros("1970-01-01 00:00:01.5"), Some(1_500_000));
+            assert_eq!(
+                timestamp_micros("2026-10-20 13:23:46.992107"),
+                Some(1_792_502_626_992_107)
+            );
+            assert_eq!(timestamp_micros("1969-12-31 23:59:59.999999"), Some(-1));
+            assert_eq!(timestamp_micros("-infinity"), None);
+        }
+
+        #[test]
+        fn timestamptz_is_iso_8601_in_utc() {
+            assert_eq!(
+                timestamptz_iso("2026-10-20 13:23:46.992107+00").as_deref(),
+                Some("2026-10-20T13:23:46.992107Z")
+            );
+            assert_eq!(
+                timestamptz_iso("2026-10-20 15:23:46.5+02").as_deref(),
+                Some("2026-10-20T13:23:46.5Z")
+            );
+            assert_eq!(
+                timestamptz_iso("2026-01-01 00:30:00-05:30").as_deref(),
+                Some("2026-01-01T06:00:00Z")
+            );
+            assert_eq!(
+                timestamptz_iso("2026-01-01 00:00:00+01").as_deref(),
+                Some("2025-12-31T23:00:00Z")
+            );
+            assert_eq!(
+                timestamptz_iso("1900-01-01 00:00:00+00:19:32").as_deref(),
+                Some("1899-12-31T23:40:28Z")
+            );
+            assert_eq!(timestamptz_iso("infinity"), None);
+        }
     }
 }
 
@@ -581,7 +802,7 @@ mod tests {
         };
         let mut cache = RelationCache::default();
         cache.insert(rel);
-        cache.key(42, &decode_tuple(tuple)).unwrap()
+        cache.key(42, &decode_tuple(tuple), None).unwrap()
     }
 
     fn decode_tuple(cols: &[Option<&str>]) -> Tuple {
@@ -611,8 +832,41 @@ mod tests {
         cache.insert(flagged_all);
         let old = decode_tuple(&[Some("5"), Some("a")]);
         let new = decode_tuple(&[Some("5"), Some("b")]);
-        assert_eq!(cache.key(42, &old).unwrap(), None);
-        assert_eq!(cache.key(42, &new).unwrap(), None);
+        assert_eq!(cache.key(42, &old, None).unwrap(), None);
+        assert_eq!(cache.key(42, &new, None).unwrap(), None);
+        // With the primary key from the catalog, FULL tables are keyed like any other.
+        let pk = ["id".to_string()];
+        assert_eq!(
+            cache.key(42, &new, Some(&pk)).unwrap().as_deref(),
+            Some(r#"{"id":5}"#)
+        );
+    }
+
+    #[test]
+    fn the_primary_key_wins_over_the_identity_and_falls_back_to_it() {
+        let Message::Relation(rel) = decode(&relation_bytes_with(b'i')).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let row = decode_tuple(&[Some("5"), Some("a")]);
+        let pk = ["name".to_string(), "id".to_string()];
+        assert_eq!(
+            cache.key(42, &row, Some(&pk)).unwrap().as_deref(),
+            Some(r#"{"name":"a","id":5}"#),
+            "the primary key, in key order"
+        );
+        // A delete's old tuple under USING INDEX lacks the other key column: the identity is used.
+        let old = decode_tuple(&[Some("5"), None]);
+        assert_eq!(
+            cache.key(42, &old, Some(&pk)).unwrap().as_deref(),
+            Some(r#"{"id":5}"#)
+        );
+        let unknown = ["gone".to_string()];
+        assert_eq!(
+            cache.key(42, &row, Some(&unknown)).unwrap().as_deref(),
+            Some(r#"{"id":5}"#)
+        );
     }
 
     #[test]
@@ -625,13 +879,13 @@ mod tests {
         let new = vec![Datum::Unchanged, Datum::Text("b".into())];
         let old = vec![Datum::Text("5".into()), Datum::Null];
         let insert_key = cache
-            .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+            .key(42, &decode_tuple(&[Some("5"), Some("a")]), None)
             .unwrap();
         assert_eq!(
-            cache.key_with_old(42, &new, Some(&old)).unwrap(),
+            cache.key_with_old(42, &new, Some(&old), None).unwrap(),
             insert_key
         );
-        assert_eq!(cache.key_with_old(42, &new, None).unwrap(), None);
+        assert_eq!(cache.key_with_old(42, &new, None, None).unwrap(), None);
     }
 
     #[test]
@@ -646,7 +900,7 @@ mod tests {
         cache.insert(rel);
         assert_eq!(
             cache
-                .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+                .key(42, &decode_tuple(&[Some("5"), Some("a")]), None)
                 .unwrap(),
             None
         );
@@ -660,7 +914,7 @@ mod tests {
         let mut cache = RelationCache::default();
         cache.insert(rel);
         let tuple = vec![Datum::Unchanged, Datum::Text("a".into())];
-        assert_eq!(cache.key(42, &tuple).unwrap(), None);
+        assert_eq!(cache.key(42, &tuple, None).unwrap(), None);
     }
 
     #[test]
@@ -683,7 +937,7 @@ mod tests {
         cache.insert(rel);
         assert_eq!(
             cache
-                .key(42, &decode_tuple(&[Some("5"), Some("a")]))
+                .key(42, &decode_tuple(&[Some("5"), Some("a")]), None)
                 .unwrap(),
             None
         );
@@ -691,8 +945,9 @@ mod tests {
 
     #[test]
     fn default_and_index_identity_keep_the_key() {
-        assert_eq!(key_of(b'd', &[Some("5"), Some("a")]), Some("5".to_string()));
-        assert_eq!(key_of(b'i', &[Some("5"), Some("a")]), Some("5".to_string()));
+        let id5 = Some(r#"{"id":5}"#.to_string());
+        assert_eq!(key_of(b'd', &[Some("5"), Some("a")]), id5);
+        assert_eq!(key_of(b'i', &[Some("5"), Some("a")]), id5);
     }
 
     #[test]
@@ -730,7 +985,10 @@ mod tests {
         };
         let row = cache.row(relation, &new).unwrap();
         assert_eq!(row.get(), r#"{"id":5,"name":null}"#);
-        assert_eq!(cache.key(relation, &new).unwrap().as_deref(), Some("5"));
+        assert_eq!(
+            cache.key(relation, &new, None).unwrap().as_deref(),
+            Some(r#"{"id":5}"#)
+        );
     }
 
     #[test]

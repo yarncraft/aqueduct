@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -413,6 +413,9 @@ pub struct PostgresSource {
     /// Relations already logged as `REPLICA IDENTITY FULL`; every poll re-sends the Relation messages,
     /// so this lives on the source, not in the per-poll relation cache.
     full_identity_logged: HashSet<(String, String)>,
+    /// Primary-key columns per published `schema.table` (empty without one), from the
+    /// catalog: the record key, as Debezium keys records, whatever the replica identity.
+    pks: HashMap<String, Vec<String>>,
     /// Highest key known to be durably checkpointed: the start checkpoint, then every `ack`.
     checkpointed: Key,
     /// When the last heartbeat was attempted.
@@ -447,6 +450,7 @@ impl PostgresSource {
             tx_ends: VecDeque::new(),
             last_end: 0,
             full_identity_logged: HashSet::new(),
+            pks: HashMap::new(),
             checkpointed: Key::default(),
             last_heartbeat: Instant::now(),
             metrics: None,
@@ -784,6 +788,12 @@ impl PostgresSource {
             client
         };
 
+        // Time values are converted from their text output, which must be in ISO style; the
+        // peek and the snapshot chunk reads both run in this session.
+        client
+            .batch_execute("SET DateStyle TO ISO")
+            .await
+            .map_err(src_err)?;
         // Authoritative check of what was negotiated (tokio-postgres hides it).
         let encrypted: bool = client
             .query_one(
@@ -1010,6 +1020,7 @@ impl PostgresSource {
             // the heartbeat action query) is always past W, and the slot would never move.
             self.refresh_slot_stats().await;
             let fetched = self.transport()?.fetch().await?;
+            self.learn_keys(&fetched.messages).await?;
             self.apply(fetched.messages)?;
             if self.heartbeat_begin().await?.is_some() {
                 match fetched.caught_up {
@@ -1022,12 +1033,46 @@ impl PostgresSource {
         let heartbeat_wal = self.heartbeat_begin().await?;
         self.refresh_slot_stats().await;
         let fetched = self.transport()?.fetch().await?;
+        self.learn_keys(&fetched.messages).await?;
         self.apply(fetched.messages)?;
         if let Some(wal) = heartbeat_wal {
             // A peek drained the slot; a stream is drained up to the WAL position its last
             // keepalive reported, when nothing followed it.
             let drained = fetched.drained || fetched.caught_up.is_some_and(|w| w >= wal);
             self.heartbeat_end(wal, drained).await?;
+        }
+        Ok(())
+    }
+
+    /// Reads the primary keys of the published tables from the catalog.
+    async fn refresh_keys(&mut self) -> Result<()> {
+        let catalog = read_catalog(self.client()?, &self.cfg.publication).await?;
+        self.pks = catalog
+            .tables
+            .into_iter()
+            .map(|t| (table_id(&t.schema, &t.name), t.primary_key))
+            .collect();
+        Ok(())
+    }
+
+    /// A Relation message for a table not seen before (added to the publication since the
+    /// catalog was read) reloads the primary keys before its rows are keyed.
+    async fn learn_keys(&mut self, messages: &[(u64, Message)]) -> Result<()> {
+        let unknown: Vec<String> = messages
+            .iter()
+            .filter_map(|(_, m)| match m {
+                Message::Relation(r) => Some(table_id(&r.schema, &r.name)),
+                _ => None,
+            })
+            .filter(|id| !self.pks.contains_key(id))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        self.refresh_keys().await?;
+        for id in unknown {
+            // Still unknown (not in the publication's catalog): key by replica identity.
+            self.pks.entry(id).or_default();
         }
         Ok(())
     }
@@ -1084,14 +1129,19 @@ impl PostgresSource {
                     keys.begin(final_lsn);
                 }
                 Message::Relation(rel) => {
+                    let no_pk = self
+                        .pks
+                        .get(&table_id(&rel.schema, &rel.name))
+                        .is_none_or(Vec::is_empty);
                     if rel.identity_full()
+                        && no_pk
                         && self
                             .full_identity_logged
                             .insert((rel.schema.clone(), rel.name.clone()))
                     {
                         tracing::info!(
                             table = %format!("{}.{}", rel.schema, rel.name),
-                            "REPLICA IDENTITY FULL: with partition_by = key this table uses the table key (per-table order only)"
+                            "REPLICA IDENTITY FULL without a primary key: records of this table have a null key"
                         );
                     }
                     if let Some(e) = self.snapshot.as_mut() {
@@ -1109,9 +1159,10 @@ impl PostgresSource {
                         continue;
                     }
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    let row_key = cache.key(relation, &new).map_err(dec)?;
-                    let key = keys.next(lsn);
                     let id = table_id(&name.0, &name.1);
+                    let pk = self.pks.get(&id).map(Vec::as_slice);
+                    let row_key = cache.key(relation, &new, pk).map_err(dec)?;
+                    let key = keys.next(lsn);
                     if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(&id, Live::Insert { rel: r, new: &new });
@@ -1124,8 +1175,10 @@ impl PostgresSource {
                     if self.is_watermark_table(&name) {
                         continue;
                     }
+                    let id = table_id(&name.0, &name.1);
+                    let pk = self.pks.get(&id).map(Vec::as_slice);
                     let row_key = cache
-                        .key_with_old(relation, &new, old.as_ref())
+                        .key_with_old(relation, &new, old.as_ref(), pk)
                         .map_err(dec)?;
                     let before = old
                         .as_ref()
@@ -1134,7 +1187,6 @@ impl PostgresSource {
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
                     let key = keys.next(lsn);
-                    let id = table_id(&name.0, &name.1);
                     if self.queue(key, xid, ts, name, Op::Update, before, after, row_key) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(
@@ -1155,9 +1207,10 @@ impl PostgresSource {
                         continue;
                     }
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
-                    let row_key = cache.key(relation, &old).map_err(dec)?;
-                    let key = keys.next(lsn);
                     let id = table_id(&name.0, &name.1);
+                    let pk = self.pks.get(&id).map(Vec::as_slice);
+                    let row_key = cache.key(relation, &old, pk).map_err(dec)?;
+                    let key = keys.next(lsn);
                     if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(&id, Live::Delete { rel: r, old: &old });
@@ -1443,6 +1496,7 @@ impl Source for PostgresSource {
                 }
             }
         }
+        self.refresh_keys().await?;
         // A recreated slot starts a new stream, so an old snapshot's progress no longer applies.
         let resume = parsed.and_then(|p| p.2).filter(|_| !recreated);
         self.start_snapshot(resume, first_start).await?;

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate::{record_key, SourceInfo};
 use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
 use rskafka::client::error::{Error as ClientError, ProtocolError};
@@ -88,12 +89,12 @@ impl KafkaSecurity {
 /// How the record key, and so the partition, is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartitionBy {
-    /// Key `schema.table`: all changes to a table share a partition (total per-table order).
-    #[default]
+    /// All changes to a table share a partition (total per-table order).
     Table,
-    /// Key `schema.table` plus the primary-key values: rows of one table spread across
-    /// partitions, and changes to one row keep their order. Tables without a key fall back
-    /// to `Table`.
+    /// By the whole record key (table and primary key), as Debezium does: rows of one table
+    /// spread across partitions, and changes to one row keep their order. Rows of a table
+    /// without a primary key share the table's partition.
+    #[default]
     Key,
 }
 
@@ -227,6 +228,7 @@ pub struct KafkaSink {
     new_topic_partitions: i32,
     replication_factor: Option<i16>,
     partition_by: PartitionBy,
+    source: SourceInfo,
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
 }
 
@@ -256,6 +258,7 @@ impl KafkaSink {
             new_topic_partitions: new_topic_partitions.max(1),
             replication_factor,
             partition_by: PartitionBy::default(),
+            source: SourceInfo::default(),
             topics: HashMap::new(),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
@@ -266,9 +269,15 @@ impl KafkaSink {
         Ok(sink)
     }
 
-    /// Choose how records are keyed and partitioned (default: by table).
+    /// Choose how records are partitioned (default: by key).
     pub fn with_partition_by(mut self, by: PartitionBy) -> Self {
         self.partition_by = by;
+        self
+    }
+
+    /// Name the source in every record's `source` block and key.
+    pub fn with_source(mut self, source: SourceInfo) -> Self {
+        self.source = source;
         self
     }
 
@@ -354,19 +363,19 @@ fn partition_index(key: &str, n: usize) -> usize {
     (h % n as u64) as usize
 }
 
-/// Record key: `schema.table`, plus `:` and the primary-key values when partitioning by key.
-fn record_key(event: &ChangeEvent, by: PartitionBy) -> String {
-    match (by, &event.key) {
-        (PartitionBy::Key, Some(k)) => format!("{}.{}:{k}", event.schema, event.table),
-        _ => format!("{}.{}", event.schema, event.table),
+/// What decides the partition: the whole record key, or only the table.
+fn partition_input(event: &ChangeEvent, key: &str, by: PartitionBy) -> String {
+    match by {
+        PartitionBy::Key => key.to_owned(),
+        PartitionBy::Table => format!("{}.{}", event.schema, event.table),
     }
 }
 
-fn record(event: &ChangeEvent, key: String) -> Result<Record> {
+fn record(event: &ChangeEvent, key: String, source: &SourceInfo) -> Result<Record> {
     let mut headers = BTreeMap::new();
     headers.insert(
         "op".to_string(),
-        format!("{:?}", event.op).to_lowercase().into_bytes(),
+        crate::op_code(event.op).as_bytes().to_vec(),
     );
     headers.insert(
         "lsn".to_string(),
@@ -376,7 +385,9 @@ fn record(event: &ChangeEvent, key: String) -> Result<Record> {
         .unwrap_or_else(chrono::Utc::now);
     Ok(Record {
         key: Some(key.into_bytes()),
-        value: Some(crate::encode(event)?.into_bytes()),
+        value: Some(
+            crate::encode(event, source, chrono::Utc::now().timestamp_micros())?.into_bytes(),
+        ),
         headers,
         timestamp,
     })
@@ -409,12 +420,15 @@ impl Sink for KafkaSink {
                     ))
                 })?;
             self.open_topic(&topic).await?;
-            let key = record_key(event, self.partition_by);
-            let part = partition_index(&key, self.topics[&topic].len());
+            let key = record_key(event, &self.source);
+            let part = partition_index(
+                &partition_input(event, &key, self.partition_by),
+                self.topics[&topic].len(),
+            );
             groups
                 .entry((topic, part))
                 .or_default()
-                .push(record(event, key)?);
+                .push(record(event, key, &self.source)?);
         }
         let sends = groups.into_iter().map(|((topic, part), records)| {
             let client = self.topics[&topic][part].clone();
@@ -514,37 +528,62 @@ mod tests {
         assert_eq!(deliverable(&batch[..1]).count(), 0);
     }
 
+    fn pg() -> SourceInfo {
+        SourceInfo::Postgres { db: "app".into() }
+    }
+
     #[test]
     fn read_events_get_a_read_op_header() {
         let mut e = crate::sample();
         e.op = Op::Read;
-        let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
-        assert_eq!(r.headers["op"], b"read");
+        let r = record(&e, record_key(&e, &pg()), &pg()).unwrap();
+        assert_eq!(r.headers["op"], b"r");
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
-        assert_eq!(v["op"], "read");
+        assert_eq!(v["op"], "r");
+        assert_eq!(v["source"]["snapshot"], "incremental");
     }
 
     #[test]
     fn record_has_key_headers_and_json_value() {
         let e = crate::sample();
-        let r = record(&e, record_key(&e, PartitionBy::Table)).unwrap();
-        assert_eq!(r.key.as_deref(), Some(&b"public.users"[..]));
-        assert_eq!(r.headers["op"], b"insert");
+        let r = record(&e, record_key(&e, &pg()), &pg()).unwrap();
+        assert_eq!(
+            r.key.as_deref(),
+            Some(&br#"{"db":"app","schema":"public","table":"users","key":{"id":1}}"#[..])
+        );
+        assert_eq!(r.headers["op"], b"c");
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
-        assert_eq!(v["table"], "users");
+        assert_eq!(v["source"]["table"], "users");
     }
 
     #[test]
-    fn key_mode_adds_primary_key_and_spreads_rows() {
-        let mut e = crate::sample();
-        assert_eq!(record_key(&e, PartitionBy::Key), "public.users:1");
-        e.key = None;
-        assert_eq!(record_key(&e, PartitionBy::Key), "public.users");
+    fn rows_spread_by_key_unless_partitioned_by_table() {
+        assert_eq!(PartitionBy::default(), PartitionBy::Key);
+        let e = crate::sample();
         let parts: std::collections::HashSet<usize> = (0..200)
-            .map(|i| partition_index(&format!("public.users:{i}"), 6))
+            .map(|i| {
+                let mut e = e.clone();
+                e.key = Some(format!(r#"{{"id":{i}}}"#));
+                partition_index(
+                    &partition_input(&e, &record_key(&e, &pg()), PartitionBy::Key),
+                    6,
+                )
+            })
             .collect();
-        assert!(parts.len() > 1);
+        assert!(parts.len() > 1, "rows spread over partitions");
+        let tables: std::collections::HashSet<usize> = (0..200)
+            .map(|i| {
+                let mut e = e.clone();
+                e.key = Some(format!(r#"{{"id":{i}}}"#));
+                partition_index(
+                    &partition_input(&e, &record_key(&e, &pg()), PartitionBy::Table),
+                    6,
+                )
+            })
+            .collect();
+        assert_eq!(tables.len(), 1, "one partition per table");
         assert_eq!("key".parse::<PartitionBy>(), Ok(PartitionBy::Key));
+        assert_eq!("table".parse::<PartitionBy>(), Ok(PartitionBy::Table));
         assert!("x".parse::<PartitionBy>().is_err());
     }
 

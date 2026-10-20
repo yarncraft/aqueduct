@@ -780,7 +780,8 @@ mod handshake_tests {
             read_untagged(&mut s).await;
             s.write_all(b"N").await.unwrap();
             let startup = read_untagged(&mut s).await;
-            assert!(startup.ends_with(b"replication\0database\0client_encoding\0UTF8\0\0"));
+            assert!(startup
+                .ends_with(b"replication\0database\0client_encoding\0UTF8\0DateStyle\0ISO\0\0"));
             s.write_all(&ok_and_ready()).await.unwrap();
         })
         .await;

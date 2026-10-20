@@ -1,6 +1,7 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
-    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, TopicRouter,
+    KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SourceInfo,
+    TopicRouter,
 };
 
 use crate::config::KafkaConfig;
@@ -40,7 +41,7 @@ fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
 
 /// Build the Kafka sink and the inspector that reads the same topics back
 /// (with the same TLS/SASL settings).
-pub async fn build(cfg: &KafkaConfig) -> Result<(KafkaSink, KafkaInspector)> {
+pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, KafkaInspector)> {
     let router = router(cfg)?;
     let security = security(cfg)?;
     let inspector = KafkaInspector::new(cfg.brokers.clone(), &router, security.clone());
@@ -57,6 +58,7 @@ pub async fn build(cfg: &KafkaConfig) -> Result<(KafkaSink, KafkaInspector)> {
         &security,
     )
     .await?
-    .with_partition_by(by);
+    .with_partition_by(by)
+    .with_source(source);
     Ok((sink, inspector))
 }

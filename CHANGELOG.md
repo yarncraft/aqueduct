@@ -6,6 +6,22 @@ Notable changes to Aqueduct. Newest first.
 
 ### Breaking changes and upgrade notes
 
+- **Events use Debezium's envelope, keys and time encodings** (Postgres and MongoDB). Every consumer must be updated:
+  - Value: `{"before", "after", "source": {"version", "connector", "ts_ms", "ts_us", "snapshot", "db", "schema",
+    "table", "txId", "lsn"}, "op", "ts_ms", "ts_us"}` (MongoDB: `db` and `collection` in `source`). The old top-level
+    `lsn`, `xid`, `commit_ts_micros`, `schema` and `table` moved into `source` (`lsn`, `txId`, `ts_us`, `schema`,
+    `table`).
+  - `op` is a letter: `c`, `u`, `d`, `t`, `r` (was `insert`, `update`, `delete`, `truncate`, `read`); the Kafka header
+    `op` too.
+  - `timestamptz` values are ISO-8601 in UTC (`2026-10-20T13:23:46.992107Z`, was Postgres text with an offset),
+    `timestamp` values microseconds since the epoch, `date` values days since the epoch (both were text).
+  - Record key: `{"db": "app", "schema": "public", "table": "orders", "key": {"id": 42}}` (was `public.orders` or
+    `public.orders:42`); `key` is the primary key, also for `REPLICA IDENTITY FULL` tables.
+  - Partitioning: `partition_by` now defaults to `key` (per-row order, a table spreads over partitions). Set
+    `partition_by = "table"` under `[sink]` to keep total per-table order. Records of a table can land on other
+    partitions than before, so let consumers drain the topics before upgrading if they rely on order across the
+    switch.
+  - Upgrade: deploy consumers that read the new format first (or a new topic per route), then upgrade Aqueduct.
 - **The supported Postgres versions are 12 and newer**, not 10 as the docs said. Postgres 10 has no
   `pg_replication_slot_advance`, and on 11 repeated slot peeks over one connection fail with
   `out of relcache_callback_list slots`; neither ever worked. Nothing changes on 12 and newer.
@@ -92,9 +108,9 @@ Notable changes to Aqueduct. Newest first.
 
 - **Postgres snapshots: copy rows that already exist while changes stream** (#74, ADR 0001). New `[postgres]` keys
   `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and
-  `snapshot_key_columns`. Copied rows arrive as `"op": "read"`, encoded like an `insert` of the same row. Needs
+  `snapshot_key_columns`. Copied rows arrive as `"op": "r"`, encoded like an `insert` of the same row. Needs
   Postgres 14+ and `EXECUTE` on `pg_logical_emit_message`. See DEPLOYMENT.md, "Snapshots".
-  - **New op value `read`: consumers that decode `op` as a closed enum must accept it.**
+  - **New op value `r` (snapshot rows): consumers that decode `op` as a closed enum must accept it.**
 - **Postgres streaming transport** (#109, ADR 0003): `[postgres] transport = "stream"` receives changes over a
   replication connection as they commit instead of polling the slot every 500 ms. Same events, keys and checkpoints
   as `poll`, which stays the default. Needs one more walsender per instance (`max_wal_senders`), a `pg_hba.conf` line
@@ -103,7 +119,7 @@ Notable changes to Aqueduct. Newest first.
 - **MongoDB snapshots: copy documents that already exist while changes stream** (#77, ADR 0001). New MongoDB
   `[source]` keys `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size` and
   `snapshot_max_rows_per_sec`, the same as for Postgres, and `/api/snapshot` accepts `database.collection`. Documents
-  arrive as `"op": "read"`, encoded like an `insert` of the same document, in `_id` order (mixed `_id` types work).
+  arrive as `"op": "r"`, encoded like an `insert` of the same document, in `_id` order (mixed `_id` types work).
   With snapshots on, Aqueduct writes watermark documents into `<database>.aqueduct_watermarks` and needs `insert`,
   `remove` and `createIndex` on that collection; startup checks it. See DEPLOYMENT.md, "MongoDB snapshots".
   - While a MongoDB snapshot runs the checkpoint file holds JSON (`{"pos": <resume token>, "snap": {...}}`); a
