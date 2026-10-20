@@ -232,6 +232,10 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
 
+When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
+copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
+counted as `READ` in the operations breakdown, the event-rate chart and the inspector's op filter.
+
 A second row shows replication health: slot lag in bytes and the confirmed flush LSN, the age of the last heartbeat against its interval (amber past 2x, red past 5x), and how many heartbeats were skipped and why. These come from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. A field the server does not send shows `–`, and `off` means heartbeats are disabled. The age is measured against the browser clock, so a large clock skew between the browser and the container shifts it.
 
 ## Operations
