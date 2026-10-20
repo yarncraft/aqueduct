@@ -120,6 +120,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-tls",
  "async-trait",
+ "bytes",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

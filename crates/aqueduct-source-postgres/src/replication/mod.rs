@@ -8,5 +8,7 @@
 mod client;
 pub mod frame;
 
-pub use client::{ReplicationClient, SystemInfo};
+pub use client::{
+    ReplicationClient, ReplicationStream, StartReplication, StatusSender, SystemInfo,
+};
 pub use frame::Replication;
