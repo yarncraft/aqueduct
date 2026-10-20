@@ -782,6 +782,9 @@ impl PostgresSource {
                             "REPLICA IDENTITY FULL: with partition_by = key this table uses the table key (per-table order only)"
                         );
                     }
+                    if let Some(e) = self.snapshot.as_mut() {
+                        e.relation(&table_id(&rel.schema, &rel.name), &rel);
+                    }
                     cache.insert(rel)
                 }
                 Message::Insert { relation, new } => {
@@ -904,7 +907,8 @@ impl PostgresSource {
         let allowed: bool = self
             .client()?
             .query_one(
-                "SELECT has_function_privilege('pg_logical_emit_message(boolean,text,text)', 'EXECUTE')",
+                // By OID, not signature: PG17 added a fourth argument (`flush`).
+                "SELECT COALESCE(bool_or(has_function_privilege(p.oid, 'EXECUTE')), false)                  FROM pg_proc p WHERE p.proname = 'pg_logical_emit_message'                  AND p.pronamespace = 'pg_catalog'::regnamespace AND p.proargtypes[1] = 'text'::regtype",
                 &[],
             )
             .await
@@ -1097,12 +1101,17 @@ impl Source for PostgresSource {
                 }
             }
             self.poll().await?;
-            let busy = self
-                .snapshot
-                .as_ref()
-                .is_some_and(|e| e.in_flight() || e.due());
-            if self.buffer.is_empty() && !busy {
-                tokio::time::sleep(self.cfg.poll_interval).await;
+            if self.buffer.is_empty() {
+                // A chunk in flight waits for its high watermark: poll again soon, but not in a
+                // hot loop (the watermark may not be flushed yet). A due chunk starts at once.
+                let pause = match &self.snapshot {
+                    Some(e) if e.due() => Duration::ZERO,
+                    Some(e) if e.in_flight() => {
+                        Duration::from_millis(20).min(self.cfg.poll_interval)
+                    }
+                    _ => self.cfg.poll_interval,
+                };
+                tokio::time::sleep(pause).await;
             }
         }
     }

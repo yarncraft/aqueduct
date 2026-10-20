@@ -33,6 +33,9 @@ pub struct PublishedTable {
     pub row_filter: Option<String>,
     /// The planner's row estimate (`reltuples`). `None` until the table has been analyzed.
     pub estimated_rows: Option<u64>,
+    /// Column sets that identify a row: each unique index (primary key included) on plain
+    /// columns, without a predicate, whose key columns are all `NOT NULL`. In key order.
+    pub unique_keys: Vec<Vec<String>>,
 }
 
 impl PublishedTable {
@@ -118,11 +121,25 @@ fn tables_query(server_version_num: u32) -> String {
         WHERE i.indrelid = c.oid
           AND ((c.relreplident = 'd' AND i.indisprimary) OR (c.relreplident = 'i' AND i.indisreplident))),
         ARRAY[]::text[])";
+    // Each unique key as its column names joined with the unit separator (0x1f); INCLUDE
+    // columns (past `indnkeyatts`) are not part of the key.
+    let unique = "COALESCE((SELECT array_agg(u.cols) FROM (
+        SELECT (SELECT string_agg(a.attname::text, E'\\x1f' ORDER BY k.ord)
+                FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE k.ord <= i.indnkeyatts) AS cols
+        FROM pg_index i
+        WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            WHERE k.ord <= i.indnkeyatts AND NOT a.attnotnull)) u),
+        ARRAY[]::text[])";
     format!(
         "SELECT p.schemaname::text, p.tablename::text, c.oid, COALESCE({names}, ARRAY[]::text[]),
                 COALESCE({types}, ARRAY[]::oid[]), {pk}, {pk_types}, c.relreplident::text,
                 {identity}, {filter}, c.reltuples::float8,
-                COALESCE({type_names}, ARRAY[]::text[])
+                COALESCE({type_names}, ARRAY[]::text[]), {unique}
          FROM pg_publication_tables p
          JOIN pg_namespace n ON n.nspname = p.schemaname
          JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename
@@ -187,6 +204,11 @@ pub async fn read_catalog(client: &Client, publication: &str) -> Result<Catalog>
                 row_filter: r.get(9),
                 estimated_rows: estimated_rows(r.get(10)),
                 column_type_names: r.get(11),
+                unique_keys: r
+                    .get::<_, Vec<String>>(12)
+                    .iter()
+                    .map(|k| k.split('\u{1f}').map(str::to_owned).collect())
+                    .collect(),
             })
         })
         .collect::<Result<_>>()?;

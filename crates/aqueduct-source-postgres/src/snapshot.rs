@@ -102,8 +102,9 @@ struct Plan {
     key_types: Vec<String>,
     /// Position of each key column in `columns`.
     key_pos: Vec<usize>,
-    /// The old tuple of a live delete carries every key column (identity is the primary key, the
-    /// whole row, or an index containing the key).
+    /// The replica identity covers every key column (it is the primary key, the whole row, or an
+    /// index containing the key). Only then does a delete's old tuple carry the key, and does an
+    /// update that changes the key send its old one. Otherwise such live changes are unknown.
     key_in_old: bool,
     row_filter: Option<String>,
     estimated_rows: Option<u64>,
@@ -125,6 +126,15 @@ impl Plan {
                         .position(|p| p == c)
                         .ok_or_else(|| format!("key column {c:?} is not published"))?;
                     types.push(t.column_type_names[i].clone());
+                }
+                // The keyset cursor skips rows that share the boundary value and the window
+                // merges rows with equal keys, so the key must identify one row.
+                let same =
+                    |u: &Vec<String>| u.len() == cols.len() && u.iter().all(|c| cols.contains(c));
+                if !t.unique_keys.iter().any(same) {
+                    return Err(format!(
+                        "snapshot_key_columns {cols:?} is not a unique index of NOT NULL columns"
+                    ));
                 }
                 (cols.clone(), types)
             }
@@ -158,10 +168,11 @@ impl Plan {
                 .columns
                 .iter()
                 .zip(&t.column_types)
+                // pgoutput flags every column under FULL, the identity columns otherwise.
                 .map(|(name, &type_oid)| Column {
                     name: name.clone(),
                     type_oid,
-                    key: t.identity_columns.contains(name),
+                    key: identity == b'f' || t.identity_columns.contains(name),
                 })
                 .collect(),
             identity,
@@ -298,9 +309,15 @@ pub struct Engine {
     plans: HashMap<String, Plan>,
     window: Window<ReadRow>,
     /// Chunk ids must never repeat across restarts (a replayed watermark of an old chunk would
-    /// close a new one): they start at the clock in microseconds and count up.
+    /// close a new one), and must not be guessable (anyone with EXECUTE on
+    /// `pg_logical_emit_message` could close a window early): a random start, counting up.
     next_chunk: u64,
     in_flight: Option<u64>,
+    /// Key values of the last row the chunk in flight read: the cursor once it closes. Kept apart
+    /// from the window's joined key, which cannot be split back when a value holds 0x1f.
+    last_values: Option<Vec<String>>,
+    /// Consecutive retries of the current chunk, for the backoff.
+    retries: u32,
     chunk_size: u32,
     max_rows_per_sec: Option<u32>,
     not_before: Instant,
@@ -313,6 +330,14 @@ fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// 64 random bits from the standard library's per-process hash keys (no extra dependency).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(now_micros());
+    h.finish()
 }
 
 /// A fresh snapshot id.
@@ -368,8 +393,10 @@ impl Engine {
             state,
             plans,
             window: Window::new(),
-            next_chunk: now_micros(),
+            next_chunk: random_u64() >> 1,
             in_flight: None,
+            last_values: None,
+            retries: 0,
             chunk_size: cfg.chunk_size.max(1),
             max_rows_per_sec: cfg.max_rows_per_sec.filter(|n| *n > 0),
             not_before: Instant::now(),
@@ -485,6 +512,7 @@ impl Engine {
         let mut cache = RelationCache::default();
         cache.insert(plan.relation.clone());
         let mut chunk = Vec::new();
+        let mut last_values = None;
         for m in &messages {
             let SimpleQueryMessage::Row(r) = m else {
                 continue;
@@ -495,18 +523,19 @@ impl Engine {
                     None => Datum::Null,
                 })
                 .collect();
-            let window_key = plan
+            let values = plan
                 .key_pos
                 .iter()
                 .map(|&i| match &tuple[i] {
-                    Datum::Text(s) => Ok(s.as_str()),
+                    Datum::Text(s) => Ok(s.clone()),
                     _ => Err(Error::Source(format!(
                         "snapshot of {table}: key column {:?} is NULL",
                         plan.columns[i]
                     ))),
                 })
-                .collect::<Result<Vec<_>>>()?
-                .join(&SEP.to_string());
+                .collect::<Result<Vec<_>>>()?;
+            let window_key = values.join(&SEP.to_string());
+            last_values = Some(values);
             let dec = |e: decoder::DecodeError| Error::Source(e.to_string());
             chunk.push(ChunkRow {
                 key: window_key,
@@ -519,6 +548,7 @@ impl Engine {
             });
         }
         let n = chunk.len() as u64;
+        self.last_values = last_values;
         self.window
             .set_chunk(chunk)
             .map_err(|e| Error::Source(format!("snapshot window: {e}")))?;
@@ -545,11 +575,13 @@ impl Engine {
             Live::Insert { rel, new } => vec![plan.live_key(rel, new, None)],
             Live::Update { rel, old, new } => {
                 let mut k = vec![plan.live_key(rel, new, old)];
-                // An old tuple is only sent when the key changed or the identity is FULL.
-                if let Some(o) = old {
-                    if plan.key_in_old {
-                        k.push(plan.live_key(rel, o, None));
-                    }
+                // An old tuple is only sent when the identity changed or is FULL. If the identity
+                // does not cover the key, the key can change with no old tuple, and the row it
+                // had cannot be told.
+                match old {
+                    _ if !plan.key_in_old => k.push(None),
+                    Some(o) => k.push(plan.live_key(rel, o, None)),
+                    None => {}
                 }
                 k
             }
@@ -569,6 +601,43 @@ impl Engine {
         }
     }
 
+    /// A Relation message of `table` passed on the stream. When its columns differ from the plan
+    /// (an `ALTER TABLE` since the plan was made), later chunks read the new columns, and a chunk
+    /// in flight, read with the old ones, is read again. A key column that is gone makes the next
+    /// chunk query fail, and the restart then skips the table.
+    pub fn relation(&mut self, table: &str, rel: &Relation) {
+        let Some(plan) = self.plans.get_mut(table) else {
+            return;
+        };
+        let shape = |r: &Relation| {
+            r.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.type_oid))
+                .collect::<Vec<_>>()
+        };
+        if shape(&plan.relation) == shape(rel) {
+            return;
+        }
+        tracing::info!(table = %table, "the table's columns changed during the snapshot");
+        plan.relation = Relation {
+            id: plan.relation.id,
+            ..rel.clone()
+        };
+        plan.columns = rel.columns.iter().map(|c| c.name.clone()).collect();
+        for (pos, k) in plan.key_pos.iter_mut().zip(&plan.key) {
+            if let Some(i) = plan.columns.iter().position(|c| c == k) {
+                *pos = i;
+            }
+        }
+        plan.key_in_old = rel.identity == b'f'
+            || (rel.identity != b'n'
+                && plan
+                    .key
+                    .iter()
+                    .all(|k| rel.columns.iter().any(|c| &c.name == k && c.key)));
+        self.window.live_unknown(table);
+    }
+
     /// A watermark of this slot passed on the stream. Returns the rows to emit and the new
     /// progress when it closes the chunk in flight.
     pub fn mark(&mut self, wm: &decoder::Watermark) -> Result<Option<Closed>> {
@@ -586,6 +655,11 @@ impl Engine {
         let (rows, last_key) = match outcome {
             Outcome::None => return Ok(None),
             Outcome::Retry => {
+                // Back off, so a table that keeps producing unknown keys is not hammered.
+                self.retries = self.retries.saturating_add(1);
+                let wait = Duration::from_millis(100u64 << self.retries.min(7))
+                    .min(Duration::from_secs(10));
+                self.not_before = self.not_before.max(Instant::now() + wait);
                 tracing::info!(
                     table = %self.state.tables[self.state.table],
                     "a live change in the snapshot window had no readable key; reading the chunk again"
@@ -599,8 +673,10 @@ impl Engine {
             Outcome::Emit { rows, last_key } => (rows, last_key),
         };
         self.in_flight = None;
+        self.retries = 0;
+        let last_values = self.last_values.take();
         match last_key {
-            Some(k) => self.state.after = Some(k.split(SEP).map(str::to_owned).collect()),
+            Some(_) => self.state.after = last_values,
             None => {
                 // An empty chunk: the table is done.
                 self.state.after = None;
@@ -636,6 +712,7 @@ mod tests {
             },
             row_filter: None,
             estimated_rows: Some(10),
+            unique_keys: vec![vec!["a".into(), "b".into()], vec!["b".into()]],
         }
     }
 
@@ -698,6 +775,11 @@ mod tests {
         assert!(Plan::new(&nopk, Some(&bad))
             .unwrap_err()
             .contains("not published"));
+        // ... that are a unique key of NOT NULL columns, or rows would be skipped or merged.
+        let loose = vec!["v".to_string()];
+        assert!(Plan::new(&nopk, Some(&loose))
+            .unwrap_err()
+            .contains("not a unique index"));
     }
 
     #[test]
@@ -821,6 +903,9 @@ mod tests {
         let t = e.state.tables[e.state.table].clone();
         e.window.expect(id, &t).unwrap();
         e.in_flight = Some(id);
+        e.last_values = rows
+            .last()
+            .map(|r| r.key.split('\u{1f}').map(str::to_owned).collect());
         e.window.set_chunk(rows).unwrap();
         id
     }
@@ -895,5 +980,80 @@ mod tests {
         assert_eq!("on_demand".parse(), Ok(SnapshotMode::OnDemand));
         assert_eq!("initial".parse(), Ok(SnapshotMode::Initial));
         assert!("always".parse::<SnapshotMode>().is_err());
+    }
+
+    #[test]
+    fn an_update_the_identity_cannot_place_retries_the_chunk() {
+        // USING INDEX on `b` alone: an update may change `a` without an old tuple.
+        let cat = catalog(vec![table(ReplicaIdentity::Index)]);
+        let mut e = Engine::new(
+            "slot",
+            state(&["public.Orders"]),
+            &cat,
+            &SnapshotConfig::default(),
+        )
+        .unwrap();
+        let id = open(&mut e, vec![read("x\u{1f}5")]);
+        e.mark(&wm(id, decoder::Mark::Low)).unwrap();
+        let r = rel(b'i');
+        e.observe(
+            "public.Orders",
+            Live::Update {
+                rel: &r,
+                old: None,
+                new: &tuple("y", "5"),
+            },
+        );
+        let closed = e.mark(&wm(id, decoder::Mark::High)).unwrap().unwrap();
+        assert!(closed.rows.is_empty(), "the chunk is read again");
+        assert!(!e.due(), "after a backoff");
+    }
+
+    #[test]
+    fn the_cursor_keeps_key_values_that_hold_the_separator() {
+        let cat = catalog(vec![table(ReplicaIdentity::Default)]);
+        let mut e = Engine::new(
+            "slot",
+            state(&["public.Orders"]),
+            &cat,
+            &SnapshotConfig::default(),
+        )
+        .unwrap();
+        let id = open(&mut e, vec![read("a\u{1f}b\u{1f}1")]);
+        e.last_values = Some(vec!["a\u{1f}b".into(), "1".into()]);
+        e.mark(&wm(id, decoder::Mark::Low)).unwrap();
+        let closed = e.mark(&wm(id, decoder::Mark::High)).unwrap().unwrap();
+        assert_eq!(
+            closed.state.unwrap().after,
+            Some(vec!["a\u{1f}b".to_string(), "1".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_column_change_replans_and_retries_the_chunk_in_flight() {
+        let cat = catalog(vec![table(ReplicaIdentity::Default)]);
+        let mut e = Engine::new(
+            "slot",
+            state(&["public.Orders"]),
+            &cat,
+            &SnapshotConfig::default(),
+        )
+        .unwrap();
+        let id = open(&mut e, vec![read("a\u{1f}1")]);
+        e.mark(&wm(id, decoder::Mark::Low)).unwrap();
+        // The same columns again change nothing.
+        let mut same = e.plans["public.Orders"].relation.clone();
+        e.relation("public.Orders", &same);
+        // A new column: the plan reads it from now on, and the chunk in flight is read again.
+        same.columns.push(Column {
+            name: "w".into(),
+            type_oid: 25,
+            key: false,
+        });
+        e.relation("public.Orders", &same);
+        assert_eq!(e.plans["public.Orders"].columns, ["b", "a", "v", "w"]);
+        assert_eq!(e.plans["public.Orders"].key_pos, [1, 0]);
+        let closed = e.mark(&wm(id, decoder::Mark::High)).unwrap().unwrap();
+        assert!(closed.rows.is_empty());
     }
 }
