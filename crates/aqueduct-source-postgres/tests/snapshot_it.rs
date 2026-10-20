@@ -473,6 +473,11 @@ async fn crashes_before_the_first_and_after_the_last_checkpoint() {
     // Restart at the last row: the snapshot reads one empty chunk and ends, copying nothing.
     let mut s = source(&slot, &publication, SnapshotMode::Initial, 100);
     s.start(Some(last_read)).await.unwrap();
+    let again = collect(&mut s, Duration::from_secs(3), |_| false).await;
+    assert!(
+        again.iter().all(|e| e.op != Op::Read),
+        "nothing is copied again"
+    );
     db.execute(&format!("INSERT INTO {table} VALUES (1000)"), &[])
         .await
         .unwrap();
@@ -480,10 +485,6 @@ async fn crashes_before_the_first_and_after_the_last_checkpoint() {
         e.iter().any(|e| e.op == Op::Insert)
     })
     .await;
-    assert!(
-        tail.iter().all(|e| e.op != Op::Read),
-        "nothing is copied again"
-    );
     let Some(Position::Text(t)) = &tail.last().unwrap().checkpoint else {
         panic!("text checkpoint")
     };
