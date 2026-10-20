@@ -362,7 +362,7 @@ or two unnamed routes with the same `match` (the second could never match) fail 
 ## 4. Admin cockpit
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
-sink latency, errors, a per-operation breakdown, per-table high-water marks and an event inspector.
+sink latency, errors, a per-operation breakdown, the routing graph, per-table high-water marks and an event inspector.
 Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
@@ -410,6 +410,30 @@ recent deliveries while its topic's Kafka HWM does not move; the per-route count
 `kafka` is `null` with an `error` string when the offsets could not be read (inspector off, Kafka unreachable or slow,
 topic missing). Counts and marks start from zero when the process restarts. Prometheus has the commit time per table
 as `aqueduct_table_last_commit_timestamp_seconds{table="schema.table"}`; Kafka offsets are not exported there.
+
+### Routing graph
+
+The **Routing** card shows where each table's events go:
+
+- **Tables** (left): every table that delivered events, with its count, grouped by the route that claims it. A route
+  with more than 6 tables shows its 5 busiest and a "+N more" node; click it to expand. A table no route matches
+  while `sink.topic` is unset is listed in red under "no route" (its events fail the pipeline).
+- **Routes** (middle): `[[sink.routes]]` in match order, numbered, then `default` (`sink.topic`, marked `else`). A
+  table belongs to the first route whose `match` fits `schema.table` (`*` matches any run of characters, dots
+  included), the same rule the sink uses. Each route shows `match`, its `ops` (or "all ops"), its `where` (hover for
+  the full text, click the route for details), a badge per routing option it sets, and its produced, filtered,
+  fallback and errors counts with a bar. An amber **never seen** box lists fields its `where` reads that no row has
+  had after enough rows (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then
+  filters everything.
+- **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
+  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count.
+
+A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
+topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
+motion. The line to the dead-letter topic is dashed and appears for routes with a `where` or with errors. Hover a
+table to highlight its path. Click a topic to open it in the event inspector (only when the inspector is on). The
+plan is read once from `GET /api/routes` when the page loads; counts update every second from the stream. Without
+any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 ### Routing plan
 
