@@ -450,7 +450,7 @@ function render(d) {
     $('pc-' + k).textContent = total ? (100 * d[k] / total).toFixed(1) + '%' : '–';
   }
 
-  fillTableHwm();
+  fillTableMarks();
   appendRates(d.rates);
   renderGraph(true);
 
@@ -474,14 +474,15 @@ const ago = t => { const a = Math.max(0, Date.now() - t); return a < 1000 ? 'now
 async function pollTables() {
   try {
     const r = await fetch('/api/tables', authInit());
-    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); hwm.error = r.status === 401 ? 'unauthorized' : 'disabled'; fillTableHwm(); return; }
+    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); hwm.error = r.status === 401 ? 'unauthorized' : 'disabled'; fillTopicHwm(); return; }
     if (!r.ok) return;
     const d = await r.json();
     const byName = {};
     for (const t of d.tables) byName[t.table] = t;
     hwm = { tables: byName, error: null, read_ms: d.kafka_read_ms };
     renderGraph();
-    fillTableHwm();
+    fillTableMarks();
+    fillTopicHwm();
   } catch (_) { /* the connection badge covers outages */ }
 }
 const tablesTimer = setInterval(pollTables, HWM_POLL_MS);
@@ -1038,32 +1039,41 @@ function topicDetail(m, name) {
     + (can ? `<button type="button" data-inspect="${esc(name)}" class="rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Open in inspector</button>` : '<span class="text-ink-500">inspector off</span>')
     + closeBtn + `</div><div class="space-y-1">`
     + row('written by', writers.length ? writers.map(x => `<button type="button" data-route="${x.i}" class="mr-3 text-blue hover:underline">${esc(x.r.route)}</button>`).join('') : '<span class="text-ink-500">no route seen writing to it</span>')
-    + `</div>` + detailChart(legendItem(name === m.dlq ? RATE_LINE.errors : TOPIC_LINE, 'records acknowledged / s'));
+    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(name === m.dlq ? RATE_LINE.errors : TOPIC_LINE, 'records acknowledged / s'));
 }
 
-// A table's panel: the route that claims it (first match wins), its topic, its events and their rate.
-// The high-water marks of the table open in the detail panel; refreshed by every stream frame and Kafka read.
-function fillTableHwm() {
+// The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
+// for the topics tables are routed to; refreshed after every read.
+function fillTopicHwm() {
+  const el = document.getElementById('topichwm');
+  if (!el || topicSel == null) return;
+  const row = (label, v, title) => `<div class="flex gap-3"${title ? ` title="${esc(title)}"` : ''}><span class="w-24 shrink-0 text-ink-500">${label}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
+  const entry = Object.values(hwm.tables).find(t => t.topic === topicSel && t.kafka);
+  const k = entry && entry.kafka;
+  const offsets = k
+    ? `${fmt(k.hwm_total)} <span class="text-ink-500">· ${k.partitions.map(p => 'p' + esc(p.partition) + ' ' + fmt(p.hwm)).join(' · ')}</span>`
+    : `<span class="text-ink-500">${esc(hwm.error || 'only read for topics that tables route to by name')}</span>`;
+  el.innerHTML = row('Kafka HWM', offsets, 'Sum over the topic\'s partitions of the next offset Kafka will assign: the records written to it.')
+    + row('offsets read', hwm.read_ms ? esc(ago(hwm.read_ms)) : '–');
+}
+
+// A table's panel (source side, no Kafka details): the route that claims it, its events, how far it has got, and its
+// rate per operation. The block below the header is refreshed by every stream frame.
+function fillTableMarks() {
   const el = document.getElementById('tablehwm');
   const d = lastData;
   if (!el || !d || tableSel == null) return;
-  const name = tableSel, m = (d.table_marks || {})[name] || {}, k = hwm.tables[name] || {};
+  const name = tableSel, m = (d.table_marks || {})[name] || {};
   const row = (label, v, title) => `<div class="flex gap-3"${title ? ` title="${esc(title)}"` : ''}><span class="w-24 shrink-0 text-ink-500">${label}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const ops = (d.table_ops || {})[name] || [0, 0, 0, 0, 0], total = d.events_total || 1, events = (d.tables || {})[name] || 0;
   const fresh = Math.max(0, ...Object.values(d.table_marks || {}).map(x => x.last_commit_ms || 0));
   const behind = m.last_commit_ms ? fresh - m.last_commit_ms : 0;
   const tone = d.state !== 'streaming' ? '' : behind > BEHIND_RED_MS ? 'text-red' : behind > BEHIND_AMBER_MS ? 'text-amber' : '';
-  const kafka = k.kafka;
-  const offsets = kafka
-    ? `${fmt(kafka.hwm_total)} <span class="text-ink-500">· ${kafka.partitions.map(p => 'p' + esc(p.partition) + ' ' + fmt(p.hwm)).join(' · ')}${kafka.tables_on_topic > 1 ? ` · topic shared by ${esc(kafka.tables_on_topic)} tables` : ''}</span>`
-    : `<span class="text-ink-500">${esc(hwm.error || k.error || 'not read yet')}</span>`;
   el.innerHTML = row('ops', ['insert', 'update', 'delete', 'truncate', 'read'].map((o, i) => `${o} ${fmt(ops[i])}`).join(' · ') + ` <span class="text-ink-500">· ${(100 * events / total).toFixed(1)}% of all events</span>`)
     + row('last LSN', esc(m.last_lsn || '–'))
     + row('last commit', m.last_commit_ms ? `<span class="${tone}">${esc(ago(m.last_commit_ms))}</span> <span class="text-ink-500">${esc(isoMs(m.last_commit_ms))}</span>` : '–',
       'Age of the newest delivered change\'s commit. Amber: more than 1 min behind the freshest table, red: more than 10 min (only while streaming).')
     + row('delivered', m.last_delivered_ms ? `${esc(ago(m.last_delivered_ms))} <span class="text-ink-500">${esc(isoMs(m.last_delivered_ms))}</span>` : '–')
-    + row('Kafka HWM', offsets, 'Sum over the topic\'s partitions of the next offset Kafka will assign (sink side). Whether Aqueduct is behind the source is in the Behind source card.')
-    + row('offsets read', hwm.read_ms ? esc(ago(hwm.read_ms)) : '–')
     + row('checkpoint', `${esc(d.checkpoint || '–')} <span class="text-ink-500">(global, not per table)</span>`);
 }
 
@@ -1073,7 +1083,6 @@ function tableDetail(m, name) {
   const x = t && t.route != null ? m.routes[t.route] : null;
   $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
-    + row('topic', esc((t && t.topic) || (x ? x.r.topic : '–')))
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
     + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(TABLE_OP_LABEL.map((label, op) => `<label class="flex cursor-pointer items-center gap-1.5"><input type="checkbox" data-tableop="${op}"${tableOps.has(op) ? ' checked' : ''}><i class="inline-block h-0.5 w-3" style="background:${OPLINE[op]}"></i>${label} / s</label>`).join(''));
 }
@@ -1081,7 +1090,7 @@ function tableDetail(m, name) {
 function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
   $('routedetail').hidden = !x && topicSel == null && tableSel == null;
-  if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) { tableDetail(m, tableSel); fillTableHwm(); } return; }
+  if (!x) { if (topicSel != null) { topicDetail(m, topicSel); fillTopicHwm(); } else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const extra = Object.keys(r).filter(k => !['route', 'match', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
