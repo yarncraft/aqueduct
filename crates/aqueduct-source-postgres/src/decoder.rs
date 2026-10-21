@@ -245,7 +245,8 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
     Ok(match r.u8()? {
         b'B' => Message::Begin {
             final_lsn: r.u64()?,
-            commit_ts_micros: r.i64()? + PG_EPOCH_OFFSET_MICROS,
+            // Saturating: a malformed message must not panic (debug) or wrap (release).
+            commit_ts_micros: r.i64()?.saturating_add(PG_EPOCH_OFFSET_MICROS),
             xid: r.u32()?,
         },
         b'C' => {
@@ -253,7 +254,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             Message::Commit {
                 commit_lsn: r.u64()?,
                 end_lsn: r.u64()?,
-                commit_ts_micros: r.i64()? + PG_EPOCH_OFFSET_MICROS,
+                commit_ts_micros: r.i64()?.saturating_add(PG_EPOCH_OFFSET_MICROS),
             }
         }
         b'R' => {
@@ -613,7 +614,9 @@ mod time {
         date(s)
     }
 
-    /// `YYYY-MM-DD HH:MM:SS[.ffffff][ BC]` as microseconds since the epoch.
+    /// `YYYY-MM-DD HH:MM:SS[.ffffff][ BC]` as microseconds since the epoch. `None` past about
+    /// 294247 AD (Postgres allows up to 294276 AD), where microseconds no longer fit an i64; the
+    /// caller then sends the text.
     pub fn timestamp_micros(s: &str) -> Option<i64> {
         let (s, bc) = match s.strip_suffix(" BC") {
             Some(s) => (s, " BC"),
@@ -621,7 +624,8 @@ mod time {
         };
         let (d, t) = s.split_once(' ')?;
         let days = date(&format!("{d}{bc}"))?;
-        Some(days * 86_400_000_000 + time_of_day(t)?)
+        days.checked_mul(86_400_000_000)?
+            .checked_add(time_of_day(t)?)
     }
 
     /// `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]][ BC]` as ISO-8601 in UTC,
@@ -639,8 +643,10 @@ mod time {
         let oh: i64 = parts.next()?.parse().ok()?;
         let om: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
         let os: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
-        let local = date(&format!("{d}{bc}"))? * 86_400_000_000 + time_of_day(t)?;
-        let utc = local - sign * (oh * 3600 + om * 60 + os) * 1_000_000;
+        let local = date(&format!("{d}{bc}"))?
+            .checked_mul(86_400_000_000)?
+            .checked_add(time_of_day(t)?)?;
+        let utc = local.checked_sub(sign * (oh * 3600 + om * 60 + os) * 1_000_000)?;
         let (days, us) = (
             utc.div_euclid(86_400_000_000),
             utc.rem_euclid(86_400_000_000),
@@ -694,6 +700,26 @@ mod time {
             );
             assert_eq!(timestamp_micros("1969-12-31 23:59:59.999999"), Some(-1));
             assert_eq!(timestamp_micros("-infinity"), None);
+            // Valid in Postgres, but past what i64 microseconds since 1970 can hold: the text is
+            // sent instead of a wrapped number.
+            assert_eq!(timestamp_micros("294276-12-31 23:59:59.999999"), None);
+            assert!(timestamp_micros("294246-12-31 23:59:59").is_some());
+            assert_eq!(timestamptz_iso("294276-12-31 23:59:59+00"), None);
+        }
+
+        #[test]
+        fn begin_and_commit_times_do_not_overflow() {
+            let mut b = vec![b'B'];
+            b.extend_from_slice(&1u64.to_be_bytes());
+            b.extend_from_slice(&i64::MAX.to_be_bytes());
+            b.extend_from_slice(&7u32.to_be_bytes());
+            assert!(matches!(
+                crate::decoder::decode(&b),
+                Ok(crate::decoder::Message::Begin {
+                    commit_ts_micros: i64::MAX,
+                    ..
+                })
+            ));
         }
 
         #[test]

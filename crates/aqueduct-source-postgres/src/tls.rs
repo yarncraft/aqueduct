@@ -127,18 +127,58 @@ pub(crate) fn parse(url: &str) -> Result<Parsed> {
     })
 }
 
-/// True when every host is loopback or a unix socket (plaintext is acceptable there).
+/// True when every host is loopback or a unix socket (plaintext is acceptable there). A
+/// `hostaddr` is the address actually dialled (`host` then only names the server for TLS), so
+/// each one must be loopback too: `host=localhost hostaddr=203.0.113.9` is not local.
 pub(crate) fn is_local(config: &Config) -> bool {
-    config.get_hosts().iter().all(|h| match h {
-        Host::Tcp(h) => {
-            h == "localhost"
-                || h.parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false)
-        }
-        #[cfg(unix)]
-        Host::Unix(_) => true,
-    })
+    config.get_hostaddrs().iter().all(|ip| ip.is_loopback())
+        && config.get_hosts().iter().all(|h| match h {
+            Host::Tcp(h) => {
+                h == "localhost"
+                    || h.parse::<std::net::IpAddr>()
+                        .map(|ip| ip.is_loopback())
+                        .unwrap_or(false)
+            }
+            #[cfg(unix)]
+            Host::Unix(_) => true,
+        })
+}
+
+/// Without a `connect_timeout` in the URL, a connection attempt gives up after this.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TCP keepalive defaults for the SQL connection, applied unless the URL sets its own
+/// (`keepalives_idle`, `keepalives_interval`, `keepalives_retries`). A poll waits on its query
+/// with nothing to send, so only keepalives notice a peer that vanished (a failover, a NAT that
+/// dropped the flow): with these, about 60 s instead of the OS default of over 2 h, during which
+/// the pipeline hangs, `/healthz` stays ok and the slot pins WAL.
+pub(crate) fn apply_connection_defaults(config: &mut Config) {
+    use std::time::Duration;
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    }
+    // tokio-postgres' own idle default is 2 h; a different value came from the URL.
+    if config.get_keepalives_idle() == Duration::from_secs(2 * 60 * 60) {
+        config.keepalives_idle(Duration::from_secs(30));
+    }
+    if config.get_keepalives_interval().is_none() {
+        config.keepalives_interval(Duration::from_secs(10));
+    }
+    if config.get_keepalives_retries().is_none() {
+        config.keepalives_retries(3);
+    }
+}
+
+/// The mode to dial with. `prefer` to a non-loopback host falls back to plaintext when the server
+/// refuses TLS, and [`check_negotiated`] would then refuse the session, but only after the
+/// password was sent in the clear. Requiring TLS for the dial fails before any credential is
+/// sent, with the same outcome.
+pub(crate) fn dial_mode(mode: SslMode, local: bool) -> SslMode {
+    if mode == SslMode::Prefer && !local {
+        SslMode::Require
+    } else {
+        mode
+    }
 }
 
 /// Policy on what the server actually negotiated. Fails closed: plaintext to a
@@ -215,6 +255,53 @@ mod tests {
         assert!(!is_local(
             &parse("postgres://u@10.0.0.5/app").unwrap().config
         ));
+        // The dialled address counts, not the name.
+        assert!(!is_local(
+            &parse("host=localhost hostaddr=203.0.113.9 user=u dbname=app")
+                .unwrap()
+                .config
+        ));
+        assert!(is_local(
+            &parse("host=localhost hostaddr=127.0.0.1 user=u dbname=app")
+                .unwrap()
+                .config
+        ));
+    }
+
+    #[test]
+    fn connections_get_keepalives_and_a_connect_timeout_unless_the_url_sets_them() {
+        use std::time::Duration;
+        let mut c = parse("postgres://u@db/app").unwrap().config;
+        apply_connection_defaults(&mut c);
+        assert!(c.get_keepalives());
+        assert_eq!(c.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(c.get_keepalives_interval(), Some(Duration::from_secs(10)));
+        assert_eq!(c.get_keepalives_retries(), Some(3));
+        assert_eq!(c.get_connect_timeout(), Some(&DEFAULT_CONNECT_TIMEOUT));
+        let mut c = parse(
+            "postgres://u@db/app?connect_timeout=5&keepalives_idle=600&keepalives_interval=60&keepalives_retries=9",
+        )
+        .unwrap()
+        .config;
+        apply_connection_defaults(&mut c);
+        assert_eq!(c.get_keepalives_idle(), Duration::from_secs(600));
+        assert_eq!(c.get_keepalives_interval(), Some(Duration::from_secs(60)));
+        assert_eq!(c.get_keepalives_retries(), Some(9));
+        assert_eq!(c.get_connect_timeout(), Some(&Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn prefer_to_a_remote_host_never_sends_credentials_in_plaintext() {
+        assert_eq!(dial_mode(SslMode::Prefer, false), SslMode::Require);
+        assert_eq!(dial_mode(SslMode::Prefer, true), SslMode::Prefer);
+        for m in [
+            SslMode::Disable,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            assert_eq!(dial_mode(m, false), m);
+        }
     }
 
     #[test]

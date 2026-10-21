@@ -874,7 +874,8 @@ impl PostgresSource {
         let root = self.cfg.ssl_root_cert.clone().or(parsed.url_root_cert);
         let local = tls::is_local(&parsed.config);
         let mut pg = parsed.config;
-        pg.ssl_mode(mode.pg());
+        tls::apply_connection_defaults(&mut pg);
+        pg.ssl_mode(tls::dial_mode(mode, local).pg());
         if let Some(token) = self.access_token().await? {
             pg.password(token.secret());
         }
