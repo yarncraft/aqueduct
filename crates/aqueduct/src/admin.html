@@ -649,6 +649,8 @@ const topicTotals = name => rates && rates.topic_totals ? opSlots(rates.topic_to
 // Ops the detail chart's single line counts. One selection for the table, route and topic panels, kept while you
 // click along a path (table → its route → its topic), so the lines you compare count the same ops.
 const detailOps = new Set([0, 1, 2, 3, 4]);
+// Per route (by id), the source tables switched off in its detail chart; all are on by default.
+const routeSrcOff = new Map();
 // Toggle buttons that pick those ops.
 const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
 const OP_BTN_ON = OP_BTN + 'border-blue bg-blue/15 text-blue', OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
@@ -795,9 +797,12 @@ function graphModelOf(d) {
       if (!dlqs.has(name)) dlqs.set(name, { name, id: 'dlq:' + name, routes: [], errors: 0 });
       const d = dlqs.get(name);
       d.routes.push(x);
-      d.errors += x.dlqNames.length === 1 ? (x.c.errors || 0) : ((rates && rates.topics[name]) || []).reduce((a, n) => a + n, 0);
+      d.errors += x.dlqNames.length === 1 ? (x.c.errors || 0)
+        : (rates && rates.topic_totals && rates.topic_totals[name] ? Object.values(rates.topic_totals[name]).reduce((a, n) => a + n, 0) : ((rates && rates.topics[name]) || []).reduce((a, n) => a + n, 0));
     }
   }
+  // A dead-letter topic that has had no events is not drawn (the route's panel still names it).
+  for (const [name, d] of dlqs) if (!d.errors) dlqs.delete(name);
   const dlqAll = [...dlqs.values()].sort((a, b) => b.errors - a.errors || (a.name < b.name ? -1 : 1));
   const dlqCut = graphOpen.has('g:dlq') || dlqAll.length <= GRAPH_TOPICS ? dlqAll.length : GRAPH_TOPICS - 1;
   const dlqShown = dlqAll.slice(0, dlqCut).sort((a, b) => a.name < b.name ? -1 : 1), dlqHidden = dlqAll.slice(dlqCut);
@@ -821,7 +826,7 @@ function graphModelOf(d) {
     }
     for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
     for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
-    for (const name of x.dlqNames) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true);
+    for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true);
   }
   for (const t of unrouted) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
@@ -905,13 +910,12 @@ function fromClause(x) {
     + (more > 0 ? `<span class="shrink-0 text-ink-500" title="${esc(title)}">+${more}</span>` : '');
 }
 
-// INTO: the topic template, ELSE the content-routing fallback, ON ERROR the dead-letter topic when the route can use it.
+// INTO: the topic template and, for content routing, ELSE its fallback. The dead-letter topic is in the route's panel.
 function intoClause(r) {
   const vals = r.topic_values;
   return sqlText(r.topic, r.match == null, r.match == null ? 'sink.topic: ' + r.topic : r.topic)
     + (vals ? sqlTag(vals.length + (vals.length === 1 ? ' value' : ' values'), 'topic_values: ' + vals.join(', ')) : '')
-    + (r.topic_fallback ? `<span class="shrink-0 text-[10px] text-ink-500">ELSE</span>${sqlText(r.topic_fallback, false, 'topic_fallback: ' + r.topic_fallback)}` : '')
-    + (dlqOf(r) && canDeadLetter(r) ? `<span class="shrink-0 text-[10px] text-red">ON ERROR</span><span class="truncate text-red" title="${esc('dead-letter topic: ' + dlqOf(r))}">${esc(dlqOf(r))}</span>` : '');
+    + (r.topic_fallback ? `<span class="shrink-0 text-[10px] text-ink-500">ELSE</span>${sqlText(r.topic_fallback, false, 'topic_fallback: ' + r.topic_fallback)}` : '');
 }
 
 // PARTITIONED-BY: the route's `key`, the outbox aggregate id, else `partition_by` (dimmed: the default).
@@ -1021,7 +1025,8 @@ function trackFlow(m) {
       if (!flowPrev || !(t.events > (flowPrev.t[t.name] ?? t.events))) continue;
       const [into, out] = m.tableEdges[t.name];
       flowUntil[into] = now + FLOW_MS;
-      if (was && cur.r[x.i].produced > was.produced) { flowUntil[out] = now + FLOW_MS; moved = true; }
+      // A route that picks its topic per row has no single topic edge per table: its route → topic edges flow below.
+      if (out && was && cur.r[x.i].produced > was.produced) { flowUntil[out] = now + FLOW_MS; moved = true; }
     }
     if (was && cur.r[x.i].produced > was.produced && !moved) for (const o of x.out) flowUntil[o.id] = now + FLOW_MS;
     if (was && x.dlqEdge && cur.r[x.i].errors > was.errors) flowUntil[x.dlqEdge] = now + FLOW_MS;
@@ -1118,18 +1123,27 @@ function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
   $('routedetail').hidden = !x && topicSel == null && tableSel == null;
   if (!x) { if (topicSel != null) { topicDetail(m, topicSel); fillTopicHwm(); } else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
+  // Only what the card does not already show: the card has SELECT/WHERE/FROM/INTO/PARTITIONED-BY, the outcome
+  // counts and the op bar.
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
-  const extra = Object.keys(r).filter(k => !['route', 'match', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
+  const ON_CARD = ['route', 'match', 'where', 'topic', 'counts', 'unseen_fields', 'include', 'exclude', 'mask', 'hash', 'rename',
+    'format', 'deletes', 'tombstones', 'unchanged', 'key', 'outbox', 'topic_fallback', 'topic_values', 'dead_letter_topic'];
+  const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
+  const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
+  const off = routeSrcOff.get(x.id) || new Set();
+  const srcButtons = x.tables.length > 1
+    ? x.tables.map(t => `<button type="button" data-srctable="${esc(t.name)}" aria-pressed="${!off.has(t.name)}" class="${off.has(t.name) ? OP_BTN_OFF : OP_BTN_ON}">${esc(t.name)}</button>`).join('') + '<span class="w-full"></span>'
+    : '';
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
-    + row('match', esc(r.match ?? 'everything else (sink.topic)'))
-    + row('where', r.where != null ? `<pre class="whitespace-pre-wrap">${esc(r.where)}</pre>` : '<span class="text-ink-500">–</span>')
-    + row('topic', esc(r.topic) + (x.topics.size && isTemplate(r.topic) ? ` <span class="text-ink-500">→ ${esc([...x.topics.keys()].sort().join(', '))}</span>` : ''))
-    + row('counts', ['matched', ...ROUTE_COUNTS].map(k => `${k} <span data-v="${x.id}:${k}">${fmt(x.c[k] || 0)}</span>`).join(' · '))
+    + row('matched', `<span data-v="${x.id}:matched" class="tabular-nums">${fmt(x.c.matched || 0)}</span> <span class="text-ink-500">events the route claimed</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
-    + row('unseen', (x.c.unseen_fields || []).length ? `<span class="text-amber">${esc(x.c.unseen_fields.join(', '))}</span>` : '<span class="text-ink-500">none</span>')
-    + row('tables', x.tables.length ? esc(x.tables.map(t => t.name).join(', ')) : '<span class="text-ink-500">none seen yet</span>')
+    + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
+    + (r.topic_values && r.topic_values.length ? row('topic values', esc(r.topic_values.join(', '))) : '')
+    + (rendered.length ? row('topics written', esc(rendered.join(', '))) : '')
+    + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
+    + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(legendItem(RATE_LINE.produced, 'produced / s') + opButtons());
+    + `</div>` + detailChart(srcButtons + opButtons());
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1149,11 +1163,13 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    const rr = routeRate(graphSel);
-    rows = rr ? rr.ops || null : [];
-    all = rr ? rr.produced : [];
-    color = RATE_LINE.produced;
-    totals = m.routes[graphSel] ? opSlots(m.routes[graphSel].c.ops) : null;
+    // A route: the events per second its source tables (the ones toggled on) delivered, for the ops toggled on.
+    const x = m.routes[graphSel];
+    if (!x) return;
+    const off = routeSrcOff.get(x.id) || new Set(), per = (lastData && lastData.history_ops) || {};
+    rows = sumRows(x.tables.filter(t => !off.has(t.name)).map(t => per[t.name] || []));
+    color = TABLE_LINE;
+    totals = opSlots(x.c.ops);
   } else return;
   const sel = [...detailOps];
   const h = rows ? sumSeries(sel.map(op => rows.map(o => o[op] || 0))) : all;
@@ -1238,6 +1254,17 @@ $('graph').addEventListener('click', ev => {
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
 $('routedetail').addEventListener('click', ev => {
+  const src = ev.target.closest('[data-srctable]');
+  if (src && graphModel && graphSel != null) {
+    const x = graphModel.routes[graphSel];
+    const off = routeSrcOff.get(x.id) || new Set(), name = src.dataset.srctable, on = off.has(name);
+    on ? off.delete(name) : off.add(name);
+    routeSrcOff.set(x.id, off);
+    src.setAttribute('aria-pressed', String(on));
+    src.className = on ? OP_BTN_ON : OP_BTN_OFF;
+    drawDetail(graphModel);
+    return;
+  }
   const opBtn = ev.target.closest('[data-op]');
   if (opBtn) {
     const op = +opBtn.dataset.op, on = !detailOps.has(op);
