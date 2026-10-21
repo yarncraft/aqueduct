@@ -246,12 +246,13 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, and outbox rows without an `aggregate_id` or `payload`. Required as soon as a route uses `where`, `outbox`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, outbox rows without an `aggregate_id` or `payload`, and rows lacking unchanged TOAST columns on an `unchanged = "dead_letter"` route. Required as soon as a route uses `where`, `outbox`, `unchanged = "dead_letter"`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
 | `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
 | `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route). Optional `format`, `deletes`, `tombstones` and `unchanged` reshape the records, see [Shaping the output](#shaping-the-output) |
 
-Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
+Records: key and value as above (a route with `format = "row"` or `tombstones = true` changes the value, see
+[Shaping the output](#shaping-the-output)), headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
 an update of a primary-key column moves the row to the key's new partition. The primary key comes from the catalog,
 so tables with `REPLICA IDENTITY FULL` are keyed by it like any other. Rows of a table without a primary key, and
@@ -622,6 +623,62 @@ misspelled key never falls back to a default column.
   Use a `jsonb` object or array as the payload (the same JSON Debezium sends), or `text` (sent as plain text). Avoid
   `jsonb` scalars and `bytea`.
 
+#### Shaping the output
+
+By default a record's value is the change-event envelope (`before`, `after`, `source`, `op`, ...). Four route keys
+change that, after the route's filter, key, topic and field operations:
+
+```toml
+[sink]
+dead_letter_topic = "aqueduct.dead-letter"   # required by unchanged = "dead_letter"
+
+[[sink.routes]]
+match = "public.customers"
+topic = "customers"
+format = "row"                # value = the row itself
+deletes = "tombstone"         # row format: tombstone (default) | drop | row
+unchanged = "dead_letter"     # omit (default) | dead_letter
+
+[[sink.routes]]
+match = "public.*"
+topic = "cdc.{table}"
+tombstones = true             # envelope format: a null-value record after every delete
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `format` | `envelope` | `row`: the value is `after` (inserts, updates and snapshot reads) after field operations, with no envelope. Truncates have no row: they produce nothing and count as `filtered`. The `op` and `lsn` headers stay, so consumers that need them can still read them |
+| `deletes` | `tombstone` | Only with `format = "row"`. `tombstone`: the delete is a record with a null value and the row's key, which a compacted topic reads as "remove this key". `drop`: no record, counted as `filtered`. `row`: the before-image (after field operations) with `"__deleted": true` added as its last member; a column of the row named `__deleted` is replaced. Under the default replica identity the before-image holds only the primary key |
+| `tombstones` | `false` | Only with the envelope format (with `format = "row"`, `deletes = "tombstone"` already is the tombstone). After every delete, also a null-value record with the same key, on the same partition, right after the delete. The key is the delete's record key after field operations, so a hashed key column stays hashed |
+| `unchanged` | `omit` | What happens to a row the source sent without some columns (see TOAST below). `omit`: produce it as it is. `dead_letter`: send it to `sink.dead_letter_topic` instead (the envelope, with the route's field operations; the `aqueduct-error` header names the columns, never values), counted under `errors`. Allowed on any route; needs `dead_letter_topic` |
+
+Rules, checked at startup:
+
+- `deletes` without `format = "row"`, and `tombstones` with it, fail startup; so do unknown values (case does not
+  matter, as for `ops`).
+- **Tombstones need a per-row key**: the route sets `key = [...]`, or `partition_by = "key"` (the default). With
+  `partition_by = "table"` and no route `key`, a route with `tombstones = true` fails startup.
+- **A delete without a key gets no tombstone.** A table without a primary key (or a route whose field operations
+  remove every key column, or a `key = [...]` whose columns the before-image lacks) has a null `key` in the record key,
+  so a tombstone would stand for the whole table and a compacted topic would drop every row of it. Such a delete is
+  produced without its tombstone, a warning is logged once per route, and `tombstones_skipped` counts it (see the
+  counters below). The same holds for every row-format delete: its tombstone is the delete itself, so give tables
+  behind a compacted row-format topic a primary key.
+- `outbox` is exclusive with all four keys: an outbox record is the payload as is.
+- A MongoDB update whose document was deleted before the change stream looked it up has no `after`; in row format it
+  produces nothing (counted as `filtered`), and the delete that follows does.
+
+**TOAST and compaction.** Postgres does not send a large (TOASTed) column that an update left unchanged, so `after`
+lacks that column (the decoder leaves it out rather than guess). In the envelope a consumer can see the column is
+missing; in `format = "row"` an update can lack a large column, and **a compacted consumer that replaces whole rows
+loses it**. A `where` on that column reads `null`. Either set `unchanged = "dead_letter"` to keep such rows out of the
+topic (and handle them from the dead-letter topic), or make the consumer merge updates into the row it has. MongoDB
+sends whole documents and never has this case. `REPLICA IDENTITY FULL` does not help yet: filling the column from the
+before-image is a follow-up.
+
+The cockpit shows `format`, `deletes`, `tombstones` and `unchanged` badges on the route, and the event inspector shows
+row-format values raw and tombstones as `tombstone`, with their `op` and `lsn` headers.
+
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
 `/api/routes` and Prometheus:
@@ -630,6 +687,7 @@ Per-route counters: every event a route claims counts as `matched`, then as exac
 |--------|---------|
 | `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
+| `aqueduct_route_tombstones_skipped_total{route}` | Counter. Deletes a `tombstones = true` route produced without a tombstone because the row has no key. Not an outcome: the delete itself counts as `produced` |
 
 `route` is the route's `name`, else its `match`; `default` is reserved and cannot be used as a name. Events no route
 claims are counted under `default` when `sink.topic` is set; without `sink.topic` such an event is an error that stops
@@ -650,8 +708,9 @@ shared across tabs for 2 s) makes a separate Kafka read of up to `limit` records
 routes to, using its own connection (created on first use). A closed tab costs nothing.
 
 `/api/events` returns each record's `topic`, `partition`, `offset`, `timestamp_ms`, `key`, `headers` (as text) and
-`event`: the value parsed as JSON, or its text when it is not JSON. A value that is not a change-event envelope (an
-outbox payload) is shown raw, with its op and lsn taken from the headers.
+`event`: the value parsed as JSON, or its text when it is not JSON, and `null` for a tombstone. A value that is not a
+change-event envelope (an outbox payload, a `format = "row"` row, a tombstone) is shown raw, with its op and lsn taken
+from the headers; the table of a row or tombstone comes from its JSON record key.
 
 ### Tables · high-water marks
 
@@ -728,7 +787,10 @@ Later routing options add keys to each route, so readers should ignore keys they
 operations also has `include`, `exclude`, `mask` and `hash` (column lists) and `rename` (the map), each left out when
 unset; with a hash key the top level has `hash_key_id`. The hash key itself is never shown. An outbox route has an
 `outbox` object with its column names and topic template (`aggregate_type`, `aggregate_id`, `payload`, `topic`, and
-`id` and `type` when set); other routes leave the key out.
+`id` and `type` when set); other routes leave the key out. A route with `format = "row"` has `"format": "row"` and
+its `deletes` (`tombstone`, `drop` or `row`, the default included), a route with `tombstones = true` has
+`"tombstones": true`, and a route with `unchanged = "dead_letter"` has `"unchanged": "dead_letter"`; each is left out
+otherwise. `counts` also has `tombstones_skipped`, which is not an outcome.
 
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
@@ -736,17 +798,21 @@ unset; with a hash key the top level has `hash_key_id`. The hash key itself is n
    {"route": "paid-orders", "match": "public.orders", "ops": ["insert", "update", "delete"],
     "where": "row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
     "topic_fallback": null, "topic_values": null,
-    "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1}, "unseen_fields": []},
+    "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
+    "unseen_fields": []},
    {"route": "regional", "match": "public.customers", "ops": null, "where": null, "key": null,
     "topic": "customers.{row.region}", "topic_fallback": "customers.unknown", "topic_values": ["eu", "us"],
-    "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0}, "unseen_fields": []},
+    "format": "row", "deletes": "tombstone",
+    "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0, "tombstones_skipped": 0},
+    "unseen_fields": []},
    {"route": "default", "match": null, "ops": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
     "topic_fallback": null, "topic_values": null,
-    "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0}, "unseen_fields": []}]}
+    "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
+    "unseen_fields": []}]}
 ```
 
 `/api/metrics` and `/api/stream` carry the same counts flat, as
-`routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "unseen_fields"}]`.
+`routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "unseen_fields"}]`.
 
 ## 5. Operating Aqueduct
 

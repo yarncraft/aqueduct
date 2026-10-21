@@ -1217,6 +1217,7 @@ mod tests {
             after: after.and_then(|s| RawValue::from_string(s.into()).ok()),
             key: None,
             checkpoint: None,
+            unchanged: Vec::new(),
         }
     }
 

@@ -51,6 +51,18 @@ pub struct KafkaRoute {
     /// `include` | `exclude`, `mask`, `hash` and `rename` (ADR 0002 §5 "Fields"), applied to
     /// `before`, `after` and, without `key`, the record key's `key` object.
     pub fields: FieldSpec,
+    /// `envelope` (the default) or `row`: the record value is the change event envelope, or the
+    /// row itself (`after`, after field operations).
+    pub format: Option<String>,
+    /// With `format = "row"`, what a delete becomes: `tombstone` (the default, a null value),
+    /// `drop` (no record) or `row` (the before-image with `"__deleted": true`).
+    pub deletes: Option<String>,
+    /// Envelope format: after every delete, also a null-value record with the same key, so a
+    /// compacted topic forgets the row. Needs a per-row key.
+    pub tombstones: bool,
+    /// `omit` (the default) or `dead_letter`: what happens to a row the source sent without some
+    /// unchanged columns (Postgres TOAST). `dead_letter` needs `sink.dead_letter_topic`.
+    pub unchanged: Option<String>,
 }
 
 /// Debezium's outbox event router defaults, used for every `outbox` key left unset.
@@ -101,8 +113,9 @@ pub struct OutRecord {
     pub key: String,
     /// What the partition is hashed from: the key, or only the table (`partition_by`).
     pub partition_key: String,
-    /// The JSON event (the envelope), or the transformed value once a route reshapes it.
-    pub value: String,
+    /// The JSON event (the envelope), or the transformed value once a route reshapes it
+    /// (`format = "row"`). `None` is a tombstone: a record with a null value.
+    pub value: Option<String>,
     /// The `op` header (Debezium's letter).
     pub op: &'static str,
     /// The `lsn` header: the checkpoint form of the event position.
@@ -121,6 +134,9 @@ pub struct OutRecord {
 pub struct ContentTopic {
     pub route: usize,
     pub fallback: String,
+    /// The tombstone that follows a delete (`tombstones = true`): re-routed with the delete, so it
+    /// stays on the delete's partition, but not counted again.
+    pub tombstone: bool,
 }
 
 /// The longest value one placeholder of a content-routed topic may substitute.
@@ -368,6 +384,213 @@ struct CompiledRoute {
     outbox: Option<Outbox>,
     /// `None`: no field operation, the record is built exactly as without routing.
     fields: Option<FieldOps>,
+    /// `format`, `deletes`, `tombstones` and `unchanged`; the default builds the envelope.
+    shape: Shape,
+}
+
+/// The record value: `format`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Format {
+    /// The change event envelope (`before`, `after`, `source`, `op`, ...).
+    #[default]
+    Envelope,
+    /// The row alone: `after`, or for a delete what `deletes` says.
+    Row,
+}
+
+/// What a delete becomes under `format = "row"`: `deletes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Deletes {
+    /// A null value with the row's key.
+    #[default]
+    Tombstone,
+    /// No record; counted as filtered.
+    Drop,
+    /// The before-image with `"__deleted": true`.
+    Row,
+}
+
+impl Deletes {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tombstone => "tombstone",
+            Self::Drop => "drop",
+            Self::Row => "row",
+        }
+    }
+}
+
+/// How a route shapes its records (ADR 0002 §5, step 5 and 6 of the fixed order).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Shape {
+    format: Format,
+    deletes: Deletes,
+    /// Envelope format: a tombstone after every delete.
+    tombstones: bool,
+    /// `unchanged = "dead_letter"`: a row with columns the source left out goes to the
+    /// dead-letter topic.
+    unchanged_dead_letter: bool,
+}
+
+impl Shape {
+    /// True when the route produces no record for `event` because of its shape: under
+    /// `format = "row"`, a truncate (no row), a delete with `deletes = "drop"`, or a change without
+    /// an `after` row (a MongoDB update whose document was deleted before the lookup; its delete
+    /// follows).
+    fn drops(&self, event: &ChangeEvent) -> bool {
+        self.format == Format::Row
+            && match event.op {
+                Op::Truncate => true,
+                Op::Delete => self.deletes == Deletes::Drop,
+                _ => event.after.is_none(),
+            }
+    }
+}
+
+/// The marker a `deletes = "row"` value ends with.
+const DELETED_MARK: &str = r#""__deleted":true"#;
+
+/// Matches a string one of `names`, ignoring ASCII case, and says what was expected otherwise.
+fn parse_choice<T: Copy>(name: &str, key: &str, value: &str, names: &[(&str, T)]) -> Result<T> {
+    names
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(value))
+        .map(|(_, t)| *t)
+        .ok_or_else(|| {
+            let expected: Vec<String> = names.iter().map(|(n, _)| format!("`{n}`")).collect();
+            Error::Config(format!(
+                "sink route `{name}`: unknown {key} `{value}` (expected {})",
+                expected.join(" or ")
+            ))
+        })
+}
+
+/// Validates `format`, `deletes`, `tombstones` and `unchanged`. What depends on `partition_by`
+/// (tombstones need a per-row key) is checked by [`RoutePlan::check_partition_by`].
+fn parse_shape(name: &str, r: &KafkaRoute, dead_letter_topic: Option<&str>) -> Result<Shape> {
+    let format = r
+        .format
+        .as_deref()
+        .map(|f| {
+            parse_choice(
+                name,
+                "format",
+                f,
+                &[("envelope", Format::Envelope), ("row", Format::Row)],
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let deletes = match (&r.deletes, format) {
+        (None, _) => Deletes::default(),
+        (Some(_), Format::Envelope) => {
+            return Err(Error::Config(format!(
+                "sink route `{name}`: `deletes` applies to `format = \"row\"` only; an envelope route keeps deletes as `op = \"d\"` events (add `tombstones = true` for a tombstone after each)"
+            )))
+        }
+        (Some(d), Format::Row) => parse_choice(
+            name,
+            "deletes",
+            d,
+            &[
+                ("tombstone", Deletes::Tombstone),
+                ("drop", Deletes::Drop),
+                ("row", Deletes::Row),
+            ],
+        )?,
+    };
+    if r.tombstones && format == Format::Row {
+        return Err(Error::Config(format!(
+            "sink route `{name}`: `tombstones` is for the envelope format; with `format = \"row\"`, `deletes = \"tombstone\"` (the default) already makes each delete a tombstone"
+        )));
+    }
+    let unchanged_dead_letter = r
+        .unchanged
+        .as_deref()
+        .map(|u| {
+            parse_choice(
+                name,
+                "unchanged",
+                u,
+                &[("omit", false), ("dead_letter", true)],
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if unchanged_dead_letter && dead_letter_topic.is_none() {
+        return Err(Error::Config(format!(
+            "sink route `{name}` uses `unchanged = \"dead_letter\"`, which needs `sink.dead_letter_topic`: rows that lack unchanged TOAST columns go there"
+        )));
+    }
+    // `outbox` routes never get here with a shape key set: `RoutePlan::build` refuses them.
+    Ok(Shape {
+        format,
+        deletes,
+        tombstones: r.tombstones,
+        unchanged_dead_letter,
+    })
+}
+
+/// A delete's value under `deletes = "row"`: the (rewritten) before-image with
+/// `"__deleted": true` as its last member. A `__deleted` column of the row is replaced by the
+/// marker. Without a before-image, or if it is not a JSON object, the value is the marker alone.
+fn deleted_row(before: Option<&RawValue>) -> String {
+    let marker_only = || format!("{{{DELETED_MARK}}}");
+    let Some(text) = before.map(|b| b.get().trim()) else {
+        return marker_only();
+    };
+    let Some(body) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) else {
+        return marker_only();
+    };
+    let mut out = String::with_capacity(text.len() + DELETED_MARK.len() + 1);
+    out.push('{');
+    // Outside a string a quote is never escaped, so `"__deleted"` appears only as that column's
+    // name or as a whole string value; anything else keeps the fast path.
+    if !body.contains(r#""__deleted""#) {
+        if !body.trim().is_empty() {
+            out.push_str(body);
+            out.push(',');
+        }
+    } else {
+        let Ok(Members(members)) = serde_json::from_str::<Members<'_>>(text) else {
+            return marker_only();
+        };
+        for (k, v) in members.into_iter().filter(|(k, _)| k != "__deleted") {
+            out.push_str(&serde_json::to_string(&k).unwrap_or_default());
+            out.push(':');
+            out.push_str(v.get());
+            out.push(',');
+        }
+    }
+    out.push_str(DELETED_MARK);
+    out.push('}');
+    out
+}
+
+/// The top-level members of a JSON object in order, values borrowed raw.
+struct Members<'a>(Vec<(String, &'a RawValue)>);
+
+impl<'de> serde::Deserialize<'de> for Members<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Members<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    out.push((k, map.next_value::<&'de RawValue>()?));
+                }
+                Ok(Members(out))
+            }
+        }
+        d.deserialize_map(Visit)
+    }
 }
 
 /// `before` and `after` after field operations.
@@ -377,6 +600,8 @@ type Rows = (Option<Box<RawValue>>, Option<Box<RawValue>>);
 struct Rewritten {
     /// The record key and partition input from the rewritten key object; `None` with `key = [...]`.
     keys: Option<(String, String)>,
+    /// The rewritten key object is `null`: no primary key, or every key column removed.
+    null_key: bool,
     rows: Rows,
     headers: Vec<(&'static str, String)>,
 }
@@ -582,6 +807,10 @@ pub struct RouteStats {
     /// Events sent to a route's `topic_fallback` (content routing).
     fallback: Vec<AtomicU64>,
     errors: Vec<AtomicU64>,
+    /// Deletes that got no tombstone because their key is null (`tombstones = true`).
+    tombstones_skipped: Vec<AtomicU64>,
+    /// Per route, whether the first skipped tombstone was logged.
+    tombstone_logged: Vec<AtomicBool>,
     /// Per route, every field path it references. `where` registers its paths here; templates,
     /// `key`, field operations and outbox columns register theirs the same way.
     fields: Vec<Vec<WatchedField>>,
@@ -607,6 +836,10 @@ pub struct RouteCounts {
     pub fallback: u64,
     /// Events sent to `sink.dead_letter_topic` because a row could not be evaluated.
     pub errors: u64,
+    /// Not an outcome: deletes produced without the tombstone `tombstones = true` asks for,
+    /// because their key is null (a table without a primary key), so the tombstone would erase
+    /// the whole table from a compacted topic.
+    pub tombstones_skipped: u64,
 }
 
 /// A point-in-time copy of one route's counters. `route` is the route's `name`, else its `match`
@@ -645,6 +878,8 @@ impl RouteStats {
             filtered: zeros(),
             fallback: zeros(),
             errors: zeros(),
+            tombstones_skipped: zeros(),
+            tombstone_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             fields,
             error_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             fallback_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
@@ -669,6 +904,7 @@ impl RouteStats {
             filtered: get(&self.filtered),
             fallback: get(&self.fallback),
             errors: get(&self.errors),
+            tombstones_skipped: get(&self.tombstones_skipped),
         }
     }
 
@@ -772,6 +1008,18 @@ pub struct RouteDescription {
     pub hash: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rename: Option<BTreeMap<String, String>>,
+    /// `row` for a route with `format = "row"`; left out for the envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'static str>,
+    /// With `format = "row"`: `tombstone`, `drop` or `row`, defaults included; left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletes: Option<&'static str>,
+    /// `true` for an envelope route with `tombstones = true`; left out otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    pub tombstones: bool,
+    /// `dead_letter` for a route with `unchanged = "dead_letter"`; left out for `omit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchanged: Option<&'static str>,
     pub counts: RouteCounts,
     pub unseen_fields: Vec<String>,
 }
@@ -791,6 +1039,10 @@ pub struct RoutePlan {
     fixed: Vec<String>,
     /// Present when configured; required as soon as a route uses `hash`.
     hash_key: Option<HashKey>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A Kafka topic name: 1 to 249 of `[A-Za-z0-9._-]`, and not `.` or `..`.
@@ -1064,9 +1316,9 @@ fn check_field_ops(
             )));
         }
     }
-    // TODO(R7): `format = "row"` with `deletes = "row"` must emit the rewritten before-image
-    // (`rewrite_rows`), and envelope `tombstones` must reuse the record's rewritten key
-    // (`rewrite_key` or the route key), never `event.key` as is.
+    // `format = "row"` values and `deletes = "row"` before-images come from `rewrite_rows`, and a
+    // tombstone copies its delete's record key (the route key, or the `rewrite_key` object), so
+    // neither bypasses the operations (`RoutePlan::render_into`).
     Ok(())
 }
 
@@ -1159,7 +1411,23 @@ impl RoutePlan {
                     // keys that would set them too are refused rather than silently ignored.
                     // Field operations are refused as a whole: an outbox route has none, so no
                     // protected column can reach its `aggregate_id`, `topic` or payload.
-                    // TODO(R7): refuse `format` here too.
+                    // The shape keys are refused too: the outbox record is its own shape, and an
+                    // outbox route publishes no deletes to tombstone.
+                    let shaped: Vec<&str> = [
+                        ("format", r.format.is_some()),
+                        ("deletes", r.deletes.is_some()),
+                        ("tombstones", r.tombstones),
+                        ("unchanged", r.unchanged.is_some()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, on)| on.then_some(k))
+                    .collect();
+                    if !shaped.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `outbox` and `{}` are mutually exclusive: an outbox record is the `payload` column as is, keyed by `aggregate_id`",
+                            shaped.join("`, `")
+                        )));
+                    }
                     let f = &r.fields;
                     let set: Vec<&str> = [
                         ("include", f.include.is_some()),
@@ -1217,6 +1485,7 @@ impl RoutePlan {
             };
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
             let field_ops = FieldOps::compile(&name, &r.fields)?;
+            let shape = parse_shape(&name, r, dead_letter_topic.as_deref())?;
             let mut watched: Vec<FieldRef> = filter
                 .iter()
                 .flat_map(|f| f.fields())
@@ -1240,6 +1509,7 @@ impl RoutePlan {
                 topic_values,
                 outbox,
                 fields: field_ops,
+                shape,
             };
             check_field_ops(
                 &name,
@@ -1410,6 +1680,23 @@ impl RoutePlan {
         self.partition_by = by;
     }
 
+    /// The startup checks that depend on `partition_by`, which is set after [`build`](Self::build):
+    /// a route with `tombstones = true` needs a per-row key, `key = [...]` or
+    /// `partition_by = "key"`, so a tombstone never stands for more than one row.
+    pub fn check_partition_by(&self, by: PartitionBy) -> Result<()> {
+        if by == PartitionBy::Key {
+            return Ok(());
+        }
+        for (r, name) in self.routes.iter().zip(&self.stats.names) {
+            if r.shape.tombstones && r.key.is_none() {
+                return Err(Error::Config(format!(
+                    "sink route `{name}` uses `tombstones`, which needs a per-row key: set `key = [...]` on the route, or `partition_by = \"key\"`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The source named in every record's `source` block and key.
     pub fn set_source(&mut self, source: SourceInfo) {
         self.source = source;
@@ -1475,7 +1762,13 @@ impl RoutePlan {
         let route = |i: usize, pattern: Option<String>, r: Option<&CompiledRoute>, topic: &str| {
             let spec = r.and_then(|r| r.fields.as_ref()).map(FieldOps::spec);
             let list = |v: &Vec<String>| (!v.is_empty()).then(|| v.clone());
+            let shape = r.map(|r| r.shape).unwrap_or_default();
+            let row = shape.format == Format::Row;
             RouteDescription {
+                format: row.then_some("row"),
+                deletes: row.then(|| shape.deletes.as_str()),
+                tombstones: shape.tombstones,
+                unchanged: shape.unchanged_dead_letter.then_some("dead_letter"),
                 include: spec.and_then(|s| s.include.clone()),
                 exclude: spec.and_then(|s| s.exclude.as_ref().and_then(list)),
                 mask: spec.and_then(|s| list(&s.mask)),
@@ -1584,6 +1877,25 @@ impl RoutePlan {
                 if let Some(outbox) = &r.outbox {
                     return self.render_outbox(route, r, outbox, &view, now_us, out);
                 }
+                // Row format: a truncate, a dropped delete or a change without a row is no record.
+                if r.shape.drops(event) {
+                    self.stats.claimed(&self.stats.filtered, route);
+                    return Ok(());
+                }
+                // A row without its unchanged TOAST columns, where the route wants none: the
+                // dead-letter topic. The reason names the columns, never values.
+                if r.shape.unchanged_dead_letter && !event.unchanged.is_empty() {
+                    let cols: Vec<String> =
+                        event.unchanged.iter().map(|c| format!("`{c}`")).collect();
+                    let reason = format!(
+                        "route `{}`: unchanged = \"dead_letter\": the source left out unchanged column(s) {}",
+                        self.stats.names[route],
+                        cols.join(", ")
+                    );
+                    self.dead_letter(route, reason, event, now_us, out)?;
+                    self.stats.claimed(&self.stats.errors, route);
+                    return Ok(());
+                }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
                 if let Some(f) = &r.fields {
                     match self.rewrite(f, event, route_key.is_none()) {
@@ -1604,35 +1916,58 @@ impl RoutePlan {
                 topic
             }
         };
+        let shape = self.routes.get(route).map(|r| r.shape).unwrap_or_default();
+        let wants_tombstone = shape.tombstones && event.op == Op::Delete;
         let rewritten_keys = rewritten.as_mut().and_then(|w| w.keys.take());
-        let (key, partition_key) = match (route_key, rewritten_keys) {
-            // A per-route key partitions by the whole key, whatever `partition_by` says.
-            (Some(key), _) => (key.clone(), key),
+        // `null_key`: the record key's `key` is null, so a tombstone would stand for the whole
+        // table. Only worked out when a tombstone is wanted.
+        let (key, partition_key, null_key) = match (route_key, rewritten_keys) {
+            // A per-route key partitions by the whole key, whatever `partition_by` says. It is
+            // null when no listed column has a value.
+            (Some(key), _) => {
+                let null = wants_tombstone
+                    && self
+                        .routes
+                        .get(route)
+                        .and_then(|r| r.key.as_ref())
+                        .is_some_and(|k| {
+                            k.fields
+                                .iter()
+                                .all(|f| view.raw(f).is_none_or(|v| v.get().trim() == "null"))
+                        });
+                (key.clone(), key, null)
+            }
             // The key object after field operations, partitioned like the plain key.
-            (None, Some(keys)) => keys,
+            (None, Some((key, partition_key))) => {
+                let null = rewritten.as_ref().is_some_and(|w| w.null_key);
+                (key, partition_key, null)
+            }
             (None, None) => {
                 let key = record_key(event, &self.source);
                 let partition_key = partition_input(event, &key, self.partition_by);
-                (key, partition_key)
+                (key, partition_key, key_object(event).is_none())
             }
         };
         // The value and headers are fixed here, before the sink may re-route the record to the
         // fallback (`topic_refused` changes only the topic), so a fallback record carries the
-        // same rewritten value, key and `aqueduct-hash-key-id` as any other.
-        let (value, headers) = match rewritten {
-            None => (encode(event, &self.source, now_us)?, Vec::new()),
-            Some(w) => (
-                encode_rows(
-                    event,
-                    &self.source,
-                    now_us,
-                    w.rows.0.as_deref(),
-                    w.rows.1.as_deref(),
-                )?,
-                w.headers,
-            ),
+        // same rewritten value, key and `aqueduct-hash-key-id` as any other. The rows are the
+        // rewritten ones when the route has field operations, so no shape bypasses them.
+        let (before, after) = match &rewritten {
+            Some(w) => (w.rows.0.as_deref(), w.rows.1.as_deref()),
+            None => (event.before.as_deref(), event.after.as_deref()),
         };
-        out.push(OutRecord {
+        let value = match shape.format {
+            Format::Envelope => Some(encode_rows(event, &self.source, now_us, before, after)?),
+            Format::Row => match event.op {
+                // `deletes = "tombstone"`: the delete itself is the tombstone. `drop` never
+                // gets here (`Shape::drops`).
+                Op::Delete => (shape.deletes == Deletes::Row).then(|| deleted_row(before)),
+                // `Shape::drops` filtered a change without `after`.
+                _ => Some(after.map_or("null", |a| a.get()).to_string()),
+            },
+        };
+        let headers = rewritten.map(|w| w.headers).unwrap_or_default();
+        let record = OutRecord {
             topic,
             partition_key,
             key,
@@ -1642,9 +1977,46 @@ impl RoutePlan {
             commit_ts_micros: event.commit_ts_micros,
             headers,
             content,
-        });
+        };
+        // Envelope `tombstones`: a null value with the delete's (rewritten) key, topic and
+        // partition input, right after it, so it lands on the same partition behind it.
+        let tombstone = match (wants_tombstone, null_key) {
+            (true, false) => Some(OutRecord {
+                topic: record.topic.clone(),
+                key: record.key.clone(),
+                partition_key: record.partition_key.clone(),
+                value: None,
+                op: record.op,
+                lsn: record.lsn.clone(),
+                commit_ts_micros: record.commit_ts_micros,
+                headers: record.headers.clone(),
+                content: record.content.as_ref().map(|c| ContentTopic {
+                    tombstone: true,
+                    ..c.clone()
+                }),
+            }),
+            (true, true) => {
+                self.tombstone_skipped(route);
+                None
+            }
+            (false, _) => None,
+        };
+        out.push(record);
+        out.extend(tombstone);
         self.stats.claimed(outcome, route);
         Ok(())
+    }
+
+    /// A delete with a null key got no tombstone: one keyed by the table alone would erase every
+    /// row of the table from a compacted topic. Counted, and logged once per route.
+    fn tombstone_skipped(&self, route: usize) {
+        self.stats.tombstones_skipped[route].fetch_add(1, Ordering::Relaxed);
+        if !self.stats.tombstone_logged[route].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                route = %self.stats.names[route],
+                "a delete of a row without a primary key (a null record key) got no tombstone, since it would erase the whole table from a compacted topic; later ones are only counted under tombstones_skipped"
+            );
+        }
     }
 
     /// The topic of route `r` for this event, the [`ContentTopic`] of a topic chosen from row
@@ -1661,7 +2033,11 @@ impl RoutePlan {
                     .topic_fallback
                     .clone()
                     .filter(|_| from_row)
-                    .map(|fallback| ContentTopic { route, fallback });
+                    .map(|fallback| ContentTopic {
+                        route,
+                        fallback,
+                        tombstone: false,
+                    });
                 (topic, content, false)
             }
             Err(fallback) => (fallback, None, true),
@@ -1738,7 +2114,7 @@ impl RoutePlan {
             topic,
             partition_key: key.clone(),
             key,
-            value: payload,
+            value: Some(payload),
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
@@ -1812,8 +2188,12 @@ impl RoutePlan {
             return;
         };
         self.dynamic.refuse(&out.topic);
-        self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
-        self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
+        // A delete's tombstone follows it to the fallback; the event was counted once, with
+        // the delete.
+        if !c.tombstone {
+            self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
+            self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
+        }
         if !self.stats.refused_logged[c.route].swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 route = %self.stats.names[c.route],
@@ -1871,8 +2251,10 @@ impl RoutePlan {
         own_key: bool,
     ) -> std::result::Result<Rewritten, FieldError> {
         let rows = self.rewrite_rows(fields, event, true)?;
+        let mut null_key = false;
         let keys = if own_key {
             let k = self.rewrite_key(fields, event)?;
+            null_key = k.is_none();
             let key = key_json(event, &self.source, k.as_deref().unwrap_or("null"));
             // Partitioned by the rewritten key, so a hashed key column keeps per-row order.
             let partition_key = partition_input(event, &key, self.partition_by);
@@ -1882,6 +2264,7 @@ impl RoutePlan {
         };
         Ok(Rewritten {
             keys,
+            null_key,
             rows,
             headers: self.hash_headers(fields),
         })
@@ -1971,7 +2354,7 @@ impl RoutePlan {
             topic,
             partition_key: key.clone(),
             key,
-            value,
+            value: Some(value),
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
@@ -2296,7 +2679,7 @@ mod tests {
         );
         assert_eq!(r.partition_key, r.key);
         // The route has no field operations, so the value is the envelope as is.
-        assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+        assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
         assert_eq!((r.op, r.lsn.as_str()), ("u", "7"));
         assert_eq!(r.headers.len(), 1);
         let (name, reason) = &r.headers[0];
@@ -2337,6 +2720,7 @@ mod tests {
             filtered,
             fallback: 0,
             errors,
+            tombstones_skipped: 0,
         };
         assert_eq!(
             counts,
@@ -2503,15 +2887,15 @@ mod tests {
                 "routes": [
                     {"route": "orders", "match": "public.orders", "ops": ["insert", "update"],
                      "where": "row.status == 'paid'", "key": null, "topic": "orders.topic", "topic_fallback": null, "topic_values": null,
-                     "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0},
+                     "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
                     {"route": "public.*", "match": "public.*", "ops": null, "where": null,
                      "key": ["id", "tenant"], "topic": "cdc.{table}", "topic_fallback": null, "topic_values": null,
-                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0},
+                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
                     {"route": "default", "match": null, "ops": null, "where": null, "key": null,
                      "topic": "rest", "topic_fallback": null, "topic_values": null,
-                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0},
+                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []}
                 ]
             })
@@ -2568,7 +2952,7 @@ mod tests {
             );
             // The whole key is the partition input, whatever `partition_by` says.
             assert_eq!(r.partition_key, r.key, "{by:?}");
-            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+            assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
         }
     }
 
@@ -2800,7 +3184,7 @@ mod tests {
             }
             // Topic aside, the record is the same: key, value, headers.
             assert_eq!(r.key, record_key(&e, &pg()));
-            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+            assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
             assert!(r.headers.is_empty());
         }
         let c = p.stats().snapshot()[0].counts;
@@ -3311,7 +3695,8 @@ mod tests {
             out.content,
             Some(ContentTopic {
                 route: 0,
-                fallback: "orders.unknown".into()
+                fallback: "orders.unknown".into(),
+                tombstone: false,
             })
         );
         assert_eq!(p.dynamic_topic_count(), 1);
@@ -3508,7 +3893,7 @@ mod tests {
             (r.topic.as_str(), r.key.as_str(), r.op),
             ("outbox.order", "A-1", "r")
         );
-        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!(r.value.text(), r#"{"total":12.50,"items":[1,2]}"#);
         assert_eq!(
             outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
             "outbox.order"
@@ -3586,7 +3971,7 @@ mod tests {
         assert_eq!(r.key, "A-1");
         assert_eq!(r.partition_key, r.key);
         // A `json`/`jsonb` payload is the JSON text as the row holds it.
-        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!(r.value.text(), r#"{"total":12.50,"items":[1,2]}"#);
         assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
 
         // A text payload is its string content, unescaped; a numeric aggregate id its JSON text.
@@ -3602,7 +3987,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(r.key, "42");
-        assert_eq!(r.value, "say \"hi\"\n é");
+        assert_eq!(r.value.text(), "say \"hi\"\n é");
         // An escaped string aggregate id is unescaped too; other values keep their JSON text.
         for (id, key) in [
             (r#""a\"bé""#, "a\"bé"),
@@ -3616,7 +4001,7 @@ mod tests {
                 .unwrap()
                 .remove(0);
             assert_eq!(r.key, key, "{id}");
-            assert_eq!(r.value, "{}");
+            assert_eq!(r.value.text(), "{}");
         }
     }
 
@@ -3694,7 +4079,7 @@ mod tests {
                 r.key,
                 r#"{"db":"app","schema":"public","table":"outbox","key":null}"#
             );
-            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+            assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
             assert_eq!(r.headers.len(), 1);
             assert_eq!(r.headers[0].0, "aqueduct-error");
             assert_eq!(r.headers[0].1, format!("route `ob`: outbox {why}"));
@@ -3750,7 +4135,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(
-            (rec.topic.as_str(), rec.key.as_str(), rec.value.as_str()),
+            (rec.topic.as_str(), rec.key.as_str(), rec.value.text()),
             ("outbox.unknown", "a", "p")
         );
         assert_eq!(rec.headers, vec![("id", "e1".to_string())]);
@@ -4088,8 +4473,31 @@ mod tests {
         p
     }
 
-    fn json(s: &str) -> serde_json::Value {
-        serde_json::from_str(s).unwrap()
+    /// JSON text in tests: a key, an encoded value, or a record value that is not a tombstone.
+    trait Text {
+        fn text(&self) -> &str;
+    }
+
+    impl Text for str {
+        fn text(&self) -> &str {
+            self
+        }
+    }
+
+    impl Text for String {
+        fn text(&self) -> &str {
+            self
+        }
+    }
+
+    impl Text for Option<String> {
+        fn text(&self) -> &str {
+            self.as_deref().expect("a record value, not a tombstone")
+        }
+    }
+
+    fn json<T: Text + ?Sized>(s: &T) -> serde_json::Value {
+        serde_json::from_str(s.text()).unwrap()
     }
 
     #[test]
@@ -4126,7 +4534,7 @@ mod tests {
             assert_eq!(v[k], plain[k], "{k}");
         }
         assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
-        assert!(!r.value.contains("old@x.y") && !r.value.contains("4111"));
+        assert!(!r.value.text().contains("old@x.y") && !r.value.text().contains("4111"));
     }
 
     #[test]
@@ -4241,7 +4649,7 @@ mod tests {
             json(&r.value)["after"],
             serde_json::json!({"amount": "abc", "card": "***", "email": hmac_hex("a@b.c")})
         );
-        assert!(!r.value.contains("4111") && !r.value.contains("secret"));
+        assert!(!r.value.text().contains("4111") && !r.value.text().contains("secret"));
         assert_eq!(r.headers[0].0, "aqueduct-error");
         assert_eq!(r.headers[1], (HASH_KEY_ID_HEADER, "k1".to_string()));
         assert_eq!(json(&r.key)["key"], serde_json::Value::Null);
@@ -4274,7 +4682,7 @@ mod tests {
         );
         let v = json(&r.value);
         assert_eq!(v["after"], serde_json::Value::Null);
-        assert!(!r.value.contains("secret") && !r.value.contains("4111"));
+        assert!(!r.value.text().contains("secret") && !r.value.text().contains("4111"));
     }
 
     #[test]
@@ -4612,8 +5020,8 @@ mod tests {
             assert_eq!(json(&r.key)["key"]["email"], hmac_hex("a@b.c").as_str());
             assert_eq!(r.partition_key, r.key);
             assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
-            assert!(!r.value.contains("a@b.c") && !r.key.contains("a@b.c"));
-            assert!(!r.value.contains("4111"));
+            assert!(!r.value.text().contains("a@b.c") && !r.key.contains("a@b.c"));
+            assert!(!r.value.text().contains("4111"));
         };
         // Normal content-routed record.
         let normal = p.render(&ev(r#""eu""#), NOW).unwrap().remove(0);
@@ -4684,6 +5092,7 @@ mod tests {
                 .flatten(),
             key: key.map(Into::into),
             checkpoint: None,
+            unchanged: Vec::new(),
         }
     }
 
@@ -4759,7 +5168,7 @@ mod tests {
                     let key = record_key(e, &info);
                     assert_eq!(r.partition_key, partition_input(e, &key, by));
                     assert_eq!(r.key, key);
-                    assert_eq!(r.value, encode(e, &info, NOW).unwrap());
+                    assert_eq!(r.value.text(), encode(e, &info, NOW).unwrap());
                     assert_eq!(r.op, op_code(e.op));
                     assert_eq!(r.lsn, e.position.to_checkpoint());
                     assert_eq!(r.commit_ts_micros, e.commit_ts_micros);
@@ -4783,7 +5192,7 @@ mod tests {
         assert_eq!(r.op, "c");
         assert_eq!(r.lsn, "97500059720");
         assert_eq!(
-            r.value,
+            r.value.text(),
             concat!(
                 r#"{"before":null,"after":{"id":1,"name":"ada"},"source":{"version":""#,
                 env!("CARGO_PKG_VERSION"),
@@ -4825,7 +5234,7 @@ mod tests {
         for _ in 0..n {
             out.clear();
             plan.render_into(&e, NOW, &mut out).unwrap();
-            sink += out[0].topic.len() + out[0].key.len() + out[0].value.len();
+            sink += out[0].topic.len() + out[0].key.len() + out[0].value.text().len();
         }
         let new = t.elapsed();
         println!("legacy {legacy:?}, plan {new:?} for {n} events (sink {sink})");
@@ -4892,10 +5301,439 @@ mod tests {
             for _ in 0..n {
                 out.clear();
                 plan.render_into(&e, NOW, &mut out).unwrap();
-                sink += out[0].value.len();
+                sink += out[0].value.text().len();
             }
             let per = t.elapsed().as_nanos() / n as u128;
             println!("fields {class:>8}: {per} ns/event (sink {sink})");
         }
+    }
+
+    // --- shapes (R7) ------------------------------------------------------------------------------
+
+    fn shaped(name: &str, format: Option<&str>, deletes: Option<&str>) -> KafkaRoute {
+        KafkaRoute {
+            format: format.map(Into::into),
+            deletes: deletes.map(Into::into),
+            ..named(name, "public.*", "t")
+        }
+    }
+
+    fn tombstoned(name: &str) -> KafkaRoute {
+        KafkaRoute {
+            tombstones: true,
+            ..named(name, "public.*", "t")
+        }
+    }
+
+    const PG_KEY: &str = r#"{"db":"app","schema":"public","table":"orders","key":{"id":1}}"#;
+
+    #[test]
+    fn row_format_values_are_the_row_after_field_ops_are_none() {
+        let p = plan_with(vec![shaped("rows", Some("row"), None)]);
+        for op in [Op::Insert, Op::Update, Op::Read] {
+            let mut e = row("orders", op, r#"{"id":1,"n":"a"}"#);
+            if op == Op::Update {
+                e.before = raw(r#"{"id":1,"n":"old"}"#);
+            }
+            let out = p.render(&e, NOW).unwrap();
+            assert_eq!(out.len(), 1, "{op:?}");
+            let r = &out[0];
+            assert_eq!(
+                r.value.text(),
+                r#"{"id":1,"n":"a"}"#,
+                "{op:?}: the row as is"
+            );
+            assert_eq!(r.key, PG_KEY);
+            assert_eq!((r.op, r.lsn.as_str()), (op_code(op), "7"), "headers stay");
+            assert!(r.headers.is_empty());
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced), (3, 3));
+    }
+
+    #[test]
+    fn each_delete_mode_and_truncates_in_row_format() {
+        let del = row("orders", Op::Delete, r#"{"id":1,"n":"a"}"#);
+        let trunc = row("orders", Op::Truncate, "{}");
+        // Default and explicit `tombstone`: the delete itself is a null value under the row's key.
+        for deletes in [None, Some("tombstone")] {
+            let p = plan_with(vec![shaped("rows", Some("row"), deletes)]);
+            let out = p.render(&del, NOW).unwrap();
+            assert_eq!(out.len(), 1, "no extra record: the delete is the tombstone");
+            assert_eq!(out[0].value, None);
+            assert_eq!((out[0].key.as_str(), out[0].op), (PG_KEY, "d"));
+            assert_eq!(out[0].partition_key, PG_KEY);
+            assert!(p.render(&trunc, NOW).unwrap().is_empty());
+            let c = p.stats().snapshot()[0].counts;
+            assert_eq!((c.matched, c.produced, c.filtered), (2, 1, 1));
+        }
+        // `drop`: no record, counted as filtered, like the truncate.
+        let p = plan_with(vec![shaped("rows", Some("row"), Some("drop"))]);
+        assert!(p.render(&del, NOW).unwrap().is_empty());
+        assert!(p.render(&trunc, NOW).unwrap().is_empty());
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.filtered), (2, 0, 2));
+        // `row`: the before-image with `"__deleted": true` written into the object.
+        let p = plan_with(vec![shaped("rows", Some("row"), Some("row"))]);
+        let out = p.render(&del, NOW).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value.text(), r#"{"id":1,"n":"a","__deleted":true}"#);
+        assert_eq!((out[0].key.as_str(), out[0].op), (PG_KEY, "d"));
+        // A change without a row (a MongoDB update whose document is gone) is no record.
+        let mut gone = row("orders", Op::Update, "{}");
+        gone.after = None;
+        assert!(p.render(&gone, NOW).unwrap().is_empty());
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.filtered), (2, 1, 1));
+    }
+
+    #[test]
+    fn deleted_rows_replace_a_deleted_column_and_keep_order() {
+        let d = |s: Option<&str>| deleted_row(s.and_then(raw).as_deref());
+        assert_eq!(d(None), r#"{"__deleted":true}"#);
+        assert_eq!(d(Some("{}")), r#"{"__deleted":true}"#);
+        assert_eq!(d(Some(" { } ")), r#"{"__deleted":true}"#);
+        assert_eq!(d(Some(r#"{"a":1}"#)), r#"{"a":1,"__deleted":true}"#);
+        assert_eq!(
+            d(Some(r#"{"a":1,"__deleted":false,"b":"x"}"#)),
+            r#"{"a":1,"b":"x","__deleted":true}"#
+        );
+        // A string value "__deleted" takes the slow path and is kept.
+        assert_eq!(
+            d(Some(r#"{"a":"__deleted"}"#)),
+            r#"{"a":"__deleted","__deleted":true}"#
+        );
+        // An escaped quote inside a string never looks like the column.
+        assert_eq!(
+            d(Some(r#"{"a":"x\"__deleted\""}"#)),
+            r#"{"a":"x\"__deleted\"","__deleted":true}"#
+        );
+        assert_eq!(d(Some("[1]")), r#"{"__deleted":true}"#);
+        for s in [r#"{"a":1,"__deleted":false}"#, r#"{"a":{"b":[1,2]}}"#] {
+            let v: serde_json::Value = serde_json::from_str(&d(Some(s))).unwrap();
+            assert_eq!(v["__deleted"], true, "{s}");
+        }
+    }
+
+    #[test]
+    fn field_ops_apply_to_row_values_deleted_rows_and_tombstone_keys() {
+        let spec = || FieldSpec {
+            exclude: Some(strs(&["note"])),
+            mask: strs(&["card"]),
+            hash: strs(&["email"]),
+            rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+            ..Default::default()
+        };
+        let users = |op: Op| {
+            let mut e = row(
+                "users",
+                op,
+                r#"{"email":"a@b.c","card":"4111","note":"secret","cust_id":9}"#,
+            );
+            e.key = Some(r#"{"email":"a@b.c"}"#.into());
+            e
+        };
+        let check = |v: &serde_json::Value| {
+            assert_eq!(v["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(v["card"], "***");
+            assert_eq!(v["customer_id"], 9);
+            assert!(v.get("note").is_none() && v.get("cust_id").is_none(), "{v}");
+        };
+        // Row format: the value and a `deletes = "row"` before-image are rewritten.
+        let p = fields_plan(vec![KafkaRoute {
+            format: Some("row".into()),
+            deletes: Some("row".into()),
+            ..with_fields("u", "public.users", spec())
+        }]);
+        let r = p.render(&users(Op::Insert), NOW).unwrap().remove(0);
+        check(&json(&r.value));
+        assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
+        let r = p.render(&users(Op::Delete), NOW).unwrap().remove(0);
+        let v = json(&r.value);
+        check(&v);
+        assert_eq!(v["__deleted"], true);
+        assert!(!r.value.text().contains("a@b.c") && !r.value.text().contains("4111"));
+        assert!(!r.key.contains("a@b.c"), "the key is rewritten too");
+        assert_eq!(json(&r.key)["key"]["email"], hmac_hex("a@b.c").as_str());
+
+        // Row-format tombstone and envelope tombstone: the rewritten key, never the original.
+        for route in [
+            KafkaRoute {
+                format: Some("row".into()),
+                ..with_fields("u", "public.users", spec())
+            },
+            KafkaRoute {
+                tombstones: true,
+                ..with_fields("u", "public.users", spec())
+            },
+        ] {
+            let p = fields_plan(vec![route]);
+            let out = p.render(&users(Op::Delete), NOW).unwrap();
+            let t = out.last().unwrap();
+            assert_eq!(t.value, None);
+            assert!(!t.key.contains("a@b.c"), "{}", t.key);
+            assert_eq!(json(&t.key)["key"]["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(t.partition_key, t.key);
+        }
+    }
+
+    #[test]
+    fn a_tombstone_follows_its_delete_with_the_same_key_and_partition() {
+        let p = plan_with(vec![tombstoned("orders")]);
+        let ins = row("orders", Op::Insert, r#"{"id":1}"#);
+        let del = row("orders", Op::Delete, r#"{"id":1}"#);
+        assert_eq!(p.render(&ins, NOW).unwrap().len(), 1, "only deletes");
+        let out = p.render(&del, NOW).unwrap();
+        assert_eq!(out.len(), 2);
+        let (d, t) = (&out[0], &out[1]);
+        assert_eq!(
+            json(&d.value)["op"],
+            "d",
+            "the delete first, as an envelope"
+        );
+        assert_eq!(t.value, None, "then the tombstone");
+        assert_eq!(
+            (&t.topic, &t.key, &t.partition_key, t.op, &t.lsn),
+            (&d.topic, &d.key, &d.partition_key, d.op, &d.lsn)
+        );
+        assert_eq!(t.key, PG_KEY);
+        // Counted once, as the delete.
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.tombstones_skipped), (2, 2, 0));
+
+        // A per-route key: the tombstone carries it too.
+        let p = plan_with(vec![KafkaRoute {
+            key: Some(strs(&["id"])),
+            ..tombstoned("orders")
+        }]);
+        let out = p.render(&del, NOW).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].key, out[0].key);
+        assert_eq!(json(&out[1].key)["key"], serde_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn a_delete_with_a_null_key_gets_no_tombstone() {
+        // No primary key: the record key's `key` is null.
+        let p = plan_with(vec![tombstoned("orders")]);
+        let mut del = row("orders", Op::Delete, r#"{"id":1}"#);
+        del.key = None;
+        let out = p.render(&del, NOW).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].value.is_some(), "the delete itself is produced");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.produced, c.tombstones_skipped), (1, 1));
+        // A per-route key whose columns the before-image lacks is null too.
+        let p = plan_with(vec![KafkaRoute {
+            key: Some(strs(&["email"])),
+            ..tombstoned("orders")
+        }]);
+        let del = row("orders", Op::Delete, r#"{"id":1}"#);
+        assert_eq!(p.render(&del, NOW).unwrap().len(), 1);
+        let mut with_email = row("orders", Op::Delete, r#"{"id":1,"email":"x"}"#);
+        with_email.key = None;
+        assert_eq!(p.render(&with_email, NOW).unwrap().len(), 2);
+        assert_eq!(p.stats().snapshot()[0].counts.tombstones_skipped, 1);
+        // Field operations that remove every key column leave a null key as well.
+        let p = fields_plan(vec![KafkaRoute {
+            tombstones: true,
+            ..with_fields(
+                "u",
+                "public.orders",
+                FieldSpec {
+                    exclude: Some(strs(&["id"])),
+                    ..Default::default()
+                },
+            )
+        }]);
+        assert_eq!(p.render(&del, NOW).unwrap().len(), 1);
+        assert_eq!(p.stats().snapshot()[0].counts.tombstones_skipped, 1);
+    }
+
+    #[test]
+    fn a_tombstone_follows_its_delete_to_the_fallback_and_is_not_counted_twice() {
+        let mut p = RoutePlan::new(
+            vec![KafkaRoute {
+                tombstones: true,
+                ..content("o", "orders.{row.region}", Some("orders.unknown"), None)
+            }],
+            None,
+        )
+        .unwrap();
+        p.set_source(pg());
+        let del = row("orders", Op::Delete, r#"{"id":1,"region":"eu"}"#);
+        let mut out = p.render(&del, NOW).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].topic, "orders.eu");
+        assert!(!out[0].content.as_ref().unwrap().tombstone);
+        assert!(out[1].content.as_ref().unwrap().tombstone);
+        // The broker refuses the topic: both go to the fallback, the event is counted once.
+        for r in &mut out {
+            p.topic_refused(r, "PolicyViolation");
+        }
+        assert_eq!(out[0].topic, out[1].topic);
+        assert_eq!(out[1].value, None);
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.fallback), (1, 0, 1));
+    }
+
+    #[test]
+    fn unchanged_dead_letter_sends_rows_with_omitted_toast_columns_to_the_dead_letter_topic() {
+        let route = |unchanged: Option<&str>| KafkaRoute {
+            unchanged: unchanged.map(Into::into),
+            ..shaped("docs", Some("row"), None)
+        };
+        // The decoder's signal: `doc` was an unchanged TOAST value, so `after` lacks it.
+        let mut upd = row("docs", Op::Update, r#"{"id":1,"title":"t"}"#);
+        upd.unchanged = vec!["doc".into()];
+        let p = plan_with(vec![route(Some("dead_letter"))]);
+        let out = p.render(&upd, NOW).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].topic, DLQ);
+        assert_eq!(
+            out[0].headers,
+            vec![(
+                "aqueduct-error",
+                "route `docs`: unchanged = \"dead_letter\": the source left out unchanged column(s) `doc`"
+                    .to_string()
+            )]
+        );
+        assert_eq!(
+            json(&out[0].value)["op"],
+            "u",
+            "the dead-letter value is the envelope"
+        );
+        // A complete row passes.
+        let mut full = upd.clone();
+        full.unchanged.clear();
+        assert_eq!(p.render(&full, NOW).unwrap()[0].topic, "t");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.errors), (2, 1, 1));
+        // `omit` (the default): the incomplete row is produced as it is.
+        for u in [None, Some("omit")] {
+            let p = plan_with(vec![route(u)]);
+            let out = p.render(&upd, NOW).unwrap();
+            assert_eq!(out[0].topic, "t");
+            assert_eq!(out[0].value.text(), r#"{"id":1,"title":"t"}"#);
+        }
+    }
+
+    #[test]
+    fn shapes_are_validated_at_startup() {
+        let err = |r: KafkaRoute, dlq: Option<&str>| {
+            RoutePlan::with_dead_letter(vec![r], None, dlq.map(Into::into))
+                .unwrap_err()
+                .to_string()
+        };
+        let e = err(shaped("r", None, Some("row")), None);
+        assert!(
+            e.contains("`deletes` applies to `format = \"row\"` only"),
+            "{e}"
+        );
+        let e = err(shaped("r", Some("flat"), None), None);
+        assert!(
+            e.contains("route `r`: unknown format `flat` (expected `envelope` or `row`)"),
+            "{e}"
+        );
+        let e = err(shaped("r", Some("row"), Some("delete")), None);
+        assert!(e.contains("unknown deletes `delete`"), "{e}");
+        let e = err(
+            KafkaRoute {
+                tombstones: true,
+                ..shaped("r", Some("row"), None)
+            },
+            None,
+        );
+        assert!(e.contains("`tombstones` is for the envelope format"), "{e}");
+        let unchanged = |u: &str| KafkaRoute {
+            unchanged: Some(u.into()),
+            ..named("r", "public.*", "t")
+        };
+        let e = err(unchanged("dead_letter"), None);
+        assert!(e.contains("sink.dead_letter_topic"), "{e}");
+        let e = err(unchanged("fill"), Some(DLQ));
+        assert!(e.contains("unknown unchanged `fill`"), "{e}");
+        assert!(RoutePlan::with_dead_letter(
+            vec![unchanged("dead_letter")],
+            None,
+            Some(DLQ.into())
+        )
+        .is_ok());
+        // Case does not matter, as for `ops`.
+        assert!(RoutePlan::new(vec![shaped("r", Some("ROW"), Some("Drop"))], None).is_ok());
+        // Outbox routes take none of the shape keys.
+        let e = err(
+            KafkaRoute {
+                tombstones: true,
+                unchanged: Some("omit".into()),
+                outbox: Some(OutboxSpec::default()),
+                ..named("o", "public.outbox", "")
+            },
+            Some(DLQ),
+        );
+        assert!(
+            e.contains("`outbox` and `tombstones`, `unchanged` are mutually exclusive"),
+            "{e}"
+        );
+
+        // Tombstones need a per-row key: `partition_by = "key"`, or the route's own `key`.
+        let p = RoutePlan::new(vec![tombstoned("r")], None).unwrap();
+        assert!(p.check_partition_by(PartitionBy::Key).is_ok());
+        let e = p
+            .check_partition_by(PartitionBy::Table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("route `r` uses `tombstones`, which needs a per-row key"),
+            "{e}"
+        );
+        let keyed = RoutePlan::new(
+            vec![KafkaRoute {
+                key: Some(strs(&["id"])),
+                ..tombstoned("r")
+            }],
+            None,
+        )
+        .unwrap();
+        assert!(keyed.check_partition_by(PartitionBy::Table).is_ok());
+        assert!(RoutePlan::new(vec![route("public.*", "t")], None)
+            .unwrap()
+            .check_partition_by(PartitionBy::Table)
+            .is_ok());
+    }
+
+    #[test]
+    fn shapes_are_described() {
+        let p = plan_with(vec![
+            KafkaRoute {
+                unchanged: Some("dead_letter".into()),
+                ..KafkaRoute {
+                    pattern: "public.a".into(),
+                    ..shaped("rows", Some("row"), None)
+                }
+            },
+            KafkaRoute {
+                pattern: "public.b".into(),
+                ..tombstoned("events")
+            },
+            named("plain", "public.*", "t"),
+        ]);
+        let d = p.describe();
+        let r = &d.routes;
+        assert_eq!(
+            (r[0].format, r[0].deletes, r[0].tombstones, r[0].unchanged),
+            (Some("row"), Some("tombstone"), false, Some("dead_letter"))
+        );
+        assert_eq!(
+            (r[1].format, r[1].deletes, r[1].tombstones, r[1].unchanged),
+            (None, None, true, None)
+        );
+        // Unset keys are left out of the JSON, so plain routes describe as before.
+        let v = serde_json::to_value(&r[2]).unwrap();
+        for k in ["format", "deletes", "tombstones", "unchanged"] {
+            assert!(v.get(k).is_none(), "{k}: {v}");
+        }
+        let v = serde_json::to_value(&r[1]).unwrap();
+        assert_eq!(v["tombstones"], true);
     }
 }

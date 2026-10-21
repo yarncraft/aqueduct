@@ -375,6 +375,7 @@ impl MongoSource {
                 after: Some(r.row),
                 key: r.key,
                 checkpoint: Some(progress(snap)),
+                unchanged: Vec::new(),
             });
         }
         self.last_token = Some(token.to_owned());
@@ -745,6 +746,8 @@ pub(crate) fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
         after: raw(after)?,
         key: ev.get("documentKey").map(Value::to_string),
         checkpoint: None,
+        // A change stream sends whole documents: nothing is ever left out as unchanged.
+        unchanged: Vec::new(),
     }))
 }
 

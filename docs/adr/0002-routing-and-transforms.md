@@ -452,7 +452,8 @@ and keys JSON:
   `mask`, `hash`, `rename`) on the same route, checked at startup in `RoutePlan::build`; the error names the keys set.
   So an outbox route has no field operations and nothing in it is protected, which is all R6's rule "no protected
   column in the outbox `aggregate_id` or `topic`" needs. The payload is published as the application wrote it, so
-  shape it there. `format` (R7) is not on main yet; `TODO(R7)` marks where it joins this check. Non-outbox routes keep
+  shape it there. R7 added `format`, `deletes`, `tombstones` and `unchanged` to this check (see "As built (R7)").
+  Non-outbox routes keep
   R6's order: field operations run before the topic is chosen.
 - **Unseen fields.** The outbox columns are registered as `after.<col>` (the topic template's fields as usual), so a
   misspelled column is reported after 1000 inserts without it.
@@ -462,3 +463,49 @@ and keys JSON:
   `lsn`, `aqueduct-error`, `aqueduct-hash-key-id`, and `id`/`type` when a route uses `outbox`), since the inspected
   globs can match topics other producers write to. The cockpit shows a value that is not an envelope raw, with op and
   lsn from the headers and the topic in place of the table (§7), instead of an empty row.
+
+## As built (R7)
+
+Shapes (#85): `format`, `deletes`, `tombstones` and `unchanged`. Where the code differs from §5, which was written
+before #138 made keys JSON:
+
+- **Where it runs.** After `ops`, `where`, `key`, the field operations and the topic, as the fixed order says. Events a
+  shape produces nothing for (a row-format truncate, `deletes = "drop"`, a row-format change without `after`) are
+  counted `filtered` right after `where`, before field operations, so they never reach the dead-letter topic for a
+  row error. `unchanged = "dead_letter"` is checked at the same point. Routes without these keys build the record
+  exactly as before (the R1 golden test is unchanged apart from reading the value as `Option`).
+- **`OutRecord::value` is `Option<String>`** (§1's signature); `None` is a Kafka record with a null value.
+- **Row format.** The value is `after` after field operations, copied as raw JSON. A MongoDB update whose document
+  was deleted before the lookup has no `after`; it produces nothing (`filtered`) and its delete follows.
+  `deletes = "row"` writes `"__deleted":true` into the rewritten before-image as its last member; a column already
+  named `__deleted` is replaced (the only case that parses the object; the common case appends to the text). No
+  `__deleted: false` on other rows (Debezium's `rewrite` mode adds it; §5 does not ask for it).
+- **Bypass rule.** The row value and the `deletes = "row"` before-image come from `rewrite_rows`, and a tombstone is a
+  copy of its delete's record key and partition input (the route key, or the `rewrite_key` object), so neither
+  carries a column the route protects.
+- **Tombstones.** The tombstone is pushed into the same `render` output right after its delete, with the same topic,
+  key, partition input and headers (`op` = `d`, `lsn`), so `send_batch` puts both in the same (topic, partition)
+  group in order. If the broker refuses a content-routed topic, both are re-routed to the fallback;
+  `ContentTopic::tombstone` keeps the tombstone from being counted a second time.
+- **Per-row key.** Startup rejects `tombstones = true` unless the route has `key = [...]` or `partition_by = "key"`.
+  `partition_by` is set on the plan after `build`, so `RoutePlan::check_partition_by` does this and the binary calls
+  it with the configured value. Since #138 the record key carries the primary key under `partition_by = "table"` as
+  well, so this rule is stricter than compaction needs; it is kept as the ADR states it.
+- **Null keys.** A delete whose record key has `"key": null` (no primary key, field operations removing every key
+  column, or a `key = [...]` whose columns are all null or missing in the before-image) gets no tombstone: one would
+  erase the whole table from a compacted topic. It is logged once per route and counted in
+  `RouteCounts::tombstones_skipped`, which is not an outcome (the delete counts `produced`); Prometheus has
+  `aqueduct_route_tombstones_skipped_total{route}`. A row-format `deletes = "tombstone"` record is the delete itself
+  and is produced regardless.
+- **The decoder signal for TOAST.** `ChangeEvent::unchanged: Vec<String>` names the columns `decoder.rs::row` left out
+  of `after` because pgoutput sent them as unchanged TOAST (`'u'`). `RelationCache::unchanged` fills it for updates
+  (inserts, deletes, truncates and snapshot rows never have such columns); it is empty, without allocating, in the
+  common case, `#[serde(skip)]` so the event JSON is unchanged, and always empty for MongoDB, which sends whole
+  documents. `unchanged = "dead_letter"` sends a non-empty one to the dead-letter topic with ``route `<r>`: unchanged =
+  "dead_letter": the source left out unchanged column(s) `<col>` `` (names, never values). It is allowed on envelope
+  routes too. Filling the columns from `before` under `REPLICA IDENTITY FULL` stays the follow-up of §5 "TOAST".
+- **Exclusive with outbox.** `outbox` with any of the four keys fails startup, completing R8's `TODO(R7)`.
+- **Visibility.** `/api/routes` has `format: "row"` and its effective `deletes` on row-format routes, `tombstones: true`
+  and `unchanged: "dead_letter"` when set; each is left out otherwise, so other routes describe as before. The
+  inspector reuses R8's raw display: a tombstone is `null` and labelled as such, and a row or tombstone takes its table
+  from the JSON record key.

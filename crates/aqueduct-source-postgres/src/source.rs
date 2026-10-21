@@ -909,6 +909,7 @@ impl PostgresSource {
         before: Option<Row>,
         after: Option<Row>,
         row_key: Option<String>,
+        unchanged: Vec<String>,
     ) -> bool {
         let snap = self.snapshot.as_ref().map(|e| e.state().clone());
         let checkpoint = self.checkpoint_text(key, snap);
@@ -925,6 +926,7 @@ impl PostgresSource {
                 after,
                 key: row_key,
                 checkpoint: Some(Position::Text(checkpoint)),
+                unchanged,
             },
         )
     }
@@ -991,6 +993,8 @@ impl PostgresSource {
                     after: Some(r.row),
                     key: r.key,
                     checkpoint: Some(Position::Text(checkpoint)),
+                    // A snapshot reads whole rows: nothing is left out.
+                    unchanged: Vec::new(),
                 },
             );
         }
@@ -1225,7 +1229,8 @@ impl PostgresSource {
                     let pk = self.pks.get(&id).map(Vec::as_slice);
                     let row_key = cache.key(relation, &new, pk).map_err(dec)?;
                     let key = keys.next(lsn);
-                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key) {
+                    let none = Vec::new();
+                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key, none) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(&id, Live::Insert { rel: r, new: &new });
                         }
@@ -1248,8 +1253,20 @@ impl PostgresSource {
                         .transpose()
                         .map_err(dec)?;
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
+                    // Unchanged TOAST columns `row` left out of `after`, for `unchanged` routes.
+                    let unchanged = cache.unchanged(relation, &new).map_err(dec)?;
                     let key = keys.next(lsn);
-                    if self.queue(key, xid, ts, name, Op::Update, before, after, row_key) {
+                    if self.queue(
+                        key,
+                        xid,
+                        ts,
+                        name,
+                        Op::Update,
+                        before,
+                        after,
+                        row_key,
+                        unchanged,
+                    ) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(
                                 &id,
@@ -1273,7 +1290,8 @@ impl PostgresSource {
                     let pk = self.pks.get(&id).map(Vec::as_slice);
                     let row_key = cache.key(relation, &old, pk).map_err(dec)?;
                     let key = keys.next(lsn);
-                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key) {
+                    let none = Vec::new();
+                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key, none) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(&id, Live::Delete { rel: r, old: &old });
                         }
@@ -1288,7 +1306,8 @@ impl PostgresSource {
                         }
                         let key = keys.next(lsn);
                         let id = table_id(&name.0, &name.1);
-                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None) {
+                        let none = Vec::new();
+                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None, none) {
                             if let Some(e) = self.snapshot.as_mut() {
                                 e.observe(&id, Live::Truncate);
                             }
@@ -1726,6 +1745,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Vec::new(),
                 );
             }
         };

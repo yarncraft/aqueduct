@@ -380,6 +380,18 @@ pub struct KafkaRouteConfig {
     /// `{ old = "new" }` column renames.
     #[serde(default)]
     pub rename: std::collections::BTreeMap<String, String>,
+    /// `envelope` (default) or `row`: the record value is the change event or the row alone.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// With `format = "row"`: `tombstone` (default), `drop` or `row` (before + `__deleted`).
+    #[serde(default)]
+    pub deletes: Option<String>,
+    /// Envelope format: a null-value record with the same key after every delete.
+    #[serde(default)]
+    pub tombstones: bool,
+    /// `omit` (default) or `dead_letter`: rows lacking unchanged TOAST columns.
+    #[serde(default)]
+    pub unchanged: Option<String>,
     /// Publish the rows of an outbox table as their own events: inserts (and snapshot rows when
     /// `ops` lists `read`), key = the `aggregate_id` column, value = the `payload` column.
     /// Excludes `topic` and `key`.

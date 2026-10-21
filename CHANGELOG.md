@@ -106,6 +106,23 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Routing: reshape event output (row format, deletes, tombstones)** (#85, ADR 0002). New route keys, all off by
+  default, so existing routes produce the same records byte for byte:
+  - `format = "row"`: the value is the row (`after`, after field operations) instead of the envelope; `op` and `lsn`
+    stay in the headers. Truncates produce nothing (counted `filtered`).
+  - `deletes` (row format only): `tombstone` (default, a null value with the row's key), `drop` (counted `filtered`)
+    or `row` (the rewritten before-image with `"__deleted": true`).
+  - `tombstones = true` (envelope only): a null-value record with the delete's rewritten key after every delete, on
+    the same partition. Needs `key = [...]` or `partition_by = "key"`; a delete with a null key (no primary key) gets
+    none, logged once per route and counted as `tombstones_skipped` (`/api/routes`, `/api/metrics`, Prometheus
+    `aqueduct_route_tombstones_skipped_total`).
+  - `unchanged = "omit" | "dead_letter"`: `dead_letter` sends a row the source sent without unchanged TOAST columns to
+    `sink.dead_letter_topic` (then required). The Postgres decoder now names those columns on the event (not
+    serialised). TOAST caveat: in row format an update can lack a large column, and a compacted consumer that replaces
+    whole rows loses it.
+  - Exclusive with `outbox`. `/api/routes` shows `format`, `deletes`, `tombstones` and `unchanged`; the cockpit and
+    `/api/events` show row-format values raw and tombstones as `null`, with the table taken from the record key.
+    See DEPLOYMENT.md, "Shaping the output".
 - **Routing: publish outbox-table rows as their own events** (#86, ADR 0002). `outbox = { aggregate_type,
   aggregate_id, payload, topic, id, type }` on a route turns each insert into the outbox table into one record: topic
   from a template such as `outbox.{aggregate_type}` (the content-routing rules apply, with `topic_fallback`), key = the

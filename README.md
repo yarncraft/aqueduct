@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope, or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope (+ tombstones), the row (format = row), or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -284,6 +284,29 @@ outbox = { topic = "outbox.{aggregate_type}", id = "id", type = "type" }   # Deb
 topic_fallback = "outbox.unknown"
 ```
 
+`format = "row"` on a route makes the value the row itself (`after`, after field operations) instead of the
+envelope; `op` and `lsn` stay in the headers. A delete then follows `deletes`: `tombstone` (default, a null value
+under the row's key), `drop`, or `row` (the before-image plus `"__deleted": true`). Truncates produce nothing. On an
+envelope route, `tombstones = true` adds a null-value record after every delete, on the same partition; it needs a
+per-row key (`key = [...]` or `partition_by = "key"`), and a delete of a row without a primary key gets none. TOAST
+caveat: Postgres does not send an unchanged large column on update, so a row-format update can lack it and a compacted
+consumer that replaces whole rows loses it; `unchanged = "dead_letter"` sends such rows to the dead-letter topic
+instead. See DEPLOYMENT.md, "Shaping the output".
+
+```toml
+[[sink.routes]]
+match = "public.customers"
+topic = "customers.compacted"
+format = "row"
+deletes = "tombstone"         # or "drop", "row"
+unchanged = "dead_letter"     # needs sink.dead_letter_topic
+
+[[sink.routes]]
+match = "public.*"
+topic = "cdc.{table}"
+tombstones = true
+```
+
 ### MongoDB source
 
 ```toml
@@ -319,8 +342,8 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations, outbox per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
-| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads) come back raw. Cached for 2 s |
+| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 

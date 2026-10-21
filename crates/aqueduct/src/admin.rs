@@ -723,6 +723,20 @@ fn route_metrics(o: &mut String, routes: &[RouteCount]) {
     }
     metric(
         o,
+        "aqueduct_route_tombstones_skipped_total",
+        "counter",
+        "Deletes a route with tombstones = true produced without a tombstone, because the row has no key.",
+    );
+    for r in routes {
+        let _ = writeln!(
+            o,
+            "aqueduct_route_tombstones_skipped_total{{route=\"{}\"}} {}",
+            escape_label(&r.route),
+            r.counts.tombstones_skipped
+        );
+    }
+    metric(
+        o,
         "aqueduct_route_field_unseen",
         "gauge",
         "1 for a field path a route references that no row has had yet (a typo?).",
@@ -1217,6 +1231,7 @@ Authorization: Bearer {token}
             after: serde_json::value::RawValue::from_string(row.into()).ok(),
             key: None,
             checkpoint: None,
+            unchanged: Vec::new(),
         };
         for (table, row) in [
             ("orders", r#"{"status":"paid","card":"4111-secret"}"#),
@@ -1260,7 +1275,7 @@ Authorization: Bearer {token}
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
                    "where": "row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
-                   "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1},
+                   "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
                    "unseen_fields": []})
         );
         assert_eq!(routes[1]["counts"]["produced"], 1);
@@ -1274,7 +1289,7 @@ Authorization: Bearer {token}
         assert_eq!(
             v["routes"][0],
             json!({"route": "paid \"orders\"", "matched": 3, "produced": 1, "filtered": 1,
-                   "fallback": 0, "errors": 1, "unseen_fields": []})
+                   "fallback": 0, "errors": 1, "tombstones_skipped": 0, "unseen_fields": []})
         );
 
         // Prometheus: one series per route and outcome, label values escaped.
@@ -1285,6 +1300,7 @@ Authorization: Bearer {token}
             r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="errors"} 1"#,
             r#"aqueduct_route_records_total{route="paid \"orders\"",outcome="fallback"} 0"#,
             r#"aqueduct_route_records_total{route="default",outcome="produced"} 0"#,
+            r#"aqueduct_route_tombstones_skipped_total{route="paid \"orders\""} 0"#,
             "# TYPE aqueduct_route_field_unseen gauge",
         ] {
             assert!(prom.contains(line), "missing {line}");
@@ -1546,6 +1562,7 @@ Authorization: Bearer {token}
             after: None,
             key: None,
             checkpoint: None,
+            unchanged: Vec::new(),
         }
     }
 

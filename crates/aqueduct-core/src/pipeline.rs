@@ -245,6 +245,7 @@ mod tests {
             after: None,
             key: None,
             checkpoint: None,
+            unchanged: Vec::new(),
         }
     }
 

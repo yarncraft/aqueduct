@@ -478,7 +478,8 @@ fn record(out: OutRecord) -> Record {
         .unwrap_or_else(chrono::Utc::now);
     Record {
         key: Some(out.key.into_bytes()),
-        value: Some(out.value.into_bytes()),
+        // `None`: a tombstone (`tombstones = true`, or a row-format delete).
+        value: out.value.map(String::into_bytes),
         headers,
         timestamp,
     }
