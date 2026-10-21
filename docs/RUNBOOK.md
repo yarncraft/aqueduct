@@ -26,6 +26,8 @@ Chaos scenarios that exercise the cases below live in `scripts/chaos/` (`scripts
 | Rolled back to a version older than the commit-order key (#94): the older binary refuses the new checkpoint (`not a Postgres LSN`) and crash-loops | Startup fails with a checkpoint error | Delete the checkpoint file (section "Corrupt checkpoint") and accept a replay from the slot |
 | Replication slot dropped, checkpoint present | With the `feat/hardening` guard: refuses to start. Without it: a new slot is created from "now" and the gap is silent | Section 4 |
 | Two instances on one slot | Both poll and advance; events split or duplicated | Never do this; one instance per slot |
+| MongoDB: watched database dropped (the change stream is invalidated) | The source fails with `MongoDB invalidated the change stream`, the process exits non-zero, and every restart fails the same way: nothing is captured until the checkpoint is reset | Section "MongoDB change stream invalidated" |
+| MongoDB: a change event over 16 MB (`BSONObjectTooLarge`, code 10334) | The source fails with `larger than MongoDB's 16 MB document limit` at the same event on every restart | Section "MongoDB change event larger than 16 MB" |
 
 ## 2. Recovery procedures
 
@@ -57,6 +59,43 @@ from the database for consumers that need it (Aqueduct has no initial snapshot).
 The pipeline stops on non-retryable errors by design (no silent skip). Fix the receiver or the event source, then restart.
 Skipping requires advancing the slot manually and is data loss for that event:
 `SELECT pg_replication_slot_advance('aqueduct', '<lsn after the bad txn>');` with Aqueduct stopped.
+
+### MongoDB change stream invalidated
+Dropping the watched database (also when it is recreated right after) makes MongoDB close the change stream with an
+`invalidate` event. Aqueduct does not skip past it on its own: the log shows `pipeline failed` with
+`MongoDB invalidated the change stream of database "app" at resume token {"_data":"82..."}`, and each restart replays
+to the same event and fails again. Nothing done to the database after the drop is captured until you choose:
+
+1. Stop Aqueduct and make sure the database exists again (with the collections you expect).
+2. Either resume right after the invalidate, so that everything done since the database was recreated is delivered:
+   write the token from the error into the checkpoint, prefixed with `~` (the stream reopens with `startAfter`, which
+   MongoDB allows for an invalidate token):
+   ```sh
+   echo '~{"_data":"82..."}' > checkpoint     # the token from the error, prefixed with ~
+   docker run --rm -v aqueduct-state:/v -v "$PWD:/in:ro" busybox cp /in/checkpoint /v/checkpoint
+   ```
+   or delete the checkpoint (section "Corrupt checkpoint") to start at "now": changes made between the recreation and
+   the start are then not delivered, so copy the collections with a snapshot (`snapshot = "initial"` on that start, or
+   `POST /api/snapshot`).
+3. Start Aqueduct. A snapshot that was running is dropped by either reset; request it again.
+
+Consumers still hold the documents of the dropped database: no delete or truncate events are sent for a drop.
+When the error has no token (the server closed the stream without an `invalidate` event), only the second choice applies.
+
+### MongoDB change event larger than 16 MB
+A change event carries the whole document (`updateLookup`) and, with `pre_images = true`, its pre-image too, so a
+document near the 16 MB BSON limit can make an event the server cannot return: every getMore fails with
+`BSONObjectTooLarge` (code 10334), and Aqueduct fails with `a change event ... is larger than MongoDB's 16 MB
+document limit` at the same place on every restart. The error names the resume token after which the event lies.
+
+- Set `pre_images = false` in `[source]` and restart: the event loses `fullDocumentBeforeChange`, which is usually
+  enough. Deletes then carry only the `documentKey`, updates no `before`.
+- Or shrink the document: `updateLookup` reads the document as it is now, so a smaller current version unblocks an
+  update event (not an insert or a pre-image).
+- If neither helps (an insert of a document close to 16 MB), the event can only be skipped: delete the checkpoint and
+  start at "now", which loses every change since the checkpoint, then snapshot the affected collections.
+
+MongoDB 7.0+ can split such events with `$changeStreamSplitLargeEvent`; Aqueduct does not use it yet.
 
 ## 3. Monitoring
 

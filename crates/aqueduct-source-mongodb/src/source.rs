@@ -751,6 +751,55 @@ fn src_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Source(e.to_string())
 }
 
+/// The server's `BSONObjectTooLarge`: a change event over the 16 MB BSON limit.
+const BSON_OBJECT_TOO_LARGE: i32 = 10334;
+
+/// An error of opening or reading the change stream. A change event the server cannot return
+/// because it is over 16 MB fails every getMore, and every restart, at the same place, so it is
+/// named with what to do instead of the bare server text.
+fn stream_err(e: mongodb::error::Error, database: &str, after: Option<&str>) -> Error {
+    let too_large = match *e.kind {
+        mongodb::error::ErrorKind::Command(ref c) => {
+            c.code == BSON_OBJECT_TOO_LARGE || c.code_name == "BSONObjectTooLarge"
+        }
+        _ => false,
+    };
+    if !too_large {
+        return src_err(e);
+    }
+    let after = after.map_or(String::new(), |t| format!(" after resume token {t}"));
+    Error::Source(format!(
+        "a change event of database {database:?}{after} is larger than MongoDB's 16 MB document \
+         limit, so the server cannot return it and the stream cannot get past it; every restart \
+         stops at the same event. An event holds the whole document (updateLookup) and, with \
+         source.pre_images = true, its pre-image as well. Set source.pre_images = false or shrink \
+         the document, then restart; Aqueduct does not split events with \
+         $changeStreamSplitLargeEvent. See \"MongoDB change event larger than 16 MB\" in docs/RUNBOOK.md. \
+         Server error: {e}"
+    ))
+}
+
+/// The change stream was closed by the server: an `invalidate` event (the watched database was
+/// dropped), or a cursor that ended without one. Never a clean end: the pipeline would stop with
+/// success, and a restart would replay to the same place and stop again, capturing nothing.
+fn invalidated(database: &str, token: Option<&str>) -> Error {
+    let at = token.map_or(String::new(), |t| format!(" at resume token {t}"));
+    Error::Source(format!(
+        "MongoDB invalidated the change stream of database {database:?}{at} (the database was \
+         dropped, or the stream otherwise closed); nothing after it is read, and a restart from \
+         this checkpoint stops here again. Once the database exists again, reset the checkpoint: \
+         see \"MongoDB change stream invalidated\" in docs/RUNBOOK.md"
+    ))
+}
+
+/// Fails on an `invalidate` change event, which maps to no row change but ends the stream.
+fn check_invalidate(doc: &Document, token: &str, database: &str) -> Result<()> {
+    if doc.get_str("operationType") == Ok("invalidate") {
+        return Err(invalidated(database, Some(token)));
+    }
+    Ok(())
+}
+
 /// Resume token JSON text -> driver token.
 fn parse_token(text: &str) -> Result<ResumeToken> {
     let json: Value = serde_json::from_str(text).map_err(src_err)?;
@@ -902,7 +951,10 @@ impl Source for MongoSource {
         }
         self.last_heartbeat = Instant::now();
         // The stream opens before the snapshot's first watermark is written, so it sees it.
-        self.stream = Some(watch.await.map_err(src_err)?.with_type::<Document>());
+        let opened = watch
+            .await
+            .map_err(|e| stream_err(e, &self.cfg.database, token.as_deref()))?;
+        self.stream = Some(opened.with_type::<Document>());
         self.announce_start = token.is_none();
         self.start_snapshot(resume, token.is_none()).await?;
         self.spawn_head();
@@ -951,9 +1003,15 @@ impl Source for MongoSource {
             // and returns `None` for an empty batch. Do NOT wrap `stream.next()` in a timeout
             // here: dropping that future mid-poll leaves the driver's cursor state taken, and
             // `resume_token()` then panics ("cursor state access while streaming").
-            match stream.next_if_any().await.map_err(src_err)? {
+            let read = stream.next_if_any().await;
+            let read =
+                read.map_err(|e| stream_err(e, &self.cfg.database, self.last_token.as_deref()))?;
+            match read {
                 Some(doc) => {
                     let token = doc_token_text(&doc)?;
+                    // Not checkpointed: a restart replays to it and fails again until the
+                    // operator resets the checkpoint.
+                    check_invalidate(&doc, &token, &self.cfg.database)?;
                     if !self.observe(&doc, &token)? {
                         if let Some(mut ev) = to_change_event(&doc)? {
                             ev.checkpoint = self.checkpoint_at(&token);
@@ -975,8 +1033,10 @@ impl Source for MongoSource {
                     }
                 }
                 None => {
+                    // A change stream never ends by itself; `Ok(None)` would stop the pipeline
+                    // with success. The server closes it only after an invalidate.
                     if !stream.is_alive() {
-                        return Ok(None);
+                        return Err(invalidated(&self.cfg.database, None));
                     }
                     // Empty batch: the token is the server's postBatchResumeToken, so the
                     // checkpoint can follow an idle or fully filtered stream. Only here is it
@@ -1121,6 +1181,55 @@ mod tests {
             to_change_event(&ins).unwrap().unwrap().position
         );
         assert!(doc_token_text(&doc! {"operationType": "drop"}).is_err());
+    }
+
+    #[test]
+    fn an_invalidate_fails_the_source_instead_of_being_skipped() {
+        let inv = doc! {"_id": {"_data": "8265B1"}, "operationType": "invalidate",
+        "clusterTime": mongodb::bson::Timestamp { time: 1, increment: 1 }};
+        // It maps to no row change, so without the check it would be passed over.
+        assert!(to_change_event(&inv).unwrap().is_none());
+        let token = doc_token_text(&inv).unwrap();
+        let err = check_invalidate(&inv, &token, "app")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalidated the change stream of database \"app\""),
+            "{err}"
+        );
+        assert!(
+            err.contains(r#"{"_data":"8265B1"}"#),
+            "names the token: {err}"
+        );
+        assert!(err.contains("docs/RUNBOOK.md"), "{err}");
+        // Every other event goes on to the mapping.
+        for op in ["insert", "drop", "dropDatabase", "rename"] {
+            let d = doc! {"_id": {"_data": "01"}, "operationType": op};
+            assert!(check_invalidate(&d, "t", "app").is_ok(), "{op}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_event_is_named_with_what_to_do() {
+        let reply = |code: i32, name: &str| -> mongodb::error::Error {
+            let err: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+                "code": code, "codeName": name, "errmsg": "BSONObj size: 17000000 is invalid",
+            })
+            .unwrap();
+            mongodb::error::ErrorKind::Command(err).into()
+        };
+        let e = stream_err(
+            reply(10334, "BSONObjectTooLarge"),
+            "app",
+            Some("{\"_data\":\"82\"}"),
+        )
+        .to_string();
+        assert!(e.contains("larger than MongoDB's 16 MB"), "{e}");
+        assert!(e.contains("pre_images = false"), "{e}");
+        assert!(e.contains("after resume token {\"_data\":\"82\"}"), "{e}");
+        assert!(e.contains("BSONObj size"), "keeps the server text: {e}");
+        let other = stream_err(reply(11601, "Interrupted"), "app", None).to_string();
+        assert!(!other.contains("16 MB"), "{other}");
     }
 
     #[test]

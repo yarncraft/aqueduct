@@ -223,3 +223,34 @@ async fn reports_cluster_times_for_the_behind_source_card() {
     assert!(lag.behind_secs.unwrap() <= 2.0);
     client.database(&db_name).drop().await.unwrap();
 }
+
+/// Dropping the watched database invalidates the change stream. The source must fail, not end
+/// cleanly (the pipeline would exit with success and a restart would end at the same place), and
+/// a restart from the last checkpoint must fail the same way until the operator resets it.
+#[tokio::test]
+#[ignore]
+async fn a_dropped_database_fails_the_source_instead_of_ending_it() {
+    let db_name = format!("aq_inv_{}", mongodb::bson::oid::ObjectId::new().to_hex());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let coll = client.database(&db_name).collection::<Document>("users");
+    coll.insert_one(doc! {"_id": 0}).await.unwrap();
+
+    let mut src = MongoSource::new(cfg(&db_name));
+    src.start(None).await.unwrap();
+    let hb = next(&mut src).await;
+    assert_eq!(hb.op, Op::Heartbeat);
+    let saved = hb.checkpoint.clone().unwrap_or(hb.position.clone());
+    client.database(&db_name).drop().await.unwrap();
+
+    let failed = |r: Result<aqueduct_core::Result<Option<ChangeEvent>>, _>| match r {
+        Ok(Err(e)) => e.to_string(),
+        other => panic!("expected the source to fail, got {other:?}"),
+    };
+    let err = failed(tokio::time::timeout(Duration::from_secs(15), src.next()).await);
+    assert!(err.contains("invalidated the change stream"), "{err}");
+
+    let mut again = MongoSource::new(cfg(&db_name));
+    again.start(Some(saved)).await.unwrap();
+    let err = failed(tokio::time::timeout(Duration::from_secs(15), again.next()).await);
+    assert!(err.contains("invalidated the change stream"), "{err}");
+}

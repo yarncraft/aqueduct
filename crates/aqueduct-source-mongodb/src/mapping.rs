@@ -15,7 +15,8 @@ pub struct Mapped {
 }
 
 /// Map one change-stream document (as extended JSON) to a `Mapped` event.
-/// Returns `None` for event types that carry no row change (e.g. `invalidate`).
+/// Returns `None` for event types that carry no row change (e.g. `drop`). The source fails on an
+/// `invalidate` before it gets here (`source.rs::check_invalidate`).
 pub fn map_event(ev: &Value) -> Option<Mapped> {
     let op = match ev.get("operationType")?.as_str()? {
         "insert" => Op::Insert,
