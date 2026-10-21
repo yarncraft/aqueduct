@@ -59,6 +59,7 @@ fn with_ca() -> ConnectOptions {
     ConnectOptions {
         ssl_mode: None,
         ssl_root_cert: Some(env("AQUEDUCT_TEST_PG_CA")),
+        password: None,
     }
 }
 
@@ -126,6 +127,7 @@ async fn verify_full_refuses_a_bad_certificate() {
     let wrong = ConnectOptions {
         ssl_mode: None,
         ssl_root_cert: Some(env("AQUEDUCT_TEST_PG_WRONG_CA")),
+        password: None,
     };
     fails_with(&u, &wrong, UNTRUSTED).await;
     // Right CA, but the certificate names localhost only.

@@ -136,6 +136,8 @@ topic = "cdc.{schema}.{table}"
 | `publication` | `aqueduct` | Existing publication to stream |
 | `ssl_mode` | from URL, else `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. Weaker modes must be set explicitly; `verify-full` is the default and the production setting |
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
+| `auth` | `password` | `password` uses the password in `url`. `azure-workload-identity` (AKS) or `azure-container-apps` signs in with a Microsoft Entra token from the pod's or app's managed identity instead; see [Azure managed identity](#azure-managed-identity) |
+| `azure_client_id` | unset | With an `azure-*` `auth`: the managed identity's client ID. Overrides `AZURE_CLIENT_ID` on AKS; on Container Apps it picks a user-assigned identity (unset: the system-assigned one) |
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
 | `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
@@ -152,6 +154,8 @@ certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-
 checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) whether the session is really
 encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning); an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
+With an `azure-*` `auth` only `verify-full` is accepted: startup refuses every other `ssl_mode`, also `verify-ca`
+and `require` with `ssl_root_cert`.
 
 ### `[source]` (alternative sources)
 
@@ -709,6 +713,122 @@ event by event. `poll` stays the default.
 - **Failures:** a broken connection is a source error, and the restart resumes from the checkpoint (duplicates only).
   If a previous connection still holds the slot, startup retries for up to 15 s.
 
+### Azure managed identity
+
+On Azure Database for PostgreSQL (Flexible Server) Aqueduct can sign in with a managed identity instead of a stored
+password: the server accepts a Microsoft Entra access token as the password, so no static database secret is stored
+anywhere. Aqueduct fetches a token, caches it until 5 minutes before the
+expiry the identity endpoint reports (at most 24 hours), and uses a valid one as the password of **every** connection
+it opens: the SQL session and, with `transport = "stream"`, the replication connection. Each start of the source,
+including a restart after an error, uses a cached or fresh token. A failed token fetch fails that connection like a
+wrong password would (a source error; the restart applies).
+
+```toml
+[postgres]
+# The user is the Postgres role of the managed identity (its name). No password.
+url = "postgres://aqueduct-mi@myserver.postgres.database.azure.com:5432/app"
+auth = "azure-workload-identity"   # or "azure-container-apps"
+# azure_client_id = "00000000-0000-0000-0000-000000000000"
+```
+
+Fail-closed rules, checked at startup:
+
+- The token only travels over TLS with the certificate chain **and hostname** verified: `ssl_mode = "verify-full"`
+  (the default), with the bundled public roots or an explicit `ssl_root_cert`. Every other mode is refused, including
+  `verify-ca` and `require` with `ssl_root_cert`: without the hostname check, anyone holding a certificate from a
+  trusted CA could intercept the bearer token. The `*.postgres.database.azure.com` certificates chain to public roots
+  (DigiCert Global Root G2, Microsoft RSA Root Certificate Authority 2017) that the bundled set should contain, so the
+  default `verify-full` should work without `ssl_root_cert`; this was not verified against a real server. If the
+  handshake reports an unknown issuer, download Azure's root certificates and point `ssl_root_cert` at them.
+- A URL that also carries a password is refused, and so is a URL without a user.
+- A missing platform variable is refused with its name. Tokens, the federated assertion and `IDENTITY_HEADER` are
+  never logged and are redacted from debug output; a token endpoint error shows the HTTP status and the OAuth `error`
+  and `error_description` only.
+- The token endpoint is reached over HTTPS with certificate and hostname checks. Plain `http://` is accepted only for
+  a loopback host (the Container Apps identity endpoint): a name must resolve to loopback addresses only, and
+  Aqueduct connects to those checked addresses.
+
+The server asks for the token as a cleartext password. That is the same rule as for any password: Aqueduct sends it
+only inside TLS, and the replication connection keeps the [ADR 0003 §6](adr/0003-streaming-replication.md) rules
+(cleartext is never sent over plaintext to a remote host).
+
+Nothing in the image changes: the token exchange is a small built-in HTTPS client, so the distroless image needs no
+shell, `az` CLI or extra files.
+
+#### AKS (Workload Identity)
+
+`auth = "azure-workload-identity"`. The workload identity webhook injects `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_FEDERATED_TOKEN_FILE` and `AZURE_AUTHORITY_HOST`. Aqueduct re-reads the federated token file on every fetch
+(the kubelet rotates it) and exchanges it at `{AZURE_AUTHORITY_HOST}{AZURE_TENANT_ID}/oauth2/v2.0/token` for a token
+with scope `https://ossrdbms-aad.database.windows.net/.default`. `azure_client_id` overrides `AZURE_CLIENT_ID`.
+
+1. Enable the OIDC issuer and workload identity on the cluster
+   (`az aks update -g <rg> -n <cluster> --enable-oidc-issuer --enable-workload-identity`).
+2. Create a user-assigned managed identity and a federated credential that trusts the service account:
+
+   ```sh
+   az identity create -g <rg> -n aqueduct-mi
+   az identity federated-credential create -g <rg> --identity-name aqueduct-mi --name aqueduct \
+     --issuer "$(az aks show -g <rg> -n <cluster> --query oidcIssuerProfile.issuerUrl -o tsv)" \
+     --subject system:serviceaccount:<namespace>:aqueduct --audience api://AzureADTokenExchange
+   ```
+
+3. Annotate the service account with the identity's client ID and label the pod:
+
+   ```yaml
+   apiVersion: v1
+   kind: ServiceAccount
+   metadata:
+     name: aqueduct
+     namespace: <namespace>
+     annotations:
+       azure.workload.identity/client-id: "<client ID of aqueduct-mi>"
+   ---
+   # in the Deployment
+   spec:
+     template:
+       metadata:
+         labels:
+           azure.workload.identity/use: "true"
+       spec:
+         serviceAccountName: aqueduct
+   ```
+
+#### Azure Container Apps
+
+`auth = "azure-container-apps"`. Give the app a system-assigned identity (`az containerapp identity assign -g <rg>
+-n <app> --system-assigned`) or a user-assigned one (`--user-assigned <identity resource ID>`, then set
+`azure_client_id` to its client ID). Container Apps sets `IDENTITY_ENDPOINT` and `IDENTITY_HEADER`; Aqueduct calls
+`$IDENTITY_ENDPOINT?api-version=2019-08-01&resource=https://ossrdbms-aad.database.windows.net` (plus `&client_id=`)
+with the `X-IDENTITY-HEADER` header.
+
+#### Postgres side
+
+1. Turn on Microsoft Entra authentication on the server and set an Entra admin.
+2. As the Entra admin (signed in with an Entra token, connected to the `postgres` database), create the role for the
+   identity. The role name is the identity's name: for a user-assigned identity its resource name, for a
+   system-assigned one the name of the app. It is also the user in Aqueduct's `url`.
+
+   ```sql
+   select * from pgaadauth_create_principal('aqueduct-mi', false, false);
+   ```
+
+3. Grant what Aqueduct needs. **`REPLICATION` must be granted to the Entra role itself**, as for a password role.
+   (Granting `REPLICATION` to a role made by `pgaadauth_create_principal` with `ALTER ROLE` has not been checked
+   against Microsoft's documentation or a real server; if it is refused, see Azure's logical replication docs for
+   the supported way to grant it.)
+
+   ```sql
+   ALTER ROLE "aqueduct-mi" WITH REPLICATION;
+   -- in the replicated database:
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO "aqueduct-mi";
+   CREATE PUBLICATION aqueduct FOR TABLE ...;   -- or let its owner create it
+   ```
+
+   The role creates and advances its slot (`REPLICATION`) and reads the published tables (`SELECT`, also needed for
+   snapshots); snapshots on Postgres 14+ also need `EXECUTE` on `pg_logical_emit_message`. Set the server parameter
+   `wal_level = logical` as in [Prepare Postgres](#1-prepare-postgres).
+
 ### Snapshots
 
 A snapshot copies rows that already exist into the same topics as live changes, while streaming continues. It is
@@ -850,7 +970,10 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 | `invalid connection string` | `replication=database` in `postgres.url`; remove it |
 | `publication "x" does not exist` | Create the publication before starting |
 | `logical decoding requires wal_level >= logical` | Set `wal_level = logical` and restart Postgres |
-| `permission denied to use replication slots` | The role needs `REPLICATION` (or superuser) |
+| `permission denied to use replication slots` | The role needs `REPLICATION` (or superuser). With a managed identity: `ALTER ROLE "<identity name>" WITH REPLICATION` |
+| `getting a Microsoft Entra token (...): ... HTTP 400; error: invalid_client` | AKS: often `AADSTS70021`, the federated credential's issuer or subject does not match the cluster's OIDC issuer and `system:serviceaccount:<namespace>:<name>` |
+| `postgres auth = "azure-...": ... is not set` | AKS: the pod lacks the `azure.workload.identity/use: "true"` label or the service account annotation. Container Apps: the app has no managed identity |
+| `password authentication failed` with an `azure-*` `auth` | The URL user is not the identity's role name, or the role was not created with `pgaadauth_create_principal` |
 | `checkpoint error: Permission denied` | State volume not writable by uid 65532; use the provided Dockerfile or `chown 65532` the volume |
 | `cannot update table ... does not have a replica identity` | Set a primary key or `REPLICA IDENTITY FULL` |
 | Kafka: `InvalidTopicException` | A topic name with illegal characters; check route `topic` values and templates |
@@ -858,7 +981,7 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 
 ## Securing connections (checklist)
 
-1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables.
+1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables. On Azure, a managed identity (`auth`, see [Azure managed identity](#azure-managed-identity)) needs no stored password at all.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
 3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one); never set `admin_insecure_no_auth` in production.
 4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.

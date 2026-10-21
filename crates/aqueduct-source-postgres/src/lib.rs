@@ -5,6 +5,7 @@
 //! implements [`aqueduct_core::Source`].
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod azure;
 pub mod catalog;
 pub mod decoder;
 pub mod replication;
@@ -13,9 +14,11 @@ mod source;
 mod tls;
 pub mod transport;
 
+pub use azure::{AccessToken, AzureCredential, AzureIdentity};
 pub use snapshot::{SnapshotConfig, SnapshotMode};
 pub use source::{
-    parse_lsn, PostgresSource, PostgresSourceConfig, TransportKind, DEFAULT_HEARTBEAT_INTERVAL,
+    parse_lsn, PostgresSource, PostgresSourceConfig, SourceAuth, TransportKind,
+    DEFAULT_HEARTBEAT_INTERVAL,
 };
 pub use tls::SslMode;
 

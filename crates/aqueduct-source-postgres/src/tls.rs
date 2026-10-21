@@ -43,6 +43,17 @@ impl FromStr for SslMode {
 }
 
 impl SslMode {
+    /// The libpq name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+
     pub(crate) fn verify(self, has_root_cert: bool) -> Verify {
         match self {
             Self::VerifyFull => Verify::Full,
