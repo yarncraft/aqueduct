@@ -651,15 +651,24 @@ let paused = false;
 let openId = null;
 
 const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
-// Events use Debezium's envelope: op letters, and the table and position in `source`.
+// Events use Debezium's envelope: op letters, and the table and position in `source`. A value that is not an
+// envelope (an outbox payload, a tombstone) is shown raw, with its op and lsn from the record headers.
 const OP_NAME = { c: 'insert', u: 'update', d: 'delete', t: 'truncate', r: 'read' };
-const opOf = ev => OP_NAME[ev.op] || ev.op;
-const src = ev => ev.source || {};
-const rel = e => (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
+const isEnv = ev => !!ev && typeof ev === 'object' && !Array.isArray(ev) && !!ev.source && typeof ev.source === 'object' && typeof ev.op === 'string';
+const hdr = (e, k) => (e.headers || {})[k];
+const opOf = e => { const o = isEnv(e.event) ? e.event.op : hdr(e, 'op'); return Object.hasOwn(OP_NAME, o) ? OP_NAME[o] : o; };
+const opBadge = e => { const o = opOf(e); return Object.hasOwn(OP_BADGE, o) ? OP_BADGE[o] : ''; };
+const src = ev => isEnv(ev) ? ev.source : {};
+const lsnOf = e => isEnv(e.event) ? src(e.event).lsn ?? '' : hdr(e, 'lsn') ?? '';
+const rawText = v => typeof v === 'string' ? v : JSON.stringify(v, null, 2) ?? '';
+// The table of an envelope; a value that is not one (an outbox payload) names no table, so its topic stands in.
+const rel = e => !isEnv(e.event) ? e.topic : (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
 const isoMs = ms => { const d = new Date(ms); return isNaN(d) ? '–' : d.toISOString(); };
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
 const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v) ?? ''; return t.length > 28 ? t.slice(0, 27) + '…' : t; };
-const summary = ev => {
+const summary = e => {
+  const ev = e.event;
+  if (!isEnv(ev)) return `<span class="text-ink-500">raw</span> ${esc(short(ev))}`;
   const row = ev.after || ev.before;
   return row ? Object.entries(row).slice(0, 4).map(([k, v]) => `<span class="text-ink-300">${esc(k)}=</span>${esc(short(v))}`).join(' ') : '<span class="text-ink-500">–</span>';
 };
@@ -676,18 +685,22 @@ function side(title, row, other) {
 
 function detail(e) {
   const ev = e.event;
-  const isUpd = opOf(ev) === 'update';
+  if (!isEnv(ev)) {
+    const heads = Object.entries(e.headers || {}).map(([k, v]) => `<span>${esc(k)} ${esc(v)}</span>`).join('');
+    return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span>${heads}<button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="mb-1 text-[11px] uppercase tracking-widest text-ink-300">Value (not an envelope)</div><div class="whitespace-pre-wrap break-words px-1.5">${esc(rawText(ev))}</div></td></tr>`;
+  }
+  const isUpd = opOf(e) === 'update';
   return `<tr class="border-b border-ink-700 bg-ink-900"><td colspan="6" class="px-4 py-3"><div class="mb-3 flex items-center gap-4 text-[11px] text-ink-300"><span>key ${esc(e.key || '–')}</span><span>xid ${esc(src(ev).txId ?? '–')}</span><span>commit ${esc(isoMs(src(ev).ts_ms))}</span><button type="button" data-copy="${esc(evid(e))}" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Copy JSON</button></div><div class="grid gap-6 md:grid-cols-2">${side('Before', ev.before, isUpd ? ev.after : null)}${side('After', ev.after, isUpd ? ev.before : null)}</div></td></tr>`;
 }
 
 function renderEvents() {
   const q = $('evsearch').value.trim().toLowerCase();
   const op = $('evop').value, tb = $('evtable').value;
-  const rows = evs.filter(e => (!op || opOf(e.event) === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
+  const rows = evs.filter(e => (!op || opOf(e) === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
   $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
     const ev = e.event, id = evid(e);
-    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${OP_BADGE[opOf(ev)] || ''}">${esc(opOf(ev) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(src(ev).lsn ?? ''))}</td><td class="px-4 py-1.5 text-ink-200">${summary(ev)}</td></tr>`;
+    const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${opBadge(e)}">${esc(opOf(e) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(lsnOf(e)))}</td><td class="px-4 py-1.5 text-ink-200">${summary(e)}</td></tr>`;
     return openId === id ? row + detail(e) : row;
   }).join('') : `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${evs.length ? 'No events match the filters' : 'No events in Kafka yet'}</td></tr>`;
 }
@@ -729,7 +742,7 @@ $('events').addEventListener('click', ev => {
   const copy = ev.target.closest('[data-copy]');
   if (copy) {
     const e = evs.find(x => evid(x) === copy.dataset.copy);
-    if (e && navigator.clipboard) navigator.clipboard.writeText(JSON.stringify(e.event, null, 2));
+    if (e && navigator.clipboard) navigator.clipboard.writeText(typeof e.event === 'string' ? e.event : JSON.stringify(e.event, null, 2));
     return;
   }
   const tr = ev.target.closest('tr[data-id]');

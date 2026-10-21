@@ -9,6 +9,7 @@ use super::frame::{
     startup_message, status_update, terminate, Backend, FrameReader, Replication,
 };
 use super::secure;
+use crate::azure::AccessToken;
 use crate::source::parse_lsn;
 use crate::SslMode;
 
@@ -40,6 +41,9 @@ pub struct SystemInfo {
 pub struct ConnectOptions {
     pub ssl_mode: Option<SslMode>,
     pub ssl_root_cert: Option<String>,
+    /// Sent instead of the URL's password: a Microsoft Entra access token (#140). Its `Debug`
+    /// is redacted.
+    pub password: Option<AccessToken>,
 }
 
 /// Where and how to connect, validated before a socket is opened.
@@ -130,7 +134,10 @@ impl Target {
             host,
             port,
             user,
-            password: cfg.get_password().map(<[u8]>::to_vec),
+            password: match &opts.password {
+                Some(token) => Some(token.secret().as_bytes().to_vec()),
+                None => cfg.get_password().map(<[u8]>::to_vec),
+            },
             database,
             mode,
             root_cert,
@@ -513,10 +520,22 @@ mod tests {
         let opts = ConnectOptions {
             ssl_mode: Some(SslMode::VerifyCa),
             ssl_root_cert: Some("/other.pem".into()),
+            password: None,
         };
         let t = Target::parse("postgres://u@localhost/d?sslmode=disable", &opts).unwrap();
         assert_eq!(t.mode, SslMode::VerifyCa);
         assert_eq!(t.root_cert.as_deref(), Some("/other.pem"));
+    }
+
+    #[test]
+    fn an_access_token_is_the_password() {
+        let opts = ConnectOptions {
+            password: Some(AccessToken::new("entra-token")),
+            ..ConnectOptions::default()
+        };
+        let t = Target::parse("postgres://id-name@localhost/d", &opts).unwrap();
+        assert_eq!(t.password.as_deref(), Some(&b"entra-token"[..]));
+        assert!(!format!("{opts:?} {t:?}").contains("entra-token"));
     }
 
     #[test]

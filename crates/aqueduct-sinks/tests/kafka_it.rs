@@ -2,7 +2,9 @@
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
-use aqueduct_sinks::{KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, RoutePlan};
+use aqueduct_sinks::{
+    FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, OutboxSpec, RoutePlan,
+};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use serde_json::value::to_raw_value;
@@ -178,7 +180,6 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         topic: topic.clone(),
         ops: Some(vec!["insert".into()]),
         filter: Some("row.n > 10".into()),
-        key: None,
         ..Default::default()
     };
     let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
@@ -516,4 +517,207 @@ async fn content_topics_kafka_would_refuse_go_to_the_fallback() {
         .filter(|t| t.starts_with(&prefix))
         .collect();
     assert!(!names.contains(&format!("{prefix}.eu")) && !names.contains(&format!("{prefix}.us")));
+}
+
+#[tokio::test]
+async fn hashed_columns_reach_the_topic_with_the_key_id_header() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let topic = unique("aqueduct-it-hash");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let route = KafkaRoute {
+        name: Some("users".into()),
+        pattern: "public.users".into(),
+        topic: topic.clone(),
+        fields: FieldSpec {
+            hash: vec!["email".into()],
+            mask: vec!["card".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let plan = RoutePlan::build(
+        vec![route],
+        None,
+        None,
+        Some(HashKey::new(secret, "2026-10").unwrap()),
+    )
+    .unwrap();
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 2, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let mut e = ev(1, "users");
+    e.after = Some(
+        to_raw_value(&serde_json::json!({ "email": "ada@example.com", "card": "4111", "n": 1 }))
+            .unwrap(),
+    );
+    e.key = Some(r#"{"email":"ada@example.com"}"#.into());
+    sink.send_batch(&[e]).await.unwrap();
+    sink.flush().await.unwrap();
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let got = read_all(&client, &topic).await;
+    assert_eq!(got.len(), 1);
+    let (key, headers, value) = &got[0];
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let digest: String = ring::hmac::sign(&k, b"ada@example.com")
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(value["after"]["email"], digest.as_str());
+    assert_eq!(value["after"]["card"], "***");
+    assert_eq!(value["after"]["n"], 1);
+    let k: serde_json::Value = serde_json::from_str(key).unwrap();
+    assert_eq!(k["key"]["email"], digest.as_str(), "the key is hashed too");
+    assert!(!key.contains("ada@") && !value.to_string().contains("ada@"));
+    assert_eq!(headers["aqueduct-hash-key-id"], b"2026-10");
+}
+
+/// Every record of `topic` across its partitions, value as bytes: (key, headers, value).
+async fn read_raw(
+    client: &rskafka::client::Client,
+    topic: &str,
+) -> Vec<(String, std::collections::BTreeMap<String, Vec<u8>>, Vec<u8>)> {
+    let parts = client
+        .list_topics()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == topic)
+        .unwrap_or_else(|| panic!("topic {topic} does not exist"))
+        .partitions;
+    let mut out = Vec::new();
+    for p in parts {
+        let pc = client
+            .partition_client(topic, p, UnknownTopicHandling::Error)
+            .await
+            .unwrap();
+        let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+        let mut offset = 0;
+        while offset < end {
+            let (recs, _hw) = pc.fetch_records(offset, 1..1_000_000, 1_000).await.unwrap();
+            if recs.is_empty() {
+                break;
+            }
+            for r in recs {
+                offset = r.offset + 1;
+                out.push((
+                    String::from_utf8(r.record.key.unwrap()).unwrap(),
+                    r.record.headers,
+                    r.record.value.unwrap(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn outbox_inserts_are_published_raw_and_updates_produce_nothing() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let prefix = unique("aqueduct-it-outbox");
+    let fallback = format!("{prefix}-fallback");
+    let dlq = unique("aqueduct-it-outbox-dlq");
+    let route = KafkaRoute {
+        name: Some("outbox".into()),
+        pattern: "public.outbox".into(),
+        topic_fallback: Some(fallback.clone()),
+        outbox: Some(OutboxSpec {
+            topic: format!("{prefix}.{{aggregate_type}}"),
+            id: Some("id".into()),
+            kind: Some("type".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
+    let stats = plan.stats();
+    let inspector = KafkaInspector::new(brokers.clone(), &plan, KafkaSecurity::default());
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 3, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+
+    let outbox = |n: u64, op: Op, row: serde_json::Value| {
+        let mut e = ev(n, "outbox");
+        e.op = op;
+        e.after = Some(to_raw_value(&row).unwrap());
+        e
+    };
+    let created = serde_json::json!({
+        "id": "e-1", "aggregatetype": "order", "aggregateid": "A-1",
+        "type": "OrderCreated", "payload": { "total": 12.5, "items": [1, 2] }
+    });
+    let text = serde_json::json!({
+        "id": "e-2", "aggregatetype": "order", "aggregateid": 42,
+        "type": "Note", "payload": "plain \"text\""
+    });
+    let missing = serde_json::json!({ "id": "e-3", "aggregatetype": "order", "payload": "x" });
+    sink.send_batch(&[
+        outbox(1, Op::Insert, created.clone()),
+        outbox(2, Op::Insert, text),
+        outbox(3, Op::Update, created),
+        outbox(4, Op::Insert, missing),
+    ])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let mut recs = read_raw(&client, &format!("{prefix}.order")).await;
+    recs.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(recs.len(), 2, "two inserts; the update produced nothing");
+    let header = |h: &std::collections::BTreeMap<String, Vec<u8>>, k: &str| {
+        String::from_utf8(h[k].clone()).unwrap()
+    };
+    // Sorted by key: "42" before "A-1".
+    let (key, headers, value) = &recs[0];
+    assert_eq!(key, "42", "a numeric aggregate id is its JSON text");
+    assert_eq!(value, b"plain \"text\"", "a text payload is its content");
+    assert_eq!(header(headers, "id"), "e-2");
+    assert_eq!(header(headers, "type"), "Note");
+    let (key, headers, value) = &recs[1];
+    assert_eq!(key, "A-1", "the raw aggregate id, not the table key");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(value).unwrap(),
+        serde_json::json!({ "total": 12.5, "items": [1, 2] }),
+        "a jsonb payload is passed through as JSON"
+    );
+    assert_eq!(header(headers, "id"), "e-1");
+    assert_eq!(header(headers, "type"), "OrderCreated");
+    assert_eq!(header(headers, "op"), "c");
+    assert_eq!(header(headers, "lsn"), "1");
+
+    let dead = read_raw(&client, &dlq).await;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(
+        header(&dead[0].1, "aqueduct-error"),
+        "route `outbox`: outbox `aggregate_id` column `aggregateid` is missing or null"
+    );
+    assert!(read_raw(&client, &fallback).await.is_empty());
+    let c = stats.snapshot()[0].counts;
+    assert_eq!((c.matched, c.produced, c.filtered, c.errors), (4, 2, 1, 1));
+
+    // The inspector shows the raw values with their headers instead of failing to parse.
+    let seen = inspector
+        .inspect(Some(&format!("{prefix}.order")), 10)
+        .await
+        .unwrap();
+    assert_eq!(seen.events.len(), 2);
+    for e in &seen.events {
+        match e.key.as_deref() {
+            Some("42") => assert_eq!(e.event, serde_json::json!("plain \"text\"")),
+            Some("A-1") => assert_eq!(e.event["total"], 12.5),
+            other => panic!("unexpected key {other:?}"),
+        }
+        assert_eq!(e.headers["op"], "c");
+        assert!(e.headers.contains_key("type"));
+    }
 }

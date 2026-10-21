@@ -121,6 +121,14 @@ pub struct PostgresConfig {
     /// Stream transport: bytes of received messages buffered ahead of the sink. Default 64 MiB.
     #[serde(default)]
     pub stream_buffer_bytes: Option<usize>,
+    /// `password` (default): the URL's password. `azure-workload-identity` (AKS) or
+    /// `azure-container-apps`: a Microsoft Entra token from the managed identity is the password.
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// Managed identity client ID: overrides `AZURE_CLIENT_ID` on AKS, and picks a user-assigned
+    /// identity on Container Apps.
+    #[serde(default)]
+    pub azure_client_id: Option<String>,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -129,6 +137,14 @@ fn default_heartbeat_interval_secs() -> u64 {
 
 impl PostgresConfig {
     pub fn source_config(&self) -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
+        self.source_config_with_env(&|k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// [`Self::source_config`] with the managed identity variables read through `env`.
+    pub fn source_config_with_env(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
         let mut c = aqueduct_source_postgres::PostgresSourceConfig::new(
             self.url.clone(),
             self.slot.clone(),
@@ -179,6 +195,28 @@ impl PostgresConfig {
             }
             c.stream_buffer_bytes = n;
         }
+        let client_id = self.azure_client_id.as_deref().filter(|s| !s.is_empty());
+        let auth = self.auth.as_deref().unwrap_or("password");
+        if auth == "password" && client_id.is_some() {
+            return Err(
+                "postgres.azure_client_id is set but postgres.auth is \"password\"; set auth to \
+                 \"azure-workload-identity\" or \"azure-container-apps\""
+                    .into(),
+            );
+        }
+        c.auth = match auth {
+            "password" => aqueduct_source_postgres::SourceAuth::Password,
+            other => {
+                let kind = other
+                    .parse::<aqueduct_source_postgres::AzureIdentity>()
+                    .map_err(|e| format!("postgres.{e}"))?;
+                aqueduct_source_postgres::SourceAuth::Azure(
+                    aqueduct_source_postgres::AzureCredential::from_env(kind, client_id, env)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+        };
+        c.check_auth().map_err(|e| e.to_string())?;
         Ok(c)
     }
 }
@@ -209,6 +247,17 @@ pub struct KafkaConfig {
     /// as a route uses `where`; opened (created if missing) at startup.
     #[serde(default)]
     pub dead_letter_topic: Option<String>,
+    /// Never accepted: the key for `hash` comes from `AQUEDUCT_HASH_KEY` or `hash_key_file`
+    /// only. Read here so that a key pasted into the TOML fails startup instead of being ignored.
+    #[serde(default)]
+    pub hash_key: Option<Secret>,
+    /// File holding the key for `hash` (one trailing newline is ignored). Or `AQUEDUCT_HASH_KEY`.
+    #[serde(default)]
+    pub hash_key_file: Option<String>,
+    /// Short label of the hash key, sent as the `aqueduct-hash-key-id` header on every record of
+    /// a hashing route. Required with a key.
+    #[serde(default)]
+    pub hash_key_id: Option<String>,
     /// How many topics content routing (a route `topic` that reads a row field) may create,
     /// counted from the broker at startup; beyond it events go to the route's `topic_fallback`.
     #[serde(default = "default_max_dynamic_topics")]
@@ -240,6 +289,50 @@ impl KafkaConfig {
             _ => Ok(()),
         }
     }
+
+    /// The key for `hash`, from `env` (the value of `AQUEDUCT_HASH_KEY`) or `hash_key_file`.
+    /// `None` when neither is set; the route plan then refuses any route that hashes. Errors
+    /// never contain the key.
+    pub fn hash_key(&self, env: Option<String>) -> Result<Option<aqueduct_sinks::HashKey>, String> {
+        if self.hash_key.is_some() {
+            return Err(
+                "sink.hash_key is not allowed in the config file, so the key never sits next to the config; set AQUEDUCT_HASH_KEY or sink.hash_key_file"
+                    .into(),
+            );
+        }
+        let env = env.filter(|v| !v.is_empty());
+        let secret = match (env, &self.hash_key_file) {
+            (Some(_), Some(_)) => {
+                return Err("both AQUEDUCT_HASH_KEY and sink.hash_key_file are set; use one".into())
+            }
+            (Some(v), None) => v.into_bytes(),
+            (None, Some(path)) => {
+                std::fs::read(path).map_err(|e| format!("sink.hash_key_file {path}: {e}"))?
+            }
+            (None, None) if self.hash_key_id.is_some() => {
+                return Err(
+                    "sink.hash_key_id is set but there is no hash key; set AQUEDUCT_HASH_KEY or sink.hash_key_file, or remove hash_key_id"
+                        .into(),
+                )
+            }
+            (None, None) => return Ok(None),
+        };
+        // The same secret gives the same digests from the environment or a file: one trailing
+        // newline (`\n` or `\r\n`, as `echo` or an editor leaves it) is not part of the key.
+        let mut secret = secret;
+        if secret.ends_with(b"\n") {
+            secret.pop();
+            if secret.ends_with(b"\r") {
+                secret.pop();
+            }
+        }
+        let id = self.hash_key_id.as_deref().ok_or(
+            "sink.hash_key_id is required with a hash key: a short label consumers see in the aqueduct-hash-key-id header, changed whenever the key is",
+        )?;
+        aqueduct_sinks::HashKey::new(&secret, id)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -251,8 +344,10 @@ pub struct KafkaRouteConfig {
     #[serde(rename = "match")]
     pub pattern: String,
     /// Destination topic template: `{schema}`, `{table}`, `{op}` and row fields such as
-    /// `{row.region}` (content routing, which needs `topic_fallback`).
-    pub topic: String,
+    /// `{row.region}` (content routing, which needs `topic_fallback`). Required, except with
+    /// `outbox`, which sets the topic itself.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Where events go whose content-routed `topic` cannot be used (null, missing or disallowed
     /// value, or `max_dynamic_topics` reached). Required when `topic` reads a row field.
     #[serde(default)]
@@ -270,6 +365,63 @@ pub struct KafkaRouteConfig {
     /// Overrides `partition_by` for this route: the partition is hashed from the whole key.
     #[serde(default)]
     pub key: Option<Vec<String>>,
+    /// Keep only these top-level columns. Exclusive with `exclude`.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Drop these top-level columns.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+    /// Strings become `"***"`, other values `null`.
+    #[serde(default)]
+    pub mask: Vec<String>,
+    /// HMAC-SHA256 hex with the key from `AQUEDUCT_HASH_KEY` or `sink.hash_key_file`.
+    #[serde(default)]
+    pub hash: Vec<String>,
+    /// `{ old = "new" }` column renames.
+    #[serde(default)]
+    pub rename: std::collections::BTreeMap<String, String>,
+    /// Publish the rows of an outbox table as their own events: inserts (and snapshot rows when
+    /// `ops` lists `read`), key = the `aggregate_id` column, value = the `payload` column.
+    /// Excludes `topic` and `key`.
+    #[serde(default)]
+    pub outbox: Option<OutboxConfig>,
+}
+
+/// `outbox = {...}` on a route. Unset keys take Debezium's outbox event router defaults
+/// (`aqueduct_sinks::OutboxSpec::default`). Unknown keys fail startup, so a misspelled key never
+/// silently falls back to a default column.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxConfig {
+    #[serde(default)]
+    pub aggregate_type: Option<String>,
+    #[serde(default)]
+    pub aggregate_id: Option<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    /// Topic template over the outbox columns, e.g. `outbox.{aggregate_type}`.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Column for the `id` header.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Column for the `type` header.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
+impl OutboxConfig {
+    pub fn spec(&self) -> aqueduct_sinks::OutboxSpec {
+        let d = aqueduct_sinks::OutboxSpec::default();
+        aqueduct_sinks::OutboxSpec {
+            aggregate_type: self.aggregate_type.clone().unwrap_or(d.aggregate_type),
+            aggregate_id: self.aggregate_id.clone().unwrap_or(d.aggregate_id),
+            payload: self.payload.clone().unwrap_or(d.payload),
+            topic: self.topic.clone().unwrap_or(d.topic),
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+        }
+    }
 }
 
 fn default_max_dynamic_topics() -> usize {
@@ -554,6 +706,133 @@ admin_insecure_no_auth = true",
         assert!(!d.contains("hunter2") && d.contains("svc"));
     }
 
+    fn sink_cfg(extra: &str) -> KafkaConfig {
+        toml::from_str(&format!("brokers = ['b:9092']\ntopic = 't'\n{extra}")).unwrap()
+    }
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn hash_key_comes_from_env_or_file_never_the_toml() {
+        // In the TOML: rejected, and redacted in Debug like other secrets.
+        let c = sink_cfg(&format!("hash_key = '{KEY}'\nhash_key_id = 'k1'"));
+        let e = c.hash_key(None).unwrap_err();
+        assert!(e.contains("sink.hash_key is not allowed"), "{e}");
+        assert!(!e.contains(KEY));
+        assert!(!format!("{c:?}").contains(KEY));
+
+        // Neither: no key (a hashing route then fails to compile).
+        assert!(sink_cfg("").hash_key(None).unwrap().is_none());
+        assert!(sink_cfg("")
+            .hash_key(Some(String::new()))
+            .unwrap()
+            .is_none());
+        // A key id without a key fails closed.
+        let e = sink_cfg("hash_key_id = 'k1'").hash_key(None).unwrap_err();
+        assert!(
+            e.contains("sink.hash_key_id is set but there is no hash key"),
+            "{e}"
+        );
+
+        // From the environment, with its id.
+        let c = sink_cfg("hash_key_id = 'k1'");
+        let k = c.hash_key(Some(KEY.into())).unwrap().unwrap();
+        assert_eq!(k.id(), "k1");
+        assert!(!format!("{k:?}").contains(KEY));
+        // A missing id, a short key.
+        let e = sink_cfg("").hash_key(Some(KEY.into())).unwrap_err();
+        assert!(e.contains("sink.hash_key_id is required"), "{e}");
+        let e = c.hash_key(Some(KEY[..31].into())).unwrap_err();
+        assert!(
+            e.contains("shorter than 32 bytes") && !e.contains(&KEY[..31]),
+            "{e}"
+        );
+
+        // From a file: one trailing newline is not part of the key.
+        let dir = std::env::temp_dir().join(format!(
+            "aqueduct-hash-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            sink_cfg(&format!(
+                "hash_key_file = {:?}\nhash_key_id = 'k1'",
+                p.to_str().unwrap()
+            ))
+        };
+        let ok = file("ok", &format!("{KEY}\n"));
+        assert!(ok.hash_key(None).unwrap().is_some());
+        // A trailing newline is trimmed from the environment too: the same secret gives the same
+        // digest either way, and `{KEY}\n` with a 31-byte key is still too short.
+        let env_nl = c.hash_key(Some(format!("{KEY}\r\n"))).unwrap().unwrap();
+        let file_key = ok.hash_key(None).unwrap().unwrap();
+        let digest = |k: &aqueduct_sinks::HashKey| {
+            let mut p = aqueduct_sinks::RoutePlan::build(
+                vec![aqueduct_sinks::KafkaRoute {
+                    pattern: "*".into(),
+                    topic: "t".into(),
+                    fields: aqueduct_sinks::FieldSpec {
+                        hash: vec!["e".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                None,
+                None,
+                Some(k.clone()),
+            )
+            .unwrap();
+            p.set_source(aqueduct_sinks::SourceInfo::default());
+            let mut ev = aqueduct_core::ChangeEvent::heartbeat(aqueduct_core::Position::Lsn(1), 0);
+            ev.op = aqueduct_core::Op::Insert;
+            ev.schema = "s".into();
+            ev.table = "t".into();
+            ev.after = serde_json::value::RawValue::from_string(r#"{"e":"a@b.c"}"#.into()).ok();
+            p.render(&ev, 0).unwrap().remove(0).value
+        };
+        assert_eq!(digest(&env_nl), digest(&file_key));
+        assert!(c.hash_key(Some(format!("{}\n", &KEY[..31]))).is_err());
+        let e = file("short", &format!("{}\r\n", &KEY[..31]))
+            .hash_key(None)
+            .unwrap_err();
+        assert!(e.contains("shorter than 32 bytes"), "{e}");
+        // Both sources: ambiguous, rejected.
+        let e = ok.hash_key(Some(KEY.into())).unwrap_err();
+        assert!(e.contains("use one"), "{e}");
+        let missing = sink_cfg("hash_key_file = '/nonexistent/aqueduct-key'\nhash_key_id = 'k'");
+        assert!(missing
+            .hash_key(None)
+            .unwrap_err()
+            .contains("sink.hash_key_file /nonexistent/aqueduct-key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_field_ops_parse() {
+        let c = sink_cfg(
+            "[[routes]]
+match = 'public.users'
+topic = 'users'
+exclude = ['note']
+mask = ['card']
+hash = ['email']
+rename = { cust_id = 'customer_id' }
+",
+        );
+        let r = &c.routes[0];
+        assert_eq!(r.exclude.as_deref(), Some(&["note".to_string()][..]));
+        assert_eq!(r.mask, ["card"]);
+        assert_eq!(r.hash, ["email"]);
+        assert_eq!(r.rename["cust_id"], "customer_id");
+        assert!(r.include.is_none());
+    }
+
     const SINK: &str = "[sink]
 brokers = ['b:9092']
 topic = 't'
@@ -731,10 +1010,107 @@ heartbeat_action_query = 'SELECT 1'")
             snapshot_watermark_table: None,
             transport: None,
             stream_buffer_bytes: None,
+            auth: None,
+            azure_client_id: None,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());
         assert!(p.source_config().is_ok());
+    }
+
+    #[test]
+    fn azure_managed_identity_auth() {
+        use aqueduct_source_postgres::{AzureIdentity, SourceAuth};
+        let pg = |extra: &str| -> PostgresConfig {
+            toml::from_str(&format!(
+                "url = 'postgres://aqueduct-mi@db.postgres.database.azure.com/app'
+{extra}"
+            ))
+            .unwrap()
+        };
+        let wi = |k: &str| -> Option<String> {
+            match k {
+                "AZURE_CLIENT_ID" => Some("cid".into()),
+                "AZURE_TENANT_ID" => Some("tid".into()),
+                "AZURE_FEDERATED_TOKEN_FILE" => Some("/var/run/secrets/token".into()),
+                _ => None,
+            }
+        };
+        let aca = |k: &str| -> Option<String> {
+            match k {
+                "IDENTITY_ENDPOINT" => Some("http://localhost:42356/msi/token".into()),
+                "IDENTITY_HEADER" => Some("hdr-s3cret".into()),
+                _ => None,
+            }
+        };
+        let none = |_: &str| -> Option<String> { None };
+        // Default: the URL's password, no environment needed.
+        assert!(matches!(
+            pg("").source_config_with_env(&none).unwrap().auth,
+            SourceAuth::Password
+        ));
+        assert!(matches!(
+            pg("auth = 'password'")
+                .source_config_with_env(&none)
+                .unwrap()
+                .auth,
+            SourceAuth::Password
+        ));
+        match pg("auth = 'azure-workload-identity'")
+            .source_config_with_env(&wi)
+            .unwrap()
+            .auth
+        {
+            SourceAuth::Azure(c) => assert_eq!(c.kind(), AzureIdentity::WorkloadIdentity),
+            other => panic!("{other:?}"),
+        }
+        match pg("auth = 'azure-container-apps'
+azure_client_id = 'uami'")
+        .source_config_with_env(&aca)
+        .unwrap()
+        .auth
+        {
+            SourceAuth::Azure(c) => {
+                assert_eq!(c.kind(), AzureIdentity::ContainerApps);
+                assert!(!format!("{c:?}").contains("hdr-s3cret"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // (extra config, env, a substring the error must contain)
+        type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+        let cases: [(&str, Env, &str); 7] = [
+            ("auth = 'azure'", &wi, "expected \"password\""),
+            ("auth = 'azure-workload-identity'", &none, "AZURE_CLIENT_ID"),
+            ("auth = 'azure-container-apps'", &none, "IDENTITY_ENDPOINT"),
+            ("auth = 'azure-container-apps'", &wi, "IDENTITY_ENDPOINT"),
+            ("azure_client_id = 'x'", &wi, "azure_client_id is set"),
+            (
+                "auth = 'azure-workload-identity'
+ssl_mode = 'disable'",
+                &wi,
+                "must be verified",
+            ),
+            (
+                "auth = 'azure-container-apps'
+ssl_mode = 'verify-ca'
+ssl_root_cert = '/ca.pem'",
+                &aca,
+                "\"verify-ca\"",
+            ),
+        ];
+        for (extra, env, needle) in cases {
+            let e = pg(extra).source_config_with_env(env).unwrap_err();
+            assert!(e.contains(needle), "{extra}: {e}");
+            assert!(!e.contains("hdr-s3cret"), "{extra}: {e}");
+        }
+        let e = toml::from_str::<PostgresConfig>(
+            "url = 'postgres://mi:pw@db/app'
+auth = 'azure-container-apps'",
+        )
+        .unwrap()
+        .source_config_with_env(&aca)
+        .unwrap_err();
+        assert!(e.contains("also carries a password"), "{e}");
     }
 
     #[test]

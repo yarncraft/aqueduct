@@ -1,15 +1,19 @@
 //! The compiled routing table and its pure `render` step.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use super::expr::{op_name, EventView, Expr, FieldRef, Template, Tri};
+use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
-use crate::{encode, key_json, op_code, record_key, table_key, SourceInfo};
+use crate::{
+    encode, encode_rows, key_json, key_object, op_code, record_key, table_key, SourceInfo,
+};
 
 /// Rows of a matched table seen without a field a route references, while the field has never been
 /// seen, before the field is reported as unseen (warn-once log, metric, cockpit).
@@ -41,6 +45,53 @@ pub struct KafkaRoute {
     pub topic_fallback: Option<String>,
     /// The only values a content-routed `topic`'s row fields may substitute.
     pub topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`: publish the rows of an outbox table as their own events (ADR 0002 §5).
+    /// The route's `topic` must then be empty: the outbox has its own `topic` template.
+    pub outbox: Option<OutboxSpec>,
+    /// `include` | `exclude`, `mask`, `hash` and `rename` (ADR 0002 §5 "Fields"), applied to
+    /// `before`, `after` and, without `key`, the record key's `key` object.
+    pub fields: FieldSpec,
+}
+
+/// Debezium's outbox event router defaults, used for every `outbox` key left unset.
+pub const OUTBOX_AGGREGATE_TYPE: &str = "aggregatetype";
+pub const OUTBOX_AGGREGATE_ID: &str = "aggregateid";
+pub const OUTBOX_PAYLOAD: &str = "payload";
+pub const OUTBOX_TOPIC: &str = "outbox.event.{aggregate_type}";
+
+/// A route's `outbox = {...}`: column names of the outbox table and the topic template. Only
+/// inserts are published: key = the `aggregate_id` value, value = the `payload` value, headers
+/// `id` and `type` from those columns when configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboxSpec {
+    /// Column the topic template's `{aggregate_type}` reads.
+    pub aggregate_type: String,
+    /// Column whose value is the record key.
+    pub aggregate_id: String,
+    /// Column whose value is the record value.
+    pub payload: String,
+    /// Topic template over the outbox columns: `{aggregate_type}`, `{schema}`, `{table}`,
+    /// `{after.<col>}` or `{row.<col>}`.
+    pub topic: String,
+    /// Column for the `id` header; no header when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Column for the `type` header; no header when unset.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl Default for OutboxSpec {
+    fn default() -> Self {
+        Self {
+            aggregate_type: OUTBOX_AGGREGATE_TYPE.into(),
+            aggregate_id: OUTBOX_AGGREGATE_ID.into(),
+            payload: OUTBOX_PAYLOAD.into(),
+            topic: OUTBOX_TOPIC.into(),
+            id: None,
+            kind: None,
+        }
+    }
 }
 
 /// One Kafka record, before it is handed to the client. Topic and key decide the partition.
@@ -313,6 +364,143 @@ struct CompiledRoute {
     topic_fallback: Option<String>,
     /// The values a content-routed topic's row fields may take; `None` allows any valid segment.
     topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`; its topic template is `topic`.
+    outbox: Option<Outbox>,
+    /// `None`: no field operation, the record is built exactly as without routing.
+    fields: Option<FieldOps>,
+}
+
+/// `before` and `after` after field operations.
+type Rows = (Option<Box<RawValue>>, Option<Box<RawValue>>);
+
+/// A record's parts after the route's field operations, computed before its topic is chosen.
+struct Rewritten {
+    /// The record key and partition input from the rewritten key object; `None` with `key = [...]`.
+    keys: Option<(String, String)>,
+    rows: Rows,
+    headers: Vec<(&'static str, String)>,
+}
+
+/// A compiled `outbox = {...}`: the spec as configured and the `after.<col>` paths it reads.
+#[derive(Debug, Clone)]
+struct Outbox {
+    spec: OutboxSpec,
+    aggregate_id: FieldRef,
+    payload: FieldRef,
+    id: Option<FieldRef>,
+    kind: Option<FieldRef>,
+}
+
+/// Why an outbox column cannot be used for one row; never holds the value.
+enum OutboxError {
+    /// Missing or `null`.
+    Missing,
+    /// A string with an escape that is not Unicode (a lone surrogate), so it has no UTF-8 form.
+    NotUnicode,
+}
+
+impl Outbox {
+    /// Validates the column names (non-empty, top-level) and the topic template, and compiles
+    /// the template with `{aggregate_type}` read from `after.<aggregate_type>`.
+    fn compile(name: &str, spec: &OutboxSpec) -> Result<(Self, TopicTemplate)> {
+        let bad = |msg: String| Error::Config(format!("sink route `{name}`: `outbox` {msg}"));
+        let field = |key: &str, col: &str| {
+            if col.is_empty() {
+                return Err(bad(format!("`{key}` is an empty column name")));
+            }
+            if col.contains('.') || col.contains('{') || col.contains('}') {
+                return Err(bad(format!(
+                    "`{key}` column `{col}` is not a top-level column name (no dots or braces)"
+                )));
+            }
+            FieldRef::parse(&format!("after.{col}"))
+                .map_err(|e| bad(format!("`{key}` column `{col}`: {e}")))
+        };
+        field("aggregate_type", &spec.aggregate_type)?;
+        let aggregate_id = field("aggregate_id", &spec.aggregate_id)?;
+        let payload = field("payload", &spec.payload)?;
+        let id = spec.id.as_deref().map(|c| field("id", c)).transpose()?;
+        let kind = spec.kind.as_deref().map(|c| field("type", c)).transpose()?;
+        let what = format!("sink route `{name}`: `outbox` `topic`");
+        let replacement = format!("{{after.{}}}", spec.aggregate_type);
+        let rewritten = spec.topic.replace(AGGREGATE_TYPE, &replacement);
+        // Syntax errors name the template as written, with the position in it.
+        if let Err(e) = Template::parse(&rewritten) {
+            let pos = written_pos(&spec.topic, replacement.len(), e.pos);
+            return Err(Error::Config(format!(
+                "{what} `{}` is not a valid template: {} (at byte {pos})",
+                spec.topic, e.msg
+            )));
+        }
+        let mut topic = parse_topic(&what, &rewritten).map_err(|e| {
+            // Report the template as written, not the rewritten form.
+            Error::Config(e.to_string().replace(&rewritten, &spec.topic))
+        })?;
+        // Only inserts and snapshot reads are published, and they have no before-image.
+        if let Some(f) = topic
+            .parsed
+            .fields()
+            .find(|f| f.as_str().starts_with("before."))
+        {
+            return Err(bad(format!(
+                "`topic` `{}` reads `{f}`, but only inserts and snapshot reads are published and they have no before-image; use `{{aggregate_type}}` or `{{after.<column>}}`",
+                spec.topic
+            )));
+        }
+        topic.raw = spec.topic.clone();
+        Ok((
+            Self {
+                spec: spec.clone(),
+                aggregate_id,
+                payload,
+                id,
+                kind,
+            },
+            topic,
+        ))
+    }
+
+    /// Every row path the outbox reads besides the topic template's, for the unseen-field check.
+    fn fields(&self) -> impl Iterator<Item = &FieldRef> {
+        [&self.aggregate_id, &self.payload]
+            .into_iter()
+            .chain(self.id.as_ref())
+            .chain(self.kind.as_ref())
+    }
+}
+
+/// The outbox topic placeholder for the `aggregate_type` column.
+const AGGREGATE_TYPE: &str = "{aggregate_type}";
+
+/// Maps byte `pos` in a template whose [`AGGREGATE_TYPE`] placeholders were each replaced by
+/// `replacement_len` bytes back to `written`, the template as configured. A position inside a
+/// replacement maps to the start of its placeholder.
+fn written_pos(written: &str, replacement_len: usize, pos: usize) -> usize {
+    let mut shift: isize = 0;
+    for (i, _) in written.match_indices(AGGREGATE_TYPE) {
+        let start = i.saturating_add_signed(shift);
+        if pos < start {
+            break;
+        }
+        if pos < start + replacement_len {
+            return i;
+        }
+        shift += replacement_len as isize - AGGREGATE_TYPE.len() as isize;
+    }
+    pos.saturating_add_signed(-shift)
+}
+
+/// The text of an outbox column as Kafka gets it: a JSON string's content, unescaped, and any
+/// other value its JSON text as the row holds it (`json`/`jsonb` columns are already JSON in the
+/// row). `null` and a missing column are [`OutboxError::Missing`].
+fn outbox_text(view: &EventView<'_>, f: &FieldRef) -> std::result::Result<String, OutboxError> {
+    let raw = view.raw(f).ok_or(OutboxError::Missing)?;
+    let text = raw.get().trim();
+    match text.as_bytes().first() {
+        None | Some(b'n') => Err(OutboxError::Missing),
+        Some(b'"') => serde_json::from_str::<String>(text).map_err(|_| OutboxError::NotUnicode),
+        Some(_) => Ok(text.to_string()),
+    }
 }
 
 /// A route's `key = [...]`.
@@ -332,7 +520,6 @@ impl CompiledRoute {
     /// The row fields the topic template reads (`row.region`, `after.address.city`, ...); empty
     /// for a topic without content routing. `FieldRef::column` gives each one's top-level column.
     /// Field operations (R6) check these, like [`CompiledRoute::key_columns`].
-    #[allow(dead_code)] // R6 (field operations) checks these; tests use them until then.
     pub(crate) fn topic_fields(&self) -> impl Iterator<Item = &FieldRef> {
         self.topic.parsed.fields().filter(|f| f.column().is_some())
     }
@@ -542,6 +729,9 @@ pub struct RoutesDescription {
     pub dead_letter_topic: Option<String>,
     /// `key` or `table`.
     pub partition_by: &'static str,
+    /// `sink.hash_key_id`, when a hash key is configured. Never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_key_id: Option<String>,
     /// In match order; the `sink.topic` fallback, if any, is last, named `default`.
     pub routes: Vec<RouteDescription>,
 }
@@ -567,6 +757,21 @@ pub struct RouteDescription {
     pub topic_fallback: Option<String>,
     /// The allow-list of a content-routed topic's values; `null` without one.
     pub topic_values: Option<Vec<String>>,
+    /// `outbox = {...}`: the column names and the topic template (also in `topic`); left out
+    /// for other routes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<OutboxSpec>,
+    /// Field operations: column names (and the rename map), left out when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rename: Option<BTreeMap<String, String>>,
     pub counts: RouteCounts,
     pub unseen_fields: Vec<String>,
 }
@@ -584,6 +789,8 @@ pub struct RoutePlan {
     dynamic: Arc<DynamicTopics>,
     /// [`RoutePlan::static_topics`], computed once.
     fixed: Vec<String>,
+    /// Present when configured; required as soon as a route uses `hash`.
+    hash_key: Option<HashKey>,
 }
 
 /// A Kafka topic name: 1 to 249 of `[A-Za-z0-9._-]`, and not `.` or `..`.
@@ -812,6 +1019,57 @@ fn check_collisions(
     Ok(())
 }
 
+/// Startup checks of a route's field operations: `hash` needs the key, `rename` without
+/// `include` needs the dead-letter topic, and no row data may bypass the operations (ADR 0002
+/// §5): `key = [...]` and a content-routed topic read the original row, so neither may name a
+/// column the route removes, masks or hashes. `topic_values` constrains the values of those same
+/// template fields, and `topic_fallback` is a fixed topic, so checking the template's fields covers
+/// both.
+fn check_field_ops(
+    name: &str,
+    r: &CompiledRoute,
+    hash_key: Option<&HashKey>,
+    dead_letter_topic: Option<&str>,
+) -> Result<()> {
+    let Some(f) = &r.fields else {
+        return Ok(());
+    };
+    if f.hashes() && hash_key.is_none() {
+        return Err(Error::Config(format!(
+            "sink route `{name}` uses `hash`, which needs a key: set AQUEDUCT_HASH_KEY or sink.hash_key_file, and sink.hash_key_id"
+        )));
+    }
+    if f.may_collide() && dead_letter_topic.is_none() {
+        return Err(Error::Config(format!(
+            "sink route `{name}` uses `rename` without `include`, which needs `sink.dead_letter_topic`: a row that already has a column named like a rename target goes there instead of stopping the pipeline"
+        )));
+    }
+    for c in r.key_columns().unwrap_or_default() {
+        if let Some(how) = f.protection(c) {
+            return Err(Error::Config(format!(
+                "sink route `{name}`: `key` column `{c}` is {how} by the route's field operations, so the record key would carry it unprotected; key by other columns"
+            )));
+        }
+    }
+    for field in r.topic_fields() {
+        let Some(c) = field.column() else { continue };
+        if let Some(how) = f.protection(c) {
+            let values = if r.topic_values().is_some() {
+                " (and `topic_values`)"
+            } else {
+                ""
+            };
+            return Err(Error::Config(format!(
+                "sink route `{name}`: `topic` reads `{field}`, but column `{c}` is {how} by the route's field operations, so the topic name{values} would carry it unprotected; route by another column"
+            )));
+        }
+    }
+    // TODO(R7): `format = "row"` with `deletes = "row"` must emit the rewritten before-image
+    // (`rewrite_rows`), and envelope `tombstones` must reuse the record's rewritten key
+    // (`rewrite_key` or the route key), never `event.key` as is.
+    Ok(())
+}
+
 impl RoutePlan {
     /// A plan without a dead-letter topic, so no route may use `where`.
     pub fn new(routes: Vec<KafkaRoute>, default: Option<String>) -> Result<Self> {
@@ -824,6 +1082,17 @@ impl RoutePlan {
         routes: Vec<KafkaRoute>,
         default: Option<String>,
         dead_letter_topic: Option<String>,
+    ) -> Result<Self> {
+        Self::build(routes, default, dead_letter_topic, None)
+    }
+
+    /// [`with_dead_letter`](Self::with_dead_letter) with the key for `hash`, which is required
+    /// as soon as a route hashes a column.
+    pub fn build(
+        routes: Vec<KafkaRoute>,
+        default: Option<String>,
+        dead_letter_topic: Option<String>,
+        hash_key: Option<HashKey>,
     ) -> Result<Self> {
         if routes.is_empty() && default.is_none() {
             return Err(Error::Config(
@@ -875,18 +1144,93 @@ impl RoutePlan {
                 )));
             }
             let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
-            let topic = parse_topic(&format!("sink route `{name}`: `topic`"), &r.topic)?;
+            let (topic, outbox) = match &r.outbox {
+                None => {
+                    if r.topic.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}` has no `topic`; set one (or `outbox`)"
+                        )));
+                    }
+                    let what = format!("sink route `{name}`: `topic`");
+                    (parse_topic(&what, &r.topic)?, None)
+                }
+                Some(spec) => {
+                    // The outbox decides the topic, the key and the value (ADR 0002 §5), so the
+                    // keys that would set them too are refused rather than silently ignored.
+                    // Field operations are refused as a whole: an outbox route has none, so no
+                    // protected column can reach its `aggregate_id`, `topic` or payload.
+                    // TODO(R7): refuse `format` here too.
+                    let f = &r.fields;
+                    let set: Vec<&str> = [
+                        ("include", f.include.is_some()),
+                        ("exclude", f.exclude.is_some()),
+                        ("mask", !f.mask.is_empty()),
+                        ("hash", !f.hash.is_empty()),
+                        ("rename", !f.rename.is_empty()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, on)| on.then_some(k))
+                    .collect();
+                    if !set.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `outbox` and the field operations (`{}`) are mutually exclusive: an outbox record is the `payload` column as is, so shape the payload in the application, or route the table without `outbox`",
+                            set.join("`, `")
+                        )));
+                    }
+                    if !r.topic.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `topic` and `outbox` are mutually exclusive; set the topic template as `outbox.topic`"
+                        )));
+                    }
+                    if r.key.is_some() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `key` and `outbox` are mutually exclusive; an outbox record is keyed by its `aggregate_id`"
+                        )));
+                    }
+                    // Only inserts (and, when `ops` lists it, `read`) are published, so an `ops`
+                    // list without either, or a `where` on the before-image, drops every row.
+                    if ops
+                        .as_ref()
+                        .is_some_and(|o| !o.contains(&Op::Insert) && !o.contains(&Op::Read))
+                    {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `ops` lists neither `insert` nor `read`, but an outbox route only publishes those, so it would publish nothing"
+                        )));
+                    }
+                    if let Some(f) = filter.as_ref().and_then(|w| {
+                        w.fields()
+                            .into_iter()
+                            .find(|f| f.as_str().starts_with("before."))
+                    }) {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}`: `where` reads `{f}`, but an outbox route only publishes inserts and snapshot reads, which have no before-image; use `after.` or `row.`"
+                        )));
+                    }
+                    if dead_letter_topic.is_none() {
+                        return Err(Error::Config(format!(
+                            "sink route `{name}` uses `outbox`, which needs `sink.dead_letter_topic`: outbox rows without an `aggregate_id` or `payload` go there instead of stopping the pipeline"
+                        )));
+                    }
+                    let (outbox, topic) = Outbox::compile(&name, spec)?;
+                    (topic, Some(outbox))
+                }
+            };
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
-            fields.push(
-                filter
-                    .iter()
-                    .flat_map(|f| f.fields())
-                    .chain(key.iter().flat_map(|k| k.fields.iter()))
-                    .chain(topic.parsed.fields())
-                    .cloned()
-                    .collect(),
-            );
-            compiled.push(CompiledRoute {
+            let field_ops = FieldOps::compile(&name, &r.fields)?;
+            let mut watched: Vec<FieldRef> = filter
+                .iter()
+                .flat_map(|f| f.fields())
+                .chain(key.iter().flat_map(|k| k.fields.iter()))
+                .chain(topic.parsed.fields())
+                .chain(outbox.iter().flat_map(Outbox::fields))
+                .cloned()
+                .collect();
+            for c in r.fields.columns() {
+                // Top-level names only (checked by `FieldOps::compile`), so `row.<name>` parses.
+                watched.extend(FieldRef::parse(&format!("row.{c}")).ok());
+            }
+            fields.push(watched);
+            let route = CompiledRoute {
                 pattern: r.pattern.clone(),
                 topic,
                 ops,
@@ -894,7 +1238,16 @@ impl RoutePlan {
                 key,
                 topic_fallback,
                 topic_values,
-            });
+                outbox,
+                fields: field_ops,
+            };
+            check_field_ops(
+                &name,
+                &route,
+                hash_key.as_ref(),
+                dead_letter_topic.as_deref(),
+            )?;
+            compiled.push(route);
             names.push(name);
         }
         if default.is_some() {
@@ -973,6 +1326,7 @@ impl RoutePlan {
             stats: Arc::new(RouteStats::new(names, fields)),
             dynamic: Arc::new(DynamicTopics::new()),
             fixed: Vec::new(),
+            hash_key,
         };
         plan.fixed = plan.static_topics();
         // A content-routed name must not collide (`.` vs `_`) with a fixed topic either.
@@ -1071,6 +1425,11 @@ impl RoutePlan {
         self.default.as_ref().map(|t| t.raw.as_str())
     }
 
+    /// True when a route uses `outbox`, whose records carry `id` and `type` headers.
+    pub fn has_outbox(&self) -> bool {
+        self.routes.iter().any(|r| r.outbox.is_some())
+    }
+
     /// `sink.dead_letter_topic`, if configured.
     pub fn dead_letter_topic(&self) -> Option<&str> {
         self.dead_letter.as_deref()
@@ -1114,7 +1473,14 @@ impl RoutePlan {
     /// The compiled plan and its live counts, for `/api/routes`.
     pub fn describe(&self) -> RoutesDescription {
         let route = |i: usize, pattern: Option<String>, r: Option<&CompiledRoute>, topic: &str| {
+            let spec = r.and_then(|r| r.fields.as_ref()).map(FieldOps::spec);
+            let list = |v: &Vec<String>| (!v.is_empty()).then(|| v.clone());
             RouteDescription {
+                include: spec.and_then(|s| s.include.clone()),
+                exclude: spec.and_then(|s| s.exclude.as_ref().and_then(list)),
+                mask: spec.and_then(|s| list(&s.mask)),
+                hash: spec.and_then(|s| list(&s.hash)),
+                rename: spec.and_then(|s| (!s.rename.is_empty()).then(|| s.rename.clone())),
                 route: self.stats.names[i].clone(),
                 pattern,
                 ops: r
@@ -1127,6 +1493,7 @@ impl RoutePlan {
                 topic: topic.to_string(),
                 topic_fallback: r.and_then(|r| r.topic_fallback.clone()),
                 topic_values: r.and_then(|r| r.topic_values().map(<[String]>::to_vec)),
+                outbox: r.and_then(|r| r.outbox.as_ref()).map(|o| o.spec.clone()),
                 counts: self.stats.counts(i),
                 unseen_fields: self.stats.unseen(i),
             }
@@ -1144,6 +1511,7 @@ impl RoutePlan {
             default_topic: self.default_topic().map(str::to_string),
             dead_letter_topic: self.dead_letter.clone(),
             partition_by: self.partition_by.as_str(),
+            hash_key_id: self.hash_key.as_ref().map(|k| k.id().to_string()),
             routes,
         }
     }
@@ -1174,12 +1542,22 @@ impl RoutePlan {
         let view = EventView::new(event);
         // The record key and the partition input, when the route sets its own key.
         let mut route_key = None;
+        // Field operations, applied before the topic is chosen, so a row they cannot rewrite goes
+        // to the dead-letter topic without taking a content-routing cap slot.
+        let mut rewritten = None;
         let mut outcome = &self.stats.produced;
         let mut content = None;
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
-                if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op)) {
+                // An outbox publishes inserts, and snapshot reads only when `ops` lists `read`
+                // (ADR 0002 §5, "As built (R8)"): updates, deletes and truncates of the outbox
+                // table are filtered before anything else.
+                let ops_read = r.ops.as_ref().is_some_and(|ops| ops.contains(&Op::Read));
+                if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op))
+                    || (r.outbox.is_some()
+                        && !(event.op == Op::Insert || (event.op == Op::Read && ops_read)))
+                {
                     self.stats.claimed(&self.stats.filtered, route);
                     return Ok(());
                 }
@@ -1203,44 +1581,175 @@ impl RoutePlan {
                         }
                     }
                 }
+                if let Some(outbox) = &r.outbox {
+                    return self.render_outbox(route, r, outbox, &view, now_us, out);
+                }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
-                match self.content_topic(route, r, &view) {
-                    Ok((topic, from_row)) => {
-                        if from_row {
-                            content = r
-                                .topic_fallback
-                                .clone()
-                                .map(|fallback| ContentTopic { route, fallback });
+                if let Some(f) = &r.fields {
+                    match self.rewrite(f, event, route_key.is_none()) {
+                        Ok(w) => rewritten = Some(w),
+                        Err(e) => {
+                            let reason = format!("route `{}`: {e}", self.stats.names[route]);
+                            self.dead_letter(route, reason, event, now_us, out)?;
+                            self.stats.claimed(&self.stats.errors, route);
+                            return Ok(());
                         }
-                        topic
-                    }
-                    Err(fallback) => {
-                        outcome = &self.stats.fallback;
-                        fallback
                     }
                 }
+                let (topic, c, fell_back) = self.route_topic(route, r, &view);
+                content = c;
+                if fell_back {
+                    outcome = &self.stats.fallback;
+                }
+                topic
             }
         };
-        let (key, partition_key) = match route_key {
+        let rewritten_keys = rewritten.as_mut().and_then(|w| w.keys.take());
+        let (key, partition_key) = match (route_key, rewritten_keys) {
             // A per-route key partitions by the whole key, whatever `partition_by` says.
-            Some(key) => (key.clone(), key),
-            None => {
+            (Some(key), _) => (key.clone(), key),
+            // The key object after field operations, partitioned like the plain key.
+            (None, Some(keys)) => keys,
+            (None, None) => {
                 let key = record_key(event, &self.source);
                 let partition_key = partition_input(event, &key, self.partition_by);
                 (key, partition_key)
             }
         };
+        // The value and headers are fixed here, before the sink may re-route the record to the
+        // fallback (`topic_refused` changes only the topic), so a fallback record carries the
+        // same rewritten value, key and `aqueduct-hash-key-id` as any other.
+        let (value, headers) = match rewritten {
+            None => (encode(event, &self.source, now_us)?, Vec::new()),
+            Some(w) => (
+                encode_rows(
+                    event,
+                    &self.source,
+                    now_us,
+                    w.rows.0.as_deref(),
+                    w.rows.1.as_deref(),
+                )?,
+                w.headers,
+            ),
+        };
         out.push(OutRecord {
             topic,
             partition_key,
             key,
-            value: encode(event, &self.source, now_us)?,
+            value,
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
-            headers: Vec::new(),
+            headers,
             content,
         });
+        self.stats.claimed(outcome, route);
+        Ok(())
+    }
+
+    /// The topic of route `r` for this event, the [`ContentTopic`] of a topic chosen from row
+    /// content, and whether the event went to the route's `topic_fallback`.
+    fn route_topic(
+        &self,
+        route: usize,
+        r: &CompiledRoute,
+        view: &EventView<'_>,
+    ) -> (String, Option<ContentTopic>, bool) {
+        match self.content_topic(route, r, view) {
+            Ok((topic, from_row)) => {
+                let content = r
+                    .topic_fallback
+                    .clone()
+                    .filter(|_| from_row)
+                    .map(|fallback| ContentTopic { route, fallback });
+                (topic, content, false)
+            }
+            Err(fallback) => (fallback, None, true),
+        }
+    }
+
+    /// The record for an insert into an outbox table (ADR 0002 §5): topic from the outbox's
+    /// template, key = the `aggregate_id` value, value = the `payload` value, headers `id` and
+    /// `type` when configured and present. A row without an `aggregate_id` or `payload` goes to
+    /// the dead-letter topic, with an `aqueduct-error` header naming the column, never the value.
+    fn render_outbox(
+        &self,
+        route: usize,
+        r: &CompiledRoute,
+        outbox: &Outbox,
+        view: &EventView<'_>,
+        now_us: i64,
+        out: &mut Vec<OutRecord>,
+    ) -> Result<()> {
+        let event = view.event();
+        let spec = &outbox.spec;
+        let required = [
+            ("aggregate_id", &spec.aggregate_id, &outbox.aggregate_id),
+            ("payload", &spec.payload, &outbox.payload),
+        ];
+        let optional = [
+            ("id", spec.id.as_ref(), outbox.id.as_ref()),
+            ("type", spec.kind.as_ref(), outbox.kind.as_ref()),
+        ];
+        let mut texts = Vec::with_capacity(2);
+        let mut headers = Vec::new();
+        let mut failed = None;
+        for (what, col, f) in required {
+            match outbox_text(view, f) {
+                Ok(t) => texts.push(t),
+                Err(e) => {
+                    failed = Some((what, col, e));
+                    break;
+                }
+            }
+        }
+        if failed.is_none() {
+            for (what, col, f) in optional {
+                let (Some(col), Some(f)) = (col, f) else {
+                    continue;
+                };
+                match outbox_text(view, f) {
+                    Ok(t) => headers.push((what, t)),
+                    Err(OutboxError::Missing) => {}
+                    Err(e) => {
+                        failed = Some((what, col, e));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((what, col, e)) = failed {
+            let why = match e {
+                OutboxError::Missing => "is missing or null",
+                OutboxError::NotUnicode => "is a string that is not valid Unicode",
+            };
+            let reason = format!(
+                "route `{}`: outbox `{what}` column `{col}` {why}",
+                self.stats.names[route]
+            );
+            self.dead_letter(route, reason, event, now_us, out)?;
+            self.stats.claimed(&self.stats.errors, route);
+            return Ok(());
+        }
+        let payload = texts.pop().unwrap_or_default();
+        let key = texts.pop().unwrap_or_default();
+        let (topic, content, fell_back) = self.route_topic(route, r, view);
+        out.push(OutRecord {
+            topic,
+            partition_key: key.clone(),
+            key,
+            value: payload,
+            op: op_code(event.op),
+            lsn: event.position.to_checkpoint(),
+            commit_ts_micros: event.commit_ts_micros,
+            headers,
+            content,
+        });
+        let outcome = if fell_back {
+            &self.stats.fallback
+        } else {
+            &self.stats.produced
+        };
         self.stats.claimed(outcome, route);
         Ok(())
     }
@@ -1353,10 +1862,78 @@ impl RoutePlan {
         key_json(event, &self.source, &obj)
     }
 
+    /// The value rows, key and headers of a record of a route with field operations. `own_key`:
+    /// the route has no `key = [...]`, so the key object is rewritten too.
+    fn rewrite(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+        own_key: bool,
+    ) -> std::result::Result<Rewritten, FieldError> {
+        let rows = self.rewrite_rows(fields, event, true)?;
+        let keys = if own_key {
+            let k = self.rewrite_key(fields, event)?;
+            let key = key_json(event, &self.source, k.as_deref().unwrap_or("null"));
+            // Partitioned by the rewritten key, so a hashed key column keeps per-row order.
+            let partition_key = partition_input(event, &key, self.partition_by);
+            Some((key, partition_key))
+        } else {
+            None
+        };
+        Ok(Rewritten {
+            keys,
+            rows,
+            headers: self.hash_headers(fields),
+        })
+    }
+
+    /// `before` and `after` with the route's field operations applied.
+    fn rewrite_rows(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+        renames: bool,
+    ) -> std::result::Result<Rows, FieldError> {
+        let key = self.hash_key.as_ref();
+        let row = |r: &Option<Box<RawValue>>| {
+            r.as_deref()
+                .map(|r| fields.rewrite_raw(r, key, renames))
+                .transpose()
+        };
+        Ok((row(&event.before)?, row(&event.after)?))
+    }
+
+    /// The record key's `key` object with the route's field operations applied: excluded columns
+    /// removed, masked, hashed and renamed ones as in the value. An object left empty is `None`
+    /// (`"key": null`).
+    fn rewrite_key(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+    ) -> std::result::Result<Option<String>, FieldError> {
+        let Some(k) = key_object(event) else {
+            return Ok(None);
+        };
+        let mut out = String::with_capacity(k.len());
+        let n = fields.rewrite(k, self.hash_key.as_ref(), true, &mut out)?;
+        Ok((n > 0).then_some(out))
+    }
+
+    /// `aqueduct-hash-key-id` on every record of a route that hashes.
+    fn hash_headers(&self, fields: &FieldOps) -> Vec<(&'static str, String)> {
+        match &self.hash_key {
+            Some(k) if fields.hashes() => vec![(HASH_KEY_ID_HEADER, k.id().to_string())],
+            _ => Vec::new(),
+        }
+    }
+
     /// The dead-letter record for an event route `route` could not evaluate. `reason` names the
     /// route, the expression and the type problem, never a row value: it becomes the
     /// `aqueduct-error` header and a log line. The key is the table-only record key (no row data),
-    /// and the partition is hashed from it.
+    /// and the partition is hashed from it. The value has the route's field operations applied
+    /// (ADR 0002 §5a), so the dead-letter topic never holds data the route would have removed,
+    /// masked or hashed: renamed if the renames apply, else under the original names, and with
+    /// `before`/`after` null if a row is not an object the operations can rewrite.
     fn dead_letter(
         &self,
         route: usize,
@@ -1371,10 +1948,25 @@ impl RoutePlan {
             ))
         })?;
         let key = table_key(event, &self.source);
-        // R6 (field operations) must apply the route's include/exclude, mask, hash and rename to
-        // this value before it is produced, so the dead-letter topic never holds data the route
-        // would have masked (ADR 0002 §5a). Until then a route has no field operations to apply.
-        let value = encode(event, &self.source, now_us)?;
+        let fields = self.routes.get(route).and_then(|r| r.fields.as_ref());
+        let mut headers = vec![("aqueduct-error", reason.clone())];
+        let value = match fields {
+            None => encode(event, &self.source, now_us)?,
+            Some(f) => {
+                headers.extend(self.hash_headers(f));
+                let (before, after) = self
+                    .rewrite_rows(f, event, true)
+                    .or_else(|_| self.rewrite_rows(f, event, false))
+                    .unwrap_or((None, None));
+                encode_rows(
+                    event,
+                    &self.source,
+                    now_us,
+                    before.as_deref(),
+                    after.as_deref(),
+                )?
+            }
+        };
         out.push(OutRecord {
             topic,
             partition_key: key.clone(),
@@ -1383,7 +1975,7 @@ impl RoutePlan {
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
-            headers: vec![("aqueduct-error", reason.clone())],
+            headers,
             content: None,
         });
         if !self.stats.error_logged[route].swap(true, Ordering::Relaxed) {
@@ -1703,7 +2295,7 @@ mod tests {
             r#"{"db":"app","schema":"public","table":"orders","key":null}"#
         );
         assert_eq!(r.partition_key, r.key);
-        // The value is the envelope (field operations come with R6).
+        // The route has no field operations, so the value is the envelope as is.
         assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
         assert_eq!((r.op, r.lsn.as_str()), ("u", "7"));
         assert_eq!(r.headers.len(), 1);
@@ -2850,6 +3442,1200 @@ mod tests {
         assert_eq!(q.stats().snapshot()[0].unseen_fields, vec!["row.regoin"]);
     }
 
+    // --- outbox (R8) -----------------------------------------------------------------------------
+
+    fn outbox_spec() -> OutboxSpec {
+        OutboxSpec {
+            topic: "outbox.{aggregate_type}".into(),
+            id: Some("id".into()),
+            kind: Some("type".into()),
+            ..Default::default()
+        }
+    }
+
+    fn outbox_route(spec: OutboxSpec) -> KafkaRoute {
+        KafkaRoute {
+            name: Some("ob".into()),
+            pattern: "public.outbox".into(),
+            topic_fallback: Some("outbox.unknown".into()),
+            outbox: Some(spec),
+            ..Default::default()
+        }
+    }
+
+    fn outbox_plan() -> RoutePlan {
+        plan_with(vec![outbox_route(outbox_spec())])
+    }
+
+    const OUTBOX_ROW: &str = r#"{"id":"0f6e","aggregatetype":"order","aggregateid":"A-1","type":"OrderCreated","payload":{"total":12.50,"items":[1,2]}}"#;
+
+    #[test]
+    fn outbox_publishes_inserts_only() {
+        let p = outbox_plan();
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        // Updates, deletes, truncates and snapshot reads of outbox rows are filtered.
+        for op in [Op::Update, Op::Delete, Op::Truncate, Op::Read] {
+            assert_eq!(
+                outcome(&p, &row("outbox", op, OUTBOX_ROW)),
+                "filtered",
+                "{op:?}"
+            );
+        }
+        // Even a row that would be dead-lettered as an insert.
+        assert_eq!(outcome(&p, &row("outbox", Op::Update, "{}")), "filtered");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.filtered), (6, 1, 5));
+    }
+
+    #[test]
+    fn outbox_publishes_snapshot_reads_only_when_ops_lists_read() {
+        let with_ops = |ops: &[&str]| {
+            plan_with(vec![KafkaRoute {
+                ops: Some(ops.iter().map(|s| s.to_string()).collect()),
+                ..outbox_route(outbox_spec())
+            }])
+        };
+        let p = with_ops(&["insert", "read", "update", "delete", "truncate"]);
+        // A snapshot read is published like an insert, with the `r` op header.
+        let r = p
+            .render(&row("outbox", Op::Read, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (r.topic.as_str(), r.key.as_str(), r.op),
+            ("outbox.order", "A-1", "r")
+        );
+        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        // Listing them in `ops` never publishes updates, deletes or truncates.
+        for op in [Op::Update, Op::Delete, Op::Truncate] {
+            assert_eq!(
+                outcome(&p, &row("outbox", op, OUTBOX_ROW)),
+                "filtered",
+                "{op:?}"
+            );
+        }
+        // `ops = ["read"]` publishes snapshot reads only.
+        let q = with_ops(&["read"]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "filtered"
+        );
+        // Without `read` in `ops` (or without `ops`), snapshot reads are filtered.
+        let q = with_ops(&["insert"]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
+            "filtered"
+        );
+        // A snapshot read without an aggregate id goes to the dead-letter topic too.
+        assert_eq!(
+            outcome(&p, &row("outbox", Op::Read, r#"{"payload":"p"}"#)),
+            "dlq"
+        );
+    }
+
+    #[test]
+    fn outbox_template_errors_point_into_the_template_as_written() {
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 1), 1);
+        // Inside the replacement: the placeholder's start.
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 10), 2);
+        // After it: shifted back by the length difference (24 - 16).
+        assert_eq!(written_pos("a.{aggregate_type}.{x", 24, 27), 19);
+        assert_eq!(
+            written_pos("{aggregate_type}.{aggregate_type}.}", 9, 20),
+            34
+        );
+        let err = RoutePlan::with_dead_letter(
+            vec![outbox_route(OutboxSpec {
+                topic: "outbox.{aggregate_type}.{x".into(),
+                ..outbox_spec()
+            })],
+            None,
+            Some(DLQ.into()),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(
+                "`outbox.{aggregate_type}.{x` is not a valid template: unclosed `{` (at byte 24)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn outbox_key_is_the_raw_aggregate_id_and_value_the_raw_payload() {
+        let p = outbox_plan();
+        let r = p
+            .render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert_eq!(r.topic, "outbox.order");
+        // A string's content, not the JSON key of the table.
+        assert_eq!(r.key, "A-1");
+        assert_eq!(r.partition_key, r.key);
+        // A `json`/`jsonb` payload is the JSON text as the row holds it.
+        assert_eq!(r.value, r#"{"total":12.50,"items":[1,2]}"#);
+        assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
+
+        // A text payload is its string content, unescaped; a numeric aggregate id its JSON text.
+        let r = p
+            .render(
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    r#"{"aggregatetype":"order","aggregateid":42,"payload":"say \"hi\"\n é"}"#,
+                ),
+                NOW,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(r.key, "42");
+        assert_eq!(r.value, "say \"hi\"\n é");
+        // An escaped string aggregate id is unescaped too; other values keep their JSON text.
+        for (id, key) in [
+            (r#""a\"bé""#, "a\"bé"),
+            ("1.0e3", "1.0e3"),
+            ("true", "true"),
+            (r#"{"$oid":"6530"}"#, r#"{"$oid":"6530"}"#),
+        ] {
+            let json = format!(r#"{{"aggregatetype":"o","aggregateid":{id},"payload":"{{}}"}}"#);
+            let r = p
+                .render(&row("outbox", Op::Insert, &json), NOW)
+                .unwrap()
+                .remove(0);
+            assert_eq!(r.key, key, "{id}");
+            assert_eq!(r.value, "{}");
+        }
+    }
+
+    #[test]
+    fn outbox_headers_are_id_and_type_when_configured_and_present() {
+        let p = outbox_plan();
+        let headers = |json: &str| {
+            p.render(&row("outbox", Op::Insert, json), NOW)
+                .unwrap()
+                .remove(0)
+                .headers
+        };
+        assert_eq!(
+            headers(OUTBOX_ROW),
+            vec![
+                ("id", "0f6e".to_string()),
+                ("type", "OrderCreated".to_string())
+            ]
+        );
+        // A null or missing header column leaves the header out.
+        assert_eq!(
+            headers(r#"{"aggregatetype":"o","aggregateid":"a","payload":"p","id":7,"type":null}"#),
+            vec![("id", "7".to_string())]
+        );
+        // Without `id` and `type` in the spec there are no extra headers.
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            topic: "outbox.{aggregate_type}".into(),
+            ..Default::default()
+        })]);
+        let r = q
+            .render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+            .unwrap()
+            .remove(0);
+        assert!(r.headers.is_empty());
+        // The sink adds `op` and `lsn` to every record.
+        assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
+    }
+
+    #[test]
+    fn outbox_rows_without_aggregate_id_or_payload_go_to_the_dead_letter_topic() {
+        let p = outbox_plan();
+        let cases = [
+            (
+                r#"{"aggregatetype":"o","payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":null,"payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret"}"#,
+                "`payload` column `payload` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret","payload":null}"#,
+                "`payload` column `payload` is missing or null",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"\ud800","payload":"secret"}"#,
+                "`aggregate_id` column `aggregateid` is a string that is not valid Unicode",
+            ),
+            (
+                r#"{"aggregatetype":"o","aggregateid":"secret","payload":"p","type":"\udc00"}"#,
+                "`type` column `type` is a string that is not valid Unicode",
+            ),
+        ];
+        for (json, why) in cases {
+            let e = row("outbox", Op::Insert, json);
+            let out = p.render(&e, NOW).unwrap();
+            assert_eq!(out.len(), 1, "{json}");
+            let r = &out[0];
+            assert_eq!(r.topic, DLQ, "{json}");
+            assert_eq!(
+                r.key,
+                r#"{"db":"app","schema":"public","table":"outbox","key":null}"#
+            );
+            assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
+            assert_eq!(r.headers.len(), 1);
+            assert_eq!(r.headers[0].0, "aqueduct-error");
+            assert_eq!(r.headers[0].1, format!("route `ob`: outbox {why}"));
+            assert!(!r.headers[0].1.contains("secret"));
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.errors, c.produced), (6, 6, 0));
+        // A dead-lettered row takes no content-routed topic slot.
+        assert_eq!(p.dynamic_topic_count(), 0);
+    }
+
+    #[test]
+    fn outbox_topic_follows_the_content_routing_rules_and_falls_back() {
+        let mut p = plan_with(vec![KafkaRoute {
+            topic_values: Some(vec!["order".into(), "invoice".into(), "late".into()]),
+            ..outbox_route(outbox_spec())
+        }]);
+        p.set_max_dynamic_topics(2);
+        let r = |agg: &str| {
+            outcome(
+                &p,
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    &format!(r#"{{"aggregatetype":{agg},"aggregateid":"a","payload":"p"}}"#),
+                ),
+            )
+        };
+        assert_eq!(r(r#""order""#), "outbox.order");
+        assert_eq!(r(r#""invoice""#), "outbox.invoice");
+        for bad in [
+            r#"null"#,
+            r#""x.y""#,
+            r#""shipment""#,
+            r#""""#,
+            r#"{"a":1}"#,
+        ] {
+            assert_eq!(r(bad), "outbox.unknown", "{bad}");
+        }
+        assert_eq!(r(r#""late""#), "outbox.unknown", "over max_dynamic_topics");
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.produced, c.fallback), (2, 6));
+        // A fallback record is still the outbox record: same key, value and headers.
+        let rec = p
+            .render(
+                &row(
+                    "outbox",
+                    Op::Insert,
+                    r#"{"aggregatetype":null,"aggregateid":"a","payload":"p","id":"e1"}"#,
+                ),
+                NOW,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (rec.topic.as_str(), rec.key.as_str(), rec.value.as_str()),
+            ("outbox.unknown", "a", "p")
+        );
+        assert_eq!(rec.headers, vec![("id", "e1".to_string())]);
+
+        // A template without row fields needs no fallback; `{schema}`, `{table}` and
+        // `{after.<col>}` work too.
+        let q = plan_with(vec![KafkaRoute {
+            topic_fallback: None,
+            ..outbox_route(OutboxSpec {
+                topic: "events.{table}".into(),
+                ..outbox_spec()
+            })
+        }]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "events.outbox"
+        );
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            topic: "ev.{schema}.{after.type}".into(),
+            ..outbox_spec()
+        })]);
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "ev.public.OrderCreated"
+        );
+    }
+
+    #[test]
+    fn outbox_routes_refuse_every_field_operation() {
+        let specs: Vec<(&str, FieldSpec)> = vec![
+            (
+                "include",
+                FieldSpec {
+                    include: Some(strs(&["payload"])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "exclude",
+                FieldSpec {
+                    exclude: Some(strs(&["secret"])),
+                    ..Default::default()
+                },
+            ),
+            // An empty `exclude` is still a field key on an outbox route.
+            (
+                "exclude",
+                FieldSpec {
+                    exclude: Some(vec![]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mask",
+                FieldSpec {
+                    mask: strs(&["aggregateid"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "hash",
+                FieldSpec {
+                    hash: strs(&["aggregateid"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rename",
+                FieldSpec {
+                    rename: [("payload".to_string(), "body".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (key, fields) in specs {
+            let err = RoutePlan::build(
+                vec![KafkaRoute {
+                    fields,
+                    ..outbox_route(outbox_spec())
+                }],
+                None,
+                Some(DLQ.into()),
+                Some(hash_key()),
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!(
+                    "sink route `ob`: `outbox` and the field operations (`{key}`) are mutually exclusive"
+                )),
+                "{key}: {err}"
+            );
+        }
+        // Several at once are all named.
+        let err = RoutePlan::build(
+            vec![KafkaRoute {
+                fields: FieldSpec {
+                    mask: strs(&["a"]),
+                    hash: strs(&["b"]),
+                    ..Default::default()
+                },
+                ..outbox_route(outbox_spec())
+            }],
+            None,
+            Some(DLQ.into()),
+            Some(hash_key()),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("(`mask`, `hash`)"), "{err}");
+    }
+
+    #[test]
+    fn outbox_routes_are_validated_at_startup() {
+        let build = |r: KafkaRoute, dlq: Option<&str>| {
+            RoutePlan::with_dead_letter(vec![r], Some("rest".into()), dlq.map(Into::into))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let ok = outbox_route(outbox_spec());
+        assert_eq!(build(ok.clone(), Some(DLQ)), Ok(()));
+        let spec = |f: fn(&mut OutboxSpec)| {
+            let mut s = outbox_spec();
+            f(&mut s);
+            outbox_route(s)
+        };
+        let cases: Vec<(KafkaRoute, Option<&str>, &str)> = vec![
+            (
+                ok.clone(),
+                None,
+                "uses `outbox`, which needs `sink.dead_letter_topic`",
+            ),
+            (
+                KafkaRoute {
+                    topic: "t".into(),
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`topic` and `outbox` are mutually exclusive",
+            ),
+            (
+                KafkaRoute {
+                    key: Some(vec!["id".into()]),
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`key` and `outbox` are mutually exclusive",
+            ),
+            (
+                spec(|s| s.aggregate_id = String::new()),
+                Some(DLQ),
+                "`aggregate_id` is an empty column name",
+            ),
+            (
+                spec(|s| s.payload = "a.b".into()),
+                Some(DLQ),
+                "`payload` column `a.b` is not a top-level column name",
+            ),
+            (
+                spec(|s| s.aggregate_type = "{x}".into()),
+                Some(DLQ),
+                "`aggregate_type` column `{x}` is not a top-level",
+            ),
+            (
+                spec(|s| s.id = Some(String::new())),
+                Some(DLQ),
+                "`id` is an empty column name",
+            ),
+            (
+                spec(|s| s.kind = Some("t.x".into())),
+                Some(DLQ),
+                "`type` column `t.x`",
+            ),
+            (
+                spec(|s| s.topic = "outbox.{before.kind}".into()),
+                Some(DLQ),
+                "reads `before.kind`, but only inserts and snapshot reads are published",
+            ),
+            (
+                KafkaRoute { ops: Some(vec!["update".into(), "delete".into()]), ..ok.clone() },
+                Some(DLQ),
+                "`ops` lists neither `insert` nor `read`",
+            ),
+            (
+                KafkaRoute { filter: Some("before.status == 'x' or after.n > 1".into()), ..ok.clone() },
+                Some(DLQ),
+                "`where` reads `before.status`, but an outbox route only publishes inserts and snapshot reads",
+            ),
+            (
+                spec(|s| s.topic = "outbox.{aggregate_id}".into()),
+                Some(DLQ),
+                "`outbox` `topic` `outbox.{aggregate_id}` is not a valid template",
+            ),
+            // The content-routing rules: a fixed prefix, a fallback, no collisions.
+            (
+                spec(|s| s.topic = "{aggregate_type}".into()),
+                Some(DLQ),
+                "`topic` `{aggregate_type}` reads a row field, so it must start with fixed text",
+            ),
+            (
+                KafkaRoute {
+                    topic_fallback: None,
+                    ..ok.clone()
+                },
+                Some(DLQ),
+                "`topic` `outbox.{aggregate_type}` reads a row field, so it needs `topic_fallback`",
+            ),
+            (
+                spec(|s| s.topic = "outbox.events".into()),
+                Some(DLQ),
+                "`topic_fallback` is only for a `topic` that reads a row field",
+            ),
+            (
+                spec(|s| s.topic = "bad topic".into()),
+                Some(DLQ),
+                "is not a valid Kafka topic name",
+            ),
+        ];
+        for (r, dlq, want) in cases {
+            let err = build(r, dlq).expect_err(want);
+            assert!(err.contains("sink route `ob`"), "{err}");
+            assert!(err.contains(want), "{err} should contain {want}");
+        }
+        // A topic the template could produce cannot be the dead-letter topic or another route's.
+        let err = build(ok.clone(), Some("outbox.dlq")).unwrap_err();
+        assert!(
+            err.contains("is also a topic events are routed to"),
+            "{err}"
+        );
+        let err = RoutePlan::with_dead_letter(
+            vec![ok.clone(), route("public.x", "outbox.x")],
+            None,
+            Some(DLQ.into()),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("could produce `outbox.x`, which is route `public.x`'s `topic`"),
+            "{err}"
+        );
+        // A fixed topic with no fallback is fine; so are Debezium's defaults.
+        assert_eq!(
+            build(
+                KafkaRoute {
+                    topic_fallback: None,
+                    ..spec(|s| s.topic = "outbox.events".into())
+                },
+                Some(DLQ)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            build(outbox_route(OutboxSpec::default()), Some(DLQ)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn outbox_routes_are_described_inspected_and_watched() {
+        let p = outbox_plan();
+        assert_eq!(
+            p.topic_globs(),
+            vec!["outbox.*", "rest", "outbox.unknown", DLQ]
+        );
+        let d = serde_json::to_value(p.describe()).unwrap();
+        assert_eq!(d["routes"][0]["topic"], "outbox.{aggregate_type}");
+        assert_eq!(d["routes"][0]["topic_fallback"], "outbox.unknown");
+        assert_eq!(
+            d["routes"][0]["outbox"],
+            serde_json::json!({
+                "aggregate_type": "aggregatetype", "aggregate_id": "aggregateid",
+                "payload": "payload", "topic": "outbox.{aggregate_type}",
+                "id": "id", "type": "type"
+            })
+        );
+        // Other routes have no `outbox` key at all.
+        assert!(d["routes"][1].get("outbox").is_none());
+        // Misspelled outbox columns are reported as unseen fields, on inserts only.
+        let q = plan_with(vec![outbox_route(OutboxSpec {
+            aggregate_id: "aggregate_id".into(),
+            ..outbox_spec()
+        })]);
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            q.render(&row("outbox", Op::Insert, OUTBOX_ROW), NOW)
+                .unwrap();
+            q.render(&row("outbox", Op::Delete, "{}"), NOW).unwrap();
+        }
+        assert_eq!(
+            q.stats().snapshot()[0].unseen_fields,
+            vec!["after.aggregate_id"]
+        );
+    }
+
+    // --- fields: include/exclude, mask, hash, rename (R6) ---------------------------------------
+
+    const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn hash_key() -> HashKey {
+        HashKey::new(SECRET, "k1").unwrap()
+    }
+
+    /// The expected digest of `text`, computed with ring directly.
+    fn hmac_hex(text: &str) -> String {
+        let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, SECRET);
+        ring::hmac::sign(&k, text.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn with_fields(name: &str, p: &str, f: FieldSpec) -> KafkaRoute {
+        KafkaRoute {
+            fields: f,
+            ..named(name, p, &format!("{name}.topic"))
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn fields_plan(routes: Vec<KafkaRoute>) -> RoutePlan {
+        let mut p = RoutePlan::build(
+            routes,
+            Some("rest".into()),
+            Some(DLQ.into()),
+            Some(hash_key()),
+        )
+        .unwrap();
+        p.set_source(pg());
+        p
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn field_ops_rewrite_before_and_after_but_not_source() {
+        let p = fields_plan(vec![with_fields(
+            "people",
+            "public.people",
+            FieldSpec {
+                exclude: Some(strs(&["note"])),
+                mask: strs(&["card", "age"]),
+                hash: strs(&["email"]),
+                rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                ..Default::default()
+            },
+        )]);
+        let mut e = event("public", "people", Op::Update, None, Position::Lsn(7));
+        e.before =
+            raw(r#"{"id":1,"email":"old@x.y","card":"4111","age":40,"note":"n","cust_id":3}"#);
+        e.after = raw(r#"{"id":1,"email":"new@x.y","card":null,"age":41,"note":"n","cust_id":3}"#);
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, "people.topic");
+        let v = json(&r.value);
+        assert_eq!(
+            v["before"],
+            serde_json::json!({"id": 1, "email": hmac_hex("old@x.y"), "card": "***", "age": null, "customer_id": 3})
+        );
+        assert_eq!(
+            v["after"],
+            serde_json::json!({"id": 1, "email": hmac_hex("new@x.y"), "card": null, "age": null, "customer_id": 3})
+        );
+        // `source`, `op` and the times are the envelope's, untouched.
+        let plain = json(&encode(&e, &pg(), NOW).unwrap());
+        for k in ["source", "op", "ts_ms", "ts_us"] {
+            assert_eq!(v[k], plain[k], "{k}");
+        }
+        assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
+        assert!(!r.value.contains("old@x.y") && !r.value.contains("4111"));
+    }
+
+    #[test]
+    fn the_key_object_gets_the_same_field_ops_and_decides_the_partition() {
+        let route = |f: FieldSpec| with_fields("t", "public.t", f);
+        let e = |email: &str| {
+            let mut e = event("public", "t", Op::Insert, None, Position::Lsn(1));
+            e.after = raw(&format!(r#"{{"email":"{email}","id":1,"n":2}}"#));
+            e.key = Some(format!(r#"{{"email":"{email}","id":1}}"#));
+            e
+        };
+        let k = |key: &str| format!(r#"{{"db":"app","schema":"public","table":"t","key":{key}}}"#);
+        let cases: Vec<(FieldSpec, String)> = vec![
+            (
+                FieldSpec {
+                    hash: strs(&["email"]),
+                    ..Default::default()
+                },
+                k(&format!(r#"{{"email":"{}","id":1}}"#, hmac_hex("a@b.c"))),
+            ),
+            (
+                FieldSpec {
+                    mask: strs(&["email"]),
+                    rename: [("id".to_string(), "user_id".to_string())].into(),
+                    ..Default::default()
+                },
+                k(r#"{"email":"***","user_id":1}"#),
+            ),
+            (
+                FieldSpec {
+                    exclude: Some(strs(&["email"])),
+                    ..Default::default()
+                },
+                k(r#"{"id":1}"#),
+            ),
+            // Every key column removed: `"key": null`, so the table's partition.
+            (
+                FieldSpec {
+                    include: Some(strs(&["n"])),
+                    ..Default::default()
+                },
+                k("null"),
+            ),
+        ];
+        for (spec, want) in cases {
+            for by in [PartitionBy::Key, PartitionBy::Table] {
+                let mut p = fields_plan(vec![route(spec.clone())]);
+                p.set_partition_by(by);
+                let r = p.render(&e("a@b.c"), NOW).unwrap().remove(0);
+                assert_eq!(r.key, want, "{spec:?}");
+                assert!(!r.key.contains("a@b.c"), "{}", r.key);
+                let part = match by {
+                    PartitionBy::Key => want.clone(),
+                    PartitionBy::Table => "public.t".to_string(),
+                };
+                assert_eq!(r.partition_key, part, "{spec:?} {by:?}");
+            }
+        }
+        // A hashed key column keeps rows apart and the same row together: per-row order holds.
+        let p = fields_plan(vec![route(FieldSpec {
+            hash: strs(&["email"]),
+            ..Default::default()
+        })]);
+        let pk = |email: &str| p.render(&e(email), NOW).unwrap().remove(0).partition_key;
+        assert_eq!(pk("a@b.c"), pk("a@b.c"));
+        assert_ne!(pk("a@b.c"), pk("x@y.z"));
+        // A MongoDB `_id` object is hashed from its compact JSON, in the key as in the value.
+        let mut p = fields_plan(vec![with_fields(
+            "m",
+            "shop.users",
+            FieldSpec {
+                hash: strs(&["_id"]),
+                ..Default::default()
+            },
+        )]);
+        p.set_source(SourceInfo::Mongodb);
+        let mut m = event(
+            "shop",
+            "users",
+            Op::Insert,
+            None,
+            Position::Text("t".into()),
+        );
+        m.after = raw(r#"{"_id":{"$oid":"6530"},"n":1}"#);
+        m.key = Some(r#"{"_id": {"$oid": "6530"}}"#.into());
+        let r = p.render(&m, NOW).unwrap().remove(0);
+        let digest = hmac_hex(r#"{"$oid":"6530"}"#);
+        assert_eq!(json(&r.key)["key"]["_id"], digest.as_str());
+        assert_eq!(json(&r.value)["after"]["_id"], digest.as_str());
+    }
+
+    #[test]
+    fn dead_letter_values_have_the_field_ops_applied() {
+        let p = fields_plan(vec![KafkaRoute {
+            filter: Some("row.amount > 10".into()),
+            fields: FieldSpec {
+                mask: strs(&["card"]),
+                hash: strs(&["email"]),
+                exclude: Some(strs(&["note"])),
+                ..Default::default()
+            },
+            ..named("o", "public.orders", "orders")
+        }]);
+        let e = row(
+            "orders",
+            Op::Insert,
+            r#"{"amount":"abc","card":"4111","email":"a@b.c","note":"secret"}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            json(&r.value)["after"],
+            serde_json::json!({"amount": "abc", "card": "***", "email": hmac_hex("a@b.c")})
+        );
+        assert!(!r.value.contains("4111") && !r.value.contains("secret"));
+        assert_eq!(r.headers[0].0, "aqueduct-error");
+        assert_eq!(r.headers[1], (HASH_KEY_ID_HEADER, "k1".to_string()));
+        assert_eq!(json(&r.key)["key"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_unhashable_string_goes_to_the_dead_letter_topic_without_the_row() {
+        let p = fields_plan(vec![with_fields(
+            "h",
+            "public.users",
+            FieldSpec {
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+        )]);
+        let e = row(
+            "users",
+            Op::Insert,
+            r#"{"email":"\ud800secret","card":"4111"}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            r.headers[0],
+            (
+                "aqueduct-error",
+                "route `h`: hash `email`: the value is a string that is not valid Unicode"
+                    .to_string()
+            )
+        );
+        let v = json(&r.value);
+        assert_eq!(v["after"], serde_json::Value::Null);
+        assert!(!r.value.contains("secret") && !r.value.contains("4111"));
+    }
+
+    #[test]
+    fn a_rename_collision_goes_to_the_dead_letter_topic_with_original_names() {
+        let p = fields_plan(vec![with_fields(
+            "r",
+            "public.users",
+            FieldSpec {
+                mask: strs(&["card"]),
+                rename: [("cust".to_string(), "customer".to_string())].into(),
+                ..Default::default()
+            },
+        )]);
+        let ok = row("users", Op::Insert, r#"{"cust":1,"card":"4111"}"#);
+        assert_eq!(
+            json(&p.render(&ok, NOW).unwrap()[0].value)["after"],
+            serde_json::json!({"customer": 1, "card": "***"})
+        );
+        let clash = row(
+            "users",
+            Op::Insert,
+            r#"{"cust":1,"customer":2,"card":"4111"}"#,
+        );
+        let r = p.render(&clash, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            r.headers,
+            vec![(
+                "aqueduct-error",
+                "route `r`: rename `cust` to `customer`: the row already has a column `customer`"
+                    .to_string()
+            )]
+        );
+        // Masked even though the rename could not apply.
+        assert_eq!(
+            json(&r.value)["after"],
+            serde_json::json!({"cust": 1, "customer": 2, "card": "***"})
+        );
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.errors), (2, 1, 1));
+    }
+
+    #[test]
+    fn field_ops_are_validated_at_startup() {
+        let build = |f: FieldSpec, dlq: Option<&str>, key: Option<HashKey>| {
+            RoutePlan::build(
+                vec![with_fields("r", "public.*", f)],
+                None,
+                dlq.map(Into::into),
+                key,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let hash = FieldSpec {
+            hash: strs(&["email"]),
+            ..Default::default()
+        };
+        let e = build(hash.clone(), None, None).unwrap_err();
+        assert!(
+            e.contains("sink route `r` uses `hash`") && e.contains("AQUEDUCT_HASH_KEY"),
+            "{e}"
+        );
+        assert!(build(hash, None, Some(hash_key())).is_ok());
+        let rename = FieldSpec {
+            rename: [("a".to_string(), "b".to_string())].into(),
+            ..Default::default()
+        };
+        let e = build(rename.clone(), None, None).unwrap_err();
+        assert!(e.contains("`rename` without `include`") && e.contains("dead_letter_topic"));
+        assert!(build(rename, Some(DLQ), None).is_ok());
+        // With `include`, collisions are ruled out at startup, so no dead-letter topic is needed.
+        let included = FieldSpec {
+            include: Some(strs(&["a"])),
+            rename: [("a".to_string(), "b".to_string())].into(),
+            ..Default::default()
+        };
+        assert!(build(included, None, None).is_ok());
+        // Spec errors name the route.
+        let both = FieldSpec {
+            include: Some(strs(&["a"])),
+            exclude: Some(strs(&["b"])),
+            ..Default::default()
+        };
+        let e = build(both, None, None).unwrap_err();
+        assert!(e.contains("sink route `r`: `include` and `exclude`"), "{e}");
+        let dotted = FieldSpec {
+            mask: strs(&["address.city"]),
+            ..Default::default()
+        };
+        assert!(build(dotted, None, None).unwrap_err().contains("dotted"));
+    }
+
+    #[test]
+    fn unseen_field_op_columns_are_reported_without_a_where() {
+        let p = fields_plan(vec![with_fields(
+            "u",
+            "public.users",
+            FieldSpec {
+                mask: strs(&["card_last_4"]),
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+        )]);
+        let ev = row(
+            "users",
+            Op::Insert,
+            r#"{"email":"a@b.c","card_last4":"1234"}"#,
+        );
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            p.render(&ev, NOW).unwrap();
+        }
+        assert_eq!(
+            p.stats().snapshot()[0].unseen_fields,
+            vec!["row.card_last_4"]
+        );
+    }
+
+    #[test]
+    fn describe_lists_field_ops_and_the_key_id_but_never_the_key() {
+        let p = fields_plan(vec![
+            with_fields(
+                "u",
+                "public.users",
+                FieldSpec {
+                    exclude: Some(strs(&["note"])),
+                    mask: strs(&["card"]),
+                    hash: strs(&["email"]),
+                    rename: [("cust".to_string(), "customer".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+            with_fields(
+                "i",
+                "public.items",
+                FieldSpec {
+                    include: Some(strs(&["id"])),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let v = serde_json::to_value(p.describe()).unwrap();
+        assert_eq!(v["hash_key_id"], "k1");
+        let u = &v["routes"][0];
+        assert_eq!(u["exclude"], serde_json::json!(["note"]));
+        assert_eq!(u["mask"], serde_json::json!(["card"]));
+        assert_eq!(u["hash"], serde_json::json!(["email"]));
+        assert_eq!(u["rename"], serde_json::json!({"cust": "customer"}));
+        assert!(u.get("include").is_none());
+        assert_eq!(v["routes"][1]["include"], serde_json::json!(["id"]));
+        assert!(v["routes"][1].get("hash").is_none());
+        let text = v.to_string();
+        assert!(!text.contains("0123456789abcdef"), "{text}");
+        assert!(!format!("{p:?}").contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn a_route_key_may_not_name_a_protected_column() {
+        let build = |key: &[&str], f: FieldSpec| {
+            RoutePlan::build(
+                vec![KafkaRoute {
+                    key: Some(strs(key)),
+                    fields: f,
+                    ..named("r", "public.users", "users")
+                }],
+                None,
+                Some(DLQ.into()),
+                Some(hash_key()),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let cases: Vec<(FieldSpec, &str)> = vec![
+            (
+                FieldSpec {
+                    hash: strs(&["email"]),
+                    ..Default::default()
+                },
+                "hashed",
+            ),
+            (
+                FieldSpec {
+                    mask: strs(&["email"]),
+                    ..Default::default()
+                },
+                "masked",
+            ),
+            (
+                FieldSpec {
+                    exclude: Some(strs(&["email"])),
+                    ..Default::default()
+                },
+                "excluded",
+            ),
+            (
+                FieldSpec {
+                    include: Some(strs(&["id"])),
+                    ..Default::default()
+                },
+                "not included",
+            ),
+        ];
+        for (f, how) in cases {
+            let e = build(&["id", "email"], f.clone()).unwrap_err();
+            assert!(
+                e.contains(&format!("sink route `r`: `key` column `email` is {how}")),
+                "{e}"
+            );
+            // Keying by an unprotected column is fine.
+            assert_eq!(build(&["id"], f), Ok(()));
+        }
+        // A renamed column may key the route: it is not protected.
+        let renamed = FieldSpec {
+            rename: [("id".to_string(), "user_id".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(build(&["id"], renamed), Ok(()));
+    }
+
+    #[test]
+    fn a_route_key_is_kept_and_the_value_rewritten() {
+        let p = fields_plan(vec![KafkaRoute {
+            key: Some(strs(&["id"])),
+            fields: FieldSpec {
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+            ..named("r", "public.users", "users")
+        }]);
+        let mut e = row("users", Op::Insert, r#"{"id":5,"email":"a@b.c"}"#);
+        e.key = Some(r#"{"email":"a@b.c"}"#.into());
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"app","schema":"public","table":"users","key":{"id":5}}"#
+        );
+        assert_eq!(r.partition_key, r.key);
+        assert_eq!(json(&r.value)["after"]["email"], hmac_hex("a@b.c").as_str());
+        assert!(!r.key.contains("a@b.c"));
+    }
+
+    #[test]
+    fn a_content_routed_topic_may_not_read_a_protected_column() {
+        let build = |topic: &str, values: Option<&[&str]>, f: FieldSpec| {
+            RoutePlan::build(
+                vec![KafkaRoute {
+                    fields: f,
+                    ..content("r", topic, Some("orders.unknown"), values)
+                }],
+                None,
+                Some(DLQ.into()),
+                Some(hash_key()),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let spec = |how: &str| match how {
+            "hashed" => FieldSpec {
+                hash: strs(&["region"]),
+                ..Default::default()
+            },
+            "masked" => FieldSpec {
+                mask: strs(&["region"]),
+                ..Default::default()
+            },
+            "excluded" => FieldSpec {
+                exclude: Some(strs(&["region"])),
+                ..Default::default()
+            },
+            _ => FieldSpec {
+                include: Some(strs(&["id"])),
+                ..Default::default()
+            },
+        };
+        for how in ["hashed", "masked", "excluded", "not included"] {
+            // Any row path into the column counts: `row.`, `after.`, `before.`, nested too.
+            for path in ["row.region", "after.region", "before.region.code"] {
+                let e = build(&format!("orders.{{{path}}}"), None, spec(how)).unwrap_err();
+                assert!(
+                    e.contains(&format!(
+                        "sink route `r`: `topic` reads `{path}`, but column `region` is {how}"
+                    )),
+                    "{e}"
+                );
+            }
+            // With an allow-list the message says `topic_values` would carry it too.
+            let e = build("orders.{row.region}", Some(&["eu", "us"]), spec(how)).unwrap_err();
+            assert!(e.contains("the topic name (and `topic_values`)"), "{e}");
+            // Routing by an unprotected column is fine.
+            let ok = build("orders.{row.tenant}", None, spec(how));
+            assert_eq!(ok.is_ok(), how != "not included", "{ok:?}");
+        }
+        // `not included` also covers the tenant column in that last case.
+        let e = build("orders.{row.tenant}", None, spec("not included")).unwrap_err();
+        assert!(e.contains("column `tenant` is not included"), "{e}");
+        // A renamed column may route: the template reads the original row.
+        let renamed = FieldSpec {
+            rename: [("region".to_string(), "area".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(build("orders.{row.region}", None, renamed), Ok(()));
+    }
+
+    #[test]
+    fn fallback_records_carry_the_rewritten_value_key_and_key_id() {
+        let mut p = RoutePlan::build(
+            vec![KafkaRoute {
+                fields: FieldSpec {
+                    hash: strs(&["email"]),
+                    mask: strs(&["card"]),
+                    ..Default::default()
+                },
+                ..content("o", "orders.{row.region}", Some("orders.unknown"), None)
+            }],
+            None,
+            None,
+            Some(hash_key()),
+        )
+        .unwrap();
+        p.set_source(pg());
+        let ev = |region: &str| {
+            let mut e = row(
+                "orders",
+                Op::Insert,
+                &format!(r#"{{"email":"a@b.c","card":"4111","region":{region}}}"#),
+            );
+            e.key = Some(r#"{"email":"a@b.c"}"#.into());
+            e
+        };
+        let check = |r: &OutRecord, topic: &str| {
+            assert_eq!(r.topic, topic);
+            let v = json(&r.value);
+            assert_eq!(v["after"]["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(v["after"]["card"], "***");
+            assert_eq!(json(&r.key)["key"]["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(r.partition_key, r.key);
+            assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
+            assert!(!r.value.contains("a@b.c") && !r.key.contains("a@b.c"));
+            assert!(!r.value.contains("4111"));
+        };
+        // Normal content-routed record.
+        let normal = p.render(&ev(r#""eu""#), NOW).unwrap().remove(0);
+        check(&normal, "orders.eu");
+        // Render-time fallback: a null routing value.
+        let fallback = p.render(&ev("null"), NOW).unwrap().remove(0);
+        check(&fallback, "orders.unknown");
+        // The sink's refusal re-route changes only the topic.
+        let mut refused = p.render(&ev(r#""us""#), NOW).unwrap().remove(0);
+        p.topic_refused(&mut refused, "TopicAuthorizationFailed");
+        check(&refused, "orders.unknown");
+        // Apart from the topic, all three records are the same.
+        for r in [&fallback, &refused] {
+            assert_eq!(
+                (&r.key, &r.headers, r.op),
+                (&normal.key, &normal.headers, normal.op)
+            );
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.fallback), (3, 1, 2));
+    }
+
     // --- golden: byte-identical to the router and record builders this plan replaced ----------
 
     const NOW: i64 = 1_792_502_627_093_140;
@@ -3043,5 +4829,73 @@ mod tests {
         }
         let new = t.elapsed();
         println!("legacy {legacy:?}, plan {new:?} for {n} events (sink {sink})");
+
+        // Field operations, one class at a time, on a 10-column row with a 2-column key.
+        let mut e = event("public", "users", Op::Update, None, Position::Lsn(42));
+        let row = r#"{"id":7,"tenant":3,"email":"ada@example.com","name":"Ada Lovelace","card":"4111111111111111","phone":"+32 470 00 00 00","note":"likes \"engines\"","cust_id":99,"active":true,"created_at":1792502627093140}"#;
+        e.before = raw(row);
+        e.after = raw(row);
+        e.key = Some(r#"{"id":7,"tenant":3}"#.into());
+        let s = strs;
+        let classes: Vec<(&str, FieldSpec)> = vec![
+            ("none", FieldSpec::default()),
+            (
+                "include",
+                FieldSpec {
+                    include: Some(s(&["id", "tenant", "name", "active"])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "exclude",
+                FieldSpec {
+                    exclude: Some(s(&["note", "phone"])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mask",
+                FieldSpec {
+                    mask: s(&["card", "phone"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "hash",
+                FieldSpec {
+                    hash: s(&["email", "phone"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rename",
+                FieldSpec {
+                    rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "all",
+                FieldSpec {
+                    exclude: Some(s(&["note"])),
+                    mask: s(&["card"]),
+                    hash: s(&["email", "phone"]),
+                    rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let n = 500_000;
+        for (class, spec) in classes {
+            let plan = fields_plan(vec![with_fields("u", "public.users", spec)]);
+            let t = Instant::now();
+            for _ in 0..n {
+                out.clear();
+                plan.render_into(&e, NOW, &mut out).unwrap();
+                sink += out[0].value.len();
+            }
+            let per = t.elapsed().as_nanos() / n as u128;
+            println!("fields {class:>8}: {per} ns/event (sink {sink})");
+        }
     }
 }

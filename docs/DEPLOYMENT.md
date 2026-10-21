@@ -99,7 +99,7 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 ## 3. Configuration reference
 
 Configuration is one TOML file, read from `/etc/aqueduct/aqueduct.toml` or the path in `AQUEDUCT_CONFIG`.
-Environment overrides: `AQUEDUCT_PG_URL`, `AQUEDUCT_ADMIN_TOKEN`. See `config/aqueduct.example.toml`.
+Environment overrides: `AQUEDUCT_PG_URL`, `AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`. See `config/aqueduct.example.toml`.
 
 ```toml
 health_addr = "0.0.0.0:8080"
@@ -136,6 +136,8 @@ topic = "cdc.{schema}.{table}"
 | `publication` | `aqueduct` | Existing publication to stream |
 | `ssl_mode` | from URL, else `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. Weaker modes must be set explicitly; `verify-full` is the default and the production setting |
 | `ssl_root_cert` | unset | PEM CA bundle to verify the server against (also accepted as `sslrootcert=` in the URL). Unset means the bundled public roots |
+| `auth` | `password` | `password` uses the password in `url`. `azure-workload-identity` (AKS) or `azure-container-apps` signs in with a Microsoft Entra token from the pod's or app's managed identity instead; see [Azure managed identity](#azure-managed-identity) |
+| `azure_client_id` | unset | With an `azure-*` `auth`: the managed identity's client ID. Overrides `AZURE_CLIENT_ID` on AKS; on Container Apps it picks a user-assigned identity (unset: the system-assigned one) |
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](#idle-heartbeat) |
 | `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
@@ -152,6 +154,8 @@ certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-
 checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) whether the session is really
 encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning); an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
+With an `azure-*` `auth` only `verify-full` is accepted: startup refuses every other `ssl_mode`, also `verify-ca`
+and `require` with `ssl_root_cert`.
 
 ### `[source]` (alternative sources)
 
@@ -242,8 +246,10 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, and outbox rows without an `aggregate_id` or `payload`. Required as soon as a route uses `where`, `outbox`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
+| `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -341,7 +347,7 @@ topic = "orders-paid"
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where`, `key` or a topic template, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and field path in `where`, `key`, a topic template, a field operation or `outbox`, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
@@ -445,6 +451,177 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   set `topic_values` so you know the set.
 - The event inspector reads the content-routed topics (the template as a glob) and the fallback.
 
+#### Protecting fields per route
+
+A route can remove, mask, hash and rename top-level columns before its records leave Aqueduct:
+
+```toml
+[sink]
+hash_key_file = "/run/secrets/aqueduct-hash-key"   # or AQUEDUCT_HASH_KEY; never in this file
+hash_key_id = "2026-10"                            # required with a key
+dead_letter_topic = "aqueduct.dead-letter"         # required for `rename` without `include`
+
+[[sink.routes]]
+match = "public.customers"
+topic = "customers"
+exclude = ["internal_note"]
+mask = ["card_last4"]                    # "4242" -> "***"
+hash = ["email"]                         # HMAC-SHA256, lowercase hex
+rename = { cust_id = "customer_id" }
+```
+
+- **Where they apply.** `before` and `after` of every record the route produces, and of its dead-letter records.
+  `source` and the headers are never rewritten. They run after `ops`, `where`, `key` and `topic`, which read the
+  original row.
+- **`include`** keeps only the listed columns, **`exclude`** drops the listed ones; not both on one route. A listed
+  column a row does not have is simply absent.
+- **`mask`**: a string becomes `"***"`. Any other non-null value (number, bool, object, array) becomes `null`, so a
+  column keeps its JSON type or goes null, and a number never turns into a string. `null` stays `null`. Since #138
+  `timestamp` and `date` columns are numbers, so they mask to `null`; `timestamptz`, `numeric` and `uuid` are strings
+  and mask to `"***"`.
+- **`hash`**: HMAC-SHA256 with the hash key, as 64 lowercase hex characters (a JSON string). The input is the value's
+  canonical text: the content of a string (unescaped), a number or bool exactly as the source wrote it (`42`,
+  `true`), or the compact JSON of an object or array (whitespace removed, key order kept; a MongoDB `ObjectId` is
+  `{"$oid":"..."}`). `null` stays `null`. So the same value hashes to the same digest in every table, topic and
+  source, and consumers can join on it: a Postgres `int4 42`, a MongoDB `Int32`/`Int64` `42` and the string `"42"`
+  all give one digest. **A MongoDB double is written `42.0` and hashes differently from the integer `42`**, so
+  hash identifiers stored as integers or strings in MongoDB, not as doubles. Edge cases of the canonical text:
+  - Only the top-level string is unescaped. Inside an object or array, escapes stay as the source wrote them, so
+    `{"n":"\u00e9"}` and `{"n":"é"}` hash differently (each source writes its own values consistently).
+  - Numbers are not normalised: `-0` and `0`, `1e2` and `100`, `42.0` and `42` all differ.
+  - The text carries no type: `true` and the string `"true"` give the same digest, as do the object `{"a":1}` and
+    the string `"{\"a\":1}"`, and the number `42` and the string `"42"`.
+  - A string that is not valid Unicode (a lone surrogate escape such as `"\ud800"`) cannot be hashed: the event goes
+    to `dead_letter_topic` with `before` and `after` set to `null`, and the header names the column.
+- **`rename`** maps old column names to new ones. A target may not be another renamed column, another target, or a
+  column listed in `include`. The other operations name the **original** columns: a target listed in `mask`, `hash`
+  or `exclude` fails startup (`rename = { email = "x" }` with `hash = ["x"]` would hash nothing and pass the email
+  through as `x`), so list the source column (`hash = ["email"]`) instead. Without `include` the columns are only known when rows arrive, so a row that already
+  has a column named like a target goes to `dead_letter_topic` (value: the operations applied without the renames;
+  header `aqueduct-error`: ``route `customers`: rename `cust_id` to `customer_id`: the row already has a column
+  `customer_id` ``), which is then required. With `include`, collisions are ruled out at startup.
+- **Names** are top-level columns only and **case-sensitive**: `Email` does not match a column `email`, which matters
+  for MongoDB, where field names are not folded. A misspelt or wrongly cased name is reported as an unseen field
+  (below). A dotted path (`address.city`) fails startup: nested MongoDB fields cannot be
+  addressed, but a whole nested value can be dropped, masked, hashed or renamed through its top-level column. Other
+  startup errors: `include` together with a non-empty `exclude` (an empty `exclude` is no exclusion), an empty `include`, a column both masked and hashed, a column
+  masked, hashed or renamed that `exclude` drops or `include` leaves out.
+- **The record key.** Without `key = [...]`, the record key's `"key"` object holds the primary-key columns, so the
+  route's operations are applied to it too: excluded or not-included columns are removed (an object left empty
+  becomes `"key": null`), masked ones masked, hashed ones hashed with the same key as the value, renamed ones
+  renamed. Under `partition_by = "key"` the partition is hashed from that rewritten key, so a hashed primary key
+  still keeps each row on one partition. If every key column is removed, the table's rows share one partition.
+  With `key = [...]`, a key column may not be excluded, masked, hashed or left out of `include` (startup error), so
+  no protected value reaches the key; a renamed column may key the route and keeps its original name there.
+- **The topic.** A content-routed `topic` (see [Routing by row content](#routing-by-row-content)) reads the original
+  row, so it may not read a column the route excludes, masks, hashes or leaves out of `include` (any path into it:
+  `row.region`, `after.region`, `row.address.city` for `address`); that fails startup. `topic_values` limits those
+  same fields, and `topic_fallback` is a fixed name, so they are covered too. A record sent to the fallback, at render
+  time or after the broker refused to create a topic, has the same rewritten value and key and the same
+  `aqueduct-hash-key-id` header as any other.
+- **Hash key.** Read from the `AQUEDUCT_HASH_KEY` environment variable or the file `sink.hash_key_file`, never from
+  the TOML. One trailing newline (`\n` or `\r\n`) is ignored in both, so the same secret gives the same digests from
+  either: a `hash_key` key in the config fails startup. Setting both also fails.
+  The key must be at least 32 bytes (`openssl rand -hex 32` gives 64); it is required as soon as a route uses `hash`,
+  redacted from debug output and never logged. **`hash_key_id`** (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with
+  a key, fails startup without one, and is sent as the header `aqueduct-hash-key-id` on every record of a route that hashes, dead-letter records
+  included. It is shown in `/api/routes`; the key never is.
+- **Rotating the key.** A new key changes every digest. Generate a new key, give it a new `hash_key_id`, and restart.
+  Consumers join or deduplicate per `aqueduct-hash-key-id`: digests under different ids are not comparable. Records
+  replayed after a restart (at-least-once) are hashed with the key in use when they are produced.
+- **Unseen fields.** Every column the operations name is watched like the paths of `where` and `key` (as
+  `row.<column>`), on routes with or without `where`, so a misspelled `mask = ["card_last_4"]` shows up as an unseen
+  field instead of silently letting `card_last4` through.
+- **Cost.** A route without field operations takes the unchanged path. With them, each row is rewritten in one pass
+  over its top-level columns; hashing costs one HMAC per hashed non-null value.
+
+#### Outbox
+
+`outbox` on a route publishes the rows of an outbox table as their own events, much like Debezium's outbox event
+router, with the differences listed under "Differences from Debezium" below. The application writes an event into the outbox table in the same transaction as its business change. Aqueduct turns
+each **insert** into one Kafka record whose key is the aggregate id and whose value is the payload:
+
+```toml
+[sink]
+dead_letter_topic = "aqueduct.dead-letter"   # required once any route uses `outbox`
+
+[[sink.routes]]
+match = "public.outbox"
+outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", payload = "payload", topic = "outbox.{aggregate_type}", id = "id", type = "type" }
+topic_fallback = "outbox.unknown"            # required: the topic reads a row value
+topic_values = ["order", "customer"]         # optional allow-list, as for any content-routed topic
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `aggregate_type` | `aggregatetype` | Column that `{aggregate_type}` in `topic` reads |
+| `aggregate_id` | `aggregateid` | Column whose value is the record key |
+| `payload` | `payload` | Column whose value is the record value |
+| `topic` | `outbox.event.{aggregate_type}` | Topic template over the outbox columns |
+| `id` | unset | Column sent as the `id` header |
+| `type` | unset | Column sent as the `type` header |
+
+The defaults are Debezium's column names and topic, so `outbox = {}` reads a Debezium-style outbox table. The `id`
+and `type` headers are opt-in: set `id` and `type` to the columns. Unknown keys inside `outbox` fail startup, so a
+misspelled key never falls back to a default column.
+
+- **Inserts, and snapshot rows only on request.** Updates, deletes and truncates of the outbox table never produce a
+  record (even if `ops` lists them) and count as `filtered`, so deleting outbox rows once written is safe. Snapshot
+  rows (`read`) are filtered unless the route's `ops` lists `"read"`, for example `ops = ["insert", "read"]`; they are
+  then published like inserts, with the `op` header `r`. Enable `read` to publish rows that were already in the
+  outbox table before Aqueduct streamed it (a first deployment with `snapshot = "initial"`). The trade-off: every
+  snapshot of the table publishes every row still in it, including rows already published when they were inserted,
+  so consumers see those events twice. Delete outbox rows once written, or snapshot the table only once, to keep
+  that small. `where` still applies if you set it.
+- **Startup refusals.** An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.<column>`
+  (inserts and snapshot rows have no before-image, so it could never be true), fail startup naming the route.
+- **Key: the raw `aggregate_id` value**, not the JSON record key other routes use. A string is sent as its content
+  (unescaped UTF-8: `A-1`, not `"A-1"`), a number or boolean as its JSON text (`42`), an object (a MongoDB `ObjectId`)
+  as its JSON (`{"$oid":"..."}`). The partition is the FNV-1a hash of that key, whatever `partition_by` says, so the
+  events of one aggregate stay in order on one partition. Consumers of an outbox expect this key; code that parses
+  the JSON keys of other topics cannot read outbox topics unchanged.
+- **Value: the `payload` value, passed through.** A `json` or `jsonb` payload is its JSON text as stored. A text
+  payload is sent as its content, not as a JSON string literal: `say "hi"`, not `"say \"hi\""`. The value is not the
+  change-event envelope: it has no `source`, `op` or timestamps. **Use a `jsonb` object or array, or `text`, as the
+  payload**; the other cases differ from Debezium (below).
+- **Headers:** `op` (`c`, or `r` for a snapshot row) and `lsn`, as on every record, plus `id` and `type` from the configured columns, with the
+  same text rules as the key. A null or missing `id` or `type` leaves that header out. These two headers carry row
+  values; no other header does.
+- **Topic.** The template may use `{aggregate_type}`, `{schema}`, `{table}`, `{after.<column>}` and `{row.<column>}`
+  (both read the inserted row). `{before.<column>}` fails startup, since an insert has no before-image; a syntax
+  error names its byte position in the template as written. A template that
+  reads a row value follows every rule of [Routing by row content](#routing-by-row-content): fixed text first,
+  `topic_fallback` required, one segment per value, `topic_values`, no collision with fixed topics,
+  `max_dynamic_topics`. A null or invalid `aggregate_type` sends the record (same key, value and headers) to the
+  fallback. A fixed `topic` such as `outbox.events` needs no fallback.
+- **Rows that cannot be published go to the dead-letter topic:** a null or missing `aggregate_id` or `payload`, or a
+  string in the key, payload or a header column that is not valid Unicode (a lone `\ud800` escape). The dead-letter
+  record is the full change-event envelope of the row, the payload included (an outbox route has no field
+  operations to apply), keyed by the table only, with an `aqueduct-error` header that names
+  the column, never its value, for example ``route `outbox`: outbox `aggregate_id` column `aggregateid` is missing or
+  null``. It counts under `errors`, and the pipeline goes on.
+- **Exclusive keys.** `outbox` sets the topic, the key and the value, so a route with `outbox` may not also set `topic`,
+  `key` or any field operation (`include`, `exclude`, `mask`, `hash`, `rename`, see
+  [Protecting fields per route](#protecting-fields-per-route)); startup fails naming the route and the keys. Shape the
+  payload in the application instead. Column names must be top-level (no dots).
+- **Unseen fields.** The outbox columns are watched like any other field path, as `after.<column>`: a misspelled
+  column is reported after 1000 inserts that lack it.
+- The cockpit shows an `outbox` badge on the route. The event inspector shows outbox records as raw values with their
+  headers and their topic in place of the table, since they are not envelopes.
+- **Differences from Debezium's outbox event router.** Aqueduct reads the payload from the row's JSON, which does not
+  record the column type, so:
+  - A `jsonb` payload that is a bare JSON string (`'"hello"'::jsonb`) is sent without its quotes (`hello`); Debezium
+    keeps the JSON text (`"hello"`).
+  - A `text` payload that holds JSON text (`{"a":1}`) is sent as that text, so a JSON consumer reads an object;
+    Debezium (with the JSON converter) delivers a JSON string.
+  - A `bytea` payload arrives as Postgres hex text (`\x4869`), not as the raw bytes or base64.
+  - Debezium publishes snapshot rows like inserts and only warns on updates; Aqueduct publishes snapshot rows only
+    when `ops` lists `read` and always drops updates.
+  - The `id` and `type` headers are opt-in.
+
+  Use a `jsonb` object or array as the payload (the same JSON Debezium sends), or `text` (sent as plain text). Avoid
+  `jsonb` scalars and `bytea`.
+
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
 `/api/routes` and Prometheus:
@@ -539,6 +716,10 @@ MongoDB; the rates are `null` for the first 2 s; `eta_secs` is `null` unless the
 left out while unknown. Like the rest of `/api/*` and `/metrics` they need the admin token; none of them carry row
 data. Samples, rates and the window start over when the process restarts.
 
+`/api/events` returns each record's `topic`, `partition`, `offset`, `timestamp_ms`, `key`, `headers` (as text) and
+`event`: the value parsed as JSON, or its text when it is not JSON. A value that is not a change-event envelope (an
+outbox payload) is shown raw, with its op and lsn taken from the headers.
+
 ### Tables · high-water marks
 
 The card shows, per table (or collection) that has delivered events since the process started, how far it has got:
@@ -610,7 +791,11 @@ any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 `GET /api/routes` describes the compiled routing for the cockpit's routing graph: each route in match order, then
 the `sink.topic` fallback as a route named `default` with `"match": null`, with live counts. It never contains row data.
-Later routing options add keys to each route, so readers should ignore keys they do not know.
+Later routing options add keys to each route, so readers should ignore keys they do not know. A route with field
+operations also has `include`, `exclude`, `mask` and `hash` (column lists) and `rename` (the map), each left out when
+unset; with a hash key the top level has `hash_key_id`. The hash key itself is never shown. An outbox route has an
+`outbox` object with its column names and topic template (`aggregate_type`, `aggregate_id`, `payload`, `topic`, and
+`id` and `type` when set); other routes leave the key out.
 
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
@@ -748,6 +933,122 @@ event by event. `poll` stays the default.
   transaction is streamed with a few MiB.
 - **Failures:** a broken connection is a source error, and the restart resumes from the checkpoint (duplicates only).
   If a previous connection still holds the slot, startup retries for up to 15 s.
+
+### Azure managed identity
+
+On Azure Database for PostgreSQL (Flexible Server) Aqueduct can sign in with a managed identity instead of a stored
+password: the server accepts a Microsoft Entra access token as the password, so no static database secret is stored
+anywhere. Aqueduct fetches a token, caches it until 5 minutes before the
+expiry the identity endpoint reports (at most 24 hours), and uses a valid one as the password of **every** connection
+it opens: the SQL session and, with `transport = "stream"`, the replication connection. Each start of the source,
+including a restart after an error, uses a cached or fresh token. A failed token fetch fails that connection like a
+wrong password would (a source error; the restart applies).
+
+```toml
+[postgres]
+# The user is the Postgres role of the managed identity (its name). No password.
+url = "postgres://aqueduct-mi@myserver.postgres.database.azure.com:5432/app"
+auth = "azure-workload-identity"   # or "azure-container-apps"
+# azure_client_id = "00000000-0000-0000-0000-000000000000"
+```
+
+Fail-closed rules, checked at startup:
+
+- The token only travels over TLS with the certificate chain **and hostname** verified: `ssl_mode = "verify-full"`
+  (the default), with the bundled public roots or an explicit `ssl_root_cert`. Every other mode is refused, including
+  `verify-ca` and `require` with `ssl_root_cert`: without the hostname check, anyone holding a certificate from a
+  trusted CA could intercept the bearer token. The `*.postgres.database.azure.com` certificates chain to public roots
+  (DigiCert Global Root G2, Microsoft RSA Root Certificate Authority 2017) that the bundled set should contain, so the
+  default `verify-full` should work without `ssl_root_cert`; this was not verified against a real server. If the
+  handshake reports an unknown issuer, download Azure's root certificates and point `ssl_root_cert` at them.
+- A URL that also carries a password is refused, and so is a URL without a user.
+- A missing platform variable is refused with its name. Tokens, the federated assertion and `IDENTITY_HEADER` are
+  never logged and are redacted from debug output; a token endpoint error shows the HTTP status and the OAuth `error`
+  and `error_description` only.
+- The token endpoint is reached over HTTPS with certificate and hostname checks. Plain `http://` is accepted only for
+  a loopback host (the Container Apps identity endpoint): a name must resolve to loopback addresses only, and
+  Aqueduct connects to those checked addresses.
+
+The server asks for the token as a cleartext password. That is the same rule as for any password: Aqueduct sends it
+only inside TLS, and the replication connection keeps the [ADR 0003 §6](adr/0003-streaming-replication.md) rules
+(cleartext is never sent over plaintext to a remote host).
+
+Nothing in the image changes: the token exchange is a small built-in HTTPS client, so the distroless image needs no
+shell, `az` CLI or extra files.
+
+#### AKS (Workload Identity)
+
+`auth = "azure-workload-identity"`. The workload identity webhook injects `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_FEDERATED_TOKEN_FILE` and `AZURE_AUTHORITY_HOST`. Aqueduct re-reads the federated token file on every fetch
+(the kubelet rotates it) and exchanges it at `{AZURE_AUTHORITY_HOST}{AZURE_TENANT_ID}/oauth2/v2.0/token` for a token
+with scope `https://ossrdbms-aad.database.windows.net/.default`. `azure_client_id` overrides `AZURE_CLIENT_ID`.
+
+1. Enable the OIDC issuer and workload identity on the cluster
+   (`az aks update -g <rg> -n <cluster> --enable-oidc-issuer --enable-workload-identity`).
+2. Create a user-assigned managed identity and a federated credential that trusts the service account:
+
+   ```sh
+   az identity create -g <rg> -n aqueduct-mi
+   az identity federated-credential create -g <rg> --identity-name aqueduct-mi --name aqueduct \
+     --issuer "$(az aks show -g <rg> -n <cluster> --query oidcIssuerProfile.issuerUrl -o tsv)" \
+     --subject system:serviceaccount:<namespace>:aqueduct --audience api://AzureADTokenExchange
+   ```
+
+3. Annotate the service account with the identity's client ID and label the pod:
+
+   ```yaml
+   apiVersion: v1
+   kind: ServiceAccount
+   metadata:
+     name: aqueduct
+     namespace: <namespace>
+     annotations:
+       azure.workload.identity/client-id: "<client ID of aqueduct-mi>"
+   ---
+   # in the Deployment
+   spec:
+     template:
+       metadata:
+         labels:
+           azure.workload.identity/use: "true"
+       spec:
+         serviceAccountName: aqueduct
+   ```
+
+#### Azure Container Apps
+
+`auth = "azure-container-apps"`. Give the app a system-assigned identity (`az containerapp identity assign -g <rg>
+-n <app> --system-assigned`) or a user-assigned one (`--user-assigned <identity resource ID>`, then set
+`azure_client_id` to its client ID). Container Apps sets `IDENTITY_ENDPOINT` and `IDENTITY_HEADER`; Aqueduct calls
+`$IDENTITY_ENDPOINT?api-version=2019-08-01&resource=https://ossrdbms-aad.database.windows.net` (plus `&client_id=`)
+with the `X-IDENTITY-HEADER` header.
+
+#### Postgres side
+
+1. Turn on Microsoft Entra authentication on the server and set an Entra admin.
+2. As the Entra admin (signed in with an Entra token, connected to the `postgres` database), create the role for the
+   identity. The role name is the identity's name: for a user-assigned identity its resource name, for a
+   system-assigned one the name of the app. It is also the user in Aqueduct's `url`.
+
+   ```sql
+   select * from pgaadauth_create_principal('aqueduct-mi', false, false);
+   ```
+
+3. Grant what Aqueduct needs. **`REPLICATION` must be granted to the Entra role itself**, as for a password role.
+   (Granting `REPLICATION` to a role made by `pgaadauth_create_principal` with `ALTER ROLE` has not been checked
+   against Microsoft's documentation or a real server; if it is refused, see Azure's logical replication docs for
+   the supported way to grant it.)
+
+   ```sql
+   ALTER ROLE "aqueduct-mi" WITH REPLICATION;
+   -- in the replicated database:
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO "aqueduct-mi";
+   CREATE PUBLICATION aqueduct FOR TABLE ...;   -- or let its owner create it
+   ```
+
+   The role creates and advances its slot (`REPLICATION`) and reads the published tables (`SELECT`, also needed for
+   snapshots); snapshots on Postgres 14+ also need `EXECUTE` on `pg_logical_emit_message`. Set the server parameter
+   `wal_level = logical` as in [Prepare Postgres](#1-prepare-postgres).
 
 ### Snapshots
 
@@ -890,7 +1191,10 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 | `invalid connection string` | `replication=database` in `postgres.url`; remove it |
 | `publication "x" does not exist` | Create the publication before starting |
 | `logical decoding requires wal_level >= logical` | Set `wal_level = logical` and restart Postgres |
-| `permission denied to use replication slots` | The role needs `REPLICATION` (or superuser) |
+| `permission denied to use replication slots` | The role needs `REPLICATION` (or superuser). With a managed identity: `ALTER ROLE "<identity name>" WITH REPLICATION` |
+| `getting a Microsoft Entra token (...): ... HTTP 400; error: invalid_client` | AKS: often `AADSTS70021`, the federated credential's issuer or subject does not match the cluster's OIDC issuer and `system:serviceaccount:<namespace>:<name>` |
+| `postgres auth = "azure-...": ... is not set` | AKS: the pod lacks the `azure.workload.identity/use: "true"` label or the service account annotation. Container Apps: the app has no managed identity |
+| `password authentication failed` with an `azure-*` `auth` | The URL user is not the identity's role name, or the role was not created with `pgaadauth_create_principal` |
 | `checkpoint error: Permission denied` | State volume not writable by uid 65532; use the provided Dockerfile or `chown 65532` the volume |
 | `cannot update table ... does not have a replica identity` | Set a primary key or `REPLICA IDENTITY FULL` |
 | Kafka: `InvalidTopicException` | A topic name with illegal characters; check route `topic` values and templates |
@@ -898,10 +1202,10 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 
 ## Securing connections (checklist)
 
-1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables.
+1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables. On Azure, a managed identity (`auth`, see [Azure managed identity](#azure-managed-identity)) needs no stored password at all.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
 3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one); never set `admin_insecure_no_auth` in production.
-4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
+4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
 
 ## Always-on simulation
 

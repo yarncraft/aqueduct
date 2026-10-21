@@ -1231,7 +1231,6 @@ Authorization: Bearer {token}
             ),
             ops: filter.map(|_| vec!["insert".to_string()]),
             filter: filter.map(Into::into),
-            key: None,
             ..Default::default()
         };
         let plan = RoutePlan::with_dead_letter(

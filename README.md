@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback)<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope, or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -159,6 +159,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.url` | – | Connection string, plain SQL connection (no `replication=` parameter). Override with `AQUEDUCT_PG_URL` |
 | `postgres.slot` / `postgres.publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
 | `postgres.ssl_mode` / `postgres.ssl_root_cert` | `verify-full` / unset | TLS with certificate and hostname checks by default, so a server without TLS fails startup, even on localhost. For a non-TLS dev Postgres set `ssl_mode = "disable"` explicitly |
+| `postgres.auth` / `postgres.azure_client_id` | `password` / unset | `azure-workload-identity` (AKS) or `azure-container-apps` signs in to Azure Database for PostgreSQL with the managed identity's Microsoft Entra token instead of a password; only with `ssl_mode = "verify-full"`. See DEPLOYMENT.md, "Azure managed identity" |
 | `postgres.transport` | `poll` | `poll` peeks the slot over SQL every 500 ms; `stream` receives changes over a replication connection as they commit (same events and keys). See DEPLOYMENT.md, "Streaming transport" |
 | `postgres.snapshot` | `never` | `initial` copies every published table on a start without a checkpoint, `on_demand` only on request; rows arrive as `"op": "r"`. Postgres 14+, or 12 and 13 with `snapshot_watermark_table`. `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and `snapshot_key_columns` tune it; see DEPLOYMENT.md, "Snapshots" |
 | `postgres.checkpoint_skip_system_check` | `false` | Skip comparing the checkpoint's cluster and timeline with the server's at startup (the database is still compared). Only for servers that refuse `pg_control_system()`; see DEPLOYMENT.md, "Checkpoint origin check" |
@@ -249,6 +250,40 @@ takes an optional `topic_values` allow-list. Values must be one segment (`[A-Za-
 the fallback: a null value, a value that is not allowed, or a value past `max_dynamic_topics` (default 100, counted from
 the broker). See DEPLOYMENT.md, "Routing by row content".
 
+A route can protect personal data: `include` or `exclude` columns, `mask` them (strings become `"***"`, other values
+`null`), `hash` them (HMAC-SHA256 hex, the same digest everywhere so consumers can still join) and `rename` them. The
+operations apply to `before`, `after`, dead-letter records and the primary-key object in the record key. The hash key
+comes only from `AQUEDUCT_HASH_KEY` or `hash_key_file`, and `hash_key_id` is sent as the `aqueduct-hash-key-id`
+header. See DEPLOYMENT.md, "Protecting fields per route".
+
+```toml
+[sink]
+hash_key_file = "/run/secrets/aqueduct-hash-key"  # or AQUEDUCT_HASH_KEY
+hash_key_id = "2026-10"
+
+[[sink.routes]]
+match = "public.customers"
+topic = "customers"
+exclude = ["internal_note"]
+mask = ["card_last4"]
+hash = ["email"]
+```
+
+`outbox = { ... }` on a route publishes an outbox table's inserts as their own events, much like Debezium's outbox
+router: topic from a template such as `outbox.{aggregate_type}`, key = the raw `aggregate_id` value (not the JSON
+table key), value = the `payload` column as is, headers `id` and `type` when configured. Updates and deletes of the
+outbox are dropped, and snapshot rows too unless the route's `ops` lists `read`; a row without an `aggregate_id` or
+`payload` goes to the dead-letter topic. Unlike Debezium, a `jsonb` payload that is a bare string loses its quotes, a
+`text` payload holding JSON reads as JSON, and `bytea` arrives as hex text: use a `jsonb` object or array, or `text`,
+as the payload. See DEPLOYMENT.md, "Outbox".
+
+```toml
+[[sink.routes]]
+match = "public.outbox"
+outbox = { topic = "outbox.{aggregate_type}", id = "id", type = "type" }   # Debezium's column names by default
+topic_fallback = "outbox.unknown"
+```
+
 ### MongoDB source
 
 ```toml
@@ -284,8 +319,8 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
-| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
+| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations, outbox per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
