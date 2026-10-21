@@ -144,7 +144,13 @@ impl Target {
             local: crate::tls::is_local(&cfg),
             application_name,
             options,
-            connect_timeout: cfg.get_connect_timeout().copied(),
+            // Without one in the URL, the same default as the SQL connection: the handshake,
+            // IDENTIFY_SYSTEM and START_REPLICATION must not wait forever on a dead peer.
+            connect_timeout: Some(
+                cfg.get_connect_timeout()
+                    .copied()
+                    .unwrap_or(crate::tls::DEFAULT_CONNECT_TIMEOUT),
+            ),
         })
     }
 }

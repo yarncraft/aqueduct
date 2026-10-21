@@ -134,7 +134,7 @@ topic = "cdc.{schema}.{table}"
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `url` | required | `postgres://user:pass@host:5432/db`. A normal connection: **do not** add `replication=database`. Env: `AQUEDUCT_PG_URL` |
+| `url` | required | `postgres://user:pass@host:5432/db`. A normal connection: **do not** add `replication=database`. Env: `AQUEDUCT_PG_URL`. Unless the URL sets them, connections use `connect_timeout=30` and TCP keepalives `keepalives_idle=30`, `keepalives_interval=10`, `keepalives_retries=3`, so a vanished server (failover, dropped NAT flow) fails the source in about a minute and the container restarts, instead of hanging for the OS default of over 2 h |
 | `slot` | `aqueduct` | Logical slot name, created if missing. Use a distinct name per instance |
 | `publication` | `aqueduct` | Existing publication to stream |
 | `ssl_mode` | from URL, else `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Overrides `sslmode=` in the URL. Weaker modes must be set explicitly; `verify-full` is the default and the production setting |
@@ -155,7 +155,7 @@ topic = "cdc.{schema}.{table}"
 TLS uses rustls (no OpenSSL). Semantics follow libpq: `prefer` and `require` encrypt but do **not** verify the
 certificate (`require` with `ssl_root_cert` set does verify the chain); `verify-ca` checks the chain; `verify-full` also
 checks the hostname. After connecting, Aqueduct asks the server (`pg_stat_ssl`) whether the session is really
-encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning); an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
+encrypted. A plaintext session to a non-loopback host **aborts startup** unless `ssl_mode = "disable"` is set explicitly (then it only logs a warning). A `hostaddr` in the URL is the address actually dialled, so it must be loopback too for the host to count as local, and `prefer` to a non-loopback host dials as `require`, so a server without TLS is refused before any password is sent; an encrypted but unverified session (`prefer`/`require` without a CA) logs a warning.
 Server side you need `ssl = on` with a certificate, and `hostssl` lines in `pg_hba.conf` if you want to forbid plaintext.
 With an `azure-*` `auth` only `verify-full` is accepted: startup refuses every other `ssl_mode`, also `verify-ca`
 and `require` with `ssl_root_cert`.
