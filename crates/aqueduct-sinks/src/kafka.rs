@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::route::{OutRecord, RoutePlan};
+use crate::topic_stats::TopicStats;
 use crate::SourceInfo;
 use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
@@ -251,6 +252,8 @@ pub struct KafkaSink {
     topics: HashMap<String, Vec<Arc<PartitionClient>>>,
     /// Create-topic requests sent, for diagnostics and tests.
     create_attempts: AtomicU64,
+    /// Records acknowledged per topic, shared with the admin server.
+    topic_stats: Arc<TopicStats>,
 }
 
 fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
@@ -280,6 +283,7 @@ impl KafkaSink {
             replication_factor,
             topics: HashMap::new(),
             create_attempts: AtomicU64::new(0),
+            topic_stats: Arc::new(TopicStats::new()),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
         // default like `cdc.{table}` only resolves per event, so it opens on first use).
@@ -332,6 +336,11 @@ impl KafkaSink {
     /// The route plan, e.g. to share its counters and description with the admin server.
     pub fn plan(&self) -> &RoutePlan {
         &self.plan
+    }
+
+    /// Records acknowledged per topic; clone the `Arc` to read them from elsewhere.
+    pub fn topic_stats(&self) -> Arc<TopicStats> {
+        self.topic_stats.clone()
     }
 
     /// Choose how records are partitioned (default: by key).
@@ -484,6 +493,19 @@ fn record(out: OutRecord) -> Record {
     }
 }
 
+/// Awaits `produce` and, once the broker acknowledged it, counts its `n` records for `topic`.
+/// A failed produce counts nothing: its batch is retried and counted then.
+async fn counted(
+    stats: &TopicStats,
+    topic: &str,
+    n: u64,
+    produce: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    produce.await?;
+    stats.acked(topic, n);
+    Ok(())
+}
+
 /// The events that become Kafka records: heartbeats carry no row and produce nothing.
 fn deliverable(events: &[ChangeEvent]) -> impl Iterator<Item = &ChangeEvent> {
     events.iter().filter(|e| e.op != Op::Heartbeat)
@@ -528,14 +550,19 @@ impl Sink for KafkaSink {
                     .push(record(out));
             }
         }
+        let stats = &*self.topic_stats;
         let sends = groups.into_iter().map(|((topic, part), records)| {
             let client = self.topics[&topic][part].clone();
             async move {
-                client
-                    .produce(records, Compression::NoCompression)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
+                let n = records.len() as u64;
+                let produce = async {
+                    client
+                        .produce(records, Compression::NoCompression)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
+                };
+                counted(stats, &topic, n, produce).await
             }
         });
         futures::future::try_join_all(sends).await?;
@@ -635,6 +662,24 @@ mod tests {
             assert_eq!(p, partition_index(k, 6));
         }
         assert_eq!(partition_index("anything", 1), 0);
+    }
+
+    #[tokio::test]
+    async fn only_acknowledged_produces_count_per_topic() {
+        let stats = TopicStats::new();
+        counted(&stats, "t", 3, async { Ok(()) }).await.unwrap();
+        let failed = counted(&stats, "t", 5, async {
+            Err(Error::Sink("kafka produce to t: broker down".into()))
+        })
+        .await;
+        assert!(failed.is_err());
+        counted(&stats, "u", 0, async { Ok(()) }).await.unwrap();
+        let failed_new = counted(&stats, "v", 2, async { Err(Error::Sink("x".into())) }).await;
+        assert!(failed_new.is_err());
+        assert_eq!(
+            stats.snapshot().into_iter().collect::<Vec<_>>(),
+            vec![("t".to_string(), 3)]
+        );
     }
 
     #[test]

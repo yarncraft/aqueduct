@@ -2,6 +2,7 @@
 mod admin;
 mod checkpoint;
 mod config;
+mod rates;
 mod sink;
 
 use std::sync::Arc;
@@ -81,6 +82,8 @@ async fn main() {
     // The sink's plan: it names each table's topic, and its counters are shared (an `Arc`)
     // with the sink, so the admin server reads what the sink counts.
     admin.set_router(sink.plan().clone());
+    // Records acknowledged per topic, counted by the sink after each produce.
+    admin.set_topic_stats(sink.topic_stats());
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin.clone()));
 
