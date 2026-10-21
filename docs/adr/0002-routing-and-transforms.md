@@ -543,3 +543,37 @@ kept as approved; the code differs as follows:
 - **Outbox.** An outbox route publishes inserts; snapshot `read` events only when the route has a `where` that is
   true for them (`where = "op in ['insert', 'read']"`). Without `where`, inserts only. Updates, deletes and truncates
   are always filtered. The startup check on an `ops` list without `insert` or `read` went with `ops`.
+
+## As built (2026-10-21): a dead-letter topic per route, `<topic>.dlq` by default
+
+Owner's convention: "the convention for dlq (default) is to use the same topic but with .dlq suffix, f.e. sim.assets
+=> sim.assets.dlq" (#177). The text above, and R3, have one `sink.dead_letter_topic` that is required as soon as a
+route can dead-letter a row; the code differs as follows:
+
+- **Every route has one.** Resolution: the route's `dead_letter_topic` (a fixed name), else `sink.dead_letter_topic`
+  (now a global override), else the route's topic plus `.dlq`. A static topic gives `<topic>.dlq`. A
+  `{schema}`/`{table}` template gives the same template plus `.dlq`, rendered per event and created on first use like
+  the topics; `{op}` is dropped with one separator next to it (`cdc.{table}.{op}` gives `cdc.{table}.dlq`), since a
+  per-operation dead-letter topic is of no use. A content-routed or outbox topic gives `<topic_fallback>.dlq`: the row
+  that failed cannot render the template. The `default` route follows the same rules, though nothing it does can fail
+  per row. The "requires `sink.dead_letter_topic`" startup errors (`where` on row data, `outbox`,
+  `unchanged = "dead_letter"`, `rename` without `include`) are gone.
+- **Collision rule, now exact for dead-letter names.** A fixed dead-letter name (an override or a default) is refused
+  when any route's topic or `sink.topic` can render it: row values as content routing allows them (one segment, no
+  dots, `topic_values`), `{op}` one of the operation names, `{schema}`/`{table}` one name without dots. It must also
+  be a valid name, not start with `_` and not be a `topic_fallback`. A `{table}` dead-letter template may not overlap a
+  content-routed glob. The old glob test would have refused a content route's own `orders.unknown.dlq` (`orders.*`
+  matches it), though no row can render it.
+- **`dlq` is a reserved row value.** With several placeholders, `a.{row.x}.{row.y}` could render `a.foo.dlq` for
+  `y = "dlq"`, the dead-letter topic of a static `a.foo`. Such a row goes to `topic_fallback` instead, and
+  `topic_values` may not list `dlq`; so a placeholder never renders the `.dlq` part, and the safest option needs no
+  per-template special case. Topic names are case-sensitive, so only `dlq` itself is reserved. A template with a fixed
+  `.dlq` suffix can still render such names and is refused next to one.
+- **Opening.** The fixed dead-letter topics of routes that can dead-letter a row (the R3/R6/R7/R8 cases) are opened at
+  connect, so a missing or unwritable one fails startup as before. A rendered one is created on first use; a failure
+  fails the batch, so at-least-once is unchanged. A rendered name Kafka would refuse fails the batch too. A default name
+  that breaks a rule fails startup only on a route that can dead-letter a row; on any other route it is left out.
+- **Visibility.** Each route in `/api/routes` has `dead_letter_topic` (the template for a rendered one); the top-level
+  `dead_letter_topic` is the global override. The inspector reads every dead-letter topic or template glob. The
+  cockpit draws one red node per distinct dead-letter topic or template, and a topic's panel names the dead-letter
+  topic of the routes writing to it. Prometheus is unchanged: per-route `errors` already count dead-lettered rows.

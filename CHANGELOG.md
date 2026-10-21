@@ -122,7 +122,7 @@ Notable changes to Aqueduct. Newest first.
   - A MongoDB update whose document was deleted before the lookup keeps its key in the envelope's `after` as before;
     row format drops it instead of publishing the key as the document.
   - `unchanged = "omit" | "dead_letter"`: `dead_letter` sends a row the source sent without unchanged TOAST columns to
-    `sink.dead_letter_topic` (then required). The Postgres decoder now names those columns on the event (not
+    the route's dead-letter topic. The Postgres decoder now names those columns on the event (not
     serialised). TOAST caveat: in row format an update can lack a large column, and a compacted consumer that replaces
     whole rows loses it.
   - Exclusive with `outbox`. `/api/routes` shows `format`, `deletes`, `tombstones` and `unchanged`; the cockpit and
@@ -168,8 +168,8 @@ Notable changes to Aqueduct. Newest first.
   in the table are published again on every snapshot). A `where` on `before.*` fails startup. Differences from Debezium's outbox
   router: a `jsonb` payload that is a bare string loses its quotes, a `text` payload holding JSON reads as JSON, and
   `bytea` arrives as hex text, so use a `jsonb` object or array, or `text`, as the payload. A row
-  without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
-  `aqueduct-error` header naming the column. `outbox` excludes `topic`, `key` and the field operations on the same route. The route's
+  without an `aggregate_id` or `payload` goes to the route's dead-letter topic (`<topic_fallback>.dlq` by default),
+  with an `aqueduct-error` header naming the column. `outbox` excludes `topic`, `key` and the field operations on the same route. The route's
   `topic` key is now optional in the config when `outbox` is set. `/api/routes` shows an `outbox` object, the cockpit
   the outbox columns on the route card, and `/api/events` now returns each record's headers (only `op`, `lsn`, `aqueduct-error`,
   `aqueduct-hash-key-id`, and the outbox `id`/`type`) and shows non-envelope values raw.
@@ -181,7 +181,7 @@ Notable changes to Aqueduct. Newest first.
   key comes only from `AQUEDUCT_HASH_KEY` or the new `[sink] hash_key_file` (at least 32 bytes; a `hash_key` in the
   TOML fails startup), and the new `hash_key_id` is sent as the `aqueduct-hash-key-id` header. A `key` column, or
   a column a content-routed `topic` reads, may not be excluded, masked, hashed or left out of `include`, and a rename target may not be listed in `mask`, `hash`
-  or `exclude`. A row whose renamed column collides goes to `dead_letter_topic`. `/api/routes`
+  or `exclude`. A row whose renamed column collides goes to the route's dead-letter topic. `/api/routes`
   lists each route's field operations and the key id, never the key. Additive: routes without these keys are
   unchanged.
 - **Postgres: sign in with an Azure managed identity** (#140). New `[postgres]` keys `auth` (`password` by default,
@@ -221,21 +221,26 @@ Notable changes to Aqueduct. Newest first.
   `null`. The partition is hashed from that whole key, overriding `partition_by` for the route. Truncates keep the
   table-only key. `GET /api/routes` shows each route's `key`. Additive: routes without `key` are unchanged.
 - **Cockpit: a Routing card draws the routing graph** (#87, ADR 0002). Tables on the left, routes in match order
-  (numbered, first match wins) in the middle, topics and the dead-letter topic on the right. Each route shows its
+  (numbered, first match wins) in the middle, topics and the routes' dead-letter topics on the right. Each route shows its
   `match`, `where`, per-route counts (produced, filtered, fallback, errors) with a bar, and an amber warning
   listing fields its `where` reads that no row has had. Edge width follows the counts and edges with recent traffic
   animate (static under reduced motion). Hover a table to light up its path, click a route for its details, click a
   topic to open it in the event inspector. Busy routes collapse to the 6 busiest tables and topics with "+N more".
   No new server route: it reads `/api/routes`, `/api/tables` and the stream.
-- **Routing: filter events per route and send failures to a dead-letter topic** (#81, ADR 0002). `[[sink.routes]]`
+- **Routing: filter events per route and send failures to the route's own dead-letter topic** (#81, #177, ADR 0002). `[[sink.routes]]`
   takes `where`, a typed predicate with SQL-style three-valued logic (an unknown result is filtered). It filters
   operations too: `where = "op in ['insert', 'update']"` (`op` is `insert`, `update`, `delete`, `truncate` or `read`;
   any other value, and comparing `op`, `schema` or `table` with a number or boolean, fails startup). There is no
   separate `ops` key; a route that sets one fails startup and prints the equivalent `where`. The first matching route
-  owns the event; nothing falls through. Rows a `where` cannot evaluate (a type error) go to the new
-  `[sink] dead_letter_topic` with an `aqueduct-error` header and a table-only key; it is required once a route's
-  `where` reads row data (`before.`, `after.`, `row.`), not for a `where` on `op`, `schema` and `table` alone, which
-  cannot fail, and is opened at startup. Per-route counters
+  owns the event; nothing falls through. Rows a `where` cannot evaluate (a type error) go to the route's dead-letter
+  topic with an `aqueduct-error` header and a table-only key. A `where` on `op`, `schema` and `table` alone cannot
+  fail. Every route has a dead-letter topic, with no setting required: its own topic plus `.dlq` (`sim.assets` →
+  `sim.assets.dlq`); a `{schema}`/`{table}` template plus `.dlq`, rendered per event and created on first use, `{op}`
+  left out; `<topic_fallback>.dlq` for a content-routed or outbox topic. A route's `dead_letter_topic`, then
+  `[sink] dead_letter_topic`, override it. Fixed dead-letter topics of routes that can dead-letter a row are opened at
+  startup. Dead-letter names are checked at startup (valid, no leading `_`, not a fallback, not producible by any
+  route's topic), and `dlq` is a reserved row value for content routing, so no row can render a dead-letter name.
+  `/api/routes` gives each route's `dead_letter_topic`, and the inspector reads them all. Per-route counters
   (`matched`, `produced`, `filtered`, `fallback`, `errors`) and unseen-field warnings appear in `/api/metrics`, the new
   `GET /api/routes` (the compiled plan with live counts) and Prometheus (`aqueduct_route_records_total`,
   `aqueduct_route_field_unseen`). Additive: routes without the new keys behave exactly as before.
@@ -297,7 +302,9 @@ Notable changes to Aqueduct. Newest first.
 - **Cockpit: each route in the Routing graph reads as SELECT / WHERE / FROM / INTO / PARTITIONED-BY** (#171). Every
   route card has the same five aligned rows: the fields (`*`, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`,
   `col AS new`, `ROW` and the shape tags, an outbox's `payload`), the `where`, the `match` glob with the tables it
-  claimed, the topic with `ELSE` fallback and `ON ERROR` dead-letter topic, and the route key, primary key or table.
+  claimed, the topic with `ELSE` fallback and `ON ERROR` the route's dead-letter topic, and the route key, primary key
+  or table. The graph draws one red node per distinct dead-letter topic or template, and a topic's panel names the
+  dead-letter topic of the routes writing to it (#177).
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
 - **Cockpit: the event inspector shows a sample, not a feed.** It reads the newest 100 events once when it opens (and
