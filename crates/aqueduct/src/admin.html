@@ -960,7 +960,6 @@ function routeNode(x, last) {
     + `<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5"><span class="flex min-w-0 items-center gap-2"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></span>`
     + `<span class="ml-auto flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(k => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</span></div>`
-    + opBar(x.id)
     + `<div class="mt-1" title="Per second, last 120 s: produced (green), filtered (grey), fallback (violet), errors (red)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
@@ -1160,7 +1159,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(srcButtons + opButtons());
+    + `</div>` + detailChart(srcButtons);
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1200,7 +1199,7 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    // A route: the events per second its source tables (the ones toggled on) delivered, for the ops toggled on.
+    // A route: the events per second its source tables (the ones toggled on) delivered, all ops (no op buttons).
     const x = m.routes[graphSel];
     if (!x) return;
     const off = routeSrcOff.get(x.id) || new Set(), per = (lastData && lastData.history_ops) || {};
@@ -1208,7 +1207,7 @@ function drawDetail(m) {
     color = TABLE_LINE;
     totals = opSlots(x.c.ops);
   } else return;
-  const sel = [...detailOps];
+  const sel = graphSel != null && topicSel == null && tableSel == null ? [0, 1, 2, 3, 4] : [...detailOps];
   const h = rows ? sumSeries(sel.map(op => rows.map(o => o[op] || 0))) : all;
   chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'

@@ -956,13 +956,12 @@ picks its topic per row (content routing) animates its lines to the topics it wr
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
-**Operation shares and rate.** Each card has a thin stacked bar of its counts per operation since start, as shares
-(insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and percentages), and
-under it a step line of its rate over the last 120 s (a route: produced, with filtered, fallback and errors as thin
-lines). The bar counts:
+**Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
+start, as shares (insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and
+percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: produced, with
+filtered, fallback and errors as thin lines). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
-- a route: events it produced to its topic (`counts.ops`); filtered, fallback and dead-lettered events are not in it;
 - a topic (the dead-letter topic too): records Kafka acknowledged, counted by the sink after the broker acknowledged
   the produce, so a failed produce never counts and a retried batch counts when it succeeds. A tombstone carries its
   delete's `op` header and counts as a delete. Topic cards also show the acknowledged count;
@@ -973,9 +972,9 @@ records, a dead-letter topic's errors).
 
 **Rates.** Click a table, a route or a topic for a panel with one step line over the last 120 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
-a topic's acknowledged records per second, counting only the operations toggled on with the buttons above the chart
-(insert, update, delete, truncate, read). The selection is shared by the three panels, so a table, its route and its
-topic are compared over the same operations. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
+a topic's acknowledged records per second. A table's and a topic's chart count only the operations toggled on with the
+buttons above it (insert, update, delete, truncate, read); the selection is shared by the two. A route's chart has no
+operation buttons: it counts every operation from the source tables toggled on. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
 operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
 select it), the full table list when the card's `FROM` is cut short, and any other config keys. Its line is the events
 per second from its source tables; with more than one source table, a button per table above the chart picks which
