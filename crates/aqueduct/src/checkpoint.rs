@@ -36,6 +36,15 @@ impl CheckpointStore for FileCheckpoint {
     }
 }
 
+/// `<path>.tmp`, next to `path`. Appended rather than swapping the extension, so it is never
+/// `path` itself (a `checkpoint_path` ending in `.tmp` would otherwise be truncated in place and
+/// a crash mid-write would leave it torn) nor another file that differs only in its extension.
+fn tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    name.into()
+}
+
 /// tmp file + fsync + rename + fsync of the directory, so a power loss leaves either the old
 /// or the new value, never a torn or empty file.
 fn write_durable(path: &std::path::Path, value: &str) -> std::io::Result<()> {
@@ -44,7 +53,7 @@ fn write_durable(path: &std::path::Path, value: &str) -> std::io::Result<()> {
     if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(value.as_bytes())?;
     f.sync_all()?;
@@ -60,6 +69,23 @@ fn write_durable(path: &std::path::Path, value: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tmp_file_is_never_the_checkpoint_itself() {
+        use std::path::Path;
+        assert_eq!(
+            tmp_path(Path::new("/s/checkpoint")),
+            Path::new("/s/checkpoint.tmp")
+        );
+        assert_eq!(
+            tmp_path(Path::new("/s/ckpt.tmp")),
+            Path::new("/s/ckpt.tmp.tmp")
+        );
+        assert_eq!(
+            tmp_path(Path::new("/s/ckpt.json")),
+            Path::new("/s/ckpt.json.tmp")
+        );
+    }
 
     #[tokio::test]
     async fn roundtrip() {
