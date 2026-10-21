@@ -367,10 +367,11 @@ delivered rates, the time to catch up, and while a snapshot runs its rows/s, row
 `aqueduct_source_behind_seconds`, `aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and
 `aqueduct_snapshot_eta_seconds`. See DEPLOYMENT.md, "Behind source".
 
-In the routing graph every route and topic carries a small step line of its rate over the last 120 s (a route's
-produced rate, with filtered, fallback and errors as thin lines; a topic's records acknowledged by Kafka), and each
-"+N more" group one for the group as a whole. Click a route or a topic for a larger chart with the current, average and
-maximum rate; a topic's panel also lists the routes that write to it and opens it in the event inspector.
+In the routing graph every table, route and topic carries a small step line of its rate over the last 120 s (a
+table's events per second; a route's produced rate, with filtered, fallback and errors as thin lines; a topic's records
+acknowledged by Kafka), and each "+N more" group one for the group as a whole. Click a table, a route or a topic for a
+larger chart with the current, average and maximum rate; a table's panel also names the route that claims it, and a
+topic's lists the routes that write to it and opens it in the event inspector.
 
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are

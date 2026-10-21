@@ -142,6 +142,12 @@ Notable changes to Aqueduct. Newest first.
   The Postgres slot stats query now runs every second (instead of every 5 s) in its own task on the SQL
   connection, and also returns the WAL head and flush position.
 
+- **Cockpit: each table's event rate in the Routing card, on taller table and topic cards** (#166). Table cards (the
+  source side) now carry a 120 s step line of their events per second, like routes and topics, and a "+N more" table
+  group the sum. Table and topic cards are taller, with the step line on its own line under the name and count.
+  Clicking a table opens a panel with a larger chart, the current, average and maximum rate, the route that claims it
+  and its topic. The per-table history is the one the stream already carries (`history_ops`); no API change.
+
 - **Cockpit: event rates per route and per topic as step lines in the Routing card.** Each route shows its produced
   rate over the last 120 s, with filtered, fallback and errors as thin lines; each topic its records acknowledged by
   Kafka per second; each "+N more" group the sum. A content-routed template now lists the topics it produced to.
