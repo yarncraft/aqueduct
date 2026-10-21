@@ -655,12 +655,14 @@ const topicTotals = name => rates && rates.topic_totals ? opSlots(rates.topic_to
 const detailOps = new Set([0, 1, 2, 3, 4]);
 // Toggle buttons that pick those ops.
 const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
-const OP_BTN_ON = OP_BTN + 'border-blue bg-blue/15 text-blue', OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
+const OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
 // Op buttons for the ops that have happened (totals per op, insert..read); without totals (an older server) all five.
 const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '11111';
+// An op button: when on, tinted in its op's line colour (it is the chart's legend); when off, grey.
+const opBtnAttrs = (op, on) => on ? `class="${OP_BTN}" style="border-color:${OPLINE[op]};color:${OPLINE[op]};background-color:${OPLINE[op]}26"` : `class="${OP_BTN_OFF}"`;
 const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
-    : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" class="${detailOps.has(op) ? OP_BTN_ON : OP_BTN_OFF}">${label}</button>`).join('')
+    : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
   + '</span>';
 // Sum of series, aligned on their newest sample.
 const sumSeries = list => {
@@ -1093,7 +1095,7 @@ function topicDetail(m, name) {
       + wide('dead letter for', served)
       + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
       + wide('acknowledged', '<span id="detailops">–</span>')
-      + `</div>` + detailChart(legendItem(RATE_LINE.errors, 'records acknowledged / s') + opButtons(dlqTotals(name)));
+      + `</div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(dlqTotals(name)));
     return;
   }
   const writers = topicRoutes(m, name);
@@ -1104,7 +1106,7 @@ function topicDetail(m, name) {
     + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
       : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TOPIC_LINE, 'records acknowledged / s') + opButtons(topicTotals(name)));
+    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(topicTotals(name)));
 }
 
 // The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
@@ -1149,7 +1151,7 @@ function tableDetail(m, name) {
   $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
-    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TABLE_LINE, 'events / s') + opButtons(((lastData && lastData.table_ops) || {})[name] || null));
+    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">events / s</span>' + opButtons(((lastData && lastData.table_ops) || {})[name] || null));
 }
 
 function routeDetail(m) {
@@ -1230,9 +1232,13 @@ function drawDetail(m) {
     if (el) el.textContent = t ? OP_LABEL.map((k, i) => `${k} ${fmt(t[i])}`).join(' · ') : 'no per-operation counts from this server';
     return;
   } else return;
-  const sel = [...detailOps];
-  const h = rows ? sumSeries(sel.map(op => rows.map(o => o[op] || 0))) : all;
-  chart([{ op: 0, h }], dc, [color], 160);
+  // One line per selected op, in the op colours (the buttons are the legend); without per-op history, one line.
+  // Only ops that have happened get a line (and a button).
+  const seen = tableSel != null ? ((lastData && lastData.table_ops) || {})[tableSel] || null : totals;
+  const sel = [...detailOps].filter(op => !seen || seen[op] > 0).sort();
+  const perOp = rows ? sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })) : null;
+  const h = perOp ? sumSeries(perOp.map(s => s.h)) : all;
+  if (perOp) chart(perOp, dc, OPLINE, 160); else chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
   // An op that happens for the first time gets its button without reopening the panel.
@@ -1325,7 +1331,7 @@ $('routedetail').addEventListener('click', ev => {
     const op = +opBtn.dataset.op, on = !detailOps.has(op);
     on ? detailOps.add(op) : detailOps.delete(op);
     opBtn.setAttribute('aria-pressed', String(on));
-    opBtn.className = on ? OP_BTN_ON : OP_BTN_OFF;
+    opBtn.outerHTML = `<button type="button" data-op="${op}" aria-pressed="${on}" ${opBtnAttrs(op, on)}>${OP_LABEL[op]}</button>`;
     if (graphModel) drawDetail(graphModel);
     return;
   }
