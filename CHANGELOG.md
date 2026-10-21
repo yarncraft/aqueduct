@@ -146,7 +146,8 @@ Notable changes to Aqueduct. Newest first.
   source side) now carry a 120 s step line of their events per second, like routes and topics, and a "+N more" table
   group the sum. Table and topic cards are taller, with the step line on its own line under the name and count.
   Clicking a table opens a panel with a larger chart, the current, average and maximum rate, the route that claims it
-  and its topic. The per-table history is the one the stream already carries (`history_ops`); no API change.
+  and its topic. Its chart draws one line per operation, with a checkbox each to filter them. The per-table history is
+  the one the stream already carries (`history_ops`); no API change.
 
 - **Cockpit: event rates per route and per topic as step lines in the Routing card.** Each route shows its produced
   rate over the last 120 s, with filtered, fallback and errors as thin lines; each topic its records acknowledged by

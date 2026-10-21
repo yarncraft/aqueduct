@@ -789,6 +789,11 @@ function appendRates(f) {
 const routeRate = i => rates && plan && rates.routes[i] && rates.routes[i].route === plan.routes[i].route ? rates.routes[i] : null;
 const topicRate = name => (rates && rates.topics[name]) || [];
 const tableRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
+// A table's events per second for one op (index into the history_ops rows: insert, update, delete, truncate, read).
+const tableOpRate = (name, op) => ((lastData && lastData.history_ops) || {})[name]?.map(o => o[op] || 0) || [];
+// Ops shown in a table's detail chart; kept while you click between tables.
+const tableOps = new Set([0, 1, 2, 3, 4]);
+const TABLE_OP_LABEL = ['insert', 'update', 'delete', 'truncate', 'read'];
 // Sum of series, aligned on their newest sample.
 const sumSeries = list => {
   const n = Math.max(0, ...list.map(a => a.length));
@@ -1146,7 +1151,7 @@ function tableDetail(m, name) {
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
     + row('topic', esc((t && t.topic) || (x ? x.r.topic : '–')))
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
-    + `</div>` + detailChart(legendItem(TABLE_LINE, 'events / s'));
+    + `</div>` + detailChart(TABLE_OP_LABEL.map((label, op) => `<label class="flex cursor-pointer items-center gap-1.5"><input type="checkbox" data-tableop="${op}"${tableOps.has(op) ? ' checked' : ''}><i class="inline-block h-0.5 w-3" style="background:${OPLINE[op]}"></i>${label} / s</label>`).join(''));
 }
 
 function routeDetail(m) {
@@ -1190,9 +1195,10 @@ function drawSparks(m) {
     chart([{ op: 0, h }], dc, [topicSel === m.dlq ? RATE_LINE.errors : TOPIC_LINE], 160);
     $('detailstats').textContent = rateStats(h);
   } else if (tableSel != null) {
-    const h = tableRate(tableSel);
-    chart([{ op: 0, h }], dc, [TABLE_LINE], 160);
-    $('detailstats').textContent = rateStats(h);
+    // One step line per selected op, coloured like the per-op rate chart; the stats sum the selected ops.
+    const series = [...tableOps].sort().map(op => ({ op, h: tableOpRate(tableSel, op) }));
+    chart(series, dc, OPLINE, 160);
+    $('detailstats').textContent = series.length ? rateStats(sumSeries(series.map(s => s.h))) : 'no op selected';
   } else if (graphSel != null) {
     const rr = routeRate(graphSel);
     chart(rr ? ROUTE_COUNTS.map(([k], op) => ({ op, h: rr[k] })) : [], dc, ROUTE_COUNTS.map(([k]) => RATE_LINE[k]), 160);
@@ -1265,6 +1271,12 @@ $('graph').addEventListener('click', ev => {
   if (topic) { topicSel = topicSel === topic.dataset.topic ? null : topic.dataset.topic; graphSel = tableSel = null; renderGraph(); return; }
   const route = ev.target.closest('[data-route]');
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
+});
+$('routedetail').addEventListener('change', ev => {
+  const box = ev.target.closest('[data-tableop]');
+  if (!box) return;
+  box.checked ? tableOps.add(+box.dataset.tableop) : tableOps.delete(+box.dataset.tableop);
+  if (graphModel) drawSparks(graphModel);
 });
 $('routedetail').addEventListener('click', ev => {
   if (ev.target.closest('#routeclose')) { graphSel = topicSel = tableSel = null; renderGraph(); return; }
