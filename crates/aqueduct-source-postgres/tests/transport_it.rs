@@ -84,11 +84,23 @@ fn key_text(ev: &ChangeEvent) -> String {
     }
 }
 
-/// Takes events until nothing arrives for `idle`, acking the last one of every batch.
-async fn drain(s: &mut PostgresSource, idle: Duration, out: &mut Delivered) -> Option<Position> {
+/// Takes events until `out` holds `want` distinct keys, then until nothing more arrives for 1 s
+/// (so an extra event still shows up), acking each one. Waits up to 60 s for the `want`th:
+/// under load a source can take far longer than a fixed window to deliver (#143).
+async fn drain(s: &mut PostgresSource, want: usize, out: &mut Delivered) -> Option<Position> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut last = None;
     loop {
-        match tokio::time::timeout(idle, s.next()).await {
+        let wait = if out.len() < want {
+            tokio::time::sleep_until(deadline)
+        } else {
+            tokio::time::sleep(Duration::from_secs(1))
+        };
+        let next = tokio::select! {
+            r = s.next() => Ok(r),
+            () = wait => Err(()),
+        };
+        match next {
             Ok(r) => {
                 let ev = r.unwrap().expect("the source never ends");
                 if ev.op == Op::Heartbeat {
@@ -110,7 +122,14 @@ async fn drain(s: &mut PostgresSource, idle: Duration, out: &mut Delivered) -> O
                     s.ack(c.clone()).await.unwrap();
                 }
             }
-            Err(_) => return last,
+            Err(()) => {
+                assert!(
+                    out.len() >= want,
+                    "only {} of {want} events after 60 s",
+                    out.len()
+                );
+                return last;
+            }
         }
     }
 }
@@ -121,6 +140,9 @@ async fn drain(s: &mut PostgresSource, idle: Duration, out: &mut Delivered) -> O
 #[tokio::test]
 #[ignore = "needs a Postgres server, see the module docs"]
 async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
+    // 5 + 5 + 1 inserts, a 30-row COPY, 3 updates and 5 deletes; then one TRUNCATE event per table.
+    const BEFORE_TRUNCATE: usize = 49;
+    const ALL: usize = BEFORE_TRUNCATE + 2;
     let db = connect().await;
     let a = unique("tr_a");
     let b = unique("tr_b");
@@ -174,7 +196,7 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     let mut polled = Delivered::new();
     let mut p = source(url(), &poll_slot, &publication, TransportKind::Poll, 7);
     p.start(None).await.unwrap();
-    drain(&mut p, Duration::from_secs(3), &mut polled).await;
+    drain(&mut p, BEFORE_TRUNCATE, &mut polled).await;
 
     // Stream: read part, restart from the last acked checkpoint, read the rest.
     let mut streamed = Delivered::new();
@@ -213,13 +235,17 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     db.batch_execute(&format!("TRUNCATE {a}, {b};"))
         .await
         .unwrap();
-    drain(&mut s, Duration::from_secs(3), &mut streamed).await;
+    drain(&mut s, ALL, &mut streamed).await;
     drop(s);
     let mut p = p;
-    drain(&mut p, Duration::from_secs(3), &mut polled).await;
+    drain(&mut p, ALL, &mut polled).await;
     drop(p);
 
-    assert!(polled.len() >= 50, "{} events", polled.len());
+    assert_eq!(
+        polled.len(),
+        ALL,
+        "poll delivered other events than written"
+    );
     assert!(polled.values().filter(|v| v.1 == Op::Truncate).count() == 2);
     assert_eq!(polled, streamed, "poll and stream disagree");
 
