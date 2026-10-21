@@ -1,9 +1,10 @@
 //! Needs a replica set: `podman compose -f docker-compose.test.yml up -d`, then
 //! `MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0&directConnection=true' cargo test -p aqueduct-source-mongodb -- --ignored`
-use aqueduct_core::{ChangeEvent, Op, Source};
+use aqueduct_core::{ChangeEvent, LagState, Metrics, Op, Source};
 use aqueduct_source_mongodb::{MongoConfig, MongoSource};
 use mongodb::bson::{doc, Document};
 use mongodb::Client;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn uri() -> String {
@@ -176,5 +177,41 @@ async fn start_position_is_durable_before_the_first_change() {
     assert_eq!(ev.op, Op::Insert);
     assert_eq!(ev.key.as_deref(), Some(r#"{"_id":1}"#));
 
+    client.database(&db_name).drop().await.unwrap();
+}
+
+/// "Behind source" (#150): `hello` gives the server's newest cluster time and every ack the
+/// delivered one, both in ms; right after a change is delivered the source is caught up.
+#[tokio::test]
+#[ignore]
+async fn reports_cluster_times_for_the_behind_source_card() {
+    let db_name = format!("aq_lag_{}", std::process::id());
+    let client = Client::with_uri_str(uri()).await.unwrap();
+    let coll = client.database(&db_name).collection::<Document>("users");
+    coll.insert_one(doc! {"_id": 0}).await.unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let mut src = MongoSource::new(cfg(&db_name)).with_metrics(metrics.clone());
+    src.start(None).await.unwrap();
+    assert_eq!(next(&mut src).await.op, Op::Heartbeat);
+    coll.insert_one(doc! {"_id": 1}).await.unwrap();
+    let ev = next(&mut src).await;
+    assert_eq!(ev.op, Op::Insert);
+    src.ack(ev.checkpoint.clone().unwrap_or_else(|| ev.position.clone()))
+        .await
+        .unwrap();
+    let snap = metrics.snapshot();
+    let head = snap
+        .source_head_time_ms
+        .expect("hello reports the cluster time");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(head.abs_diff(now) < 60_000, "head {head}, now {now}");
+    let lag = snap.source_lag;
+    assert_eq!(lag.rate_unit, Some("s/s"));
+    assert_eq!(lag.backlog_bytes, None);
+    assert_eq!(lag.state, LagState::CaughtUp, "{lag:?}");
+    assert!(lag.behind_secs.unwrap() <= 2.0);
     client.database(&db_name).drop().await.unwrap();
 }

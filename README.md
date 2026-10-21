@@ -7,7 +7,7 @@ Mongo resume token) is checkpointed and acknowledged only after the sink succeed
 
 - Sources: **Postgres** (default), **MongoDB**, chosen with `[source] type`; a top-level `[postgres]` table still works
 - Sink: **Kafka** (the only sink), with per-table topic routing
-- **Admin cockpit**: live throughput, lag, latency, per-table high-water marks and an event inspector
+- **Admin cockpit**: whether Aqueduct is behind its source and when it catches up, live throughput, lag, latency, per-table high-water marks and an event inspector
 - Distroless, non-root image; state in one volume
 
 ## Architecture
@@ -271,7 +271,7 @@ Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `sn
 
 ## Admin cockpit
 
-The HTTP port serves a dark operations console at `/`: throughput chart, total events, end-to-end lag,
+The HTTP port serves a dark operations console at `/`: whether Aqueduct is **behind its source**, throughput chart, total events, end-to-end lag,
 sink latency, errors, operation breakdown, a **routing graph**, per-table high-water marks, last fault, and an **event inspector**
 (reads the newest events straight from the Kafka topics, nothing is buffered in the pipeline; pick a topic, filter by op/table, search payloads, pause, click a row for a
 before/after diff and Copy JSON).
@@ -296,6 +296,16 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 **events contain row data**, so keep the port off untrusted networks.
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
+
+The **Behind source** card compares the source's head (Postgres WAL head, from the slot stats query and stream
+keepalives; MongoDB's newest majority-committed cluster time, from `hello` every 5 s) with the position Aqueduct
+delivered. It shows a status (`caught up` within 1 MiB of WAL or 2 s of cluster time, `catching up`, `falling behind`,
+or `stalled` after 30 s without progress), the backlog in bytes and time with a one-minute sparkline, the source and
+delivered rates, the time to catch up, and while a snapshot runs its rows/s, rows left, ETA and whether
+`snapshot_max_rows_per_sec` sets the pace. The End-to-end lag tile reads `idle` while caught up with nothing new.
+`/api/metrics` and `/api/stream` carry it as `source_lag`; Prometheus as `aqueduct_source_backlog_bytes`,
+`aqueduct_source_behind_seconds`, `aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and
+`aqueduct_snapshot_eta_seconds`. See DEPLOYMENT.md, "Behind source".
 
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are

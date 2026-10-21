@@ -106,6 +106,18 @@ Notable changes to Aqueduct. Newest first.
 
 ### Added
 
+- **Cockpit: show whether Aqueduct is behind the source, with backlog and time to catch up** (#150). A new
+  **Behind source** card compares the source's head (Postgres WAL head from the slot stats query and stream
+  keepalives; MongoDB's newest majority-committed cluster time from `hello` every 5 s) with the delivered position.
+  It shows caught up / catching up / falling behind / stalled, the backlog in bytes and time with a sparkline, the
+  source and delivered rates, the time to catch up, and for a running snapshot rows/s, rows left, ETA and whether
+  `snapshot_max_rows_per_sec` throttles it. Caught up means within 1 MiB of WAL (Postgres) or 2 s (MongoDB); stalled
+  means a backlog and no progress for 30 s. The End-to-end lag tile reads `idle` instead of counting up while caught
+  up. New `source_lag`, `source_head_lsn` and `source_head_time_ms` on `/api/metrics` and `/api/stream`, and
+  Prometheus gauges `aqueduct_source_backlog_bytes`, `aqueduct_source_behind_seconds`,
+  `aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and `aqueduct_snapshot_eta_seconds`.
+  The Postgres slot stats query now runs every second instead of every 5 s and also returns the WAL head.
+
 - **Routing: choose the topic from the row's contents** (#82, ADR 0002). A route's `topic` can read row fields, such as
   `orders.{row.region}`, and also takes `{op}`. Such a template must start with fixed text and needs a fixed
   `topic_fallback`. An optional `topic_values` allow-list limits the values. No fixed topic in the config may match the

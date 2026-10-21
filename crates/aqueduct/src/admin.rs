@@ -253,6 +253,7 @@ impl Admin {
         let mut last_ops: BTreeMap<String, [u64; OP_SLOTS]> = BTreeMap::new();
         loop {
             tick.tick().await;
+            self.metrics.sample_source_lag();
             let now = self.metrics.events_total();
             let ops = self.metrics.snapshot().table_ops;
             self.record_sample(now.saturating_sub(last) as f64, &ops, &last_ops);
@@ -600,6 +601,7 @@ fn prometheus(s: &Snapshot) -> String {
         );
         let _ = writeln!(o, "aqueduct_slot_lag_bytes {lag}");
     }
+    source_lag_metrics(&mut o, s);
     if let Some(st) = &s.snapshot {
         for (name, kind, help, value) in [
             (
@@ -693,6 +695,44 @@ fn prometheus(s: &Snapshot) -> String {
         );
     }
     o
+}
+
+/// "Behind source" (#150): one gauge per number that is known; an unknown one is left out.
+fn source_lag_metrics(o: &mut String, s: &Snapshot) {
+    let lag = &s.source_lag;
+    let snap = lag.snapshot.as_ref();
+    for (name, help, value) in [
+        (
+            "aqueduct_source_backlog_bytes",
+            "WAL bytes between the source's head and the position delivered (Postgres).",
+            lag.backlog_bytes.map(|b| b as f64),
+        ),
+        (
+            "aqueduct_source_behind_seconds",
+            "How far delivery trails the source, in seconds; 0 when caught up.",
+            lag.behind_secs,
+        ),
+        (
+            "aqueduct_source_catch_up_eta_seconds",
+            "Seconds until the backlog is gone at the current rates; 0 when caught up.",
+            lag.eta_secs,
+        ),
+        (
+            "aqueduct_snapshot_rows_per_second",
+            "Rows the running snapshot copies per second, over the last minute.",
+            snap.and_then(|r| r.rows_per_sec),
+        ),
+        (
+            "aqueduct_snapshot_eta_seconds",
+            "Seconds until the running snapshot has copied its estimated rows.",
+            snap.and_then(|r| r.eta_secs),
+        ),
+    ] {
+        if let Some(v) = value {
+            metric(o, name, "gauge", help);
+            let _ = writeln!(o, "{name} {v}");
+        }
+    }
 }
 
 /// Per-route Prometheus series. `matched` is not exported: it is the sum of the four outcomes.
@@ -1768,5 +1808,96 @@ Authorization: Bearer {token}
         let mut out = String::new();
         let _ = c.read_to_string(&mut out).await;
         assert!(out.is_empty(), "{out}");
+    }
+
+    /// `source_lag` (#150) is in the JSON of `/api/metrics` behind the token, with every key the
+    /// cockpit reads, and `unknown` until the source reports both positions.
+    #[tokio::test]
+    async fn source_lag_is_served_behind_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let admin = Admin::new(metrics.clone(), Some("k".into()), None);
+        tokio::spawn(serve(listener, admin));
+        let lag = json_body(&get_bearer(addr, "/api/metrics", "k").await)["source_lag"].clone();
+        assert_eq!(lag["state"], "unknown");
+        for key in [
+            "backlog_bytes",
+            "behind_secs",
+            "ingest_rate",
+            "process_rate",
+            "eta_secs",
+            "snapshot",
+        ] {
+            assert!(lag[key].is_null(), "{key}: {lag}");
+        }
+        assert_eq!(lag["threshold"]["backlog_bytes"], 1024 * 1024);
+        assert_eq!(lag["threshold"]["stalled_after_secs"], 30);
+
+        // 8 MiB of WAL behind the head.
+        metrics.report_source_head_lsn(0x100_0000 + 8 * 1024 * 1024);
+        metrics.report_source_delivered_lsn(0x100_0000);
+        metrics.sample_source_lag();
+        let v = json_body(&get_bearer(addr, "/api/metrics", "k").await);
+        let lag = &v["source_lag"];
+        assert_eq!(lag["backlog_bytes"], 8 * 1024 * 1024);
+        assert_eq!(lag["rate_unit"], "bytes/s");
+        assert!(
+            ["catching_up", "falling_behind"].contains(&lag["state"].as_str().unwrap()),
+            "{lag}"
+        );
+        assert_eq!(lag["history"].as_array().unwrap().len(), 2);
+        assert_eq!(v["source_head_lsn"], "0/1800000");
+        assert!(get(addr, "/api/metrics").await.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn prometheus_exports_source_lag_only_when_known() {
+        let m = Metrics::new();
+        let out = prometheus(&m.snapshot());
+        for name in [
+            "aqueduct_source_backlog_bytes",
+            "aqueduct_source_behind_seconds",
+            "aqueduct_source_catch_up_eta_seconds",
+            "aqueduct_snapshot_rows_per_second",
+            "aqueduct_snapshot_eta_seconds",
+        ] {
+            assert!(!out.contains(name), "{name} without a value");
+        }
+        // Caught up: a few kB of heartbeat WAL.
+        m.report_source_head_lsn(0x2000);
+        m.report_source_delivered_lsn(0x1000);
+        let out = prometheus(&m.snapshot());
+        assert!(out.contains("# TYPE aqueduct_source_backlog_bytes gauge"));
+        assert!(
+            out.contains(
+                "aqueduct_source_backlog_bytes 4096
+"
+            ),
+            "{out}"
+        );
+        assert!(out.contains(
+            "aqueduct_source_behind_seconds 0
+"
+        ));
+        assert!(out.contains(
+            "aqueduct_source_catch_up_eta_seconds 0
+"
+        ));
+        assert!(!out.contains("aqueduct_snapshot_rows_per_second"));
+        // A running snapshot without two seconds of samples has an estimate but no rate yet.
+        m.set_snapshot(Some(aqueduct_core::SnapshotStatus {
+            id: "s1".into(),
+            state: "running".into(),
+            tables: vec!["public.a".into()],
+            tables_done: 0,
+            table: Some("public.a".into()),
+            rows: 10,
+            rows_estimated: Some(100),
+            skipped: vec![],
+        }));
+        let s = m.snapshot();
+        assert_eq!(s.source_lag.snapshot.as_ref().unwrap().rows_left, Some(90));
+        assert!(!prometheus(&s).contains("aqueduct_snapshot_rows_per_second"));
     }
 }

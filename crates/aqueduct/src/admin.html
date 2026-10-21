@@ -42,7 +42,7 @@
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">End-to-end lag</div>
       <div id="lag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-      <div class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
+      <div id="lagsub" class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
@@ -53,6 +53,47 @@
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
       <div id="errors" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
       <div id="errsub" class="mt-1 font-mono text-[11px] text-ink-300">no faults</div>
+    </div>
+  </section>
+
+  <!-- Behind source (#150): the backlog between the source's head and what was delivered, the rates on both sides and the time to catch up -->
+  <section id="behind" class="rounded-sm border border-ink-600 bg-ink-800">
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-ink-600 px-4 py-2.5">
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200" title="Is Aqueduct behind its source, and when does it catch up? Measured at the source: the server's head (Postgres WAL head, MongoDB cluster time) against the newest position delivered to Kafka.">Behind source</h2>
+      <span id="bshead" class="ml-auto max-w-full truncate font-mono text-[11px] text-ink-500">–</span>
+    </div>
+    <div class="grid grid-cols-1 gap-px bg-ink-600 sm:grid-cols-2 lg:grid-cols-4">
+      <div class="bg-ink-800 p-4" title="Caught up: the backlog is within the threshold (1 MiB of WAL for Postgres, 2 s of cluster time for MongoDB; heartbeats and the batch in flight keep it above 0). Catching up: delivery runs faster than the source grows. Falling behind: it does not. Stalled: a backlog and nothing delivered for 30 s while streaming.">
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Status</div>
+        <div class="mt-2"><span id="bsstate" class="inline-flex items-center gap-2 rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 font-mono text-lg font-semibold uppercase tracking-wider text-ink-200"><i id="bsdot" class="h-2 w-2 rounded-full bg-ink-300"></i><span id="bsstatetext">unknown</span></span></div>
+        <div id="bsstatesub" class="mt-2 font-mono text-[11px] text-ink-300">waiting for the source</div>
+      </div>
+      <div class="bg-ink-800 p-4" title="Postgres: WAL bytes between the server's WAL head and the newest position delivered; time behind is the commit age of the newest delivered change while there is a backlog. MongoDB: cluster time between the server's newest majority-committed write and the newest delivered change. The line is the backlog over the window.">
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Backlog</div>
+        <div id="bsbacklog" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+        <div class="mt-1 flex items-center gap-3 font-mono text-[11px] text-ink-300"><span id="bsbehind" class="truncate">–</span><svg id="bsspark" viewBox="0 0 120 24" preserveAspectRatio="none" class="ml-auto h-6 w-28 shrink-0" aria-hidden="true"></svg></div>
+      </div>
+      <div class="bg-ink-800 p-4" title="Source: how fast the server's head moves (WAL bytes per second, or seconds of cluster time per second). Delivered: how fast Aqueduct's delivered position moves. Both over the window.">
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Source vs delivered</div>
+        <div class="mt-2 space-y-1.5 font-mono text-[12px]">
+          <div class="flex items-center gap-2"><span class="w-16 text-ink-300">source</span><div class="h-1.5 flex-1 rounded-sm bg-ink-700"><div id="bsinbar" class="h-1.5 rounded-sm bg-ink-300" style="width:0%"></div></div><b id="bsin" class="w-24 text-right font-medium tabular-nums text-ink-100">–</b></div>
+          <div class="flex items-center gap-2"><span class="w-16 text-ink-300">delivered</span><div class="h-1.5 flex-1 rounded-sm bg-ink-700"><div id="bsoutbar" class="h-1.5 rounded-sm bg-blue" style="width:0%"></div></div><b id="bsout" class="w-24 text-right font-medium tabular-nums text-ink-100">–</b></div>
+        </div>
+        <div id="bsnet" class="mt-1.5 font-mono text-[11px] text-ink-300">–</div>
+      </div>
+      <div class="bg-ink-800 p-4" title="Backlog divided by (delivered rate minus source rate): only while the backlog shrinks. 0 when caught up.">
+        <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Time to catch up</div>
+        <div id="bseta" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
+        <div id="bsetasub" class="mt-1 font-mono text-[11px] text-ink-300">at the current rates</div>
+      </div>
+    </div>
+    <div id="bssnap" hidden class="flex flex-wrap items-center gap-x-5 gap-y-1.5 border-t border-ink-600 px-4 py-2.5 font-mono text-[11px] text-ink-300" title="The running snapshot: rows per second over the last minute; rows left is the planner estimate of all its tables minus the rows this process copied; the live stream's status is the one above.">
+      <span class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Snapshot</span>
+      <span><b id="bssnaprate" class="font-medium tabular-nums text-ink-100">–</b> rows/s</span>
+      <span><b id="bssnapleft" class="font-medium tabular-nums text-ink-100">–</b> rows left</span>
+      <span>ETA <b id="bssnapeta" class="font-medium tabular-nums text-ink-100">–</b></span>
+      <span id="bsthrottled" hidden class="rounded-sm bg-amber/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber" title="The snapshot reads at 90 % or more of snapshot_max_rows_per_sec: the limit sets its pace, not the source or Kafka.">throttled by snapshot_max_rows_per_sec</span>
+      <span class="sm:ml-auto">live stream <b id="bssnaplive" class="font-medium text-ink-100">–</b></span>
     </div>
   </section>
 
@@ -194,7 +235,7 @@
   <!-- Tables: how far each table has got (pipeline side from the stream, Kafka side from /api/tables) -->
   <section class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2.5">
-      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Tables · high-water marks</h2>
+      <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200" title="How far each table has got on the pipeline side, and its topic's Kafka high-water mark (sink side: what reached Kafka). Whether Aqueduct is behind the source is in the Behind source card.">Tables · high-water marks</h2>
       <span id="tablecount" class="font-mono text-[11px] text-ink-300">0 tables</span>
       <span class="ml-auto truncate font-mono text-[11px] text-ink-300">checkpoint <span id="ckpt" class="text-ink-200">–</span></span>
       <span id="hwmnote" class="max-w-96 truncate font-mono text-[11px] text-ink-500">Kafka offsets: –</span>
@@ -268,6 +309,8 @@ const smooth = (h, w = SMOOTH_WINDOW) => h.map((_, i) => avg(h.slice(Math.max(0,
 // Sink latency samples, one per snapshot in which events were delivered (sink_last_ms only
 // changes then). Cleared on reconnect so values from before an outage are not blended in.
 let sinkSamples = [], lastTotal = null;
+// The end-to-end lag tile reads "idle" when the source is caught up and nothing was delivered for this long.
+const IDLE_AFTER_MS = 10000;
 const resetSmoothing = () => { sinkSamples = []; lastTotal = null; };
 
 const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red', stopped: 'bg-ink-300' };
@@ -369,6 +412,69 @@ function renderSnapshot(d) {
   $('snapskipped').textContent = s.skipped.length ? 'skipped: ' + s.skipped.map(x => x.table + ' (' + x.reason + ')').join(', ') : '';
 }
 
+// ---- Behind source (#150) ----
+// Everything is derived on the server from one sample a second over the last minute; the page only formats it.
+const BS_STATE = {
+  caught_up: { text: 'caught up', pill: 'border-green/40 bg-green/15 text-green', dot: 'bg-green', line: '#32a467', sub: 'backlog within the threshold' },
+  catching_up: { text: 'catching up', pill: 'border-blue/40 bg-blue/15 text-blue', dot: 'bg-blue', line: '#4c90f0', sub: 'delivery is faster than the source' },
+  falling_behind: { text: 'falling behind', pill: 'border-amber/40 bg-amber/15 text-amber', dot: 'bg-amber', line: '#ec9a3c', sub: 'the backlog does not shrink' },
+  stalled: { text: 'stalled', pill: 'border-red/40 bg-red/15 text-red', dot: 'bg-red', line: '#e76a6e', sub: 'nothing delivered for 30 s' },
+  unknown: { text: 'unknown', pill: 'border-ink-600 bg-ink-700 text-ink-200', dot: 'bg-ink-300', line: '#738091', sub: 'waiting for the source' },
+};
+const PILL = 'inline-flex items-center gap-2 rounded-sm border px-3 py-1 font-mono text-lg font-semibold uppercase tracking-wider ';
+const secs = v => v == null ? '–' : v < 1 ? (v > 0 ? '< 1s' : '0s') : dur(Math.round(v));
+function spark(h, color) {
+  if (!h || h.length < 2) { $('bsspark').innerHTML = ''; return; }
+  const max = Math.max(1, ...h), n = h.length;
+  const pts = h.map((v, i) => (120 * i / (n - 1)).toFixed(1) + ',' + (22 - 20 * v / max).toFixed(1)).join(' ');
+  $('bsspark').innerHTML = `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+}
+function renderBehind(d) {
+  const l = d.source_lag || { state: 'unknown', threshold: {} };
+  const st = BS_STATE[l.state] || BS_STATE.unknown;
+  const pg = l.rate_unit === 'bytes/s';
+  $('bsstate').className = PILL + st.pill;
+  $('bsdot').className = 'h-2 w-2 rounded-full ' + st.dot;
+  $('bsstatetext').textContent = st.text;
+  $('bsstatesub').textContent = l.state === 'unknown' ? st.sub
+    : st.sub + (l.state !== 'caught_up' ? '' : pg ? ' (≤ ' + bytes(l.threshold.backlog_bytes) + ')' : ' (≤ ' + l.threshold.behind_secs + ' s)');
+  $('bshead').textContent = d.source_head_lsn ? 'WAL head ' + d.source_head_lsn + ' · ' + Math.round(l.window_secs || 0) + ' s window'
+    : d.source_head_time_ms ? 'cluster time ' + isoMs(d.source_head_time_ms) + ' · ' + Math.round(l.window_secs || 0) + ' s window' : 'no head reported yet';
+  $('bshead').title = $('bshead').textContent;
+  if (pg) {
+    $('bsbacklog').textContent = l.backlog_bytes == null ? '–' : bytes(l.backlog_bytes);
+    $('bsbehind').textContent = l.behind_secs == null ? 'time behind –' : secs(l.behind_secs) + ' behind';
+  } else {
+    $('bsbacklog').textContent = l.behind_secs == null ? '–' : secs(l.behind_secs);
+    $('bsbehind').textContent = l.behind_secs == null ? '–' : 'of cluster time';
+  }
+  spark(l.history, st.line);
+  const rate = v => v == null ? '–' : pg ? bytes(Math.round(v)) + '/s' : v.toFixed(2) + ' s/s';
+  $('bsin').textContent = rate(l.ingest_rate);
+  $('bsout').textContent = rate(l.process_rate);
+  const top = Math.max(l.ingest_rate || 0, l.process_rate || 0);
+  $('bsinbar').style.width = (top ? 100 * (l.ingest_rate || 0) / top : 0) + '%';
+  $('bsoutbar').style.width = (top ? 100 * (l.process_rate || 0) / top : 0) + '%';
+  const net = l.ingest_rate == null ? null : l.process_rate - l.ingest_rate;
+  $('bsnet').textContent = net == null ? 'rates need 2 s of samples' : (net >= 0 ? 'shrinking ' : 'growing ') + rate(Math.abs(net));
+  $('bseta').textContent = l.state === 'caught_up' ? '0s' : l.eta_secs == null ? '–' : secs(l.eta_secs);
+  $('bseta').className = TILE + (l.state === 'stalled' ? 'text-red' : l.state === 'falling_behind' ? 'text-amber' : 'text-ink-100');
+  $('bsetasub').textContent = l.state === 'caught_up' ? 'nothing to catch up'
+    : l.state === 'stalled' ? 'no progress' : l.eta_secs == null ? (l.state === 'unknown' ? 'at the current rates' : 'not shrinking') : 'at the current rates';
+  const s = l.snapshot;
+  $('bssnap').hidden = !s;
+  if (s) {
+    $('bssnaprate').textContent = s.rows_per_sec == null ? '–' : fmt(Math.round(s.rows_per_sec));
+    $('bssnapleft').textContent = s.rows_left == null ? '–' : fmt(s.rows_left);
+    $('bssnapleft').title = s.rows_left == null ? 'no planner estimate for a table (run ANALYZE)' : 'planner estimate of all tables minus rows copied by this process';
+    $('bssnapeta').textContent = s.eta_secs == null ? '–' : secs(s.eta_secs);
+    $('bsthrottled').hidden = !s.throttled;
+    $('bsthrottled').textContent = 'throttled by snapshot_max_rows_per_sec' + (s.max_rows_per_sec ? ' = ' + fmt(s.max_rows_per_sec) : '');
+    $('bssnaplive').textContent = st.text;
+    $('bssnaplive').className = 'font-medium ' + st.pill.split(' ').filter(c => c.startsWith('text-')).join(' ');
+  }
+}
+
 function render(d) {
   $('state-text').textContent = d.state;
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
@@ -386,13 +492,18 @@ function render(d) {
     if (sinkSamples.length > SMOOTH_WINDOW) sinkSamples.shift();
   }
   lastTotal = d.events_total;
-  $('lag').textContent = d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
+  // Caught up with nothing delivered for a while: the lag would only count the idle time up.
+  const caughtUp = d.source_lag && d.source_lag.state === 'caught_up';
+  const idle = caughtUp && (d.last_event_unix_ms == null || Date.now() - d.last_event_unix_ms > IDLE_AFTER_MS);
+  $('lag').textContent = idle ? 'idle' : d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
+  $('lagsub').textContent = idle ? 'caught up · no new changes' : caughtUp ? 'commit → delivered · caught up' : 'commit → delivered';
   $('sinkavg').textContent = d.events_total ? ms(d.sink_avg_ms) : '–';
   $('sinkdet').textContent = d.events_total ? `${sinkSamples.length ? 'recent ' + ms(avg(sinkSamples)) : 'last ' + ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'mean per event';
   $('errors').textContent = fmt(d.errors);
   $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
   $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
   renderHealth(d);
+  renderBehind(d);
   renderSnapshot(d);
   lastData = d;
   syncRateTables(d);

@@ -60,6 +60,14 @@ async fn main() {
         }
     };
     let metrics = Arc::new(aqueduct_core::Metrics::new());
+    // The cockpit flags a snapshot whose pace this limit sets.
+    metrics.set_snapshot_rate_limit(
+        match &source_cfg {
+            config::SourceConfig::Postgres(p) => p.snapshot_max_rows_per_sec,
+            config::SourceConfig::Mongodb(m) => m.snapshot_max_rows_per_sec,
+        }
+        .filter(|n| *n > 0),
+    );
     // Named in every record's `source` block and key.
     let source_info = match &source_cfg {
         config::SourceConfig::Postgres(p) => aqueduct_sinks::SourceInfo::Postgres {

@@ -13,6 +13,8 @@ mod secure;
 mod task;
 
 pub use auth::AuthMethod;
+#[cfg(test)]
+pub(crate) use client::streaming;
 pub use client::{
     ConnectOptions, ReplicationClient, ReplicationStream, StartReplication, StatusSender,
     SystemInfo,

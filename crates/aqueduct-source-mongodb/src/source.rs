@@ -56,6 +56,8 @@ pub struct MongoSource {
     metrics: Option<Arc<Metrics>>,
     /// Watermark documents to delete: exact ids, or every id of an ended snapshot.
     cleanup: Vec<Cleanup>,
+    /// When the server's newest cluster time was last read, see [`HEAD_EVERY`].
+    last_head: Option<Instant>,
 }
 
 enum Cleanup {
@@ -69,6 +71,10 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 /// Server-side wait of each getMore. Bounds how often an idle stream reaches the heartbeat
 /// check and how long shutdown waits on `next()`, instead of relying on the server default.
 const MAX_AWAIT: Duration = Duration::from_secs(1);
+
+/// How often `hello` is run to learn the server's newest majority-committed cluster time, the
+/// head the cockpit's "Behind source" card measures against (#150). Only with metrics.
+const HEAD_EVERY: Duration = Duration::from_secs(5);
 
 impl MongoSource {
     pub fn new(cfg: MongoConfig) -> Self {
@@ -86,6 +92,39 @@ impl MongoSource {
             last_status: None,
             metrics: None,
             cleanup: Vec::new(),
+            last_head: None,
+        }
+    }
+
+    /// Everything up to the cluster time of `token` (resume token or checkpoint text) was
+    /// delivered (#150).
+    fn report_delivered(&self, token: &str) {
+        if let (Some(m), Some(ms)) = (&self.metrics, token_time_ms(token)) {
+            m.report_source_delivered_time_ms(ms);
+        }
+    }
+
+    /// Reads the server's newest cluster time with `hello`, at most once per [`HEAD_EVERY`].
+    /// Telemetry only: a failure is logged at debug level and never stops the stream.
+    async fn refresh_head(&mut self) {
+        let (Some(m), Some(client)) = (self.metrics.clone(), self.client.clone()) else {
+            return;
+        };
+        if self.last_head.is_some_and(|t| t.elapsed() < HEAD_EVERY) {
+            return;
+        }
+        self.last_head = Some(Instant::now());
+        match client
+            .database("admin")
+            .run_command(doc! {"hello": 1})
+            .await
+        {
+            Ok(reply) => {
+                if let Some(ms) = head_time_ms(&reply) {
+                    m.report_source_head_time_ms(ms);
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "reading the cluster time failed"),
         }
     }
 
@@ -709,6 +748,41 @@ fn doc_token_text(doc: &Document) -> Result<String> {
         .ok_or_else(|| Error::Source("change event without resume token".into()))
 }
 
+/// The cluster time, Unix ms (second precision), of a resume token in its JSON text form, or of
+/// a checkpoint that wraps one. Tokens start with the event's cluster time as a KeyString
+/// timestamp: the type byte `0x82`, then the seconds as 4 big-endian bytes, then the increment.
+fn token_time_ms(text: &str) -> Option<u64> {
+    let pos = Checkpoint::decode(text).ok()?.pos;
+    let token: Value = serde_json::from_str(&pos).ok()?;
+    let data = token.get("_data")?.as_str()?;
+    if data.len() < 10 || !data[..2].eq_ignore_ascii_case("82") {
+        return None;
+    }
+    let secs = u32::from_str_radix(data.get(2..10)?, 16).ok()?;
+    Some(u64::from(secs) * 1000)
+}
+
+/// The server's newest cluster time, Unix ms, from a `hello` reply: the majority-committed
+/// write (what a change stream can return), else the newest write, else the reply's
+/// `operationTime`.
+fn head_time_ms(reply: &Document) -> Option<u64> {
+    let ts = |b: Option<&Bson>| match b {
+        Some(Bson::Timestamp(t)) => Some(t.time),
+        _ => None,
+    };
+    let last_write = reply.get_document("lastWrite").ok();
+    let op_time = |name: &str| {
+        last_write
+            .and_then(|w| w.get_document(name).ok())
+            .and_then(|o| ts(o.get("ts")))
+    };
+    op_time("majorityOpTime")
+        .or_else(|| op_time("opTime"))
+        .or_else(|| ts(reply.get("operationTime")))
+        .filter(|s| *s > 0)
+        .map(|s| u64::from(s) * 1000)
+}
+
 /// `clusterTime` (a BSON timestamp, seconds in the high word) to microseconds.
 fn commit_micros(ev: &Value) -> i64 {
     ev.pointer("/clusterTime/$timestamp/t")
@@ -796,6 +870,7 @@ impl Source for MongoSource {
         if let Some(t) = &token {
             watch = watch.start_after(parse_token(t)?);
             self.last_token = Some(t.clone());
+            self.report_delivered(t);
         }
         self.last_heartbeat = Instant::now();
         // The stream opens before the snapshot's first watermark is written, so it sees it.
@@ -839,6 +914,7 @@ impl Source for MongoSource {
                 self.chunk_failed(&why);
                 continue;
             }
+            self.refresh_head().await;
             let stream = self
                 .stream
                 .as_mut()
@@ -877,6 +953,14 @@ impl Source for MongoSource {
                     // Empty batch: the token is the server's postBatchResumeToken, so the
                     // checkpoint can follow an idle or fully filtered stream. Only here is it
                     // safe, as the driver's token may point past undelivered events otherwise.
+                    // With everything handed on, nothing is left below its cluster time.
+                    if self.buffer.is_empty() && self.metrics.is_some() {
+                        if let Some(t) = stream.resume_token() {
+                            if let Ok(text) = token_text(&t) {
+                                self.report_delivered(&text);
+                            }
+                        }
+                    }
                     if self.last_heartbeat.elapsed() >= self.heartbeat_every {
                         if let Some(hb) = self.heartbeat()? {
                             return Ok(Some(hb));
@@ -891,7 +975,11 @@ impl Source for MongoSource {
         self.buffer.pop_front()
     }
 
-    async fn ack(&mut self, _position: Position) -> Result<()> {
+    async fn ack(&mut self, position: Position) -> Result<()> {
+        // Nothing to commit on the server; the cockpit learns what was delivered.
+        if let Position::Text(t) = &position {
+            self.report_delivered(t);
+        }
         Ok(())
     }
 }
@@ -899,6 +987,54 @@ impl Source for MongoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_tokens_carry_their_cluster_time() {
+        // 0x6530AA00 = 1697688064 s, increment 1, then the rest of the KeyString.
+        let tok = r#"{"_data":"826530AA00000000012B022C0100296E5A1004"}"#;
+        assert_eq!(token_time_ms(tok), Some(1_697_688_064_000));
+        // Lower-case hex, and wrapped in a snapshot checkpoint.
+        let wrapped = Checkpoint {
+            pos: tok.to_lowercase(),
+            snap: Some(SnapState {
+                id: "s1".into(),
+                tables: vec!["app.u".into()],
+                table: 0,
+                after: None,
+            }),
+        }
+        .encode();
+        assert_eq!(token_time_ms(&wrapped), Some(1_697_688_064_000));
+        for bad in [
+            r#"{"_data":"8265"}"#,
+            r#"{"_data":"0165A1B2C300000001"}"#,
+            r#"{"other":"826530AA0000000001"}"#,
+            "not json",
+        ] {
+            assert_eq!(token_time_ms(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn head_time_prefers_the_majority_committed_write() {
+        use mongodb::bson::Timestamp;
+        let ts = |time| Bson::Timestamp(Timestamp { time, increment: 3 });
+        let reply = doc! {
+            "isWritablePrimary": true,
+            "lastWrite": {
+                "opTime": {"ts": ts(1_700_000_010), "t": 1_i64},
+                "majorityOpTime": {"ts": ts(1_700_000_008), "t": 1_i64},
+            },
+            "operationTime": ts(1_700_000_011),
+        };
+        assert_eq!(head_time_ms(&reply), Some(1_700_000_008_000));
+        let no_majority = doc! {"lastWrite": {"opTime": {"ts": ts(1_700_000_010)}}};
+        assert_eq!(head_time_ms(&no_majority), Some(1_700_000_010_000));
+        let only_op_time = doc! {"ok": 1.0, "operationTime": ts(1_700_000_011)};
+        assert_eq!(head_time_ms(&only_op_time), Some(1_700_000_011_000));
+        // A standalone server has no cluster time.
+        assert_eq!(head_time_ms(&doc! {"ok": 1.0}), None);
+    }
 
     #[test]
     fn token_round_trips() {

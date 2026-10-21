@@ -428,11 +428,20 @@ pub struct PostgresSource {
     origin: Option<Origin>,
 }
 
+/// The slot's `confirmed_flush_lsn`, its lag behind the WAL head, and the WAL head (the replay
+/// position on a standby).
+const SLOT_STATS_SQL: &str = "SELECT confirmed_flush_lsn::text, \
+     pg_wal_lsn_diff(h.lsn, confirmed_flush_lsn)::int8, h.lsn::text \
+     FROM pg_replication_slots, (SELECT CASE WHEN pg_is_in_recovery() \
+     THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END AS lsn) h \
+     WHERE slot_name = $1";
+
 /// How long the stream transport waits for a slot another connection still holds.
 const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
 
-/// How often the slot lag is read from `pg_replication_slots`.
-const SLOT_STATS_EVERY: Duration = Duration::from_secs(5);
+/// How often the slot lag and the WAL head are read (one cheap query on the SQL connection).
+/// Once a second, so the cockpit's backlog does not trail a fast catch-up by seconds.
+const SLOT_STATS_EVERY: Duration = Duration::from_secs(1);
 
 impl PostgresSource {
     pub fn new(cfg: PostgresSourceConfig) -> Self {
@@ -726,41 +735,51 @@ impl PostgresSource {
         }
     }
 
-    /// Reads the slot's `confirmed_flush_lsn` and its distance from the WAL head, at most once
-    /// per [`SLOT_STATS_EVERY`]. Telemetry only: a failure clears the values and never stops
-    /// the stream.
-    async fn refresh_slot_stats(&mut self) {
-        let Some(metrics) = self.metrics.clone() else {
-            return;
-        };
+    /// Reads the slot's `confirmed_flush_lsn`, its distance from the WAL head and the WAL head
+    /// itself, at most once per [`SLOT_STATS_EVERY`]. Returns the head when it was read.
+    /// Telemetry only: a failure clears the values and never stops the stream.
+    async fn refresh_slot_stats(&mut self) -> Option<u64> {
+        let metrics = self.metrics.clone()?;
         if self
             .last_slot_stats
             .is_some_and(|t| t.elapsed() < SLOT_STATS_EVERY)
         {
-            return;
+            return None;
         }
         self.last_slot_stats = Some(Instant::now());
-        let row = match self.client() {
-            Ok(c) => {
-                c.query_opt(
-                    "SELECT confirmed_flush_lsn::text,                      pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()                      ELSE pg_current_wal_lsn() END, confirmed_flush_lsn)::int8                      FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&self.cfg.slot],
-                )
-                .await
-            }
-            Err(_) => return,
-        };
+        let row = self
+            .client()
+            .ok()?
+            .query_opt(SLOT_STATS_SQL, &[&self.cfg.slot])
+            .await;
         match row {
             Ok(Some(row)) => {
                 let flush: Option<String> = row.get(0);
                 let lag: Option<i64> = row.get(1);
+                let head: Option<String> = row.get(2);
                 metrics.set_slot(lag.map(|n| n.max(0) as u64), flush);
+                let head = head.as_deref().and_then(|h| parse_lsn(h).ok());
+                if let Some(h) = head {
+                    metrics.report_source_head_lsn(h);
+                }
+                head
             }
-            Ok(None) => metrics.set_slot(None, None),
+            Ok(None) => {
+                metrics.set_slot(None, None);
+                None
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "slot lag query failed");
                 metrics.set_slot(None, None);
+                None
             }
+        }
+    }
+
+    /// Everything up to `lsn` was delivered, or holds nothing to deliver (#150).
+    fn report_delivered(&self, lsn: u64) {
+        if let (Some(m), true) = (&self.metrics, lsn > 0) {
+            m.report_source_delivered_lsn(lsn);
         }
     }
 
@@ -833,6 +852,7 @@ impl PostgresSource {
         }
         self.transport()?.confirm(lsn).await?;
         self.acked = lsn;
+        self.report_delivered(lsn);
         Ok(())
     }
 
@@ -1022,6 +1042,7 @@ impl PostgresSource {
             let fetched = self.transport()?.fetch().await?;
             self.learn_keys(&fetched.messages).await?;
             self.apply(fetched.messages)?;
+            self.report_stream_positions(fetched.caught_up, fetched.server_wal_end);
             if self.heartbeat_begin().await?.is_some() {
                 match fetched.caught_up {
                     Some(w) => self.heartbeat_end(w, true).await?,
@@ -1031,10 +1052,15 @@ impl PostgresSource {
             return Ok(());
         }
         let heartbeat_wal = self.heartbeat_begin().await?;
-        self.refresh_slot_stats().await;
+        let head = self.refresh_slot_stats().await;
         let fetched = self.transport()?.fetch().await?;
         self.learn_keys(&fetched.messages).await?;
         self.apply(fetched.messages)?;
+        // The head was read before this peek, and the peek drained the slot without anything
+        // new: every change below the head has been handed on.
+        if let (Some(h), true) = (head, fetched.drained && self.buffer.is_empty()) {
+            self.report_delivered(h);
+        }
         if let Some(wal) = heartbeat_wal {
             // A peek drained the slot; a stream is drained up to the WAL position its last
             // keepalive reported, when nothing followed it.
@@ -1042,6 +1068,18 @@ impl PostgresSource {
             self.heartbeat_end(wal, drained).await?;
         }
         Ok(())
+    }
+
+    /// Stream transport: the newest keepalive's WAL end is a position the server has reached, and
+    /// a fetch that ended on a keepalive with everything handed on has nothing left below it.
+    fn report_stream_positions(&self, caught_up: Option<u64>, server_wal_end: Option<u64>) {
+        let Some(m) = &self.metrics else { return };
+        if let Some(w) = server_wal_end {
+            m.report_source_head_lsn(w);
+        }
+        if let (Some(w), true) = (caught_up, self.buffer.is_empty()) {
+            self.report_delivered(w);
+        }
     }
 
     /// Reads the primary keys of the published tables from the catalog.
@@ -1433,6 +1471,8 @@ impl Source for PostgresSource {
                 check_slot_database(&slot, slot_db.as_deref(), &current)?;
                 let flushed: Option<String> = row.get(0);
                 self.acked = flushed.as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
+                // The slot's confirmed position: everything before it was delivered earlier.
+                self.report_delivered(self.acked);
             }
             None => {
                 if let Some(lsn) = &start {
@@ -1565,6 +1605,8 @@ impl Source for PostgresSource {
                     .and_then(|c| parse_checkpoint(&c.pos))
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
+                // Delivered up to this change; the slot itself moves only at commit ends.
+                self.report_delivered(k.change);
                 self.advance_acked(k).await
             }
             Position::Lsn(l) => Err(Error::Source(format!(

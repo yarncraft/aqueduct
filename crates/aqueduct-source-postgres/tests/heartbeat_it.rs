@@ -8,9 +8,10 @@
 //!
 //! Every test makes its own tables, publication and slot, because tests share one server.
 mod common;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{ChangeEvent, Op, Position, Source};
+use aqueduct_core::{ChangeEvent, LagState, Metrics, Op, Position, Source, CAUGHT_UP_BYTES};
 use aqueduct_source_postgres::{parse_lsn, PostgresSource, PostgresSourceConfig, SslMode};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
@@ -554,5 +555,64 @@ async fn failing_action_query_does_not_stop_the_stream() {
     assert!(drive(&mut s, Duration::from_millis(2500)).await.is_none());
     f.insert_published("second").await;
     assert!(drive(&mut s, Duration::from_secs(5)).await.is_some());
+    f.cleanup(s).await;
+}
+
+/// "Behind source" (#150): the source reports the server's WAL head (stats query, and keepalives
+/// in stream mode) and what it delivered. A published backlog of a few MiB shows as such, and
+/// once it is delivered and the slot is drained, the card is caught up.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn reports_the_wal_head_and_the_backlog_until_caught_up() {
+    let f = Fixture::new("lag").await;
+    let metrics = Arc::new(Metrics::new());
+    let mut s = f
+        .source(Duration::from_secs(1))
+        .with_metrics(metrics.clone());
+    s.start(None).await.unwrap();
+    // About 3 MiB of WAL in published rows, one transaction.
+    f.db.batch_execute(&format!(
+        "INSERT INTO {} (v) SELECT repeat('y', 300) FROM generate_series(1, 8000)",
+        f.publ
+    ))
+    .await
+    .unwrap();
+    let wal = f.wal().await;
+    let first = drive(&mut s, Duration::from_secs(10))
+        .await
+        .expect("the published rows must arrive");
+    s.ack(first.checkpoint.clone().unwrap()).await.unwrap();
+    let snap = metrics.snapshot();
+    let head = parse_lsn(snap.source_head_lsn.as_deref().expect("head reported")).unwrap();
+    assert!(
+        head >= wal,
+        "head {head:x} below the WAL after the insert {wal:x}"
+    );
+    let lag = snap.source_lag;
+    assert!(
+        lag.backlog_bytes.unwrap() > CAUGHT_UP_BYTES,
+        "a 3 MiB backlog: {lag:?}"
+    );
+    assert_ne!(lag.state, LagState::CaughtUp);
+    assert_eq!(lag.rate_unit, Some("bytes/s"));
+
+    // Deliver everything, acking as the pipeline does, then let the source go idle.
+    let mut last = first;
+    while let Some(ev) = drive(&mut s, Duration::from_millis(500)).await {
+        last = ev;
+    }
+    s.ack(last.checkpoint.clone().unwrap()).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        metrics.sample_source_lag();
+        let lag = metrics.snapshot().source_lag;
+        if lag.state == LagState::CaughtUp {
+            assert!(lag.backlog_bytes.unwrap() <= CAUGHT_UP_BYTES);
+            assert_eq!((lag.behind_secs, lag.eta_secs), (Some(0.0), Some(0.0)));
+            break;
+        }
+        assert!(Instant::now() < deadline, "never caught up: {lag:?}");
+        assert!(drive(&mut s, Duration::from_millis(500)).await.is_none());
+    }
     f.cleanup(s).await;
 }
