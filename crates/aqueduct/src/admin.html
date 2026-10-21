@@ -9,18 +9,18 @@
 <body class="min-h-screen bg-ink-900 font-sans text-sm text-ink-200 antialiased">
 
 <!-- Top bar -->
-<header class="sticky top-0 z-10 flex h-12 items-center gap-4 border-b border-ink-600 bg-ink-950 px-5">
+<header class="sticky top-0 z-10 flex min-h-12 flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 bg-ink-950 px-4 py-2 sm:px-5">
   <div class="flex items-center gap-2.5">
     <svg viewBox="0 0 24 24" class="h-5 w-5 text-blue" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 18h18M5 18V9a3 3 0 0 1 6 0v9m2 0V9a3 3 0 0 1 6 0v9"/></svg>
     <span class="text-[13px] font-semibold uppercase tracking-[0.18em] text-ink-100">Aqueduct</span>
-    <span class="text-ink-500">/</span>
-    <span class="text-[12px] uppercase tracking-widest text-ink-300">Stream operations</span>
+    <span class="hidden text-ink-500 sm:inline">/</span>
+    <span class="hidden text-[12px] uppercase tracking-widest text-ink-300 sm:inline">Stream operations</span>
   </div>
-  <span id="state" class="ml-2 inline-flex items-center gap-1.5 rounded-sm border border-ink-600 bg-ink-800 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider text-ink-200">
+  <span id="state" class="inline-flex items-center gap-1.5 rounded-sm border border-ink-600 bg-ink-800 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider text-ink-200">
     <i id="state-dot" class="h-1.5 w-1.5 rounded-full bg-amber"></i><span id="state-text">starting</span>
   </span>
-  <div class="ml-auto flex items-center gap-5 font-mono text-[11px] uppercase tracking-wider text-ink-300">
-    <span>Uptime <b id="uptime" class="font-medium text-ink-100">0s</b></span>
+  <div class="ml-auto flex items-center gap-4 font-mono sm:gap-5 text-[11px] uppercase tracking-wider text-ink-300">
+    <span class="hidden sm:inline">Uptime <b id="uptime" class="font-medium text-ink-100">0s</b></span>
     <span id="conn" class="inline-flex items-center gap-1.5"><i id="conn-dot" class="h-1.5 w-1.5 rounded-full bg-red"></i><span id="conn-text">connecting</span></span>
   </div>
 </header>
