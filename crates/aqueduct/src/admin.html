@@ -653,8 +653,6 @@ const topicTotals = name => rates && rates.topic_totals ? opSlots(rates.topic_to
 // Ops the detail chart's single line counts. One selection for the table, route and topic panels, kept while you
 // click along a path (table → its route → its topic), so the lines you compare count the same ops.
 const detailOps = new Set([0, 1, 2, 3, 4]);
-// Per route (by id), the source tables switched off in its detail chart; all are on by default.
-const routeSrcOff = new Map();
 // Toggle buttons that pick those ops.
 const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
 const OP_BTN_ON = OP_BTN + 'border-blue bg-blue/15 text-blue', OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
@@ -883,7 +881,7 @@ function dlqFor(x, name) {
 
 // Table, topic and "+N more" cards: name and count on one line, the op-share bar below.
 const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${opBar(t.id)}${sparkSvg(t.id, NODE_SPARK)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${opBar(id)}${sparkSvg(id, NODE_SPARK)}</button>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${id === 'pm:dlq' ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -989,7 +987,7 @@ function topicNodeHtml(id, name, opts) {
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
   const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
   const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opBar(id)}${sparkSvg(id, NODE_SPARK)}</div>`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opts.dlq ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</div>`;
 }
 
 function graphHtml(m) {
@@ -1165,10 +1163,6 @@ function routeDetail(m) {
     'format', 'deletes', 'tombstones', 'unchanged', 'key', 'outbox', 'topic_fallback', 'topic_values', 'dead_letter_topic'];
   const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
   const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
-  const off = routeSrcOff.get(x.id) || new Set();
-  const srcButtons = x.tables.length > 1
-    ? x.tables.map(t => `<button type="button" data-srctable="${esc(t.name)}" aria-pressed="${!off.has(t.name)}" class="${off.has(t.name) ? OP_BTN_OFF : OP_BTN_ON}">${esc(t.name)}</button>`).join('') + '<span class="w-full"></span>'
-    : '';
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
@@ -1178,8 +1172,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, (label || k) + (k === 'processed' || x.tables.length < 2 ? '' : ' (all sources)'))).join('')
-      + (srcButtons ? '<span class="w-full"></span>' + srcButtons : ''));
+    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, label || k)).join(''));
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1224,14 +1217,11 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    // A route: four lines. Processed is the events its source tables (the ones toggled on) delivered: every event of a
-    // claimed table is processed by this route. Matched, fallback and errors are counted per route, for all sources.
+    // A route: four lines, processed, matched, fallback and errors, from the route's own counters.
     const x = m.routes[graphSel];
     if (!x) return;
-    const off = routeSrcOff.get(x.id) || new Set(), per = (lastData && lastData.history_ops) || {};
-    const src = sumRows(x.tables.filter(t => !off.has(t.name)).map(t => per[t.name] || []));
-    const processed = src.map(o => o.reduce((a, n) => a + n, 0));
     const rr = routeRate(x.i) || {};
+    const processed = sumSeries(ROUTE_COUNTS.map(k => rr[k] || []));
     const series = { processed, passed: sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]), fallback: rr.fallback || [], errors: rr.errors || [] };
     chart(CARD_METRICS.map(([k], op) => ({ op, h: series[k] })), dc, CARD_METRICS.map(c => c[1]), 160);
     $('detailstats').textContent = 'processed ' + rateStats(processed);
@@ -1330,17 +1320,6 @@ $('graph').addEventListener('click', ev => {
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
 $('routedetail').addEventListener('click', ev => {
-  const src = ev.target.closest('[data-srctable]');
-  if (src && graphModel && graphSel != null) {
-    const x = graphModel.routes[graphSel];
-    const off = routeSrcOff.get(x.id) || new Set(), name = src.dataset.srctable, on = off.has(name);
-    on ? off.delete(name) : off.add(name);
-    routeSrcOff.set(x.id, off);
-    src.setAttribute('aria-pressed', String(on));
-    src.className = on ? OP_BTN_ON : OP_BTN_OFF;
-    drawDetail(graphModel);
-    return;
-  }
   const opBtn = ev.target.closest('[data-op]');
   if (opBtn) {
     const op = +opBtn.dataset.op, on = !detailOps.has(op);
