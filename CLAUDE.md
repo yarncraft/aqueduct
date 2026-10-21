@@ -30,14 +30,21 @@ cargo test --workspace            # always run the whole workspace, not one crat
 docker compose up --build         # or: podman-compose up -d --build
 ```
 
-**There is no CI**, local or remote. Before you post a SHA for review, run these yourself (in podman on the Windows machine) and paste the commands and their `test result` lines on the PR:
+**There is no CI**, local or remote. Before you post a SHA for review, run these yourself (cargo with the local toolchain, see below) and paste the commands and their `test result` lines on the PR:
 
 - Every PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`.
 - PRs that touch a source, the Kafka sink or the pipeline: the integration suite too, `cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored` and `cargo test --locked -p aqueduct-sinks --test kafka_it`, against local Kafka, MongoDB and Postgres containers (`AQUEDUCT_TEST_KAFKA`, `AQUEDUCT_KAFKA_BROKERS`, `AQUEDUCT_TEST_PG_*`). The passed count must be non-zero; a test that skips itself when its variable is unset does not count.
 - PRs that change `Cargo.lock`: `cargo audit`.
 - PRs that change the `Dockerfile` or the image: `podman build .`.
 
-On the Windows dev machine: `RUSTUP_HOME=S:\rust\rustup`, `CARGO_HOME=S:\rust\cargo`, Podman in `S:\podman\bin`.
+On the Windows dev machine, cargo runs with the local toolchain in the `Ubuntu` WSL distro (rustup in `/root/.cargo`,
+with clippy and rustfmt), never in a Rust container: `wsl.exe -d Ubuntu -- bash -l -s` with the commands on stdin, on a
+`git archive` of the commit unpacked in Ubuntu's own filesystem (not `/mnt/c`). Only the services the integration
+suite needs (Kafka, MongoDB, Postgres) run in Podman (`S:\podman\bin`): publish their ports, and Ubuntu reaches them on
+`localhost`, because all WSL2 distros share one network; Ubuntu's `hostname -I` address serves as the non-loopback
+host. `podman build .` still builds the image; pulling `gcr.io` images needs the corporate (Zscaler) root CA trusted
+in the Podman machine. After a WSL restart, `podman machine stop` and `podman machine start` restore the Docker API
+pipe that `docker compose` uses.
 
 ### Cleanup (always)
 
