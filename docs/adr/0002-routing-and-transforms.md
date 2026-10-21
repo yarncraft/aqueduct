@@ -522,3 +522,24 @@ before #138 made keys JSON:
   and `unchanged: "dead_letter"` when set; each is left out otherwise, so other routes describe as before. The
   inspector reuses R8's raw display: a tombstone is `null` and labelled as such, and a row or tombstone takes its table
   from the JSON record key.
+
+## As built (2026-10-21): `ops` removed
+
+Owner decision: `ops` removed; filter on `op` in `where`. The text above, which has routes take `ops` and `where`, is
+kept as approved; the code differs as follows:
+
+- **No `ops` key.** `[[sink.routes]]` has no `ops`, `/api/routes` no `ops` field, and the cockpit no ops chips.
+  Operations are filtered in `where`: `op in ['insert', 'update']`. A config that still sets `ops` fails startup and
+  prints the equivalent `where` (`where = "(<old where>) and op in [...]"` when the route has one). `ops` was never
+  released, so this is not a breaking change.
+- **One predicate, no short-circuit.** `ops` used to drop an event before `where` ran. In `where`, the §3 rule holds
+  for the `op` part too: a type error elsewhere in the expression wins, so a row the `op` part rules out can still
+  go to the dead-letter topic.
+- **Static check.** `op`, `schema` and `table` compare only with string literals (a number or boolean literal fails
+  startup, as ordering a string already did), and `op` only with `insert`, `update`, `delete`, `truncate` or `read`.
+  A `where` on these fields alone therefore cannot hit a type error, so `sink.dead_letter_topic` is required only when
+  `where` reads row data (`before.`, `after.`, `row.`), and only row paths are watched for unseen fields. Such a
+  `where` parses no row.
+- **Outbox.** An outbox route publishes inserts; snapshot `read` events only when the route has a `where` that is
+  true for them (`where = "op in ['insert', 'read']"`). Without `where`, inserts only. Updates, deletes and truncates
+  are always filtered. The startup check on an `ops` list without `insert` or `read` went with `ops`.

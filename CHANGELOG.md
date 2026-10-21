@@ -163,8 +163,8 @@ Notable changes to Aqueduct. Newest first.
   `payload` column as is (`jsonb` as JSON text, text as its content), headers `id` and `type` from the configured
   columns besides `op` and `lsn`. Unset keys take Debezium's defaults (`aggregatetype`, `aggregateid`, `payload`,
   `outbox.event.{aggregate_type}`). Updates, deletes and truncates of the outbox are filtered; snapshot rows too,
-  unless the route's `ops` lists `read` (then rows still in the table are published again on every snapshot). An `ops`
-  list without `insert` or `read`, and a `where` on `before.*`, fail startup. Differences from Debezium's outbox
+  unless the route has a `where` that is true for them, such as `where = "op in ['insert', 'read']"` (then rows still
+  in the table are published again on every snapshot). A `where` on `before.*` fails startup. Differences from Debezium's outbox
   router: a `jsonb` payload that is a bare string loses its quotes, a `text` payload holding JSON reads as JSON, and
   `bytea` arrives as hex text, so use a `jsonb` object or array, or `text`, as the payload. A row
   without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
@@ -221,16 +221,20 @@ Notable changes to Aqueduct. Newest first.
   table-only key. `GET /api/routes` shows each route's `key`. Additive: routes without `key` are unchanged.
 - **Cockpit: a Routing card draws the routing graph** (#87, ADR 0002). Tables on the left, routes in match order
   (numbered, first match wins) in the middle, topics and the dead-letter topic on the right. Each route shows its
-  `match`, `ops`, `where`, per-route counts (produced, filtered, fallback, errors) with a bar, and an amber warning
+  `match`, `where`, per-route counts (produced, filtered, fallback, errors) with a bar, and an amber warning
   listing fields its `where` reads that no row has had. Edge width follows the counts and edges with recent traffic
   animate (static under reduced motion). Hover a table to light up its path, click a route for its details, click a
   topic to open it in the event inspector. Busy routes collapse to the 6 busiest tables and topics with "+N more".
   No new server route: it reads `/api/routes`, `/api/tables` and the stream.
 - **Routing: filter events per route and send failures to a dead-letter topic** (#81, ADR 0002). `[[sink.routes]]`
-  takes `ops` (insert, update, delete, truncate, read) and `where`, a typed predicate with SQL-style three-valued
-  logic (an unknown result is filtered). The first matching route owns the event; nothing falls through. Rows a
-  `where` cannot evaluate (a type error) go to the new `[sink] dead_letter_topic` with an `aqueduct-error` header and
-  a table-only key; it is required once a route uses `where` and is opened at startup. Per-route counters
+  takes `where`, a typed predicate with SQL-style three-valued logic (an unknown result is filtered). It filters
+  operations too: `where = "op in ['insert', 'update']"` (`op` is `insert`, `update`, `delete`, `truncate` or `read`;
+  any other value, and comparing `op`, `schema` or `table` with a number or boolean, fails startup). There is no
+  separate `ops` key; a route that sets one fails startup and prints the equivalent `where`. The first matching route
+  owns the event; nothing falls through. Rows a `where` cannot evaluate (a type error) go to the new
+  `[sink] dead_letter_topic` with an `aqueduct-error` header and a table-only key; it is required once a route's
+  `where` reads row data (`before.`, `after.`, `row.`), not for a `where` on `op`, `schema` and `table` alone, which
+  cannot fail, and is opened at startup. Per-route counters
   (`matched`, `produced`, `filtered`, `fallback`, `errors`) and unseen-field warnings appear in `/api/metrics`, the new
   `GET /api/routes` (the compiled plan with live counts) and Prometheus (`aqueduct_route_records_total`,
   `aqueduct_route_field_unseen`). Additive: routes without the new keys behave exactly as before.

@@ -4,9 +4,39 @@ use aqueduct_sinks::{
     PartitionBy, RoutePlan, SourceInfo,
 };
 
-use crate::config::KafkaConfig;
+use crate::config::{KafkaConfig, KafkaRouteConfig};
+
+/// The error for a route that still sets `ops`, which was removed before it was released: the
+/// message is the `where` that does the same.
+fn removed_ops(r: &KafkaRouteConfig) -> Option<Error> {
+    let ops = r.ops.as_ref()?;
+    let name = r.name.as_deref().unwrap_or(&r.pattern);
+    let names: Option<Vec<String>> = ops.as_array().and_then(|a| {
+        a.iter()
+            .map(|v| v.as_str().map(|s| format!("'{}'", s.to_ascii_lowercase())))
+            .collect()
+    });
+    let hint = match names {
+        Some(n) if !n.is_empty() => {
+            let op = format!("op in [{}]", n.join(", "));
+            let filter = match &r.filter {
+                Some(w) => format!("({w}) and {op}"),
+                None => op,
+            };
+            let quoted = filter.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(": replace it with `where = \"{quoted}\"`")
+        }
+        _ => ": list the operations to keep in `where` instead, e.g. `where = \"op in ['insert', 'update']\"`".into(),
+    };
+    Some(Error::Config(format!(
+        "sink route `{name}`: `ops` was removed; filter operations in `where`{hint}"
+    )))
+}
 
 fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
+    if let Some(e) = cfg.routes.iter().find_map(removed_ops) {
+        return Err(e);
+    }
     let routes = cfg
         .routes
         .iter()
@@ -15,7 +45,6 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             pattern: r.pattern.clone(),
             // Empty when unset; the plan requires a topic unless the route is an outbox.
             topic: r.topic.clone().unwrap_or_default(),
-            ops: r.ops.clone(),
             filter: r.filter.clone(),
             key: r.key.clone(),
             topic_fallback: r.topic_fallback.clone(),
@@ -115,15 +144,31 @@ dead_letter_topic = 'aqueduct.dlq'
 [[routes]]
 name = 'paid'
 match = 'public.orders'
-ops = ['insert', 'update']
-where = \"row.status == 'paid'\"
+where = \"op in ['insert', 'update'] and row.status == 'paid'\"
 topic = 'orders'
 ",
         );
         let d = plan(&cfg, None).unwrap().describe();
         assert_eq!(d.dead_letter_topic.as_deref(), Some("aqueduct.dlq"));
-        assert_eq!(d.routes[0].ops, Some(vec!["insert", "update"]));
-        assert_eq!(d.routes[0].filter.as_deref(), Some("row.status == 'paid'"));
+        assert_eq!(
+            d.routes[0].filter.as_deref(),
+            Some("op in ['insert', 'update'] and row.status == 'paid'")
+        );
+
+        // A `where` on `op`, `schema` and `table` alone needs no dead-letter topic.
+        let d = plan(
+            &kafka(
+                "[[routes]]
+match = 'public.orders'
+where = \"op in ['insert', 'update']\"
+topic = 'orders'
+",
+            ),
+            None,
+        )
+        .unwrap()
+        .describe();
+        assert_eq!(d.dead_letter_topic, None);
 
         // `where` without a dead-letter topic, and a syntax error, fail naming the route.
         let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
@@ -147,13 +192,50 @@ topic = 'orders'
         assert!(e.contains("route `paid`: invalid `where`"), "{e}");
         let e = err("[[routes]]
 match = 'public.orders'
-ops = ['upsert']
+where = \"op == 'upsert'\"
 topic = 'orders'
 ");
         assert!(
-            e.contains("route `public.orders`: unknown op `upsert`"),
+            e.contains("route `public.orders`: invalid `where`")
+                && e.contains("unknown op `upsert`"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_route_that_still_sets_ops_fails_with_the_equivalent_where() {
+        let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
+        let e = err("[[routes]]
+name = 'orders'
+match = 'public.orders'
+ops = ['insert', 'Update']
+topic = 'orders'
+");
+        assert_eq!(
+            e,
+            "config error: sink route `orders`: `ops` was removed; filter operations in `where`: replace it with `where = \"op in ['insert', 'update']\"`"
+        );
+        let e = err("dead_letter_topic = 'dlq'
+[[routes]]
+match = 'public.orders'
+ops = ['insert']
+where = 'row.note == \"a\\\\b\" or row.n > 1'
+topic = 'orders'
+");
+        assert!(
+            e.ends_with(
+                r#"sink route `public.orders`: `ops` was removed; filter operations in `where`: replace it with `where = "(row.note == \"a\\\\b\" or row.n > 1) and op in ['insert']"`"#
+            ),
+            "{e}"
+        );
+        // Not a list of strings: still refused, with an example.
+        for bad in ["ops = []", "ops = 'insert'", "ops = [1]"] {
+            let e = err(&format!("[[routes]]\nmatch = 'p.t'\n{bad}\ntopic = 't'\n"));
+            assert!(
+                e.contains("`ops` was removed") && e.contains("op in ['insert', 'update']"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]

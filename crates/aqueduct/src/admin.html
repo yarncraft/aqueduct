@@ -942,7 +942,7 @@ function graphModelOf(d) {
     }
     for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
     for (const t of x.tables) tableEdges[t.name].push(x.id + '>' + (t.topic ? topicNode.get(t.topic) : g.id));
-    if (dlq && (x.r.where != null || x.c.errors > 0)) x.dlqEdge = edge(x.id, 'dlq', x.c.errors || 0, true);
+    if (dlq && (readsRow(x.r.where) || x.c.errors > 0)) x.dlqEdge = edge(x.id, 'dlq', x.c.errors || 0, true);
   }
   for (const t of unrouted) values[t.id] = fmt(t.events);
   if (dlq) values.dlq = fmt(routes.reduce((a, x) => a + (x.c.errors || 0), 0));
@@ -955,6 +955,9 @@ const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}
 const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged per second, all of them together' : 'Events per second, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${sparkSvg(id, NODE_SPARK)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
+// Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
+// quoted text is skipped. A `where` on `op`, `schema` and `table` alone never fails.
+const readsRow = w => w != null && /(^|[^\w.])(before|after|row)\./.test(w.replace(/'(?:[^']|'')*'/g, "''"));
 const badgeVal = v => Array.isArray(v) ? v.join(', ') : v && typeof v === 'object' ? Object.keys(v).join(', ') : String(v);
 const routeBadges = r => Object.keys(ROUTE_BADGES).filter(k => r[k] != null && r[k] !== false).map(k =>
   `<span class="rounded-sm bg-blue/15 px-1.5 py-0.5 text-[10px] text-blue" title="${esc(k + ' = ' + JSON.stringify(r[k]))}">${esc(r[k] === true ? ROUTE_BADGES[k] : ROUTE_BADGES[k] + ' ' + short(badgeVal(r[k])))}</span>`).join('');
@@ -965,13 +968,13 @@ const routeBar = x => {
 
 function routeNode(x, last) {
   const r = x.r, sel = graphSel === x.i;
-  const ops = r.ops ? r.ops.map(o => `<span class="rounded-sm bg-ink-700 px-1 text-[10px] uppercase text-ink-200">${esc(o)}</span>`).join('') : '<span class="text-[10px] uppercase text-ink-500">all ops</span>';
+  const badges = routeBadges(r);
   const unseen = x.c.unseen_fields || [];
   return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
     + `<div class="flex items-center gap-2"><span class="flex h-5 min-w-5 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span>`
     + `<span class="ml-auto truncate text-ink-300" title="match">${r.match == null ? 'sink.topic' : esc(r.match)}</span></div>`
-    + `<div class="mt-1.5 flex flex-wrap items-center gap-1">${ops}${routeBadges(r)}</div>`
+    + (badges ? `<div class="mt-1.5 flex flex-wrap items-center gap-1">${badges}</div>` : '')
     + (r.where != null ? `<div class="mt-1.5 truncate text-ink-200" title="${esc(r.where)}"><span class="text-ink-500">where</span> ${esc(r.where)}</div>` : '')
     + `<div class="mt-1.5 flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(([k]) => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</div>`
     + `<div data-bar="${x.id}" class="mt-1.5 flex h-1 overflow-hidden rounded-sm bg-ink-700">${routeBar(x)}</div>`
@@ -1099,10 +1102,9 @@ function routeDetail(m) {
   $('routedetail').hidden = !x && topicSel == null && tableSel == null;
   if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) tableDetail(m, tableSel); return; }
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
-  const extra = Object.keys(r).filter(k => !['route', 'match', 'ops', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
+  const extra = Object.keys(r).filter(k => !['route', 'match', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
     + row('match', esc(r.match ?? 'everything else (sink.topic)'))
-    + row('ops', esc(r.ops ? r.ops.join(', ') : 'all'))
     + row('where', r.where != null ? `<pre class="whitespace-pre-wrap">${esc(r.where)}</pre>` : '<span class="text-ink-500">–</span>')
     + row('topic', esc(r.topic) + (x.topics.size && isTemplate(r.topic) ? ` <span class="text-ink-500">→ ${esc([...x.topics.keys()].sort().join(', '))}</span>` : ''))
     + row('counts', ['matched', ...ROUTE_COUNTS.map(c => c[0])].map(k => `${k} <span data-v="${x.id}:${k}">${fmt(x.c[k] || 0)}</span>`).join(' · '))

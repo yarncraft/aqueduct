@@ -8,7 +8,7 @@ use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-use super::expr::{op_name, EventView, Expr, FieldRef, Template, Tri};
+use super::expr::{EventView, Expr, FieldRef, Template, Tri};
 use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
 use crate::{
@@ -22,9 +22,6 @@ pub const UNSEEN_FIELD_ROWS: u64 = 1000;
 /// The label of the `sink.topic` fallback in route stats; no route may use it.
 const DEFAULT_ROUTE: &str = "default";
 
-/// The ops a route's `ops` list may name, in the order the docs give them.
-const OPS: [Op; 5] = [Op::Insert, Op::Update, Op::Delete, Op::Truncate, Op::Read];
-
 /// Sends events whose `schema.table` matches `pattern` to `topic`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KafkaRoute {
@@ -34,9 +31,8 @@ pub struct KafkaRoute {
     pub pattern: String,
     /// Destination topic; `{schema}` and `{table}` are substituted.
     pub topic: String,
-    /// Only these ops pass (`insert`, `update`, `delete`, `truncate`, `read`); `None` passes all.
-    pub ops: Option<Vec<String>>,
-    /// The `where` predicate (ADR 0002 §3); only events it is definitely true for pass.
+    /// The `where` predicate (ADR 0002 §3); only events it is definitely true for pass. It filters
+    /// operations too: `op in ['insert', 'update']`.
     pub filter: Option<String>,
     /// Top-level columns of `row` that make the record key, in order; overrides `partition_by`.
     pub key: Option<Vec<String>>,
@@ -370,8 +366,6 @@ pub const DEFAULT_MAX_DYNAMIC_TOPICS: usize = 100;
 struct CompiledRoute {
     pattern: String,
     topic: TopicTemplate,
-    /// `None`: every op passes.
-    ops: Option<Vec<Op>>,
     filter: Option<Expr>,
     /// `key = [...]`: the columns and the `row.<column>` paths that read them, in config order.
     key: Option<RouteKey>,
@@ -845,7 +839,8 @@ pub struct RouteCounts {
     pub matched: u64,
     /// Events produced to the route's topic.
     pub produced: u64,
-    /// Events dropped by `ops` or `where` (including a `where` that ends unknown).
+    /// Events dropped by `where` (including a `where` that ends unknown), and outbox changes
+    /// other than inserts and snapshot reads.
     pub filtered: u64,
     /// Events sent to the route's `topic_fallback`.
     pub fallback: u64,
@@ -996,8 +991,6 @@ pub struct RouteDescription {
     /// The `match` glob; `null` for the `default` pseudo-route (it takes what no route claims).
     #[serde(rename = "match")]
     pub pattern: Option<String>,
-    /// The `ops` filter; `null` when every op passes.
-    pub ops: Option<Vec<&'static str>>,
     /// The `where` expression as configured; `null` without one.
     #[serde(rename = "where")]
     pub filter: Option<String>,
@@ -1069,29 +1062,6 @@ fn valid_topic_name(t: &str) -> bool {
         && t != ".."
         && t.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-fn parse_ops(name: &str, ops: &[String]) -> Result<Vec<Op>> {
-    if ops.is_empty() {
-        return Err(Error::Config(format!(
-            "sink route `{name}`: `ops` is empty, so it would drop every event; list the ops to keep or remove the key"
-        )));
-    }
-    let mut out = Vec::with_capacity(ops.len());
-    for o in ops {
-        let op = OPS
-            .into_iter()
-            .find(|op| op_name(*op).eq_ignore_ascii_case(o))
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "sink route `{name}`: unknown op `{o}` in `ops` (expected insert, update, delete, truncate or read)"
-                ))
-            })?;
-        if !out.contains(&op) {
-            out.push(op);
-        }
-    }
-    Ok(out)
 }
 
 /// Whether a content-routed template may substitute `v` for `f`: row fields must be one segment
@@ -1339,13 +1309,14 @@ fn check_field_ops(
 }
 
 impl RoutePlan {
-    /// A plan without a dead-letter topic, so no route may use `where`.
+    /// A plan without a dead-letter topic, so no route's `where` may read row data.
     pub fn new(routes: Vec<KafkaRoute>, default: Option<String>) -> Result<Self> {
         Self::with_dead_letter(routes, default, None)
     }
 
-    /// Compiles and validates the routes. `dead_letter_topic` is required as soon as a route has
-    /// a `where`, may not start with `_`, and may not be a topic a route or the default writes to.
+    /// Compiles and validates the routes. `dead_letter_topic` is required as soon as a route's
+    /// `where` reads row data, may not start with `_`, and may not be a topic a route or the
+    /// default writes to.
     pub fn with_dead_letter(
         routes: Vec<KafkaRoute>,
         default: Option<String>,
@@ -1396,7 +1367,6 @@ impl RoutePlan {
                     },
                 ));
             }
-            let ops = r.ops.as_deref().map(|o| parse_ops(&name, o)).transpose()?;
             let filter = r
                 .filter
                 .as_deref()
@@ -1406,10 +1376,15 @@ impl RoutePlan {
                     })
                 })
                 .transpose()?;
-            if filter.is_some() && dead_letter_topic.is_none() {
-                return Err(Error::Config(format!(
-                    "sink route `{name}` uses `where`, which needs `sink.dead_letter_topic`: rows it cannot evaluate go there instead of stopping the pipeline"
-                )));
+            // Only a `where` that reads row data can hit a type error at run time: `op`, `schema`
+            // and `table` are strings, and comparing them with anything but a string literal is
+            // refused when the expression is parsed.
+            if let Some(f) = filter.as_ref().and_then(|w| w.row_fields().next()) {
+                if dead_letter_topic.is_none() {
+                    return Err(Error::Config(format!(
+                        "sink route `{name}` uses `where` on row data (`{f}`), which needs `sink.dead_letter_topic`: rows it cannot evaluate go there instead of stopping the pipeline"
+                    )));
+                }
             }
             let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
             let (topic, outbox) = match &r.outbox {
@@ -1471,16 +1446,8 @@ impl RoutePlan {
                             "sink route `{name}`: `key` and `outbox` are mutually exclusive; an outbox record is keyed by its `aggregate_id`"
                         )));
                     }
-                    // Only inserts (and, when `ops` lists it, `read`) are published, so an `ops`
-                    // list without either, or a `where` on the before-image, drops every row.
-                    if ops
-                        .as_ref()
-                        .is_some_and(|o| !o.contains(&Op::Insert) && !o.contains(&Op::Read))
-                    {
-                        return Err(Error::Config(format!(
-                            "sink route `{name}`: `ops` lists neither `insert` nor `read`, but an outbox route only publishes those, so it would publish nothing"
-                        )));
-                    }
+                    // Only inserts and snapshot reads are published, so a `where` on the
+                    // before-image drops every row.
                     if let Some(f) = filter.as_ref().and_then(|w| {
                         w.fields()
                             .into_iter()
@@ -1502,9 +1469,11 @@ impl RoutePlan {
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
             let field_ops = FieldOps::compile(&name, &r.fields)?;
             let shape = parse_shape(&name, r, dead_letter_topic.as_deref())?;
+            // `op`, `schema` and `table` are never missing, so only the row paths of `where` are
+            // watched.
             let mut watched: Vec<FieldRef> = filter
                 .iter()
-                .flat_map(|f| f.fields())
+                .flat_map(|f| f.row_fields())
                 .chain(key.iter().flat_map(|k| k.fields.iter()))
                 .chain(topic.parsed.fields())
                 .chain(outbox.iter().flat_map(Outbox::fields))
@@ -1518,7 +1487,6 @@ impl RoutePlan {
             let route = CompiledRoute {
                 pattern: r.pattern.clone(),
                 topic,
-                ops,
                 filter,
                 key,
                 topic_fallback,
@@ -1799,9 +1767,6 @@ impl RoutePlan {
                 rename: spec.and_then(|s| (!s.rename.is_empty()).then(|| s.rename.clone())),
                 route: self.stats.names[i].clone(),
                 pattern,
-                ops: r
-                    .and_then(|r| r.ops.as_ref())
-                    .map(|ops| ops.iter().map(|o| op_name(*o)).collect()),
                 filter: r
                     .and_then(|r| r.filter.as_ref())
                     .map(|f| f.source().to_string()),
@@ -1836,7 +1801,7 @@ impl RoutePlan {
     /// `now_us` (the envelope's top-level `ts_ms`/`ts_us`). Heartbeats produce nothing. An event
     /// no route claims is an error, as before.
     ///
-    /// The first matching route owns the event (ADR 0002 §2): `ops`, then `where` on the original
+    /// The first matching route owns the event (ADR 0002 §2): its `where` decides on the original
     /// event. A `where` that is false or unknown filters the event (no record); one that hits a
     /// type error sends it to the dead-letter topic. Neither falls through to a later route.
     pub fn render_into(
@@ -1868,13 +1833,12 @@ impl RoutePlan {
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
-                // An outbox publishes inserts, and snapshot reads only when `ops` lists `read`
-                // (ADR 0002 §5, "As built (R8)"): updates, deletes and truncates of the outbox
-                // table are filtered before anything else.
-                let ops_read = r.ops.as_ref().is_some_and(|ops| ops.contains(&Op::Read));
-                if r.ops.as_ref().is_some_and(|ops| !ops.contains(&event.op))
-                    || (r.outbox.is_some()
-                        && !(event.op == Op::Insert || (event.op == Op::Read && ops_read)))
+                // An outbox publishes inserts, and snapshot reads only when the route has a
+                // `where` (checked below, so it must be true for them; ADR 0002 §5, "As built"):
+                // updates, deletes and truncates of the outbox table are filtered before anything
+                // else.
+                if r.outbox.is_some()
+                    && !(event.op == Op::Insert || (event.op == Op::Read && r.filter.is_some()))
                 {
                     self.stats.claimed(&self.stats.filtered, route);
                     return Ok(());
@@ -2607,13 +2571,12 @@ mod tests {
         );
     }
 
-    // --- filter: ops, where, dead-letter topic (R3) ---------------------------------------------
+    // --- filter: where (op, schema, table, rows), dead-letter topic (R3) ------------------------
 
     const DLQ: &str = "aqueduct.dlq";
 
-    fn filtered(name: &str, p: &str, ops: Option<&[&str]>, filter: Option<&str>) -> KafkaRoute {
+    fn filtered(name: &str, p: &str, filter: Option<&str>) -> KafkaRoute {
         KafkaRoute {
-            ops: ops.map(|o| o.iter().map(|s| s.to_string()).collect()),
             filter: filter.map(Into::into),
             ..named(name, p, &format!("{name}.topic"))
         }
@@ -2649,30 +2612,38 @@ mod tests {
     }
 
     #[test]
-    fn ops_and_where_filter_per_route_table_driven() {
+    fn where_filters_ops_and_rows_per_route_table_driven() {
         let p = plan_with(vec![
-            filtered("ins", "public.ins", Some(&["insert"]), None),
-            filtered("w", "public.orders", None, Some("row.status == 'paid'")),
+            filtered("ins", "public.ins", Some("op == 'insert'")),
+            filtered("w", "public.orders", Some("row.status == 'paid'")),
             filtered(
                 "both",
                 "public.both",
-                Some(&["insert", "update"]),
-                Some("row.amount > 10"),
+                Some("op in ['insert', 'update'] and row.amount > 10"),
             ),
             filtered(
                 "keep_null",
                 "public.k",
-                None,
                 Some("row.region is null or not (row.region == 'eu')"),
             ),
-            filtered("neg", "public.neg", None, Some("not (row.region == 'eu')")),
+            filtered("neg", "public.neg", Some("not (row.region == 'eu')")),
+            filtered(
+                "nodel",
+                "public.nodel",
+                Some("not (op in ['delete', 'truncate'])"),
+            ),
         ]);
         let cases: &[(&str, Op, &str, &str)] = &[
-            // ops
+            // op
             ("ins", Op::Insert, r#"{"id":1}"#, "ins.topic"),
             ("ins", Op::Update, r#"{"id":1}"#, "filtered"),
             ("ins", Op::Delete, r#"{"id":1}"#, "filtered"),
             ("ins", Op::Truncate, "{}", "filtered"),
+            ("ins", Op::Read, r#"{"id":1}"#, "filtered"),
+            ("nodel", Op::Update, r#"{"id":1}"#, "nodel.topic"),
+            ("nodel", Op::Read, r#"{"id":1}"#, "nodel.topic"),
+            ("nodel", Op::Delete, r#"{"id":1}"#, "filtered"),
+            ("nodel", Op::Truncate, "{}", "filtered"),
             // where: true, false, unknown (missing field), null field
             ("orders", Op::Insert, r#"{"status":"paid"}"#, "w.topic"),
             ("orders", Op::Insert, r#"{"status":"open"}"#, "filtered"),
@@ -2683,12 +2654,14 @@ mod tests {
             ("orders", Op::Delete, r#"{"status":"paid"}"#, "w.topic"),
             // type error: a number literal against text that is not a number
             ("orders", Op::Insert, r#"{"status":1}"#, "dlq"),
-            // ops first, then where; an op the list drops never reaches where (no type error)
+            // op and row data in one predicate
             ("both", Op::Insert, r#"{"amount":11}"#, "both.topic"),
             ("both", Op::Update, r#"{"amount":"10.5"}"#, "both.topic"),
             ("both", Op::Insert, r#"{"amount":9}"#, "filtered"),
+            ("both", Op::Delete, r#"{"amount":11}"#, "filtered"),
             ("both", Op::Insert, r#"{"amount":"abc"}"#, "dlq"),
-            ("both", Op::Delete, r#"{"amount":"abc"}"#, "filtered"),
+            // a type error wins over the op part too (no short-circuit, ADR 0002 §3)
+            ("both", Op::Delete, r#"{"amount":"abc"}"#, "dlq"),
             // `not` over null is unknown, so filtered; `is null or` keeps the row
             ("neg", Op::Insert, r#"{"region":"us"}"#, "neg.topic"),
             ("neg", Op::Insert, r#"{"region":"eu"}"#, "filtered"),
@@ -2708,7 +2681,7 @@ mod tests {
     fn a_claimed_event_never_falls_through_to_a_later_route() {
         // The second route would pass everything; the first owns public.orders.
         let p = plan_with(vec![
-            filtered("strict", "public.orders", None, Some("row.n > 0")),
+            filtered("strict", "public.orders", Some("row.n > 0")),
             route("public.*", "everything"),
         ]);
         assert_eq!(
@@ -2730,7 +2703,6 @@ mod tests {
         let p = plan_with(vec![filtered(
             "orders",
             "public.orders",
-            None,
             Some("row.amount > 10 and row.status == 'paid'"),
         )]);
         let mut e = row(
@@ -2765,13 +2737,13 @@ mod tests {
     #[test]
     fn counters_add_up_per_route() {
         let p = plan_with(vec![
-            filtered("o", "public.orders", Some(&["insert"]), Some("row.n > 1")),
+            filtered("o", "public.orders", Some("op == 'insert' and row.n > 1")),
             route("public.*", "p"),
         ]);
         for (table, op, json) in [
             ("orders", Op::Insert, r#"{"n":2}"#),   // produced
             ("orders", Op::Insert, r#"{"n":1}"#),   // filtered by where
-            ("orders", Op::Update, r#"{"n":2}"#),   // filtered by ops
+            ("orders", Op::Update, r#"{"n":2}"#),   // filtered by op
             ("orders", Op::Insert, r#"{"n":"x"}"#), // error
             ("orders", Op::Insert, r#"{}"#),        // unknown: filtered
             ("users", Op::Insert, r#"{}"#),         // second route
@@ -2808,85 +2780,55 @@ mod tests {
     }
 
     #[test]
-    fn where_and_ops_are_validated_at_startup() {
+    fn where_is_validated_at_startup() {
         let dlq = Some(DLQ.to_string());
         let build = |r: KafkaRoute, dlq: Option<String>| {
             RoutePlan::with_dead_letter(vec![r], Some("rest".into()), dlq)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         };
-        // (ops, where, dead_letter_topic, expected error or "" for ok)
-        type Case<'a> = (
-            Option<&'a [&'a str]>,
-            Option<&'a str>,
-            Option<&'a str>,
-            &'a str,
-        );
-        let cases: &[Case] = &[
-            (Some(&["insert", "UPDATE", "read"]), None, None, ""),
+        // (where, dead_letter_topic, expected error or "" for ok)
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            // `op`, `schema` and `table` alone cannot fail, so no dead-letter topic is needed.
+            ("op in ['insert', 'update', 'read']", None, ""),
+            ("op == 'delete' or schema == 'audit' and table != 'log'", None, ""),
+            ("op is not null", None, ""),
+            ("op == 'upsert'", None, "sink route `r`: invalid `where`: unknown op `upsert`"),
+            ("op in ['insert', 'Update']", None, "unknown op `Update`"),
+            ("op == 1", None, "sink route `r`: invalid `where`"),
+            ("table in [true]", None, "`table` is a string"),
+            ("op < 'insert'", None, "ordering a string is not supported"),
+            // Reading row data needs one, as before.
+            ("row.n > 1", Some(DLQ), ""),
             (
-                Some(&["upsert"]),
+                "row.n > 1",
                 None,
-                None,
-                "sink route `r`: unknown op `upsert`",
+                "sink route `r` uses `where` on row data (`row.n`), which needs `sink.dead_letter_topic`",
             ),
-            (Some(&[]), None, None, "sink route `r`: `ops` is empty"),
-            (None, Some("row.n > 1"), Some(DLQ), ""),
             (
+                "op == 'insert' and before.n is null",
                 None,
-                Some("row.n >"),
+                "uses `where` on row data (`before.n`)",
+            ),
+            ("row.n >", Some(DLQ), "sink route `r`: invalid `where`"),
+            (
+                "row.ts < '2024-01-01'",
                 Some(DLQ),
                 "sink route `r`: invalid `where`",
             ),
-            (
-                None,
-                Some("row.ts < '2024-01-01'"),
-                Some(DLQ),
-                "sink route `r`: invalid `where`",
-            ),
-            (None, Some(""), Some(DLQ), "sink route `r`: invalid `where`"),
-            (
-                None,
-                Some("row.n > 1"),
-                None,
-                "sink route `r` uses `where`, which needs `sink.dead_letter_topic`",
-            ),
-            (
-                None,
-                Some("row.n > 1"),
-                Some("_dlq"),
-                "must not start with `_`",
-            ),
-            (
-                None,
-                Some("row.n > 1"),
-                Some("r.topic"),
-                "also a topic events are routed to",
-            ),
-            (
-                None,
-                Some("row.n > 1"),
-                Some("rest"),
-                "also a topic events are routed to",
-            ),
-            (
-                None,
-                Some("row.n > 1"),
-                Some("bad topic"),
-                "not a valid Kafka topic name",
-            ),
-            (
-                None,
-                Some("row.n > 1"),
-                Some(""),
-                "not a valid Kafka topic name",
-            ),
+            ("", Some(DLQ), "sink route `r`: invalid `where`"),
+            ("row.n > 1", Some("_dlq"), "must not start with `_`"),
+            ("op == 'insert'", Some("_dlq"), "must not start with `_`"),
+            ("row.n > 1", Some("r.topic"), "also a topic events are routed to"),
+            ("row.n > 1", Some("rest"), "also a topic events are routed to"),
+            ("row.n > 1", Some("bad topic"), "not a valid Kafka topic name"),
+            ("row.n > 1", Some(""), "not a valid Kafka topic name"),
         ];
-        for (ops, filter, dlq_topic, want) in cases {
-            let r = filtered("r", "public.*", *ops, *filter);
+        for (filter, dlq_topic, want) in cases {
+            let r = filtered("r", "public.*", Some(filter));
             let got = build(r, dlq_topic.map(str::to_string));
             if want.is_empty() {
-                assert_eq!(got, Ok(()), "{ops:?} {filter:?} {dlq_topic:?}");
+                assert_eq!(got, Ok(()), "{filter:?} {dlq_topic:?}");
             } else {
                 let err = got.expect_err(want);
                 assert!(err.contains(want), "{err} should contain {want}");
@@ -2910,7 +2852,6 @@ mod tests {
             filtered(
                 "o",
                 "public.orders",
-                None,
                 Some("row.stauts == 'paid' or row.status == 'paid' or op == 'delete' or before.n > 0"),
             ),
             route("public.*", "p"),
@@ -2937,8 +2878,7 @@ mod tests {
             filtered(
                 "orders",
                 "public.orders",
-                Some(&["insert", "update"]),
-                Some("row.status == 'paid'"),
+                Some("op in ['insert', 'update'] and row.status == 'paid'"),
             ),
             keyed("public.*", "cdc.{table}", &["id", "tenant"]),
         ]);
@@ -2956,15 +2896,15 @@ mod tests {
                 "dead_letter_topic": DLQ,
                 "partition_by": "table",
                 "routes": [
-                    {"route": "orders", "match": "public.orders", "ops": ["insert", "update"],
-                     "where": "row.status == 'paid'", "key": null, "topic": "orders.topic", "topic_fallback": null, "topic_values": null,
+                    {"route": "orders", "match": "public.orders",
+                     "where": "op in ['insert', 'update'] and row.status == 'paid'", "key": null, "topic": "orders.topic", "topic_fallback": null, "topic_values": null,
                      "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
-                    {"route": "public.*", "match": "public.*", "ops": null, "where": null,
+                    {"route": "public.*", "match": "public.*", "where": null,
                      "key": ["id", "tenant"], "topic": "cdc.{table}", "topic_fallback": null, "topic_values": null,
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
-                    {"route": "default", "match": null, "ops": null, "where": null, "key": null,
+                    {"route": "default", "match": null, "where": null, "key": null,
                      "topic": "rest", "topic_fallback": null, "topic_values": null,
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []}
@@ -3105,7 +3045,7 @@ mod tests {
     fn a_keyed_route_with_where_keys_what_passes() {
         let p = plan_with(vec![KafkaRoute {
             key: Some(vec!["id".into()]),
-            ..filtered("o", "public.orders", None, Some("row.n > 1"))
+            ..filtered("o", "public.orders", Some("row.n > 1"))
         }]);
         let r = p
             .render(&row("orders", Op::Insert, r#"{"id":3,"n":2}"#), NOW)
@@ -3932,7 +3872,7 @@ mod tests {
             outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
             "outbox.order"
         );
-        // Updates, deletes, truncates and snapshot reads of outbox rows are filtered.
+        // Updates, deletes, truncates and, without a `where`, snapshot reads are filtered.
         for op in [Op::Update, Op::Delete, Op::Truncate, Op::Read] {
             assert_eq!(
                 outcome(&p, &row("outbox", op, OUTBOX_ROW)),
@@ -3947,14 +3887,14 @@ mod tests {
     }
 
     #[test]
-    fn outbox_publishes_snapshot_reads_only_when_ops_lists_read() {
-        let with_ops = |ops: &[&str]| {
+    fn outbox_publishes_snapshot_reads_only_when_where_is_true_for_them() {
+        let with_where = |w: &str| {
             plan_with(vec![KafkaRoute {
-                ops: Some(ops.iter().map(|s| s.to_string()).collect()),
+                filter: Some(w.into()),
                 ..outbox_route(outbox_spec())
             }])
         };
-        let p = with_ops(&["insert", "read", "update", "delete", "truncate"]);
+        let p = with_where("op in ['insert', 'read', 'update', 'delete', 'truncate']");
         // A snapshot read is published like an insert, with the `r` op header.
         let r = p
             .render(&row("outbox", Op::Read, OUTBOX_ROW), NOW)
@@ -3969,7 +3909,7 @@ mod tests {
             outcome(&p, &row("outbox", Op::Insert, OUTBOX_ROW)),
             "outbox.order"
         );
-        // Listing them in `ops` never publishes updates, deletes or truncates.
+        // A `where` true for them never publishes updates, deletes or truncates.
         for op in [Op::Update, Op::Delete, Op::Truncate] {
             assert_eq!(
                 outcome(&p, &row("outbox", op, OUTBOX_ROW)),
@@ -3977,8 +3917,10 @@ mod tests {
                 "{op:?}"
             );
         }
-        // `ops = ["read"]` publishes snapshot reads only.
-        let q = with_ops(&["read"]);
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.filtered), (5, 2, 3));
+        // `op == 'read'` publishes snapshot reads only.
+        let q = with_where("op == 'read'");
         assert_eq!(
             outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
             "outbox.order"
@@ -3987,12 +3929,29 @@ mod tests {
             outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
             "filtered"
         );
-        // Without `read` in `ops` (or without `ops`), snapshot reads are filtered.
-        let q = with_ops(&["insert"]);
+        // A `where` false for reads filters them; so does no `where` (`outbox_plan`).
+        let q = with_where("op == 'insert'");
         assert_eq!(
             outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
             "filtered"
         );
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Insert, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        assert_eq!(
+            outcome(&outbox_plan(), &row("outbox", Op::Read, OUTBOX_ROW)),
+            "filtered"
+        );
+        // A row `where` applies to reads and inserts alike.
+        let q = with_where("row.aggregatetype == 'order'");
+        assert_eq!(
+            outcome(&q, &row("outbox", Op::Read, OUTBOX_ROW)),
+            "outbox.order"
+        );
+        let other = OUTBOX_ROW.replace(r#""order""#, r#""invoice""#);
+        assert_eq!(outcome(&q, &row("outbox", Op::Read, &other)), "filtered");
+        assert_eq!(outcome(&q, &row("outbox", Op::Insert, &other)), "filtered");
         // A snapshot read without an aggregate id goes to the dead-letter topic too.
         assert_eq!(
             outcome(&p, &row("outbox", Op::Read, r#"{"payload":"p"}"#)),
@@ -4386,11 +4345,6 @@ mod tests {
                 spec(|s| s.topic = "outbox.{before.kind}".into()),
                 Some(DLQ),
                 "reads `before.kind`, but only inserts and snapshot reads are published",
-            ),
-            (
-                KafkaRoute { ops: Some(vec!["update".into(), "delete".into()]), ..ok.clone() },
-                Some(DLQ),
-                "`ops` lists neither `insert` nor `read`",
             ),
             (
                 KafkaRoute { filter: Some("before.status == 'x' or after.n > 1".into()), ..ok.clone() },
@@ -5378,6 +5332,37 @@ mod tests {
             let per = t.elapsed().as_nanos() / n as u128;
             println!("fields {class:>8}: {per} ns/event (sink {sink})");
         }
+
+        // An op filter in `where` reads no row: an update that passes, a delete it filters.
+        let mut del = e.clone();
+        (del.op, del.after) = (Op::Delete, None);
+        for (class, filter) in [
+            ("none", None),
+            ("op where", Some("op in ['insert', 'update']")),
+        ] {
+            let mut plan = RoutePlan::new(
+                vec![KafkaRoute {
+                    filter: filter.map(Into::into),
+                    ..route("public.users", "users")
+                }],
+                None,
+            )
+            .unwrap();
+            plan.set_source(pg());
+            for ev in [&e, &del] {
+                let t = Instant::now();
+                for _ in 0..n {
+                    out.clear();
+                    plan.render_into(ev, NOW, &mut out).unwrap();
+                    sink += out.len();
+                }
+                let per = t.elapsed().as_nanos() / n as u128;
+                println!(
+                    "filter {class:>8} {:?}: {per} ns/event (sink {sink})",
+                    ev.op
+                );
+            }
+        }
     }
 
     // --- shapes (R7) ------------------------------------------------------------------------------
@@ -5731,7 +5716,7 @@ mod tests {
             Some(DLQ.into())
         )
         .is_ok());
-        // Case does not matter, as for `ops`.
+        // Case does not matter.
         assert!(RoutePlan::new(vec![shaped("r", Some("ROW"), Some("Drop"))], None).is_ok());
         // Outbox routes take none of the shape keys.
         let e = err(

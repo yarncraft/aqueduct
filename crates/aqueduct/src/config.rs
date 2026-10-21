@@ -355,10 +355,12 @@ pub struct KafkaRouteConfig {
     /// The only values a content-routed `topic` may substitute; others go to `topic_fallback`.
     #[serde(default)]
     pub topic_values: Option<Vec<String>>,
-    /// Only these ops pass: `insert`, `update`, `delete`, `truncate`, `read`. Default: all.
+    /// Removed before release: filter operations in `where` (`op in ['insert', 'update']`).
+    /// Still read, so a config that sets it fails startup with the `where` to use instead.
     #[serde(default)]
-    pub ops: Option<Vec<String>>,
-    /// Predicate over the event (ADR 0002 §3); only events it is true for pass.
+    pub ops: Option<toml::Value>,
+    /// Predicate over the event (ADR 0002 §3); only events it is true for pass. Filters
+    /// operations too: `op in ['insert', 'update']`.
     #[serde(default, rename = "where")]
     pub filter: Option<String>,
     /// Top-level columns of the row (`after`, else `before`) that make the record key, in order.
@@ -393,7 +395,8 @@ pub struct KafkaRouteConfig {
     #[serde(default)]
     pub unchanged: Option<String>,
     /// Publish the rows of an outbox table as their own events: inserts (and snapshot rows when
-    /// `ops` lists `read`), key = the `aggregate_id` column, value = the `payload` column.
+    /// `where` is true for them, e.g. `op in ['insert', 'read']`), key = the `aggregate_id`
+    /// column, value = the `payload` column.
     /// Excludes `topic` and `key`.
     #[serde(default)]
     pub outbox: Option<OutboxConfig>,

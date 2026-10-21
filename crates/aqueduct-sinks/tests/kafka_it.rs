@@ -184,8 +184,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         name: Some("big".into()),
         pattern: "public.*".into(),
         topic: topic.clone(),
-        ops: Some(vec!["insert".into()]),
-        filter: Some("row.n > 10".into()),
+        filter: Some("op == 'insert' and row.n > 10".into()),
         ..Default::default()
     };
     let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
@@ -234,7 +233,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     let (key, headers, value) = &dead[0];
     assert_eq!(
         String::from_utf8(headers["aqueduct-error"].clone()).unwrap(),
-        "route `big`: where `row.n > 10`: type error: `row.n` is not a finite number"
+        "route `big`: where `op == 'insert' and row.n > 10`: type error: `row.n` is not a finite number"
     );
     assert_eq!(headers["op"], b"c");
     assert_eq!(headers["lsn"], b"21");

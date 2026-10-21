@@ -10,6 +10,9 @@
 //! - Comparison is typed by the **literal**. A number literal compares exactly (decimal, not `f64`)
 //!   against a JSON number or a string that parses as a decimal. `NaN`/`±Infinity` are type errors.
 //!   A string literal allows only `==`, `!=`, `in` (ordering is rejected at parse time).
+//! - `op`, `schema` and `table` are strings: comparing them with a number or boolean is rejected
+//!   at parse time, and `op` only with one of [`OP_NAMES`]. So a predicate over them alone can
+//!   never hit a type error.
 //! - A type error wins over true, false and unknown, with no short-circuit, so `not (...)` can never
 //!   turn a mis-typed row into a pass.
 //! - Parsing is capped at [`MAX_EXPR_BYTES`] of input and [`MAX_DEPTH`] nesting levels.
@@ -181,6 +184,11 @@ impl FieldRef {
         &self.text
     }
 
+    /// True for `before.`, `after.` and `row.` paths; false for `op`, `schema` and `table`.
+    pub fn reads_row(&self) -> bool {
+        matches!(self.source, Source::Before | Source::After | Source::Row)
+    }
+
     /// The first column name below `before`/`after`/`row`, if the field reads a row.
     pub fn column(&self) -> Option<&str> {
         match self.source {
@@ -246,7 +254,11 @@ pub struct EventView<'a> {
     after: OnceCell<Option<Object<'a>>>,
 }
 
-/// The name an `op` has in expressions and in route `ops` lists.
+/// The values `op` takes in a `where`, in the order the docs give them. Heartbeats never reach a
+/// route.
+pub const OP_NAMES: [&str; 5] = ["insert", "update", "delete", "truncate", "read"];
+
+/// The name an `op` has in expressions and topic templates.
 pub(crate) fn op_name(op: Op) -> &'static str {
     match op {
         Op::Insert => "insert",
@@ -564,6 +576,12 @@ impl Expr {
         let mut out = Vec::new();
         collect_fields(&self.root, &mut out);
         out
+    }
+
+    /// The paths that read row data (`before.`, `after.`, `row.`). Only these can make
+    /// [`Expr::eval`] fail, and only these can be missing from a row.
+    pub fn row_fields(&self) -> impl Iterator<Item = &FieldRef> {
+        self.fields().into_iter().filter(|f| f.reads_row())
     }
 
     /// Evaluates against an event. `Err` is a row-level type error and follows the error policy.
@@ -943,13 +961,19 @@ impl Parser<'_> {
             if !self.eat(&Tok::LBracket) {
                 return perr(self.pos(), "expected `[` after `in`");
             }
-            let mut lits = vec![self.literal()?];
+            let at = self.pos();
+            let mut lits = vec![(self.literal()?, at)];
             while self.eat(&Tok::Comma) {
-                lits.push(self.literal()?);
+                let at = self.pos();
+                lits.push((self.literal()?, at));
             }
             if !self.eat(&Tok::RBracket) {
                 return perr(self.pos(), "expected `]`");
             }
+            for (lit, at) in &lits {
+                check_metadata(&field, lit, *at)?;
+            }
+            let lits: Vec<Lit> = lits.into_iter().map(|(l, _)| l).collect();
             if let Some(first) = lits.first() {
                 if let Some(other) = lits.iter().find(|l| l.kind() != first.kind()) {
                     return perr(
@@ -977,6 +1001,7 @@ impl Parser<'_> {
             );
         }
         let lit = self.literal()?;
+        check_metadata(&field, &lit, lit_pos)?;
         if !matches!(op, Cmp::Eq | Cmp::Ne) {
             match &lit {
                 Lit::Str(_) => {
@@ -1007,6 +1032,39 @@ impl Parser<'_> {
         };
         self.i += 1;
         Ok(lit)
+    }
+}
+
+/// `op`, `schema` and `table` are always strings, so a number or boolean literal against them
+/// could only ever be a type error at run time; it is a config error instead. `op` must also be
+/// one of [`OP_NAMES`], so a misspelled op does not silently filter every event. This is what lets
+/// a `where` over these fields alone run without `sink.dead_letter_topic`.
+fn check_metadata(field: &FieldRef, lit: &Lit, pos: usize) -> Result<(), ParseError> {
+    if field.reads_row() {
+        return Ok(());
+    }
+    let name = field.as_str();
+    match lit {
+        Lit::Str(s) if name == "op" && !OP_NAMES.contains(&s.as_str()) => perr(
+            pos,
+            format!(
+                "unknown op `{s}`: `op` is one of {}",
+                OP_NAMES.map(|o| format!("'{o}'")).join(", ")
+            ),
+        ),
+        Lit::Str(_) => Ok(()),
+        other => perr(
+            pos,
+            format!(
+                "`{name}` is a string, so comparing it with a {} is always an error: use a string, e.g. {name} == '{}'",
+                other.kind(),
+                match name {
+                    "op" => "insert",
+                    "schema" => "public",
+                    _ => "orders",
+                }
+            ),
+        ),
     }
 }
 
@@ -1289,7 +1347,7 @@ mod tests {
             "row.status",
         ] {
             let probe = if matches!(ok, "op" | "schema" | "table") {
-                format!("{ok} == 'x'")
+                format!("{ok} == 'insert'")
             } else {
                 format!("{ok} == 1")
             };
@@ -1754,11 +1812,119 @@ mod tests {
 
     #[test]
     fn fields_lists_every_path() {
-        let e = Expr::parse("(row.a == 1 or not before.b.c is null) and op in ['x']").unwrap();
+        let e = Expr::parse("(row.a == 1 or not before.b.c is null) and op in ['read']").unwrap();
         let names: Vec<_> = e.fields().iter().map(|f| f.as_str()).collect();
         assert_eq!(names, ["row.a", "before.b.c", "op"]);
         assert_eq!(e.fields()[0].column(), Some("a"));
         assert_eq!(e.fields()[2].column(), None);
+        let rows: Vec<_> = e.row_fields().map(|f| f.as_str()).collect();
+        assert_eq!(rows, ["row.a", "before.b.c"]);
+        let meta = Expr::parse("op == 'insert' and schema == 'public' or table in ['t']").unwrap();
+        assert_eq!(meta.row_fields().count(), 0);
+    }
+
+    // --- op, schema and table --------------------------------------------------------------
+
+    const EVERY_OP: [Op; 5] = [Op::Insert, Op::Update, Op::Delete, Op::Truncate, Op::Read];
+
+    #[test]
+    fn op_in_and_op_eq_filter_every_operation() {
+        for (op, name) in EVERY_OP.into_iter().zip(OP_NAMES) {
+            assert_eq!(op_name(op), name);
+            let ev = event(op, None, None);
+            assert_eq!(
+                run(&format!("op == '{name}'"), &ev),
+                Ok(Tri::True),
+                "{name}"
+            );
+            assert_eq!(
+                run(&format!("op != '{name}'"), &ev),
+                Ok(Tri::False),
+                "{name}"
+            );
+            let keep = op == Op::Insert || op == Op::Update;
+            assert_eq!(
+                run("op in ['insert', 'update']", &ev),
+                Ok(Tri::from_bool(keep)),
+                "{name}"
+            );
+            assert_eq!(
+                run("not (op in ['insert', 'update'])", &ev),
+                Ok(Tri::from_bool(!keep)),
+                "{name}"
+            );
+            assert_eq!(
+                run("op in ['insert', 'read']", &ev),
+                Ok(Tri::from_bool(op == Op::Insert || op == Op::Read)),
+                "{name}"
+            );
+        }
+        // Combined with row data, a type error still wins (no short-circuit, as for any `and`).
+        let upd = event(Op::Update, None, Some(r#"{"n":"x"}"#));
+        assert!(
+            run("op in ['insert'] and row.n > 1", &upd).is_err(),
+            "no short-circuit"
+        );
+        assert_eq!(run("op in ['insert', 'update']", &upd), Ok(Tri::True));
+    }
+
+    #[test]
+    fn op_schema_and_table_only_compare_with_known_strings() {
+        for bad in [
+            "op == 1",
+            "op != true",
+            "op in [1, 2]",
+            "op < 3",
+            "op < 'x'",
+            "schema == 1",
+            "table in [true]",
+            "table >= 2",
+            "op == 'upsert'",
+            "op == 'INSERT'",
+            "op in ['insert', 'heartbeat']",
+        ] {
+            assert!(Expr::parse(bad).is_err(), "should reject {bad:?}");
+        }
+        let e = Expr::parse("op == 1").unwrap_err().to_string();
+        assert!(
+            e.contains("`op` is a string") && e.contains("op == 'insert'"),
+            "{e}"
+        );
+        let e = Expr::parse("op in ['insert', 'upsert']").unwrap_err();
+        assert_eq!(e.pos, 17, "points at the bad item");
+        assert!(e.msg.contains("unknown op `upsert`"), "{e}");
+        assert!(
+            e.msg
+                .contains("'insert', 'update', 'delete', 'truncate', 'read'"),
+            "{e}"
+        );
+        for ok in [
+            "op == 'read'",
+            "op in ['insert', 'update', 'delete', 'truncate', 'read']",
+            "schema == '1'",
+            "table != 'audit_log'",
+            "op is null",
+            "schema is not null",
+            // Row paths still take any literal.
+            "row.op == 1",
+        ] {
+            assert!(Expr::parse(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_predicate_on_op_schema_and_table_never_fails_and_never_parses_a_row() {
+        let e = Expr::parse(
+            "(op in ['insert', 'update'] and schema == 'public') or not (table != 'orders') or op is null",
+        )
+        .unwrap();
+        // The rows are never parsed.
+        for op in EVERY_OP {
+            let ev = event(op, Some(r#"{"a":1}"#), Some(r#"{"a":2}"#));
+            let view = EventView::new(&ev);
+            assert!(e.eval(&view).is_ok());
+            assert!(view.before.get().is_none() && view.after.get().is_none());
+        }
     }
 
     // --- templates -----------------------------------------------------------------------
