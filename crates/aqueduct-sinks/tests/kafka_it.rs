@@ -130,6 +130,64 @@ async fn produces_all_events_in_per_table_order() {
     assert_eq!(parts.iter().map(|p| p.1).sum::<i64>(), total as i64);
 }
 
+/// One batch whose records for a single partition total far more than the broker's default
+/// `message.max.bytes` (1 MiB): the sink splits it into several requests, so the batch succeeds
+/// instead of being refused on every retry, and every record lands once, in order.
+#[tokio::test]
+async fn a_batch_larger_than_one_request_lands_whole_and_in_order() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let topic = unique("aqueduct-it-big");
+    let router = RoutePlan::new(vec![], Some(topic.clone())).unwrap();
+    // One partition: every record of the batch goes to the same partition.
+    let mut sink = KafkaSink::connect(brokers.clone(), router, 1, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let total = 1_000u64;
+    let pad = "x".repeat(2_000);
+    let batch: Vec<ChangeEvent> = (1..=total)
+        .map(|n| {
+            let mut e = ev(n, "big");
+            e.after = Some(to_raw_value(&serde_json::json!({ "n": n, "pad": pad })).unwrap());
+            e
+        })
+        .collect();
+    sink.send_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(
+        sink.topic_stats().snapshot().get(&topic).map(|o| o.total()),
+        Some(total)
+    );
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let pc = client
+        .partition_client(&topic, 0, UnknownTopicHandling::Error)
+        .await
+        .unwrap();
+    let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+    assert_eq!(end, total as i64, "exactly one record per event");
+    let mut lsns = Vec::new();
+    let mut offset = 0;
+    while offset < end {
+        let (recs, _hw) = pc.fetch_records(offset, 1..4_000_000, 1_000).await.unwrap();
+        if recs.is_empty() {
+            break;
+        }
+        for r in recs {
+            offset = r.offset + 1;
+            let lsn: u64 = String::from_utf8(r.record.headers["lsn"].clone())
+                .unwrap()
+                .parse()
+                .unwrap();
+            lsns.push(lsn);
+        }
+    }
+    assert_eq!(lsns, (1..=total).collect::<Vec<_>>(), "in batch order");
+}
+
 /// Every record of `topic` across its partitions: (key, headers, value).
 async fn read_all(
     client: &rskafka::client::Client,
