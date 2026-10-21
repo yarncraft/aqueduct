@@ -346,8 +346,8 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged and the resolved dead_letter_topic per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
-| `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second; per topic, records Kafka acknowledged per second. The Routing card's step lines; the stream then adds the newest second |
+| `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged and the resolved dead_letter_topic per route, plus `default`) with live per-route counts (produced also per operation, `counts.ops`) and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second, and produced per operation; per topic, records Kafka acknowledged per second, also per operation, with per-op totals since start. The Routing card's detail charts and topic op bars; the stream then adds the newest second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Per-table high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
@@ -371,12 +371,15 @@ delivered rates, the time to catch up, and while a snapshot runs its rows/s, row
 `aqueduct_source_behind_seconds`, `aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and
 `aqueduct_snapshot_eta_seconds`. See DEPLOYMENT.md, "Behind source".
 
-In the routing graph every table, route and topic carries a small step line of its rate over the last 120 s (a
-table's events per second; a route's produced rate, with filtered, fallback and errors as thin lines; a topic's records
-acknowledged by Kafka), and each "+N more" group one for the group as a whole. Click a table, a route or a topic for a
-larger chart with the current, average and maximum rate; a table's panel also names the route that claims it and draws one events-per-second
-line, with a toggle button per operation (insert, update, delete, truncate, read) to choose what it counts, and a
-topic's lists the routes that write to it and opens it in the event inspector. The inspector is a pop-up
+In the routing graph every table, route and topic card carries a thin bar of its operations' shares (insert green,
+update blue, delete red, truncate violet, read amber; hover for the counts and percentages): a table's events, a
+route's produced events, a topic's records acknowledged by Kafka (a tombstone counts as a delete), and each "+N more"
+group the sum of its members. Click a table, a route or a topic (the dead-letter topic too) for a chart with one line
+over the last 120 s, with the current, average and maximum rate: events, produced or acknowledged records per second
+of the operations toggled on with the buttons above it. The toggles are shared by the three panels, so following a
+table to its route and topic keeps counting the same operations. A table's panel also names the route that claims it;
+a route's keeps its outcome counts and lists its produced counts per operation; a topic's lists the routes that write
+to it, its acknowledged counts per operation, and opens it in the event inspector. The inspector is a pop-up
 window over the cockpit that only opens this way (it reads nothing from Kafka while closed); Close, Esc or a click
 outside it closes it.
 

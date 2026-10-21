@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::route::{OutRecord, RoutePlan};
 use crate::topic_stats::TopicStats;
-use crate::SourceInfo;
+use crate::{OpCounts, SourceInfo};
 use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
 use async_trait::async_trait;
 use rskafka::client::error::{Error as ClientError, ProtocolError};
@@ -495,16 +495,16 @@ fn record(out: OutRecord) -> Record {
     }
 }
 
-/// Awaits `produce` and, once the broker acknowledged it, counts its `n` records for `topic`.
-/// A failed produce counts nothing: its batch is retried and counted then.
+/// Awaits `produce` and, once the broker acknowledged it, counts its records (`ops`, per
+/// operation) for `topic`. A failed produce counts nothing: its batch is retried and counted then.
 async fn counted(
     stats: &TopicStats,
     topic: &str,
-    n: u64,
+    ops: &OpCounts,
     produce: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     produce.await?;
-    stats.acked(topic, n);
+    stats.acked(topic, ops);
     Ok(())
 }
 
@@ -535,7 +535,8 @@ impl Sink for KafkaSink {
     /// produce every group with one request, all partitions in parallel. Returns once the
     /// broker has acknowledged all of them.
     async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
-        let mut groups: HashMap<(String, usize), Vec<Record>> = HashMap::new();
+        // Per destination partition: the records, and how many of them carry each op.
+        let mut groups: HashMap<(String, usize), (Vec<Record>, OpCounts)> = HashMap::new();
         let mut rendered = Vec::new();
         let now_us = chrono::Utc::now().timestamp_micros();
         for event in deliverable(events) {
@@ -564,17 +565,16 @@ impl Sink for KafkaSink {
                     }
                 }
                 let part = partition_index(&out.partition_key, self.topics[&out.topic].len());
-                groups
-                    .entry((out.topic.clone(), part))
-                    .or_default()
-                    .push(record(out));
+                let group = groups.entry((out.topic.clone(), part)).or_default();
+                // A tombstone carries its delete's op, so it counts under `delete`.
+                group.1.add(out.op, 1);
+                group.0.push(record(out));
             }
         }
         let stats = &*self.topic_stats;
-        let sends = groups.into_iter().map(|((topic, part), records)| {
+        let sends = groups.into_iter().map(|((topic, part), (records, ops))| {
             let client = self.topics[&topic][part].clone();
             async move {
-                let n = records.len() as u64;
                 let produce = async {
                     client
                         .produce(records, Compression::NoCompression)
@@ -582,7 +582,7 @@ impl Sink for KafkaSink {
                         .map(|_| ())
                         .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
                 };
-                counted(stats, &topic, n, produce).await
+                counted(stats, &topic, &ops, produce).await
             }
         });
         futures::future::try_join_all(sends).await?;
@@ -687,18 +687,32 @@ mod tests {
     #[tokio::test]
     async fn only_acknowledged_produces_count_per_topic() {
         let stats = TopicStats::new();
-        counted(&stats, "t", 3, async { Ok(()) }).await.unwrap();
-        let failed = counted(&stats, "t", 5, async {
+        let ops = |pairs: &[(&str, u64)]| {
+            let mut o = OpCounts::default();
+            for (c, n) in pairs {
+                o.add(c, *n);
+            }
+            o
+        };
+        counted(&stats, "t", &ops(&[("c", 2), ("d", 1)]), async { Ok(()) })
+            .await
+            .unwrap();
+        let failed = counted(&stats, "t", &ops(&[("u", 5)]), async {
             Err(Error::Sink("kafka produce to t: broker down".into()))
         })
         .await;
         assert!(failed.is_err());
-        counted(&stats, "u", 0, async { Ok(()) }).await.unwrap();
-        let failed_new = counted(&stats, "v", 2, async { Err(Error::Sink("x".into())) }).await;
+        counted(&stats, "u", &OpCounts::default(), async { Ok(()) })
+            .await
+            .unwrap();
+        let failed_new = counted(&stats, "v", &ops(&[("c", 2)]), async {
+            Err(Error::Sink("x".into()))
+        })
+        .await;
         assert!(failed_new.is_err());
         assert_eq!(
             stats.snapshot().into_iter().collect::<Vec<_>>(),
-            vec![("t".to_string(), 3)]
+            vec![("t".to_string(), ops(&[("c", 2), ("d", 1)]))]
         );
     }
 

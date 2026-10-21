@@ -57,7 +57,9 @@ async fn produces_all_events_in_per_table_order() {
     sink.flush().await.unwrap();
     // The cockpit's per-topic rate counts every record once the broker acknowledged it.
     let acked = sink.topic_stats().snapshot();
-    assert_eq!(acked.get(&topic).copied(), Some(total));
+    assert_eq!(acked.get(&topic).map(|o| o.total()), Some(total));
+    // Per operation: every event was an insert.
+    assert_eq!(acked[&topic].slots(), [total, 0, 0, 0, 0]);
     assert_eq!(acked.len(), 1, "{acked:?}");
 
     let client = ClientBuilder::new(brokers).build().await.unwrap();
@@ -273,11 +275,14 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         (22, 10, 11, 1)
     );
     assert_eq!(snap[1].counts.errors, 1);
-    // Acknowledged records per topic: the kept rows, and each dead-lettered one on its topic.
+    // Produced per operation: the ten kept inserts (the update was filtered).
+    assert_eq!(c.ops.slots(), [10, 0, 0, 0, 0]);
+    // Acknowledged records per topic and op: the kept rows, and each dead-lettered insert on its
+    // topic.
     let acked = sink.topic_stats().snapshot();
-    assert_eq!(acked.get(&topic).copied(), Some(10));
-    assert_eq!(acked.get(&dlq).copied(), Some(1));
-    assert_eq!(acked.get(&tpl_dlq).copied(), Some(1));
+    assert_eq!(acked[&topic].slots(), [10, 0, 0, 0, 0]);
+    assert_eq!(acked[&dlq].slots(), [1, 0, 0, 0, 0]);
+    assert_eq!(acked[&tpl_dlq].slots(), [1, 0, 0, 0, 0]);
 }
 
 #[tokio::test]
@@ -852,7 +857,11 @@ async fn tombstones_follow_their_delete_and_row_format_values_are_the_row() {
     // Per-topic rates count every acknowledged record, tombstones included (20 inserts, 20 deletes,
     // 20 tombstones), and row-format deletes once each.
     let acked = sink.topic_stats().snapshot();
-    assert_eq!((acked[&events], acked[&rows]), (60, 40));
+    assert_eq!((acked[&events].total(), acked[&rows].total()), (60, 40));
+    // A tombstone carries its delete's op: 20 inserts, 20 deletes and 20 tombstones on the
+    // envelope route; the row-format route's delete is itself the tombstone.
+    assert_eq!(acked[&events].slots(), [20, 0, 40, 0, 0]);
+    assert_eq!(acked[&rows].slots(), [20, 0, 20, 0, 0]);
 
     let client = ClientBuilder::new(brokers).build().await.unwrap();
     // Envelope route: per row, insert, delete, then the tombstone, all on one partition.

@@ -12,7 +12,7 @@ use super::expr::{EventView, Expr, FieldRef, Template, Tri, OP_NAMES};
 use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
 use crate::{
-    encode, encode_rows, key_json, key_object, op_code, record_key, table_key, SourceInfo,
+    encode, encode_rows, key_json, key_object, op_code, record_key, table_key, OpCounts, SourceInfo,
 };
 
 /// Rows of a matched table seen without a field a route references, while the field has never been
@@ -925,6 +925,8 @@ pub struct RouteStats {
     names: Vec<String>,
     matched: Vec<AtomicU64>,
     produced: Vec<AtomicU64>,
+    /// `produced` per operation, `[insert, update, delete, truncate, read]`; sums to `produced`.
+    produced_ops: Vec<[AtomicU64; 5]>,
     filtered: Vec<AtomicU64>,
     /// Events sent to a route's `topic_fallback` (content routing).
     fallback: Vec<AtomicU64>,
@@ -965,6 +967,8 @@ pub struct RouteCounts {
     /// because their key is null (a table without a primary key), so the tombstone would erase
     /// the whole table from a compacted topic.
     pub tombstones_skipped: u64,
+    /// `produced` per operation of the event (a delete's tombstone is not counted again).
+    pub ops: OpCounts,
 }
 
 /// A point-in-time copy of one route's counters. `route` is the route's `name`, else its `match`
@@ -1000,6 +1004,10 @@ impl RouteStats {
         Self {
             matched: zeros(),
             produced: zeros(),
+            produced_ops: names
+                .iter()
+                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+                .collect(),
             filtered: zeros(),
             fallback: zeros(),
             errors: zeros(),
@@ -1022,6 +1030,14 @@ impl RouteStats {
         outcome[route].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts an event `route` produced to its topic: `matched`, `produced` and its op.
+    fn produced(&self, route: usize, op: &str) {
+        self.claimed(&self.produced, route);
+        if let Some(i) = OpCounts::slot(op) {
+            self.produced_ops[route][i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn counts(&self, i: usize) -> RouteCounts {
         let get = |v: &[AtomicU64]| v[i].load(Ordering::Relaxed);
         RouteCounts {
@@ -1031,6 +1047,9 @@ impl RouteStats {
             fallback: get(&self.fallback),
             errors: get(&self.errors),
             tombstones_skipped: get(&self.tombstones_skipped),
+            ops: OpCounts::from_slots(std::array::from_fn(|k| {
+                self.produced_ops[i][k].load(Ordering::Relaxed)
+            })),
         }
     }
 
@@ -2047,7 +2066,7 @@ impl RoutePlan {
         // Field operations, applied before the topic is chosen, so a row they cannot rewrite goes
         // to the dead-letter topic without taking a content-routing cap slot.
         let mut rewritten = None;
-        let mut outcome = &self.stats.produced;
+        let mut fell_back = false;
         let mut content = None;
         // The delete's key is not per-row, so the envelope tombstone is left out.
         let mut skip_tombstone = false;
@@ -2150,11 +2169,9 @@ impl RoutePlan {
                     }
                     skip_tombstone = true;
                 }
-                let (topic, c, fell_back) = self.route_topic(route, r, &view);
+                let (topic, c, fallback) = self.route_topic(route, r, &view);
                 content = c;
-                if fell_back {
-                    outcome = &self.stats.fallback;
-                }
+                fell_back = fallback;
                 topic
             }
         };
@@ -2218,9 +2235,14 @@ impl RoutePlan {
                 ..c.clone()
             }),
         });
+        let op = record.op;
         out.push(record);
         out.extend(tombstone);
-        self.stats.claimed(outcome, route);
+        if fell_back {
+            self.stats.claimed(&self.stats.fallback, route);
+        } else {
+            self.stats.produced(route, op);
+        }
         Ok(())
     }
 
@@ -2380,12 +2402,11 @@ impl RoutePlan {
             headers,
             content,
         });
-        let outcome = if fell_back {
-            &self.stats.fallback
+        if fell_back {
+            self.stats.claimed(&self.stats.fallback, route);
         } else {
-            &self.stats.produced
-        };
-        self.stats.claimed(outcome, route);
+            self.stats.produced(route, op_code(event.op));
+        }
         Ok(())
     }
 
@@ -2451,6 +2472,9 @@ impl RoutePlan {
         // the delete.
         if !c.tombstone {
             self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
+            if let Some(i) = OpCounts::slot(out.op) {
+                self.stats.produced_ops[c.route][i].fetch_sub(1, Ordering::Relaxed);
+            }
             self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
         }
         if !self.stats.refused_logged[c.route].swap(true, Ordering::Relaxed) {
@@ -2804,6 +2828,10 @@ mod tests {
             counts: RouteCounts {
                 matched: n,
                 produced: n,
+                ops: OpCounts {
+                    insert: n,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             unseen_fields: vec![],
@@ -3007,6 +3035,11 @@ mod tests {
             fallback: 0,
             errors,
             tombstones_skipped: 0,
+            // Every produced event here is an insert.
+            ops: OpCounts {
+                insert: produced,
+                ..Default::default()
+            },
         };
         assert_eq!(
             counts,
@@ -3019,7 +3052,37 @@ mod tests {
         for c in &snap {
             let k = c.counts;
             assert_eq!(k.matched, k.produced + k.filtered + k.fallback + k.errors);
+            assert_eq!(k.ops.total(), k.produced);
         }
+    }
+
+    #[test]
+    fn produced_counts_per_operation_with_tombstones_under_their_delete() {
+        let p = plan_with(vec![KafkaRoute {
+            tombstones: true,
+            ..route("public.*", "p")
+        }]);
+        for (op, n) in [
+            (Op::Insert, 3),
+            (Op::Update, 2),
+            (Op::Delete, 2),
+            (Op::Truncate, 1),
+            (Op::Read, 4),
+        ] {
+            for _ in 0..n {
+                p.render(&row("orders", op, r#"{"n":1}"#), NOW).unwrap();
+            }
+        }
+        // Heartbeats are no event of any route.
+        p.render(&row("orders", Op::Heartbeat, "{}"), NOW).unwrap();
+        let c = p.stats().snapshot()[0].counts;
+        // A delete and its tombstone are one produced event, counted under delete.
+        assert_eq!(c.ops.slots(), [3, 2, 2, 1, 4]);
+        assert_eq!(c.ops.total(), c.produced);
+        assert_eq!(
+            serde_json::to_value(c.ops).unwrap(),
+            serde_json::json!({"insert": 3, "update": 2, "delete": 2, "truncate": 1, "read": 4})
+        );
     }
 
     #[test]
@@ -3155,17 +3218,20 @@ mod tests {
                     {"route": "orders", "match": "public.orders",
                      "where": "op in ['insert', 'update'] and row.status == 'paid'", "key": null, "topic": "orders.topic", "topic_fallback": null, "topic_values": null,
                      "dead_letter_topic": DLQ,
-                     "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
+                     "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0,
+                                "ops": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}},
                      "unseen_fields": []},
                     {"route": "public.*", "match": "public.*", "where": null,
                      "key": ["id", "tenant"], "topic": "cdc.{table}", "topic_fallback": null, "topic_values": null,
                      "dead_letter_topic": DLQ,
-                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
+                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0,
+                                "ops": {"insert": 0, "update": 0, "delete": 0, "truncate": 0, "read": 0}},
                      "unseen_fields": []},
                     {"route": "default", "match": null, "where": null, "key": null,
                      "topic": "rest", "topic_fallback": null, "topic_values": null,
                      "dead_letter_topic": DLQ,
-                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
+                     "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0,
+                                "ops": {"insert": 0, "update": 0, "delete": 0, "truncate": 0, "read": 0}},
                      "unseen_fields": []}
                 ]
             })
@@ -3979,6 +4045,8 @@ mod tests {
         assert_eq!(p.dynamic_topic_count(), 0);
         let c = p.stats().snapshot()[0].counts;
         assert_eq!((c.matched, c.produced, c.fallback), (1, 0, 1));
+        // Its op leaves the produced breakdown with it.
+        assert_eq!(c.ops.total(), 0);
         // A passing failure frees the slot too; the batch is retried.
         let us = p
             .render(&row("orders", Op::Insert, r#"{"region":"us"}"#), NOW)

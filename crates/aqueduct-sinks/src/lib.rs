@@ -49,6 +49,74 @@ pub fn op_code(op: Op) -> &'static str {
     }
 }
 
+/// Records (or events) per operation, for the cockpit's per-op rates and op shares. A tombstone
+/// carries its delete's `op` letter, so it counts under `delete`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OpCounts {
+    pub insert: u64,
+    pub update: u64,
+    pub delete: u64,
+    pub truncate: u64,
+    pub read: u64,
+}
+
+impl OpCounts {
+    /// The slot of the op letter `code` ([`op_code`]) in [`OpCounts::slots`]; `None` for a
+    /// heartbeat or an unknown letter.
+    pub fn slot(code: &str) -> Option<usize> {
+        ["c", "u", "d", "t", "r"].iter().position(|c| *c == code)
+    }
+
+    /// Adds `n` under the op letter `code`; a heartbeat or an unknown letter counts nowhere.
+    pub fn add(&mut self, code: &str, n: u64) {
+        match code {
+            "c" => self.insert += n,
+            "u" => self.update += n,
+            "d" => self.delete += n,
+            "t" => self.truncate += n,
+            "r" => self.read += n,
+            _ => {}
+        }
+    }
+
+    /// From `[insert, update, delete, truncate, read]`.
+    pub fn from_slots(s: [u64; 5]) -> Self {
+        Self {
+            insert: s[0],
+            update: s[1],
+            delete: s[2],
+            truncate: s[3],
+            read: s[4],
+        }
+    }
+
+    /// `[insert, update, delete, truncate, read]`, the order of the core metrics' op slots.
+    pub fn slots(&self) -> [u64; 5] {
+        [
+            self.insert,
+            self.update,
+            self.delete,
+            self.truncate,
+            self.read,
+        ]
+    }
+
+    pub fn total(&self) -> u64 {
+        self.slots().iter().sum()
+    }
+
+    /// Every counter of `self` and `other` added.
+    pub fn plus(&self, other: &OpCounts) -> OpCounts {
+        OpCounts {
+            insert: self.insert + other.insert,
+            update: self.update + other.update,
+            delete: self.delete + other.delete,
+            truncate: self.truncate + other.truncate,
+            read: self.read + other.read,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Envelope<'a> {
     before: Option<&'a RawValue>,
