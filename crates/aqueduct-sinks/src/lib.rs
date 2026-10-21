@@ -11,8 +11,9 @@ mod topic_stats;
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
 pub use route::{
-    ContentTopic, KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan,
-    RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
+    ContentTopic, FieldSpec, HashKey, KafkaRoute, OutRecord, RouteCount, RouteCounts,
+    RouteDescription, RoutePlan, RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
+    HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
 };
 pub use topic_stats::{TopicStats, MAX_TRACKED_TOPICS, OTHER_TOPICS};
 
@@ -93,6 +94,24 @@ struct Source<'a> {
 /// `source.ts_*` is the commit time, the top-level `ts_*` when Aqueduct produced the record.
 /// MongoDB events name `db` and `collection` and carry no `txId` or `lsn`.
 pub fn encode(event: &ChangeEvent, info: &SourceInfo, now_us: i64) -> Result<String> {
+    encode_rows(
+        event,
+        info,
+        now_us,
+        event.before.as_deref(),
+        event.after.as_deref(),
+    )
+}
+
+/// [`encode`] with `before` and `after` replaced, e.g. by rows a route's field operations
+/// rewrote.
+pub(crate) fn encode_rows(
+    event: &ChangeEvent,
+    info: &SourceInfo,
+    now_us: i64,
+    before: Option<&RawValue>,
+    after: Option<&RawValue>,
+) -> Result<String> {
     let commit_us = event.commit_ts_micros;
     let snapshot = if event.op == Op::Read {
         "incremental"
@@ -131,8 +150,8 @@ pub fn encode(event: &ChangeEvent, info: &SourceInfo, now_us: i64) -> Result<Str
         },
     };
     serde_json::to_string(&Envelope {
-        before: event.before.as_deref(),
-        after: event.after.as_deref(),
+        before,
+        after,
         source,
         op: op_code(event.op),
         ts_ms: now_us.div_euclid(1000),
@@ -148,12 +167,15 @@ pub fn encode(event: &ChangeEvent, info: &SourceInfo, now_us: i64) -> Result<Str
 /// `{"db": "shop", "collection": "orders", "key": {"_id": ...}}`. `key` is `null` for a table
 /// without a primary key and for a `TRUNCATE`.
 pub fn record_key(event: &ChangeEvent, info: &SourceInfo) -> String {
-    let key = event
+    key_json(event, info, key_object(event).unwrap_or("null"))
+}
+
+/// The event's primary key as a JSON object, if it has one.
+pub(crate) fn key_object(event: &ChangeEvent) -> Option<&str> {
+    event
         .key
         .as_deref()
         .filter(|k| k.trim_start().starts_with('{'))
-        .unwrap_or("null");
-    key_json(event, info, key)
 }
 
 /// The record key with `"key": null`: only where the row lives, no row data. Dead-letter records

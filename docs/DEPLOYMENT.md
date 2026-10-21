@@ -99,7 +99,7 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 ## 3. Configuration reference
 
 Configuration is one TOML file, read from `/etc/aqueduct/aqueduct.toml` or the path in `AQUEDUCT_CONFIG`.
-Environment overrides: `AQUEDUCT_PG_URL`, `AQUEDUCT_ADMIN_TOKEN`. See `config/aqueduct.example.toml`.
+Environment overrides: `AQUEDUCT_PG_URL`, `AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`. See `config/aqueduct.example.toml`.
 
 ```toml
 health_addr = "0.0.0.0:8080"
@@ -246,8 +246,10 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error). Required as soon as a route uses `where`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error) or whose `rename` collides with an existing column. Required as soon as a route uses `where`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
+| `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -345,7 +347,7 @@ topic = "orders-paid"
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where`, `key` or a topic template, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and field path in `where`, `key`, a topic template or a field operation, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
@@ -448,6 +450,90 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
 - **Topics are created on first use** with `partitions` and `replication_factor`. Pre-create them in production, or
   set `topic_values` so you know the set.
 - The event inspector reads the content-routed topics (the template as a glob) and the fallback.
+
+#### Protecting fields per route
+
+A route can remove, mask, hash and rename top-level columns before its records leave Aqueduct:
+
+```toml
+[sink]
+hash_key_file = "/run/secrets/aqueduct-hash-key"   # or AQUEDUCT_HASH_KEY; never in this file
+hash_key_id = "2026-10"                            # required with a key
+dead_letter_topic = "aqueduct.dead-letter"         # required for `rename` without `include`
+
+[[sink.routes]]
+match = "public.customers"
+topic = "customers"
+exclude = ["internal_note"]
+mask = ["card_last4"]                    # "4242" -> "***"
+hash = ["email"]                         # HMAC-SHA256, lowercase hex
+rename = { cust_id = "customer_id" }
+```
+
+- **Where they apply.** `before` and `after` of every record the route produces, and of its dead-letter records.
+  `source` and the headers are never rewritten. They run after `ops`, `where`, `key` and `topic`, which read the
+  original row.
+- **`include`** keeps only the listed columns, **`exclude`** drops the listed ones; not both on one route. A listed
+  column a row does not have is simply absent.
+- **`mask`**: a string becomes `"***"`. Any other non-null value (number, bool, object, array) becomes `null`, so a
+  column keeps its JSON type or goes null, and a number never turns into a string. `null` stays `null`. Since #138
+  `timestamp` and `date` columns are numbers, so they mask to `null`; `timestamptz`, `numeric` and `uuid` are strings
+  and mask to `"***"`.
+- **`hash`**: HMAC-SHA256 with the hash key, as 64 lowercase hex characters (a JSON string). The input is the value's
+  canonical text: the content of a string (unescaped), a number or bool exactly as the source wrote it (`42`,
+  `true`), or the compact JSON of an object or array (whitespace removed, key order kept; a MongoDB `ObjectId` is
+  `{"$oid":"..."}`). `null` stays `null`. So the same value hashes to the same digest in every table, topic and
+  source, and consumers can join on it: a Postgres `int4 42`, a MongoDB `Int32`/`Int64` `42` and the string `"42"`
+  all give one digest. **A MongoDB double is written `42.0` and hashes differently from the integer `42`**, so
+  hash identifiers stored as integers or strings in MongoDB, not as doubles. Edge cases of the canonical text:
+  - Only the top-level string is unescaped. Inside an object or array, escapes stay as the source wrote them, so
+    `{"n":"\u00e9"}` and `{"n":"é"}` hash differently (each source writes its own values consistently).
+  - Numbers are not normalised: `-0` and `0`, `1e2` and `100`, `42.0` and `42` all differ.
+  - The text carries no type: `true` and the string `"true"` give the same digest, as do the object `{"a":1}` and
+    the string `"{\"a\":1}"`, and the number `42` and the string `"42"`.
+  - A string that is not valid Unicode (a lone surrogate escape such as `"\ud800"`) cannot be hashed: the event goes
+    to `dead_letter_topic` with `before` and `after` set to `null`, and the header names the column.
+- **`rename`** maps old column names to new ones. A target may not be another renamed column, another target, or a
+  column listed in `include`. The other operations name the **original** columns: a target listed in `mask`, `hash`
+  or `exclude` fails startup (`rename = { email = "x" }` with `hash = ["x"]` would hash nothing and pass the email
+  through as `x`), so list the source column (`hash = ["email"]`) instead. Without `include` the columns are only known when rows arrive, so a row that already
+  has a column named like a target goes to `dead_letter_topic` (value: the operations applied without the renames;
+  header `aqueduct-error`: ``route `customers`: rename `cust_id` to `customer_id`: the row already has a column
+  `customer_id` ``), which is then required. With `include`, collisions are ruled out at startup.
+- **Names** are top-level columns only and **case-sensitive**: `Email` does not match a column `email`, which matters
+  for MongoDB, where field names are not folded. A misspelt or wrongly cased name is reported as an unseen field
+  (below). A dotted path (`address.city`) fails startup: nested MongoDB fields cannot be
+  addressed, but a whole nested value can be dropped, masked, hashed or renamed through its top-level column. Other
+  startup errors: `include` together with a non-empty `exclude` (an empty `exclude` is no exclusion), an empty `include`, a column both masked and hashed, a column
+  masked, hashed or renamed that `exclude` drops or `include` leaves out.
+- **The record key.** Without `key = [...]`, the record key's `"key"` object holds the primary-key columns, so the
+  route's operations are applied to it too: excluded or not-included columns are removed (an object left empty
+  becomes `"key": null`), masked ones masked, hashed ones hashed with the same key as the value, renamed ones
+  renamed. Under `partition_by = "key"` the partition is hashed from that rewritten key, so a hashed primary key
+  still keeps each row on one partition. If every key column is removed, the table's rows share one partition.
+  With `key = [...]`, a key column may not be excluded, masked, hashed or left out of `include` (startup error), so
+  no protected value reaches the key; a renamed column may key the route and keeps its original name there.
+- **The topic.** A content-routed `topic` (see [Routing by row content](#routing-by-row-content)) reads the original
+  row, so it may not read a column the route excludes, masks, hashes or leaves out of `include` (any path into it:
+  `row.region`, `after.region`, `row.address.city` for `address`); that fails startup. `topic_values` limits those
+  same fields, and `topic_fallback` is a fixed name, so they are covered too. A record sent to the fallback, at render
+  time or after the broker refused to create a topic, has the same rewritten value and key and the same
+  `aqueduct-hash-key-id` header as any other.
+- **Hash key.** Read from the `AQUEDUCT_HASH_KEY` environment variable or the file `sink.hash_key_file`, never from
+  the TOML. One trailing newline (`\n` or `\r\n`) is ignored in both, so the same secret gives the same digests from
+  either: a `hash_key` key in the config fails startup. Setting both also fails.
+  The key must be at least 32 bytes (`openssl rand -hex 32` gives 64); it is required as soon as a route uses `hash`,
+  redacted from debug output and never logged. **`hash_key_id`** (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with
+  a key, fails startup without one, and is sent as the header `aqueduct-hash-key-id` on every record of a route that hashes, dead-letter records
+  included. It is shown in `/api/routes`; the key never is.
+- **Rotating the key.** A new key changes every digest. Generate a new key, give it a new `hash_key_id`, and restart.
+  Consumers join or deduplicate per `aqueduct-hash-key-id`: digests under different ids are not comparable. Records
+  replayed after a restart (at-least-once) are hashed with the key in use when they are produced.
+- **Unseen fields.** Every column the operations name is watched like the paths of `where` and `key` (as
+  `row.<column>`), on routes with or without `where`, so a misspelled `mask = ["card_last_4"]` shows up as an unseen
+  field instead of silently letting `card_last4` through.
+- **Cost.** A route without field operations takes the unchanged path. With them, each row is rewritten in one pass
+  over its top-level columns; hashing costs one HMAC per hashed non-null value.
 
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
@@ -574,7 +660,9 @@ zero when the process restarts.
 
 `GET /api/routes` describes the compiled routing for the cockpit's routing graph: each route in match order, then
 the `sink.topic` fallback as a route named `default` with `"match": null`, with live counts. It never contains row data.
-Later routing options add keys to each route, so readers should ignore keys they do not know.
+Later routing options add keys to each route, so readers should ignore keys they do not know. A route with field
+operations also has `include`, `exclude`, `mask` and `hash` (column lists) and `rename` (the map), each left out when
+unset; with a hash key the top level has `hash_key_id`. The hash key itself is never shown.
 
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
@@ -984,7 +1072,7 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
 1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables. On Azure, a managed identity (`auth`, see [Azure managed identity](#azure-managed-identity)) needs no stored password at all.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
 3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one); never set `admin_insecure_no_auth` in production.
-4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
+4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
 
 ## Always-on simulation
 
