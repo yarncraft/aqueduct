@@ -384,8 +384,8 @@ Field operations (#84). Where the code differs from the text above:
 - **A string that cannot be hashed** (not valid Unicode, e.g. a lone `\ud800` escape) is a row error and goes to the
   dead-letter topic with `before`/`after` null; it never becomes `null` silently.
 - **Later slices:** R7 (`deletes = "row"` and tombstones) must use the rewritten before-image and key, and R8 (outbox)
-  must reject a protected `aggregate_id` or `topic` column; `TODO(R7)` and `TODO(R8)` mark the place in
-  `RoutePlan::build`.
+  must reject a protected `aggregate_id` or `topic` column; `TODO(R7)` marks the place in `RoutePlan::build`. R8 met
+  its part by refusing field operations on outbox routes altogether (see "As built (R8)").
 - **Dead-letter values** get the route's field operations (§5a), with the `aqueduct-hash-key-id` header when the
   route hashes. A row that is not a JSON object cannot be rewritten; its dead-letter value has `before`/`after`
   `null` rather than the unprotected row.
@@ -405,3 +405,60 @@ Field operations (#84). Where the code differs from the text above:
 - **Cost** (release, 10-column row updated with before and after, 2-column key, one route): no field operations
   541 ns/event; include 1.8 µs, exclude 2.2 µs, mask 2.3 µs, rename 2.4 µs, hash of 2 columns 4.5 µs, all together
   5.4 µs.
+
+## As built (R8)
+
+Outbox (#86). Where the code differs from §5 "Outbox", which was written before #138 made events Debezium envelopes
+and keys JSON:
+
+- **Config.** `outbox = { aggregate_type, aggregate_id, payload, topic, id, type }`. Unset keys take Debezium's outbox
+  event router defaults: `aggregatetype`, `aggregateid`, `payload`, topic `outbox.event.{aggregate_type}`. `id` and
+  `type` have no default; without them there is no `id` or `type` header (Debezium's `id` header is opt-in here).
+  Unknown keys inside `outbox` fail startup. Column names are top-level only (no dots), like `key`.
+- **Topic.** The template takes `{aggregate_type}` (read as `after.<aggregate_type column>`), `{schema}`, `{table}`,
+  `{op}`, `{after.<col>}` and `{row.<col>}`; `{before.<col>}` is refused at startup. It is compiled as the route's topic,
+  so all of R4 applies unchanged: fixed prefix, one segment per value, `topic_fallback` required (route-level key, as
+  for any route), `topic_values`, the glob collision checks, refused names and `max_dynamic_topics`. The route-level
+  `topic` must be unset (it is optional in the config for this reason).
+- **Inserts, and snapshot rows on request.** Updates, deletes and truncates are always filtered, even when `ops` lists
+  them, before `where` and the unseen-field count. Snapshot (`read`) rows are filtered by default and published like
+  inserts (op header `r`) when the route's `ops` lists `read`. Rows still in the outbox table were published when
+  inserted, so a snapshot republishes them; opting in is for a first deployment (`snapshot = "initial"`) with rows
+  that were never published, and DEPLOYMENT.md states the double-publish trade-off. This differs from Debezium's
+  `EventRouterDelegate`, which skips only deletes, warns on updates (`table.op.invalid.behavior`) and publishes
+  snapshot rows like creates. An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.*`
+  (never true for an insert or a snapshot row), fail startup.
+- **Key.** Since #138 table keys are JSON, but the outbox key is the raw `aggregate_id` value, as Debezium and outbox
+  consumers expect: a JSON string's unescaped content as UTF-8, any other value its JSON text as the row holds it (a
+  number `42`, an object such as a MongoDB `ObjectId` compactly). The partition is the FNV-1a hash of that key,
+  overriding `partition_by`.
+- **Value.** The `payload` value with the same rule: `json`/`jsonb` is the JSON text in the row; a text column is its
+  content, not a JSON string literal. The value is never an envelope. **Divergences from Debezium**, because the row
+  JSON does not carry the column type: a `jsonb` bare JSON string is sent without its quotes (Debezium keeps the JSON
+  text); a `text` payload holding JSON text is sent as that text, so a JSON consumer reads an object (Debezium's JSON
+  converter delivers a string); `bytea` arrives as Postgres hex text (`\x...`). The docs advise a `jsonb` object or
+  array, or `text`, as the payload.
+- **Headers.** `op` and `lsn` as on every record, plus `id` and `type` when configured and present (null or missing:
+  no header). These carry row values, an exception to §5 "Headers only ever carry `op`, `lsn` and
+  `aqueduct-hash-key-id`" that the outbox pattern requires.
+- **Dead letters.** A null or missing `aggregate_id` or `payload`, or a string in the key, payload, `id` or `type`
+  column that is not valid Unicode (a lone surrogate escape), sends the envelope to `sink.dead_letter_topic` with the
+  table-only JSON key (R3) and `aqueduct-error` ``route `<r>`: outbox `<key>` column `<col>` is missing or null``. No
+  value is ever in the header or the log. These rows take no content-routing cap slot. `dead_letter_topic` is required
+  as soon as a route uses `outbox`. Since an outbox route has no field operations, its dead-letter value is the full
+  envelope of the row, the payload included, unlike R6 routes whose dead-letter values are rewritten; restrict the
+  dead-letter topic's readers accordingly.
+- **Mutually exclusive** with `topic`, `key` and every field operation (`include`, `exclude` even when empty,
+  `mask`, `hash`, `rename`) on the same route, checked at startup in `RoutePlan::build`; the error names the keys set.
+  So an outbox route has no field operations and nothing in it is protected, which is all R6's rule "no protected
+  column in the outbox `aggregate_id` or `topic`" needs. The payload is published as the application wrote it, so
+  shape it there. `format` (R7) is not on main yet; `TODO(R7)` marks where it joins this check. Non-outbox routes keep
+  R6's order: field operations run before the topic is chosen.
+- **Unseen fields.** The outbox columns are registered as `after.<col>` (the topic template's fields as usual), so a
+  misspelled column is reported after 1000 inserts without it.
+- **Visibility.** `/api/routes` has an `outbox` object (the spec as configured) on outbox routes only; `topic` is the
+  template as written; template syntax errors give the byte position in the template as written. The cockpit's
+  existing `outbox` badge shows it. `/api/events` now returns each record's headers, limited to an allow-list (`op`,
+  `lsn`, `aqueduct-error`, `aqueduct-hash-key-id`, and `id`/`type` when a route uses `outbox`), since the inspected
+  globs can match topics other producers write to. The cockpit shows a value that is not an envelope raw, with op and
+  lsn from the headers and the topic in place of the table (§7), instead of an empty row.

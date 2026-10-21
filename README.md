@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope<br/>key: table + primary key or route key columns (JSON) · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope, or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -269,6 +269,21 @@ mask = ["card_last4"]
 hash = ["email"]
 ```
 
+`outbox = { ... }` on a route publishes an outbox table's inserts as their own events, much like Debezium's outbox
+router: topic from a template such as `outbox.{aggregate_type}`, key = the raw `aggregate_id` value (not the JSON
+table key), value = the `payload` column as is, headers `id` and `type` when configured. Updates and deletes of the
+outbox are dropped, and snapshot rows too unless the route's `ops` lists `read`; a row without an `aggregate_id` or
+`payload` goes to the dead-letter topic. Unlike Debezium, a `jsonb` payload that is a bare string loses its quotes, a
+`text` payload holding JSON reads as JSON, and `bytea` arrives as hex text: use a `jsonb` object or array, or `text`,
+as the payload. See DEPLOYMENT.md, "Outbox".
+
+```toml
+[[sink.routes]]
+match = "public.outbox"
+outbox = { topic = "outbox.{aggregate_type}", id = "id", type = "type" }   # Debezium's column names by default
+topic_fallback = "outbox.unknown"
+```
+
 ### MongoDB source
 
 ```toml
@@ -304,8 +319,8 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
-| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
+| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations, outbox per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 

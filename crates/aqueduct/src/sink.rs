@@ -13,12 +13,14 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
         .map(|r| KafkaRoute {
             name: r.name.clone(),
             pattern: r.pattern.clone(),
-            topic: r.topic.clone(),
+            // Empty when unset; the plan requires a topic unless the route is an outbox.
+            topic: r.topic.clone().unwrap_or_default(),
             ops: r.ops.clone(),
             filter: r.filter.clone(),
             key: r.key.clone(),
             topic_fallback: r.topic_fallback.clone(),
             topic_values: r.topic_values.clone(),
+            outbox: r.outbox.as_ref().map(|o| o.spec()),
             fields: FieldSpec {
                 include: r.include.clone(),
                 exclude: r.exclude.clone(),
@@ -246,5 +248,81 @@ topic = 'orders.{row.region}'
             e.contains("route `public.orders`") && e.contains("topic_fallback"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn outbox_routes_come_from_the_config_and_are_validated() {
+        let d = plan(&kafka(
+            "dead_letter_topic = 'aqueduct.dlq'
+[[routes]]
+match = 'public.outbox'
+topic_fallback = 'outbox.unknown'
+outbox = { aggregate_type = 'agg_type', aggregate_id = 'agg_id', payload = 'body', topic = 'outbox.{aggregate_type}', id = 'event_id', type = 'event_type' }
+",
+        ),
+        None,
+        )
+        .unwrap()
+        .describe();
+        let r = &d.routes[0];
+        assert_eq!(r.topic, "outbox.{aggregate_type}");
+        let o = r.outbox.as_ref().unwrap();
+        assert_eq!(
+            (o.aggregate_type.as_str(), o.aggregate_id.as_str()),
+            ("agg_type", "agg_id")
+        );
+        assert_eq!(o.payload, "body");
+        assert_eq!(o.id.as_deref(), Some("event_id"));
+        assert_eq!(o.kind.as_deref(), Some("event_type"));
+
+        // Unset keys take Debezium's defaults.
+        let d = plan(
+            &kafka(
+                "dead_letter_topic = 'aqueduct.dlq'
+[[routes]]
+match = 'public.outbox'
+topic_fallback = 'outbox.unknown'
+outbox = {}
+",
+            ),
+            None,
+        )
+        .unwrap()
+        .describe();
+        assert_eq!(
+            d.routes[0].outbox,
+            Some(aqueduct_sinks::OutboxSpec::default())
+        );
+        assert_eq!(d.routes[0].topic, "outbox.event.{aggregate_type}");
+
+        let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
+        // A misspelled outbox key fails to parse rather than falling back to a default column.
+        let parsed: std::result::Result<KafkaConfig, _> = toml::from_str(
+            "brokers = ['b:9092']
+[[routes]]
+match = 'public.outbox'
+outbox = { aggregateid = 'id' }
+",
+        );
+        assert!(parsed.unwrap_err().to_string().contains("aggregateid"));
+        let e = err("dead_letter_topic = 'dlq'
+[[routes]]
+match = 'public.outbox'
+topic = 'events'
+outbox = { topic = 'outbox.events' }
+");
+        assert!(
+            e.contains("`topic` and `outbox` are mutually exclusive"),
+            "{e}"
+        );
+        let e = err("[[routes]]
+match = 'public.outbox'
+outbox = { topic = 'outbox.events' }
+");
+        assert!(e.contains("dead_letter_topic"), "{e}");
+        let e = err("[[routes]]
+match = 'public.orders'
+");
+        assert!(e.contains("route `public.orders` has no `topic`"), "{e}");
     }
 }
