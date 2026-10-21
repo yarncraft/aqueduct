@@ -9,9 +9,11 @@
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
 //! - `GET /api/tables`  per table high-water marks: the newest delivered change and the
 //!   topic's Kafka offsets
-//! - `GET /api/routes`  the compiled route plan with live per-route counts (no row data)
-//! - `GET /api/routes/history` per-route outcome rates and per-topic acknowledged-record rates
-//!   over the last 120 s (the stream carries only the newest second)
+//! - `GET /api/routes`  the compiled route plan with live per-route counts, produced also per
+//!   operation (no row data)
+//! - `GET /api/routes/history` per-route outcome and per-op produced rates, and per-topic
+//!   acknowledged-record rates (also per op, with totals since start) over the last 120 s (the
+//!   stream carries only the newest second)
 //! - `GET|POST|DELETE /api/snapshot` state of, start, or cancel a table snapshot (ADR 0001)
 //!
 //! If `admin_token` is configured, `/metrics` and `/api/*` require it as
@@ -32,7 +34,7 @@ use crate::rates::RateHistory;
 use aqueduct_core::{
     Metrics, Snapshot, SnapshotCommand, SnapshotRequest, SnapshotSender, State, OP_SLOTS,
 };
-use aqueduct_sinks::{KafkaInspector, RouteCount, RoutePlan, TopicStats};
+use aqueduct_sinks::{KafkaInspector, OpCounts, RouteCount, RoutePlan, TopicStats};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -137,7 +139,7 @@ impl Admin {
         let _ = self.topic_stats.set(stats);
     }
 
-    fn topic_counts(&self) -> BTreeMap<String, u64> {
+    fn topic_counts(&self) -> BTreeMap<String, OpCounts> {
         self.topic_stats
             .get()
             .map(|s| s.snapshot())
@@ -760,8 +762,9 @@ fn source_lag_metrics(o: &mut String, s: &Snapshot) {
     }
 }
 
-/// Records the sink got acknowledged per topic (`(other)` past the tracked-topic cap).
-fn topic_metrics(o: &mut String, topics: &BTreeMap<String, u64>) {
+/// Records the sink got acknowledged per topic (`(other)` past the tracked-topic cap), all
+/// operations together.
+fn topic_metrics(o: &mut String, topics: &BTreeMap<String, OpCounts>) {
     if topics.is_empty() {
         return;
     }
@@ -774,8 +777,9 @@ fn topic_metrics(o: &mut String, topics: &BTreeMap<String, u64>) {
     for (t, n) in topics {
         let _ = writeln!(
             o,
-            "aqueduct_topic_records_total{{topic=\"{}\"}} {n}",
-            escape_label(t)
+            "aqueduct_topic_records_total{{topic=\"{}\"}} {}",
+            escape_label(t),
+            n.total()
         );
     }
 }
@@ -1392,7 +1396,8 @@ Authorization: Bearer {token}
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders",
                    "where": "op == 'insert' and row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
-                   "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
+                   "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1, "tombstones_skipped": 0,
+                              "ops": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}},
                    "unseen_fields": []})
         );
         assert_eq!(routes[1]["counts"]["produced"], 1);
@@ -1406,7 +1411,9 @@ Authorization: Bearer {token}
         assert_eq!(
             v["routes"][0],
             json!({"route": "paid \"orders\"", "matched": 3, "produced": 1, "filtered": 1,
-                   "fallback": 0, "errors": 1, "tombstones_skipped": 0, "unseen_fields": []})
+                   "fallback": 0, "errors": 1, "tombstones_skipped": 0,
+                   "ops": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0},
+                   "unseen_fields": []})
         );
 
         // Prometheus: one series per route and outcome, label values escaped.
@@ -1453,10 +1460,15 @@ Authorization: Bearer {token}
         admin.set_router(plan.clone());
         admin.set_topic_stats(stats.clone());
         // Two ticks of the sampler, the sink's counters moving in between.
-        stats.acked("paid--orders-.t", 1);
+        let ops = |code: &str, n: u64| {
+            let mut o = OpCounts::default();
+            o.add(code, n);
+            o
+        };
+        stats.acked("paid--orders-.t", &ops("c", 1));
         lock(&admin.rates).record(&admin.route_counts(), &admin.topic_counts());
-        stats.acked("paid--orders-.t", 2);
-        stats.acked("cdc.users", 4);
+        stats.acked("paid--orders-.t", &ops("u", 2));
+        stats.acked("cdc.users", &ops("d", 4));
         lock(&admin.rates).record(&admin.route_counts(), &admin.topic_counts());
 
         for bad in [
@@ -1481,11 +1493,22 @@ Authorization: Bearer {token}
         assert_eq!(
             routes[0],
             json!({"route": "paid \"orders\"", "produced": [1, 0], "filtered": [1, 0],
-                   "fallback": [0, 0], "errors": [1, 0]})
+                   "fallback": [0, 0], "errors": [1, 0],
+                   "ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]]})
         );
         assert_eq!(
             v["topics"],
             json!({"cdc.users": [0, 4], "paid--orders-.t": [1, 2]})
+        );
+        // Per op: rows of [insert, update, delete, truncate, read], and the totals since start.
+        assert_eq!(
+            v["topic_ops"],
+            json!({"cdc.users": [[0, 0, 0, 0, 0], [0, 0, 4, 0, 0]],
+                   "paid--orders-.t": [[1, 0, 0, 0, 0], [0, 2, 0, 0, 0]]})
+        );
+        assert_eq!(
+            v["topic_totals"]["paid--orders-.t"],
+            json!({"insert": 1, "update": 2, "delete": 0, "truncate": 0, "read": 0})
         );
 
         // Each stream frame carries only the newest second.
@@ -1495,8 +1518,12 @@ Authorization: Bearer {token}
         assert_eq!(
             m["rates"],
             json!({"seq": 2, "routes": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
-                   "topics": {"cdc.users": 4, "paid--orders-.t": 2}})
+                   "route_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                   "topics": {"cdc.users": 4, "paid--orders-.t": 2},
+                   "topic_ops": {"cdc.users": [0, 0, 4, 0, 0], "paid--orders-.t": [0, 2, 0, 0, 0]}})
         );
+        // The stream's per-route totals carry the produced breakdown too.
+        assert_eq!(m["routes"][0]["ops"]["insert"], 1);
 
         // Prometheus: one counter per topic, label values escaped.
         let prom = get_bearer(addr, "/metrics", "k").await;
@@ -1514,7 +1541,23 @@ Authorization: Bearer {token}
         let mut o = String::new();
         topic_metrics(
             &mut o,
-            &BTreeMap::from([("(other)".to_string(), 2), ("a\"b".to_string(), 1)]),
+            &BTreeMap::from([
+                (
+                    "(other)".to_string(),
+                    OpCounts {
+                        insert: 1,
+                        delete: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "a\"b".to_string(),
+                    OpCounts {
+                        read: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]),
         );
         assert!(
             o.contains(r#"aqueduct_topic_records_total{topic="(other)"} 2"#),
