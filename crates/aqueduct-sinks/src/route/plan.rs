@@ -2584,9 +2584,11 @@ impl RoutePlan {
         let topic = match self.dead_letters.get(route).and_then(Option::as_ref) {
             Some(DeadLetter::Fixed(t)) => t.clone(),
             Some(DeadLetter::Template(t)) => t.render(&EventView::new(event)),
-            None => return Err(Error::Sink(format!(
+            None => {
+                return Err(Error::Sink(format!(
                 "{reason}, and the route has no usable dead-letter topic; set `dead_letter_topic`"
-            ))),
+            )))
+            }
         };
         // A rendered name (`{schema}`/`{table}` from the event) that Kafka would refuse, or that
         // starts with `_`, fails the batch like any topic that cannot be created.
