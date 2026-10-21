@@ -591,6 +591,9 @@ const ROUTE_COUNTS = ['produced', 'filtered', 'fallback', 'errors'];
 // Detail-chart line colours: a route's produced line; the dead-letter topic in red.
 const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
 const TOPIC_LINE = '#32a467', TABLE_LINE = '#4c90f0';
+// A route card's metrics and step lines: processed (every event it took), matched (processed minus filtered: the
+// `where` held), fallback, errors.
+const CARD_METRICS = [['processed', '#4c90f0'], ['passed', '#32a467', 'matched'], ['fallback', '#ad7bee'], ['errors', '#e76a6e']];
 
 // ---- Rates per route and per topic ----
 // /api/routes/history gives the last 120 s at 1 s (route outcomes and produced records per op, records Kafka
@@ -774,6 +777,8 @@ function graphModelOf(d) {
     }
     ops[x.id] = opSlots(x.c.ops);
     for (const k of ['matched', ...ROUTE_COUNTS]) values[x.id + ':' + k] = fmt(x.c[k] || 0);
+    values[x.id + ':processed'] = fmt(x.c.matched || 0);
+    values[x.id + ':passed'] = fmt(Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)));
   }
   // Topics, grouped by the template that renders them; a topic two routes share is drawn once.
   const groups = new Map(), owner = new Map();
@@ -950,10 +955,20 @@ function partitionClause(r) {
 
 const sqlRow = (kw, val) => `<div class="${SQL_KW}">${kw}</div><div class="${SQL_VAL}">${val}</div>`;
 
+const CARD_METRIC_HELP = {
+  processed: 'Every event the route took (its match fits the table)',
+  passed: 'Processed minus filtered: events whose where held (or that it could not evaluate, which also count as errors)',
+  fallback: 'Sent to topic_fallback (content routing could not use the row value)',
+  errors: 'Sent to the dead-letter topic',
+};
 function routeNode(x, last) {
   const r = x.r, sel = graphSel === x.i;
   const unseen = x.c.unseen_fields || [];
+  const counts = { processed: x.c.matched || 0, passed: Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)), fallback: x.c.fallback || 0, errors: x.c.errors || 0 };
   return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
+    // Step and name on top.
+    + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
+    + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
     + `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
     + sqlRow('SELECT', selectClause(r))
     + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
@@ -961,11 +976,9 @@ function routeNode(x, last) {
     + sqlRow('INTO', intoClause(r))
     + sqlRow('PARTITIONED-BY', partitionClause(r))
     + `</div>`
-    // Below the five rows: step and name, then the counts on the same line when they fit.
-    + `<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5"><span class="flex min-w-0 items-center gap-2"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
-    + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></span>`
-    + `<span class="ml-auto flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(k => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</span></div>`
-    + `<div class="mt-1" title="Per second, last 120 s: matched (blue, in) and routed to its topics (green, out: produced + fallback; the gap is filtered and dead-lettered)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
+    // The metrics, each in the colour of its step line below.
+    + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span style="color:${color}">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
+    + `<div class="mt-1" title="Per second, last 120 s: processed (blue), matched (green), fallback (violet), errors (red)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -1156,7 +1169,7 @@ function routeDetail(m) {
     ? x.tables.map(t => `<button type="button" data-srctable="${esc(t.name)}" aria-pressed="${!off.has(t.name)}" class="${off.has(t.name) ? OP_BTN_OFF : OP_BTN_ON}">${esc(t.name)}</button>`).join('') + '<span class="w-full"></span>'
     : '';
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
-    + row('matched', `<span data-v="${x.id}:matched" class="tabular-nums">${fmt(x.c.matched || 0)}</span> <span class="text-ink-500">events the route claimed</span>`)
+    + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
     + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
     + (r.topic_values && r.topic_values.length ? row('topic values', esc(r.topic_values.join(', '))) : '')
@@ -1175,11 +1188,12 @@ function drawCardSparks(m) {
   const lines = {};
   for (const x of m.routes) {
     const rr = routeRate(x.i);
-    // Matched (in, blue): every event the route claimed, i.e. produced + filtered + fallback + errors. Routed (out,
-    // green): the records it wrote to its topics, produced + fallback; never above matched.
+    // Processed (every event it took = produced + filtered + fallback + errors), matched (processed minus filtered),
+    // fallback and errors: one line each, in the colours of the card's metrics.
     if (rr) {
-      const matched = sumSeries(ROUTE_COUNTS.map(k => rr[k] || [])), routed = sumSeries([rr.produced || [], rr.fallback || []]);
-      lines[x.id] = [[matched, TABLE_LINE, 1.5], [routed, RATE_LINE.produced, 1.5]];
+      const processed = sumSeries(ROUTE_COUNTS.map(k => rr[k] || [])), passed = sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]);
+      const series = { processed, passed, fallback: rr.fallback || [], errors: rr.errors || [] };
+      lines[x.id] = CARD_METRICS.map(([k, color]) => [series[k], color, k === 'processed' ? 1.5 : 1.2]);
     }
     for (const t of x.shown) lines[t.id] = [[tableEventsRate(t.name), TABLE_LINE, 1.5]];
     if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableEventsRate(t.name))), TABLE_LINE, 1.5]];
