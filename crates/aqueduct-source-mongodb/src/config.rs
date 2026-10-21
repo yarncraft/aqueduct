@@ -17,7 +17,7 @@ pub enum SnapshotMode {
 pub const DEFAULT_CHUNK_SIZE: u32 = 1024;
 
 /// `[source]` settings for `type = "mongodb"`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct MongoConfig {
     /// Connection string; carries auth and `tls=true` options. Requires a replica set.
     pub uri: String,
@@ -45,6 +45,21 @@ fn default_true() -> bool {
 
 fn default_chunk_size() -> u32 {
     DEFAULT_CHUNK_SIZE
+}
+
+/// The URI's password is redacted: `Debug` output can end up in logs.
+impl std::fmt::Debug for MongoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongoConfig")
+            .field("uri", &aqueduct_core::redact_password(&self.uri))
+            .field("database", &self.database)
+            .field("collections", &self.collections)
+            .field("pre_images", &self.pre_images)
+            .field("snapshot", &self.snapshot)
+            .field("snapshot_chunk_size", &self.snapshot_chunk_size)
+            .field("snapshot_max_rows_per_sec", &self.snapshot_max_rows_per_sec)
+            .finish()
+    }
 }
 
 impl MongoConfig {

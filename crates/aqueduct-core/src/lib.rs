@@ -11,6 +11,7 @@ mod event;
 mod lag;
 mod metrics;
 mod pipeline;
+mod redact;
 mod snapshot;
 
 pub use control::{
@@ -28,4 +29,5 @@ pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Error, Result, Sink, Source,
     MAX_BATCH,
 };
+pub use redact::redact_password;
 pub use snapshot::{Checkpoint, ChunkId, ChunkRow, Mark, Outcome, SnapState, Window, WindowError};

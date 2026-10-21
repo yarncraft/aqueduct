@@ -282,7 +282,7 @@ impl TxKeys {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PostgresSourceConfig {
     /// libpq-style connection string / URL.
     pub url: String,
@@ -323,6 +323,30 @@ pub struct PostgresSourceConfig {
     pub stream_buffer_bytes: usize,
     /// How every connection authenticates. Default: the URL's password.
     pub auth: SourceAuth,
+}
+
+/// The URL's password is redacted: `Debug` output can end up in logs.
+impl std::fmt::Debug for PostgresSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSourceConfig")
+            .field("url", &aqueduct_core::redact_password(&self.url))
+            .field("slot", &self.slot)
+            .field("publication", &self.publication)
+            .field("poll_interval", &self.poll_interval)
+            .field("batch_size", &self.batch_size)
+            .field("allow_slot_recreate", &self.allow_slot_recreate)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("heartbeat_action_query", &self.heartbeat_action_query)
+            .field("skip_system_check", &self.skip_system_check)
+            .field("logical_messages", &self.logical_messages)
+            .field("snapshot", &self.snapshot)
+            .field("transport", &self.transport)
+            .field("stream_buffer_bytes", &self.stream_buffer_bytes)
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 /// How the source signs in to Postgres.

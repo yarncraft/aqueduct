@@ -22,7 +22,7 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     /// Shorthand for `[source] type = "postgres"`; kept so existing configs keep working.
     #[serde(default)]
@@ -50,6 +50,25 @@ pub struct Config {
     pub checkpoint_path: String,
 }
 
+/// The admin token is redacted: `Debug` output can end up in logs.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("postgres", &self.postgres)
+            .field("source", &self.source)
+            .field("sink", &self.sink)
+            .field("health_addr", &self.health_addr)
+            .field(
+                "admin_token",
+                &self.admin_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("admin_insecure_no_auth", &self.admin_insecure_no_auth)
+            .field("inspector", &self.inspector)
+            .field("checkpoint_path", &self.checkpoint_path)
+            .finish()
+    }
+}
+
 /// Which system changes are read from, picked by `type`: postgres or mongodb.
 // Parsed once at startup; boxing the Postgres variant would only add noise.
 #[allow(clippy::large_enum_variant)]
@@ -69,7 +88,7 @@ impl SourceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PostgresConfig {
     pub url: String,
     #[serde(default = "default_slot")]
@@ -129,6 +148,35 @@ pub struct PostgresConfig {
     /// identity on Container Apps.
     #[serde(default)]
     pub azure_client_id: Option<String>,
+}
+
+/// The URL's password is redacted: `Debug` output can end up in logs.
+impl std::fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("url", &aqueduct_core::redact_password(&self.url))
+            .field("slot", &self.slot)
+            .field("publication", &self.publication)
+            .field("allow_slot_recreate", &self.allow_slot_recreate)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("heartbeat_action_query", &self.heartbeat_action_query)
+            .field(
+                "checkpoint_skip_system_check",
+                &self.checkpoint_skip_system_check,
+            )
+            .field("snapshot", &self.snapshot)
+            .field("snapshot_chunk_size", &self.snapshot_chunk_size)
+            .field("snapshot_max_rows_per_sec", &self.snapshot_max_rows_per_sec)
+            .field("snapshot_key_columns", &self.snapshot_key_columns)
+            .field("snapshot_watermark_table", &self.snapshot_watermark_table)
+            .field("transport", &self.transport)
+            .field("stream_buffer_bytes", &self.stream_buffer_bytes)
+            .field("auth", &self.auth)
+            .field("azure_client_id", &self.azure_client_id)
+            .finish()
+    }
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -527,6 +575,35 @@ const MIN_ADMIN_TOKEN_LEN: usize = 16;
 /// Placeholders that were published in this repo (the compose default until #30, docs samples).
 const KNOWN_WEAK_ADMIN_TOKENS: &[&str] = &["dev-token-change-me", "change-me"];
 
+/// A TOML error as `line L, column C: <message>`, without the source line `toml` would quote:
+/// a typo on `admin_token`, `sasl_password` or a URL line would otherwise put the secret in the
+/// startup log. On such a line the message is left out too, since it can quote the value.
+fn parse_error(text: &str, e: &toml::de::Error) -> String {
+    let Some(span) = e.span() else {
+        return e.message().to_string();
+    };
+    let start = span.start.min(text.len());
+    let before = &text[..start];
+    let line_no = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let column = text[line_start..start].chars().count() + 1;
+    let line = text[line_start..].lines().next().unwrap_or("");
+    let key = line
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let secret = ["password", "token", "secret", "url", "uri"]
+        .iter()
+        .any(|w| key.contains(w));
+    if secret {
+        format!("line {line_no}, column {column}: invalid `{key}` (details hidden: it may hold a secret)")
+    } else {
+        format!("line {line_no}, column {column}: {}", e.message())
+    }
+}
+
 impl Config {
     /// Reject an admin token that is obviously not a secret. An empty value still means "unset".
     /// A literal `${` is an unexpanded compose or shell placeholder, which would make the
@@ -593,7 +670,8 @@ impl Config {
         let path = std::env::var("AQUEDUCT_CONFIG")
             .unwrap_or_else(|_| "/etc/aqueduct/aqueduct.toml".into());
         let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-        let mut cfg: Config = toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        let mut cfg: Config =
+            toml::from_str(&text).map_err(|e| format!("{path}: {}", parse_error(&text, &e)))?;
         if let Ok(t) = std::env::var("AQUEDUCT_ADMIN_TOKEN") {
             cfg.admin_token = Some(t);
         }
@@ -777,6 +855,41 @@ admin_insecure_no_auth = true",
     }
 
     #[test]
+    fn a_parse_error_never_quotes_the_line() {
+        for (text, hidden) in [
+            (
+                "admin_token = abc123secret
+",
+                "abc123secret",
+            ),
+            (
+                "[sink]
+sasl_password = \"hunter2
+",
+                "hunter2",
+            ),
+            (
+                "[postgres]
+url = postgres://u:pw-x@db/app
+",
+                "pw-x",
+            ),
+        ] {
+            let e = toml::from_str::<Config>(text).unwrap_err();
+            let msg = parse_error(text, &e);
+            assert!(!msg.contains(hidden), "{msg}");
+            assert!(msg.starts_with("line "), "{msg}");
+        }
+        // Other keys keep the parser's message.
+        let text = "[postgres]
+slot = 
+";
+        let msg = parse_error(text, &toml::from_str::<Config>(text).unwrap_err());
+        assert!(msg.starts_with("line 2, column"), "{msg}");
+        assert!(!msg.contains("details hidden"), "{msg}");
+    }
+
+    #[test]
     fn secrets_are_redacted_in_debug() {
         let cfg: Config = toml::from_str(
             r#"
@@ -794,6 +907,25 @@ admin_insecure_no_auth = true",
         .unwrap();
         let d = format!("{cfg:?}");
         assert!(!d.contains("hunter2") && d.contains("svc"));
+        // The admin token and a password in the source URL are hidden too.
+        let cfg: Config = toml::from_str(
+            r#"
+            admin_token = "0123456789abcdef-token"
+            [source]
+            type = "postgres"
+            url = "postgres://app:pg-secret@db/app"
+            [sink]
+            brokers = ["b:9093"]
+            topic = "t"
+            "#,
+        )
+        .unwrap();
+        let d = format!("{cfg:?}");
+        assert!(
+            !d.contains("0123456789abcdef-token") && !d.contains("pg-secret"),
+            "{d}"
+        );
+        assert!(d.contains("postgres://app:<redacted>@db/app"), "{d}");
     }
 
     fn sink_cfg(extra: &str) -> KafkaConfig {
