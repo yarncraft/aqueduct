@@ -147,8 +147,26 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Replicas for auto-created topics when `replication_factor` is not configured.
 pub const DEFAULT_REPLICATION_FACTOR: i16 = 3;
 
-/// Metadata reads after creating a topic before it counts as not available (200 ms apart).
-const CREATE_LIST_ATTEMPTS: u32 = 15;
+/// How long a created topic may take to show up in the metadata before it counts as not
+/// available. Well inside the pipeline's 60 s sink timeout; a busy broker can take more than a
+/// few seconds (#159).
+const CREATE_VISIBLE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The pauses between metadata reads after a create: 200 ms, doubling up to 2 s, until they add
+/// up to [`CREATE_VISIBLE_WAIT`].
+fn create_list_delays() -> impl Iterator<Item = std::time::Duration> {
+    let mut total = std::time::Duration::ZERO;
+    let mut next = std::time::Duration::from_millis(200);
+    std::iter::from_fn(move || {
+        let d = next.min(CREATE_VISIBLE_WAIT.saturating_sub(total));
+        if d.is_zero() {
+            return None;
+        }
+        total += d;
+        next = (next * 2).min(std::time::Duration::from_secs(2));
+        Some(d)
+    })
+}
 
 /// What to do after the first attempt to create a missing topic.
 #[derive(Debug, PartialEq, Eq)]
@@ -414,12 +432,12 @@ impl KafkaSink {
                 }
             }
         }
-        // A new topic can take a moment to show up in the metadata of the broker we ask, so
-        // re-list a few times before giving up (startup opens the dead-letter topics this way).
-        for attempt in 0..CREATE_LIST_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
+        // A new topic can take a while to show up in the metadata of the broker we ask, so
+        // re-list with backoff before giving up (startup opens the dead-letter topics this way).
+        // A refused create already returned above.
+        let mut delays = create_list_delays();
+        let mut logged = false;
+        loop {
             let listed = self
                 .client
                 .list_topics()
@@ -428,8 +446,18 @@ impl KafkaSink {
             if let Some(ids) = find(listed) {
                 return Ok(ids);
             }
+            let Some(delay) = delays.next() else { break };
+            if !logged {
+                tracing::info!(topic, "waiting for the new topic to appear in the metadata");
+                logged = true;
+            }
+            tokio::time::sleep(delay).await;
         }
-        Err(Error::Sink(format!("kafka topic {topic} not available")).into())
+        Err(Error::Sink(format!(
+            "kafka topic {topic} not available {}s after it was created",
+            CREATE_VISIBLE_WAIT.as_secs()
+        ))
+        .into())
     }
 
     async fn open_topic(&mut self, topic: &str) -> Result<()> {
@@ -593,6 +621,25 @@ impl Sink for KafkaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_topic_is_awaited_with_backoff_for_30_s() {
+        use std::time::Duration;
+        let delays: Vec<Duration> = create_list_delays().collect();
+        assert_eq!(delays[0], Duration::from_millis(200));
+        // Non-decreasing, except the last pause, which is only what is left of the 30 s.
+        let (last, steady) = delays.split_last().unwrap();
+        assert!(steady.windows(2).all(|w| w[0] <= w[1]), "{delays:?}");
+        assert!(*last <= *steady.last().unwrap(), "{delays:?}");
+        assert!(
+            delays.iter().all(|d| *d <= Duration::from_secs(2)),
+            "{delays:?}"
+        );
+        assert_eq!(delays.iter().sum::<Duration>(), CREATE_VISIBLE_WAIT);
+        // Far past the old ~3 s, and well inside the pipeline's 60 s sink timeout.
+        assert!(CREATE_VISIBLE_WAIT >= Duration::from_secs(20));
+        assert!(CREATE_VISIBLE_WAIT <= Duration::from_secs(40));
+    }
 
     #[test]
     fn replication_factor_fallback_only_when_unset() {
