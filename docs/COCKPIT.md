@@ -7,6 +7,10 @@ sent to the server.
 
 Every panel explained: [deep dive: cockpit](deep-dive/cockpit.md).
 
+![The cockpit: live throughput, lag, routing graph and event inspector](assets/cockpit.gif)
+
+The recording uses the compose stack with generated demo rows.
+
 | Route | Purpose |
 |-------|---------|
 | `GET /`, `/admin.css` | The dashboard (public) |

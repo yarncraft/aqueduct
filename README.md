@@ -11,6 +11,8 @@ at-least-once delivery: the source position is checkpointed and acknowledged onl
 - **Admin cockpit**: lag behind the source, throughput, routing graph, event inspector
 - Distroless, non-root image; state in one volume
 
+![The Aqueduct cockpit: live throughput, lag, routing graph and event inspector](docs/assets/cockpit.gif)
+
 ## Quick start
 
 ```sh
