@@ -167,8 +167,10 @@ server {
 
     location / {
         proxy_pass http://aqueduct:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;  # /api/stream is Server-Sent Events
         proxy_set_header Host $host;
-        proxy_read_timeout 60s;
+        proxy_read_timeout 1h;
     }
 }
 ```
