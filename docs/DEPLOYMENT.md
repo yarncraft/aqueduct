@@ -246,10 +246,10 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error) or whose `rename` collides with an existing column. Required as soon as a route uses `where`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, and outbox rows without an `aggregate_id` or `payload`. Required as soon as a route uses `where`, `outbox`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
 | `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
 | `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic`. First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route) |
 
 Records: key and value as above, headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
 hash. With the default `partition_by = "key"`, a row's changes stay ordered **while its primary key does not change**:
@@ -347,7 +347,7 @@ topic = "orders-paid"
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where`, `key`, a topic template or a field operation, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and field path in `where`, `key`, a topic template, a field operation or `outbox`, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
@@ -535,6 +535,93 @@ rename = { cust_id = "customer_id" }
 - **Cost.** A route without field operations takes the unchanged path. With them, each row is rewritten in one pass
   over its top-level columns; hashing costs one HMAC per hashed non-null value.
 
+#### Outbox
+
+`outbox` on a route publishes the rows of an outbox table as their own events, much like Debezium's outbox event
+router, with the differences listed under "Differences from Debezium" below. The application writes an event into the outbox table in the same transaction as its business change. Aqueduct turns
+each **insert** into one Kafka record whose key is the aggregate id and whose value is the payload:
+
+```toml
+[sink]
+dead_letter_topic = "aqueduct.dead-letter"   # required once any route uses `outbox`
+
+[[sink.routes]]
+match = "public.outbox"
+outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", payload = "payload", topic = "outbox.{aggregate_type}", id = "id", type = "type" }
+topic_fallback = "outbox.unknown"            # required: the topic reads a row value
+topic_values = ["order", "customer"]         # optional allow-list, as for any content-routed topic
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `aggregate_type` | `aggregatetype` | Column that `{aggregate_type}` in `topic` reads |
+| `aggregate_id` | `aggregateid` | Column whose value is the record key |
+| `payload` | `payload` | Column whose value is the record value |
+| `topic` | `outbox.event.{aggregate_type}` | Topic template over the outbox columns |
+| `id` | unset | Column sent as the `id` header |
+| `type` | unset | Column sent as the `type` header |
+
+The defaults are Debezium's column names and topic, so `outbox = {}` reads a Debezium-style outbox table. The `id`
+and `type` headers are opt-in: set `id` and `type` to the columns. Unknown keys inside `outbox` fail startup, so a
+misspelled key never falls back to a default column.
+
+- **Inserts, and snapshot rows only on request.** Updates, deletes and truncates of the outbox table never produce a
+  record (even if `ops` lists them) and count as `filtered`, so deleting outbox rows once written is safe. Snapshot
+  rows (`read`) are filtered unless the route's `ops` lists `"read"`, for example `ops = ["insert", "read"]`; they are
+  then published like inserts, with the `op` header `r`. Enable `read` to publish rows that were already in the
+  outbox table before Aqueduct streamed it (a first deployment with `snapshot = "initial"`). The trade-off: every
+  snapshot of the table publishes every row still in it, including rows already published when they were inserted,
+  so consumers see those events twice. Delete outbox rows once written, or snapshot the table only once, to keep
+  that small. `where` still applies if you set it.
+- **Startup refusals.** An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.<column>`
+  (inserts and snapshot rows have no before-image, so it could never be true), fail startup naming the route.
+- **Key: the raw `aggregate_id` value**, not the JSON record key other routes use. A string is sent as its content
+  (unescaped UTF-8: `A-1`, not `"A-1"`), a number or boolean as its JSON text (`42`), an object (a MongoDB `ObjectId`)
+  as its JSON (`{"$oid":"..."}`). The partition is the FNV-1a hash of that key, whatever `partition_by` says, so the
+  events of one aggregate stay in order on one partition. Consumers of an outbox expect this key; code that parses
+  the JSON keys of other topics cannot read outbox topics unchanged.
+- **Value: the `payload` value, passed through.** A `json` or `jsonb` payload is its JSON text as stored. A text
+  payload is sent as its content, not as a JSON string literal: `say "hi"`, not `"say \"hi\""`. The value is not the
+  change-event envelope: it has no `source`, `op` or timestamps. **Use a `jsonb` object or array, or `text`, as the
+  payload**; the other cases differ from Debezium (below).
+- **Headers:** `op` (`c`, or `r` for a snapshot row) and `lsn`, as on every record, plus `id` and `type` from the configured columns, with the
+  same text rules as the key. A null or missing `id` or `type` leaves that header out. These two headers carry row
+  values; no other header does.
+- **Topic.** The template may use `{aggregate_type}`, `{schema}`, `{table}`, `{after.<column>}` and `{row.<column>}`
+  (both read the inserted row). `{before.<column>}` fails startup, since an insert has no before-image; a syntax
+  error names its byte position in the template as written. A template that
+  reads a row value follows every rule of [Routing by row content](#routing-by-row-content): fixed text first,
+  `topic_fallback` required, one segment per value, `topic_values`, no collision with fixed topics,
+  `max_dynamic_topics`. A null or invalid `aggregate_type` sends the record (same key, value and headers) to the
+  fallback. A fixed `topic` such as `outbox.events` needs no fallback.
+- **Rows that cannot be published go to the dead-letter topic:** a null or missing `aggregate_id` or `payload`, or a
+  string in the key, payload or a header column that is not valid Unicode (a lone `\ud800` escape). The dead-letter
+  record is the full change-event envelope of the row, the payload included (an outbox route has no field
+  operations to apply), keyed by the table only, with an `aqueduct-error` header that names
+  the column, never its value, for example ``route `outbox`: outbox `aggregate_id` column `aggregateid` is missing or
+  null``. It counts under `errors`, and the pipeline goes on.
+- **Exclusive keys.** `outbox` sets the topic, the key and the value, so a route with `outbox` may not also set `topic`,
+  `key` or any field operation (`include`, `exclude`, `mask`, `hash`, `rename`, see
+  [Protecting fields per route](#protecting-fields-per-route)); startup fails naming the route and the keys. Shape the
+  payload in the application instead. Column names must be top-level (no dots).
+- **Unseen fields.** The outbox columns are watched like any other field path, as `after.<column>`: a misspelled
+  column is reported after 1000 inserts that lack it.
+- The cockpit shows an `outbox` badge on the route. The event inspector shows outbox records as raw values with their
+  headers and their topic in place of the table, since they are not envelopes.
+- **Differences from Debezium's outbox event router.** Aqueduct reads the payload from the row's JSON, which does not
+  record the column type, so:
+  - A `jsonb` payload that is a bare JSON string (`'"hello"'::jsonb`) is sent without its quotes (`hello`); Debezium
+    keeps the JSON text (`"hello"`).
+  - A `text` payload that holds JSON text (`{"a":1}`) is sent as that text, so a JSON consumer reads an object;
+    Debezium (with the JSON converter) delivers a JSON string.
+  - A `bytea` payload arrives as Postgres hex text (`\x4869`), not as the raw bytes or base64.
+  - Debezium publishes snapshot rows like inserts and only warns on updates; Aqueduct publishes snapshot rows only
+    when `ops` lists `read` and always drops updates.
+  - The `id` and `type` headers are opt-in.
+
+  Use a `jsonb` object or array as the payload (the same JSON Debezium sends), or `text` (sent as plain text). Avoid
+  `jsonb` scalars and `bytea`.
+
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
 `fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
 `/api/routes` and Prometheus:
@@ -562,6 +649,10 @@ with TLS and authentication, or set `inspector = false`.
 The inspector adds no work to the pipeline: nothing is buffered in memory. Each refresh (every 3 s while a tab is open,
 shared across tabs for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
 routes to, using its own connection (created on first use). A closed tab costs nothing.
+
+`/api/events` returns each record's `topic`, `partition`, `offset`, `timestamp_ms`, `key`, `headers` (as text) and
+`event`: the value parsed as JSON, or its text when it is not JSON. A value that is not a change-event envelope (an
+outbox payload) is shown raw, with its op and lsn taken from the headers.
 
 ### Tables · high-water marks
 
@@ -662,7 +753,9 @@ zero when the process restarts.
 the `sink.topic` fallback as a route named `default` with `"match": null`, with live counts. It never contains row data.
 Later routing options add keys to each route, so readers should ignore keys they do not know. A route with field
 operations also has `include`, `exclude`, `mask` and `hash` (column lists) and `rename` (the map), each left out when
-unset; with a hash key the top level has `hash_key_id`. The hash key itself is never shown.
+unset; with a hash key the top level has `hash_key_id`. The hash key itself is never shown. An outbox route has an
+`outbox` object with its column names and topic template (`aggregate_type`, `aggregate_id`, `payload`, `topic`, and
+`id` and `type` when set); other routes leave the key out.
 
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",

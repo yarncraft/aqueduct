@@ -11,7 +11,7 @@ mod topic_stats;
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
 pub use route::{
-    ContentTopic, FieldSpec, HashKey, KafkaRoute, OutRecord, RouteCount, RouteCounts,
+    ContentTopic, FieldSpec, HashKey, KafkaRoute, OutRecord, OutboxSpec, RouteCount, RouteCounts,
     RouteDescription, RoutePlan, RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
     HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
 };
