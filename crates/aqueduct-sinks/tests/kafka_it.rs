@@ -179,7 +179,8 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     };
     let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
     let topic = unique("aqueduct-it-filter");
-    let dlq = unique("aqueduct-it-dlq");
+    // No `dead_letter_topic` anywhere: the route's topic plus `.dlq`.
+    let dlq = format!("{topic}.dlq");
     let route = KafkaRoute {
         name: Some("big".into()),
         pattern: "public.*".into(),
@@ -187,22 +188,31 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         filter: Some("op == 'insert' and row.n > 10".into()),
         ..Default::default()
     };
-    let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
+    // A `{table}` template: its dead-letter topics are rendered per event, created on first use.
+    let prefix = unique("aqueduct-it-tpl");
+    let templated = KafkaRoute {
+        name: Some("audit".into()),
+        pattern: "audit.*".into(),
+        topic: format!("{prefix}.{{table}}"),
+        filter: Some("row.n > 10".into()),
+        ..Default::default()
+    };
+    let tpl_dlq = format!("{prefix}.log.dlq");
+    let plan = RoutePlan::new(vec![route, templated], None).unwrap();
+    assert_eq!(plan.dead_letter_topics(), std::slice::from_ref(&dlq));
     let stats = plan.stats();
     let mut sink = KafkaSink::connect(brokers.clone(), plan, 2, None, &KafkaSecurity::default())
         .await
         .unwrap();
     let client = ClientBuilder::new(brokers).build().await.unwrap();
-    // The dead-letter topic is created at connect, before any row needs it.
+    // The fixed dead-letter topic is created at connect, before any row needs it; the rendered
+    // one is not.
+    let listed = client.list_topics().await.unwrap();
     assert!(
-        client
-            .list_topics()
-            .await
-            .unwrap()
-            .iter()
-            .any(|t| t.name == dlq),
+        listed.iter().any(|t| t.name == dlq),
         "dead-letter topic opened at startup"
     );
+    assert!(!listed.iter().any(|t| t.name == tpl_dlq));
 
     let mut batch: Vec<ChangeEvent> = (1..=20).map(|n| ev(n, "orders")).collect();
     let mut bad = ev(21, "orders");
@@ -212,6 +222,10 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     let mut update = ev(22, "orders");
     update.op = Op::Update;
     batch.push(update);
+    let mut audit = ev(23, "log");
+    audit.schema = "audit".into();
+    audit.after = Some(to_raw_value(&serde_json::json!({ "n": [1] })).unwrap());
+    batch.push(audit);
     // One batch, acked as a whole: the dead-letter record is produced before send_batch returns.
     sink.send_batch(&batch).await.unwrap();
     sink.flush().await.unwrap();
@@ -245,15 +259,25 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         "the value is the envelope"
     );
 
-    let c = stats.snapshot()[0].counts;
+    // The templated route's bad row landed on its own rendered dead-letter topic.
+    let dead = read_all(&client, &tpl_dlq).await;
+    assert_eq!(dead.len(), 1, "one type-error row on {tpl_dlq}");
+    assert!(String::from_utf8(dead[0].1["aqueduct-error"].clone())
+        .unwrap()
+        .starts_with("route `audit`: where `row.n > 10`: type error"));
+
+    let snap = stats.snapshot();
+    let c = snap[0].counts;
     assert_eq!(
         (c.matched, c.produced, c.filtered, c.errors),
         (22, 10, 11, 1)
     );
-    // Acknowledged records per topic: the kept rows, and the dead-lettered one on its topic.
+    assert_eq!(snap[1].counts.errors, 1);
+    // Acknowledged records per topic: the kept rows, and each dead-lettered one on its topic.
     let acked = sink.topic_stats().snapshot();
     assert_eq!(acked.get(&topic).copied(), Some(10));
     assert_eq!(acked.get(&dlq).copied(), Some(1));
+    assert_eq!(acked.get(&tpl_dlq).copied(), Some(1));
 }
 
 #[tokio::test]
@@ -634,7 +658,8 @@ async fn outbox_inserts_are_published_raw_and_updates_produce_nothing() {
     let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
     let prefix = unique("aqueduct-it-outbox");
     let fallback = format!("{prefix}-fallback");
-    let dlq = unique("aqueduct-it-outbox-dlq");
+    // The outbox's dead-letter topic is its fallback's: `<topic_fallback>.dlq`.
+    let dlq = format!("{fallback}.dlq");
     let route = KafkaRoute {
         name: Some("outbox".into()),
         pattern: "public.outbox".into(),
@@ -647,7 +672,7 @@ async fn outbox_inserts_are_published_raw_and_updates_produce_nothing() {
         }),
         ..Default::default()
     };
-    let plan = RoutePlan::with_dead_letter(vec![route], None, Some(dlq.clone())).unwrap();
+    let plan = RoutePlan::new(vec![route], None).unwrap();
     let stats = plan.stats();
     let inspector = KafkaInspector::new(brokers.clone(), &plan, KafkaSecurity::default());
     let mut sink = KafkaSink::connect(brokers.clone(), plan, 3, None, &KafkaSecurity::default())

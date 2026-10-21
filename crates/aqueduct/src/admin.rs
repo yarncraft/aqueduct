@@ -1394,6 +1394,7 @@ Authorization: Bearer {token}
             routes[0],
             json!({"route": "paid \"orders\"", "match": "public.orders",
                    "where": "op == 'insert' and row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
+                   "dead_letter_topic": "aqueduct.dlq",
                    "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
                    "unseen_fields": []})
         );

@@ -295,12 +295,13 @@ impl KafkaSink {
         {
             sink.open_topic(&t).await?;
         }
-        // The dead-letter topic is opened (created if missing) now, so a missing or unusable one
-        // fails startup instead of the first batch with a row that cannot be evaluated.
-        if let Some(t) = sink.plan.dead_letter_topic().map(str::to_string) {
+        // The fixed dead-letter topics of the routes that can dead-letter rows are opened
+        // (created if missing) now, so a missing or unusable one fails startup instead of the
+        // first batch with a row that cannot be evaluated. `{table}` ones open on first use.
+        for t in sink.plan.dead_letter_topics() {
             sink.open_topic(&t)
                 .await
-                .map_err(|e| Error::Sink(format!("sink.dead_letter_topic {t}: {e}")))?;
+                .map_err(|e| Error::Sink(format!("dead-letter topic {t}: {e}")))?;
         }
         // Content routing: the fallbacks take every event a row cannot route, so they must work
         // from the start; and the topics the templates already created count against
@@ -414,7 +415,7 @@ impl KafkaSink {
             }
         }
         // A new topic can take a moment to show up in the metadata of the broker we ask, so
-        // re-list a few times before giving up (startup opens the dead-letter topic this way).
+        // re-list a few times before giving up (startup opens the dead-letter topics this way).
         for attempt in 0..CREATE_LIST_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;

@@ -8,7 +8,7 @@ use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-use super::expr::{EventView, Expr, FieldRef, Template, Tri};
+use super::expr::{EventView, Expr, FieldRef, Template, Tri, OP_NAMES};
 use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
 use crate::{
@@ -57,9 +57,20 @@ pub struct KafkaRoute {
     /// compacted topic forgets the row. Needs a per-row key.
     pub tombstones: bool,
     /// `omit` (the default) or `dead_letter`: what happens to a row the source sent without some
-    /// unchanged columns (Postgres TOAST). `dead_letter` needs `sink.dead_letter_topic`.
+    /// unchanged columns (Postgres TOAST). `dead_letter` sends it to the route's dead-letter topic.
     pub unchanged: Option<String>,
+    /// The route's own dead-letter topic, a fixed name. Unset: `sink.dead_letter_topic`, else the
+    /// route's topic plus `.dlq` ([`DLQ_SUFFIX`]).
+    pub dead_letter_topic: Option<String>,
 }
+
+/// Appended to a route's topic (or its `topic_fallback`, for a content-routed topic) to name its
+/// dead-letter topic when neither the route nor the sink sets `dead_letter_topic`.
+pub const DLQ_SUFFIX: &str = ".dlq";
+
+/// A row value a content-routed topic never substitutes (the event goes to `topic_fallback`), so
+/// no row can render a name ending in [`DLQ_SUFFIX`] from a placeholder.
+pub const RESERVED_SEGMENT: &str = "dlq";
 
 /// Debezium's outbox event router defaults, used for every `outbox` key left unset.
 pub const OUTBOX_AGGREGATE_TYPE: &str = "aggregatetype";
@@ -199,6 +210,98 @@ impl TopicTemplate {
     /// True when no placeholder is used: one fixed topic name.
     fn is_static(&self) -> bool {
         self.parsed.is_static()
+    }
+
+    /// True when the template renders exactly `name` for some event. Row fields take the values
+    /// content routing allows on route `r` ([`value_allowed`]); `{op}` one of the operation names;
+    /// `{schema}` and `{table}` one dot-free name (names with dots, which need quoting in Postgres,
+    /// are not considered).
+    fn produces(&self, r: Option<&CompiledRoute>, name: &str) -> bool {
+        if self.is_static() {
+            return self.raw == name;
+        }
+        self.parsed.matches(name, |f, v| match f.column() {
+            Some(_) => r.is_some_and(|r| value_allowed(r, f, v)),
+            None if f.as_str() == "op" => OP_NAMES.contains(&v),
+            None => !v.contains('.'),
+        })
+    }
+}
+
+/// `raw` without its `{op}` placeholders, each removed with one separator (`.`, `_` or `-`) next
+/// to it: `cdc.{table}.{op}` becomes `cdc.{table}`. A per-operation dead-letter topic is of no
+/// use. Unchanged when nothing would be left (a topic that is only `{op}`).
+fn without_op(raw: &str) -> String {
+    const OP: &str = "{op}";
+    let sep = |c: Option<char>| matches!(c, Some('.' | '_' | '-'));
+    let mut s = raw.to_string();
+    while let Some(i) = s.find(OP) {
+        let (head, tail) = (&s[..i], &s[i + OP.len()..]);
+        s = if sep(head.chars().last()) {
+            format!("{}{tail}", &head[..head.len() - 1])
+        } else if sep(tail.chars().next()) {
+            format!("{head}{}", &tail[1..])
+        } else {
+            format!("{head}{tail}")
+        };
+    }
+    if s.is_empty() {
+        raw.to_string()
+    } else {
+        s
+    }
+}
+
+/// Where a route's dead-letter records go (ADR 0002, "As built (2026-10-21)").
+#[derive(Debug, Clone)]
+enum DeadLetter {
+    /// One topic: a `dead_letter_topic` override, `<static topic>.dlq` or `<topic_fallback>.dlq`.
+    Fixed(String),
+    /// `<{schema}/{table} template>.dlq`, rendered for each event like the route's topic, and
+    /// created on first use like it.
+    Template(TopicTemplate),
+}
+
+impl DeadLetter {
+    /// The default for a route whose topic is `topic`: its fallback's DLQ for a content-routed
+    /// topic (the row is the problem, so the template cannot be rendered), else the topic plus
+    /// [`DLQ_SUFFIX`], `{op}` dropped.
+    fn derived(topic: &TopicTemplate, fallback: Option<&str>) -> Result<Self> {
+        if let (true, Some(f)) = (topic.reads_row, fallback) {
+            return Ok(Self::Fixed(format!("{f}{DLQ_SUFFIX}")));
+        }
+        if topic.is_static() {
+            return Ok(Self::Fixed(format!("{}{DLQ_SUFFIX}", topic.raw)));
+        }
+        let raw = format!("{}{DLQ_SUFFIX}", without_op(&topic.raw));
+        let t = parse_topic("dead-letter topic", &raw)?;
+        Ok(if t.is_static() {
+            Self::Fixed(raw)
+        } else {
+            Self::Template(t)
+        })
+    }
+
+    /// The name, or the template with its placeholders.
+    fn name(&self) -> &str {
+        match self {
+            Self::Fixed(t) => t,
+            Self::Template(t) => &t.raw,
+        }
+    }
+
+    fn glob(&self) -> String {
+        match self {
+            Self::Fixed(t) => t.clone(),
+            Self::Template(t) => t.glob(),
+        }
+    }
+
+    fn fixed(&self) -> Option<&str> {
+        match self {
+            Self::Fixed(t) => Some(t),
+            Self::Template(_) => None,
+        }
     }
 }
 
@@ -476,7 +579,7 @@ fn parse_choice<T: Copy>(name: &str, key: &str, value: &str, names: &[(&str, T)]
 
 /// Validates `format`, `deletes`, `tombstones` and `unchanged`. What depends on `partition_by`
 /// (tombstones need a per-row key) is checked by [`RoutePlan::check_partition_by`].
-fn parse_shape(name: &str, r: &KafkaRoute, dead_letter_topic: Option<&str>) -> Result<Shape> {
+fn parse_shape(name: &str, r: &KafkaRoute) -> Result<Shape> {
     let format = r
         .format
         .as_deref()
@@ -526,11 +629,6 @@ fn parse_shape(name: &str, r: &KafkaRoute, dead_letter_topic: Option<&str>) -> R
         })
         .transpose()?
         .unwrap_or(false);
-    if unchanged_dead_letter && dead_letter_topic.is_none() {
-        return Err(Error::Config(format!(
-            "sink route `{name}` uses `unchanged = \"dead_letter\"`, which needs `sink.dead_letter_topic`: rows that lack unchanged TOAST columns go there"
-        )));
-    }
     // `outbox` routes never get here with a shape key set: `RoutePlan::build` refuses them.
     Ok(Shape {
         format,
@@ -760,6 +858,23 @@ impl CompiledRoute {
     pub(crate) fn topic_values(&self) -> Option<&[String]> {
         self.topic_values.as_deref()
     }
+
+    /// Whether the route is built to dead-letter rows: a `where` on row data (a type error), an
+    /// outbox (a row without `aggregate_id` or `payload`), `unchanged = "dead_letter"`, `hash` (a
+    /// string it cannot hash) or `rename` without `include` (a name that collides). Its fixed
+    /// dead-letter topic is opened at startup. Any other route with field operations dead-letters
+    /// only a row that is not a JSON object, which the sources never send.
+    fn expects_dead_letters(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|f| f.row_fields().next().is_some())
+            || self.outbox.is_some()
+            || self.shape.unchanged_dead_letter
+            || self
+                .fields
+                .as_ref()
+                .is_some_and(|f| f.hashes() || f.may_collide())
+    }
 }
 
 /// Validates `key = [...]`: a non-empty list of distinct top-level column names.
@@ -844,7 +959,7 @@ pub struct RouteCounts {
     pub filtered: u64,
     /// Events sent to the route's `topic_fallback`.
     pub fallback: u64,
-    /// Events sent to `sink.dead_letter_topic` because a row could not be evaluated.
+    /// Events sent to the route's dead-letter topic because a row could not be evaluated.
     pub errors: u64,
     /// Not an outcome: deletes produced without the tombstone `tombstones = true` asks for,
     /// because their key is null (a table without a primary key), so the tombstone would erase
@@ -973,6 +1088,7 @@ impl RouteStats {
 pub struct RoutesDescription {
     /// `sink.topic`, placeholders included.
     pub default_topic: Option<String>,
+    /// `sink.dead_letter_topic`, the global override; each route's own is in its description.
     pub dead_letter_topic: Option<String>,
     /// `key` or `table`.
     pub partition_by: &'static str,
@@ -1029,6 +1145,10 @@ pub struct RouteDescription {
     /// `dead_letter` for a route with `unchanged = "dead_letter"`; left out for `omit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unchanged: Option<&'static str>,
+    /// Where rows the route cannot evaluate go: a topic, or a `{schema}`/`{table}` template
+    /// rendered per event (`cdc.{schema}.{table}.dlq`). `null` only when the default name is not
+    /// a usable topic name and the route cannot dead-letter anyway.
+    pub dead_letter_topic: Option<String>,
     pub counts: RouteCounts,
     pub unseen_fields: Vec<String>,
 }
@@ -1039,7 +1159,10 @@ pub struct RouteDescription {
 pub struct RoutePlan {
     routes: Vec<CompiledRoute>,
     default: Option<TopicTemplate>,
+    /// `sink.dead_letter_topic`, the global override.
     dead_letter: Option<String>,
+    /// Per route, then the `sink.topic` fallback (as in the stats): its dead-letter topic.
+    dead_letters: Vec<Option<DeadLetter>>,
     partition_by: PartitionBy,
     source: SourceInfo,
     stats: Arc<RouteStats>,
@@ -1069,6 +1192,7 @@ fn valid_topic_name(t: &str) -> bool {
 fn value_allowed(r: &CompiledRoute, f: &FieldRef, v: &str) -> bool {
     f.column().is_none()
         || (valid_segment(v)
+            && v != RESERVED_SEGMENT
             && r.topic_values
                 .as_ref()
                 .is_none_or(|vals| vals.iter().any(|a| a == v)))
@@ -1177,18 +1301,23 @@ fn check_content_routing(
                 "`topic_values` entry `{v}` can never be used: a value must be 1 to {MAX_SEGMENT} of A-Z a-z 0-9 _ -"
             ));
         }
+        if values.iter().any(|v| v == RESERVED_SEGMENT) {
+            return err(format!(
+                "`topic_values` entry `{RESERVED_SEGMENT}` can never be used: it is reserved, so no row can render a dead-letter topic name (`...{DLQ_SUFFIX}`)"
+            ));
+        }
     }
     Ok((Some(fallback.clone()), r.topic_values.clone()))
 }
 
-/// No fixed topic (a static route topic, a static `sink.topic`, a fallback, the dead-letter
-/// topic) may match a content-routed template read as a glob, except that route's own fallback:
-/// otherwise a row value could steer events into a topic another part of the config owns.
+/// No fixed topic (a static route topic, a static `sink.topic`, a fallback) may match a
+/// content-routed template read as a glob, except that route's own fallback: otherwise a row value
+/// could steer events into a topic another part of the config owns. Dead-letter topics are checked
+/// by [`check_dead_letter`].
 fn check_collisions(
     names: &[String],
     routes: &[CompiledRoute],
     default: Option<&TopicTemplate>,
-    dead_letter: Option<&str>,
 ) -> Result<()> {
     // (topic, what it is, the route whose fallback it is)
     let mut fixed: Vec<(&str, String, Option<usize>)> = routes
@@ -1214,9 +1343,6 @@ fn check_collisions(
                 Some(i),
             ));
         }
-    }
-    if let Some(d) = dead_letter {
-        fixed.push((d, "sink.dead_letter_topic".into(), None));
     }
     // Topics a `{schema}`/`{table}`/`{op}` template writes: a row value must not reach them either.
     let plain: Vec<(String, &str, String)> = routes
@@ -1257,29 +1383,82 @@ fn check_collisions(
     Ok(())
 }
 
-/// Startup checks of a route's field operations: `hash` needs the key, `rename` without
-/// `include` needs the dead-letter topic, and no row data may bypass the operations (ADR 0002
+/// Checks one dead-letter topic; `what` names where it comes from. A fixed name must be a valid
+/// topic name that does not start with `_`, is not a route's `topic_fallback`, and is not a name
+/// any route's topic (or `sink.topic`) can render ([`TopicTemplate::produces`]): no row value,
+/// table or operation may steer events into it. A route's own `<topic_fallback>.dlq` passes this
+/// for its content-routed `<prefix>.{row.x}`: a row value is one segment without dots and never
+/// [`RESERVED_SEGMENT`]. A template (`<{schema}/{table} template>.dlq`) must not start with `_` or
+/// overlap a content-routed template read as a glob.
+fn check_dead_letter(
+    what: &str,
+    hint: Option<&str>,
+    dlq: &DeadLetter,
+    routes: &[CompiledRoute],
+    default: Option<&TopicTemplate>,
+) -> Result<()> {
+    // Every error says what to do: `hint` for a default name, else pick another one.
+    let pick = hint.unwrap_or("; pick a separate topic");
+    let hint = hint.unwrap_or_default();
+    let bad = |msg: String| Err(Error::Config(format!("{what} `{}` {msg}", dlq.name())));
+    if dlq.name().starts_with('_') {
+        return bad(format!(
+            "must not start with `_` (reserved for internal topics){hint}"
+        ));
+    }
+    match dlq {
+        DeadLetter::Fixed(t) => {
+            if !valid_topic_name(t) {
+                return bad(format!(
+                    "is not a valid Kafka topic name (1 to 249 of A-Z a-z 0-9 . _ -){hint}"
+                ));
+            }
+            let topics = routes
+                .iter()
+                .map(|r| (&r.topic, Some(r)))
+                .chain(default.map(|d| (d, None)));
+            if let Some((owner, _)) = topics.into_iter().find(|(tpl, r)| tpl.produces(*r, t)) {
+                return bad(format!(
+                    "is also a topic events are routed to (`{}`){pick}",
+                    owner.raw
+                ));
+            }
+            if routes
+                .iter()
+                .any(|r| r.topic_fallback.as_deref() == Some(t.as_str()))
+            {
+                return bad(format!("is also a route's `topic_fallback`{pick}"));
+            }
+        }
+        DeadLetter::Template(t) => {
+            let glob = t.glob();
+            if let Some(r) = routes
+                .iter()
+                .find(|r| r.topic.reads_row && globs_intersect(&r.topic.glob(), &glob))
+            {
+                return bad(format!(
+                    "(as the glob `{glob}`) overlaps the content-routed `topic` `{}`: a row value could write into it{hint}",
+                    r.topic.raw
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Startup checks of a route's field operations: `hash` needs the key, and no row data may
+/// bypass the operations (ADR 0002
 /// §5): `key = [...]` and a content-routed topic read the original row, so neither may name a
 /// column the route removes, masks or hashes. `topic_values` constrains the values of those same
 /// template fields, and `topic_fallback` is a fixed topic, so checking the template's fields covers
 /// both.
-fn check_field_ops(
-    name: &str,
-    r: &CompiledRoute,
-    hash_key: Option<&HashKey>,
-    dead_letter_topic: Option<&str>,
-) -> Result<()> {
+fn check_field_ops(name: &str, r: &CompiledRoute, hash_key: Option<&HashKey>) -> Result<()> {
     let Some(f) = &r.fields else {
         return Ok(());
     };
     if f.hashes() && hash_key.is_none() {
         return Err(Error::Config(format!(
             "sink route `{name}` uses `hash`, which needs a key: set AQUEDUCT_HASH_KEY or sink.hash_key_file, and sink.hash_key_id"
-        )));
-    }
-    if f.may_collide() && dead_letter_topic.is_none() {
-        return Err(Error::Config(format!(
-            "sink route `{name}` uses `rename` without `include`, which needs `sink.dead_letter_topic`: a row that already has a column named like a rename target goes there instead of stopping the pipeline"
         )));
     }
     for c in r.key_columns().unwrap_or_default() {
@@ -1309,14 +1488,15 @@ fn check_field_ops(
 }
 
 impl RoutePlan {
-    /// A plan without a dead-letter topic, so no route's `where` may read row data.
+    /// A plan without `sink.dead_letter_topic`: each route dead-letters to its own topic (route
+    /// `dead_letter_topic`, else `<topic>.dlq`).
     pub fn new(routes: Vec<KafkaRoute>, default: Option<String>) -> Result<Self> {
         Self::with_dead_letter(routes, default, None)
     }
 
-    /// Compiles and validates the routes. `dead_letter_topic` is required as soon as a route's
-    /// `where` reads row data, may not start with `_`, and may not be a topic a route or the
-    /// default writes to.
+    /// Compiles and validates the routes. `dead_letter_topic` (`sink.dead_letter_topic`) is the
+    /// dead-letter topic of every route without its own; it may not start with `_`, and may not
+    /// be a topic a route or the default writes to.
     pub fn with_dead_letter(
         routes: Vec<KafkaRoute>,
         default: Option<String>,
@@ -1376,16 +1556,6 @@ impl RoutePlan {
                     })
                 })
                 .transpose()?;
-            // Only a `where` that reads row data can hit a type error at run time: `op`, `schema`
-            // and `table` are strings, and comparing them with anything but a string literal is
-            // refused when the expression is parsed.
-            if let Some(f) = filter.as_ref().and_then(|w| w.row_fields().next()) {
-                if dead_letter_topic.is_none() {
-                    return Err(Error::Config(format!(
-                        "sink route `{name}` uses `where` on row data (`{f}`), which needs `sink.dead_letter_topic`: rows it cannot evaluate go there instead of stopping the pipeline"
-                    )));
-                }
-            }
             let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
             let (topic, outbox) = match &r.outbox {
                 None => {
@@ -1457,18 +1627,13 @@ impl RoutePlan {
                             "sink route `{name}`: `where` reads `{f}`, but an outbox route only publishes inserts and snapshot reads, which have no before-image; use `after.` or `row.`"
                         )));
                     }
-                    if dead_letter_topic.is_none() {
-                        return Err(Error::Config(format!(
-                            "sink route `{name}` uses `outbox`, which needs `sink.dead_letter_topic`: outbox rows without an `aggregate_id` or `payload` go there instead of stopping the pipeline"
-                        )));
-                    }
                     let (outbox, topic) = Outbox::compile(&name, spec)?;
                     (topic, Some(outbox))
                 }
             };
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
             let field_ops = FieldOps::compile(&name, &r.fields)?;
-            let shape = parse_shape(&name, r, dead_letter_topic.as_deref())?;
+            let shape = parse_shape(&name, r)?;
             // `op`, `schema` and `table` are never missing, so only the row paths of `where` are
             // watched.
             let mut watched: Vec<FieldRef> = filter
@@ -1495,12 +1660,7 @@ impl RoutePlan {
                 fields: field_ops,
                 shape,
             };
-            check_field_ops(
-                &name,
-                &route,
-                hash_key.as_ref(),
-                dead_letter_topic.as_deref(),
-            )?;
+            check_field_ops(&name, &route, hash_key.as_ref())?;
             compiled.push(route);
             names.push(name);
         }
@@ -1534,47 +1694,66 @@ impl RoutePlan {
                 }
             }
         }
+        check_collisions(&names, &compiled, default.as_ref())?;
+        // Dead-letter topics: the route's own, else `sink.dead_letter_topic`, else `<topic>.dlq`.
+        // The global override is checked once, as itself.
         if let Some(dlq) = &dead_letter_topic {
-            if !valid_topic_name(dlq) {
-                return Err(Error::Config(format!(
-                    "sink.dead_letter_topic `{dlq}` is not a valid Kafka topic name (1 to 249 of A-Z a-z 0-9 . _ -)"
-                )));
-            }
-            if dlq.starts_with('_') {
-                return Err(Error::Config(format!(
-                    "sink.dead_letter_topic `{dlq}` must not start with `_` (reserved for internal topics)"
-                )));
-            }
-            if let Some(t) = compiled
-                .iter()
-                .map(|r| &r.topic)
-                .chain(default.as_ref())
-                .find(|t| glob_match(&t.glob(), dlq))
-            {
-                return Err(Error::Config(format!(
-                    "sink.dead_letter_topic `{dlq}` is also a topic events are routed to (`{}`); pick a separate topic",
-                    t.raw
-                )));
-            }
-            if compiled
-                .iter()
-                .any(|r| r.topic_fallback.as_deref() == Some(dlq.as_str()))
-            {
-                return Err(Error::Config(format!(
-                    "sink.dead_letter_topic `{dlq}` is also a route's `topic_fallback`; pick a separate topic"
-                )));
+            let d = DeadLetter::Fixed(dlq.clone());
+            check_dead_letter(
+                "sink.dead_letter_topic",
+                None,
+                &d,
+                &compiled,
+                default.as_ref(),
+            )?;
+        }
+        let mut dead_letters = Vec::with_capacity(names.len());
+        let topics = compiled
+            .iter()
+            .zip(&routes)
+            .map(|(c, r)| (&c.topic, c.topic_fallback.as_deref(), Some((c, r))))
+            .chain(default.as_ref().map(|d| (d, None, None)));
+        for (i, (topic, fallback, route)) in topics.enumerate() {
+            let name = &names[i];
+            let own = route.and_then(|(_, r)| r.dead_letter_topic.as_ref());
+            if let Some(dlq) = own {
+                let what = format!("sink route `{name}`: `dead_letter_topic`");
+                let d = DeadLetter::Fixed(dlq.clone());
+                check_dead_letter(&what, None, &d, &compiled, default.as_ref())?;
+                dead_letters.push(Some(d));
+            } else if let Some(dlq) = &dead_letter_topic {
+                dead_letters.push(Some(DeadLetter::Fixed(dlq.clone())));
+            } else {
+                // A default name that is not usable fails startup only for a route built to
+                // dead-letter rows; any other gets none (a row it cannot rewrite stops the
+                // pipeline, as before dead-letter topics).
+                let what = format!(
+                    "sink route `{name}`: the dead-letter topic (its `{}` plus `{DLQ_SUFFIX}`)",
+                    if fallback.is_some() {
+                        "topic_fallback"
+                    } else {
+                        "topic"
+                    }
+                );
+                let hint = "; set `dead_letter_topic` on the route or `sink.dead_letter_topic`";
+                let d = DeadLetter::derived(topic, fallback).and_then(|d| {
+                    check_dead_letter(&what, Some(hint), &d, &compiled, default.as_ref())
+                        .map(|()| d)
+                });
+                match d {
+                    Ok(d) => dead_letters.push(Some(d)),
+                    Err(e) if route.is_some_and(|(c, _)| c.expects_dead_letters()) => {
+                        return Err(e)
+                    }
+                    Err(_) => dead_letters.push(None),
+                }
             }
         }
-        check_collisions(
-            &names,
-            &compiled,
-            default.as_ref(),
-            dead_letter_topic.as_deref(),
-        )?;
         let mut plan = Self {
             routes: compiled,
             default,
             dead_letter: dead_letter_topic,
+            dead_letters,
             partition_by: PartitionBy::default(),
             source: SourceInfo::default(),
             stats: Arc::new(RouteStats::new(names, fields)),
@@ -1638,18 +1817,45 @@ impl RoutePlan {
     }
 
     /// Every fixed topic name in the plan: static route topics, a static `sink.topic`, the
-    /// fallbacks and the dead-letter topic.
+    /// fallbacks and the fixed dead-letter topics.
     fn static_topics(&self) -> Vec<String> {
-        self.routes
+        let mut out: Vec<String> = Vec::new();
+        let fixed = self
+            .routes
             .iter()
             .map(|r| &r.topic)
             .chain(self.default.as_ref())
             .filter(|t| t.is_static())
             .map(|t| t.raw.as_str())
             .chain(self.fallback_topics())
-            .chain(self.dead_letter.as_deref())
-            .map(str::to_string)
-            .collect()
+            .chain(
+                self.dead_letters
+                    .iter()
+                    .flatten()
+                    .filter_map(DeadLetter::fixed),
+            )
+            .chain(self.dead_letter.as_deref());
+        for t in fixed {
+            if !out.iter().any(|o| o == t) {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+
+    /// The fixed dead-letter topics of the routes built to dead-letter rows, which the sink opens
+    /// at startup, so a missing or unwritable one fails startup rather than the first bad row.
+    /// Templated ones (`cdc.{schema}.{table}.dlq`) are created on first use, like their topics.
+    pub fn dead_letter_topics(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (r, d) in self.routes.iter().zip(&self.dead_letters) {
+            if let Some(t) = d.as_ref().and_then(DeadLetter::fixed) {
+                if r.expects_dead_letters() && !out.iter().any(|o| o == t) {
+                    out.push(t.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// The routes' `topic_fallback`s, which the sink opens at startup.
@@ -1708,9 +1914,17 @@ impl RoutePlan {
         self.routes.iter().any(|r| r.outbox.is_some())
     }
 
-    /// `sink.dead_letter_topic`, if configured.
+    /// `sink.dead_letter_topic`, the global override, if configured.
     pub fn dead_letter_topic(&self) -> Option<&str> {
         self.dead_letter.as_deref()
+    }
+
+    /// The dead-letter topic of the route at stats index `i`, or its template.
+    fn dead_letter_name(&self, i: usize) -> Option<String> {
+        self.dead_letters
+            .get(i)
+            .and_then(Option::as_ref)
+            .map(|d| d.name().to_string())
     }
 
     /// The topic for a table, or `None` when no route matches and there is no default. A
@@ -1737,15 +1951,21 @@ impl RoutePlan {
 
     /// Globs matching every topic this plan can produce to: each route (a content-routed template
     /// read as a glob covers every topic it can create), the default topic, the fallbacks and the
-    /// dead-letter topic, with placeholders turned into `*`.
+    /// dead-letter topics (each once), with placeholders turned into `*`.
     pub fn topic_globs(&self) -> Vec<String> {
-        self.routes
+        let mut globs: Vec<String> = self
+            .routes
             .iter()
             .map(|r| r.topic.glob())
             .chain(self.default.as_ref().map(TopicTemplate::glob))
             .chain(self.fallback_topics().map(str::to_string))
-            .chain(self.dead_letter.clone())
-            .collect()
+            .collect();
+        for g in self.dead_letters.iter().flatten().map(DeadLetter::glob) {
+            if !globs.contains(&g) {
+                globs.push(g);
+            }
+        }
+        globs
     }
 
     /// The compiled plan and its live counts, for `/api/routes`.
@@ -1775,6 +1995,7 @@ impl RoutePlan {
                 topic_fallback: r.and_then(|r| r.topic_fallback.clone()),
                 topic_values: r.and_then(|r| r.topic_values().map(<[String]>::to_vec)),
                 outbox: r.and_then(|r| r.outbox.as_ref()).map(|o| o.spec.clone()),
+                dead_letter_topic: self.dead_letter_name(i),
                 counts: self.stats.counts(i),
                 unseen_fields: self.stats.unseen(i),
             }
@@ -2360,11 +2581,22 @@ impl RoutePlan {
         now_us: i64,
         out: &mut Vec<OutRecord>,
     ) -> Result<()> {
-        let topic = self.dead_letter.clone().ok_or_else(|| {
-            Error::Sink(format!(
-                "{reason}, and no sink.dead_letter_topic is configured"
-            ))
-        })?;
+        let topic = match self.dead_letters.get(route).and_then(Option::as_ref) {
+            Some(DeadLetter::Fixed(t)) => t.clone(),
+            Some(DeadLetter::Template(t)) => t.render(&EventView::new(event)),
+            None => {
+                return Err(Error::Sink(format!(
+                "{reason}, and the route has no usable dead-letter topic; set `dead_letter_topic`"
+            )))
+            }
+        };
+        // A rendered name (`{schema}`/`{table}` from the event) that Kafka would refuse, or that
+        // starts with `_`, fails the batch like any topic that cannot be created.
+        if !valid_topic_name(&topic) || topic.starts_with('_') {
+            return Err(Error::Sink(format!(
+                "{reason}, and its dead-letter topic `{topic}` is not a usable topic name"
+            )));
+        }
         let key = table_key(event, &self.source);
         let fields = self.routes.get(route).and_then(|r| r.fields.as_ref());
         let mut headers = vec![("aqueduct-error", reason.clone())];
@@ -2467,7 +2699,18 @@ mod tests {
             Some("cdc.{schema}.{table}".into()),
         )
         .unwrap();
-        assert_eq!(p.topic_globs(), vec!["users", "a.*", "cdc.*.*"]);
+        // Then each route's dead-letter topic: `<topic>.dlq`, templates as globs.
+        assert_eq!(
+            p.topic_globs(),
+            vec![
+                "users",
+                "a.*",
+                "cdc.*.*",
+                "users.dlq",
+                "a.*.dlq",
+                "cdc.*.*.dlq"
+            ]
+        );
     }
 
     #[test]
@@ -2791,25 +3034,26 @@ mod tests {
         let cases: &[(&str, Option<&str>, &str)] = &[
             // `op`, `schema` and `table` alone cannot fail, so no dead-letter topic is needed.
             ("op in ['insert', 'update', 'read']", None, ""),
-            ("op == 'delete' or schema == 'audit' and table != 'log'", None, ""),
+            (
+                "op == 'delete' or schema == 'audit' and table != 'log'",
+                None,
+                "",
+            ),
             ("op is not null", None, ""),
-            ("op == 'upsert'", None, "sink route `r`: invalid `where`: unknown op `upsert`"),
+            (
+                "op == 'upsert'",
+                None,
+                "sink route `r`: invalid `where`: unknown op `upsert`",
+            ),
             ("op in ['insert', 'Update']", None, "unknown op `Update`"),
             ("op == 1", None, "sink route `r`: invalid `where`"),
             ("table in [true]", None, "`table` is a string"),
             ("op < 'insert'", None, "ordering a string is not supported"),
-            // Reading row data needs one, as before.
+            // Reading row data needs a dead-letter topic, and there always is one: the route's
+            // `r.topic.dlq` without `sink.dead_letter_topic`.
             ("row.n > 1", Some(DLQ), ""),
-            (
-                "row.n > 1",
-                None,
-                "sink route `r` uses `where` on row data (`row.n`), which needs `sink.dead_letter_topic`",
-            ),
-            (
-                "op == 'insert' and before.n is null",
-                None,
-                "uses `where` on row data (`before.n`)",
-            ),
+            ("row.n > 1", None, ""),
+            ("op == 'insert' and before.n is null", None, ""),
             ("row.n >", Some(DLQ), "sink route `r`: invalid `where`"),
             (
                 "row.ts < '2024-01-01'",
@@ -2819,9 +3063,21 @@ mod tests {
             ("", Some(DLQ), "sink route `r`: invalid `where`"),
             ("row.n > 1", Some("_dlq"), "must not start with `_`"),
             ("op == 'insert'", Some("_dlq"), "must not start with `_`"),
-            ("row.n > 1", Some("r.topic"), "also a topic events are routed to"),
-            ("row.n > 1", Some("rest"), "also a topic events are routed to"),
-            ("row.n > 1", Some("bad topic"), "not a valid Kafka topic name"),
+            (
+                "row.n > 1",
+                Some("r.topic"),
+                "also a topic events are routed to",
+            ),
+            (
+                "row.n > 1",
+                Some("rest"),
+                "also a topic events are routed to",
+            ),
+            (
+                "row.n > 1",
+                Some("bad topic"),
+                "not a valid Kafka topic name",
+            ),
             ("row.n > 1", Some(""), "not a valid Kafka topic name"),
         ];
         for (filter, dlq_topic, want) in cases {
@@ -2898,14 +3154,17 @@ mod tests {
                 "routes": [
                     {"route": "orders", "match": "public.orders",
                      "where": "op in ['insert', 'update'] and row.status == 'paid'", "key": null, "topic": "orders.topic", "topic_fallback": null, "topic_values": null,
+                     "dead_letter_topic": DLQ,
                      "counts": {"matched": 1, "produced": 1, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
                     {"route": "public.*", "match": "public.*", "where": null,
                      "key": ["id", "tenant"], "topic": "cdc.{table}", "topic_fallback": null, "topic_values": null,
+                     "dead_letter_topic": DLQ,
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []},
                     {"route": "default", "match": null, "where": null, "key": null,
                      "topic": "rest", "topic_fallback": null, "topic_values": null,
+                     "dead_letter_topic": DLQ,
                      "counts": {"matched": 0, "produced": 0, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
                      "unseen_fields": []}
                 ]
@@ -3457,8 +3716,8 @@ mod tests {
             (
                 vec![ok.clone()],
                 None,
-                Some("orders.dlq"),
-                "sink.dead_letter_topic `orders.dlq` is also a topic events are routed to",
+                Some("orders.eu"),
+                "sink.dead_letter_topic `orders.eu` is also a topic events are routed to",
             ),
             (
                 vec![ok.clone()],
@@ -3797,7 +4056,17 @@ mod tests {
     #[test]
     fn content_routes_are_described_inspected_and_watched() {
         let p = content_plan(Some(&["eu", "us"]), 100);
-        assert_eq!(p.topic_globs(), vec!["orders.*", "rest", "orders.unknown"]);
+        // The content route's dead-letter topic is its fallback's: `orders.*` cannot render it.
+        assert_eq!(
+            p.topic_globs(),
+            vec![
+                "orders.*",
+                "rest",
+                "orders.unknown",
+                "orders.unknown.dlq",
+                "rest.dlq"
+            ]
+        );
         assert_eq!(
             p.topic_for("public", "orders").as_deref(),
             Some("orders.{row.region}")
@@ -4294,12 +4563,9 @@ mod tests {
             f(&mut s);
             outbox_route(s)
         };
+        // Without `sink.dead_letter_topic`, the outbox dead-letters to `outbox.unknown.dlq`.
+        assert_eq!(build(ok.clone(), None), Ok(()));
         let cases: Vec<(KafkaRoute, Option<&str>, &str)> = vec![
-            (
-                ok.clone(),
-                None,
-                "uses `outbox`, which needs `sink.dead_letter_topic`",
-            ),
             (
                 KafkaRoute {
                     topic: "t".into(),
@@ -4387,11 +4653,13 @@ mod tests {
             assert!(err.contains(want), "{err} should contain {want}");
         }
         // A topic the template could produce cannot be the dead-letter topic or another route's.
-        let err = build(ok.clone(), Some("outbox.dlq")).unwrap_err();
+        let err = build(ok.clone(), Some("outbox.order")).unwrap_err();
         assert!(
             err.contains("is also a topic events are routed to"),
             "{err}"
         );
+        // `dlq` is a reserved value, so `outbox.{aggregate_type}` never renders `outbox.dlq`.
+        assert_eq!(build(ok.clone(), Some("outbox.dlq")), Ok(()));
         let err = RoutePlan::with_dead_letter(
             vec![ok.clone(), route("public.x", "outbox.x")],
             None,
@@ -4776,10 +5044,10 @@ mod tests {
             rename: [("a".to_string(), "b".to_string())].into(),
             ..Default::default()
         };
-        let e = build(rename.clone(), None, None).unwrap_err();
-        assert!(e.contains("`rename` without `include`") && e.contains("dead_letter_topic"));
+        // A collision goes to the route's dead-letter topic, `<topic>.dlq` by default.
+        assert!(build(rename.clone(), None, None).is_ok());
         assert!(build(rename, Some(DLQ), None).is_ok());
-        // With `include`, collisions are ruled out at startup, so no dead-letter topic is needed.
+        // With `include`, collisions are ruled out at startup.
         let included = FieldSpec {
             include: Some(strs(&["a"])),
             rename: [("a".to_string(), "b".to_string())].into(),
@@ -5706,8 +5974,7 @@ mod tests {
             unchanged: Some(u.into()),
             ..named("r", "public.*", "t")
         };
-        let e = err(unchanged("dead_letter"), None);
-        assert!(e.contains("sink.dead_letter_topic"), "{e}");
+        assert!(RoutePlan::new(vec![unchanged("dead_letter")], None).is_ok());
         let e = err(unchanged("fill"), Some(DLQ));
         assert!(e.contains("unknown unchanged `fill`"), "{e}");
         assert!(RoutePlan::with_dead_letter(
@@ -6031,5 +6298,381 @@ mod tests {
             "{}",
             r.headers[0].1
         );
+    }
+
+    // --- dead-letter topics per route: `<topic>.dlq` by default (2026-10-21) --------------------
+
+    /// Every route's dead-letter topic as described, routes first, `default` last.
+    fn dlqs(p: &RoutePlan) -> Vec<Option<String>> {
+        p.describe()
+            .routes
+            .into_iter()
+            .map(|r| r.dead_letter_topic)
+            .collect()
+    }
+
+    fn some(v: &[&str]) -> Vec<Option<String>> {
+        v.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    /// A route on `public.<name>` whose `where` reads row data, so it dead-letters `{"n":"x"}`.
+    fn failing(name: &str, topic: &str) -> KafkaRoute {
+        KafkaRoute {
+            filter: Some("row.n > 1".into()),
+            ..named(name, &format!("public.{name}"), topic)
+        }
+    }
+
+    #[test]
+    fn each_route_dead_letters_to_its_own_topic_plus_dlq_by_default() {
+        let p = RoutePlan::new(
+            vec![
+                // A static topic.
+                named("assets", "sim.assets", "sim.assets.active"),
+                // A `{schema}`/`{table}` template: rendered per event, then suffixed.
+                named("cdc", "public.*", "cdc.{schema}.{table}"),
+                // `{op}` is dropped with one separator: no per-operation dead-letter topic.
+                named("ops", "hr.*", "hr.{table}.{op}"),
+                // A content-routed template: the row is the problem, so `<topic_fallback>.dlq`.
+                content(
+                    "orders",
+                    "orders.{row.region}",
+                    Some("orders.unknown"),
+                    None,
+                ),
+                // An outbox: `<outbox topic_fallback>.dlq`, or its static topic plus `.dlq`.
+                outbox_route(outbox_spec()),
+                KafkaRoute {
+                    name: Some("ob2".into()),
+                    pattern: "public.outbox2".into(),
+                    outbox: Some(OutboxSpec {
+                        topic: "events".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            // The `default` route follows the same rules.
+            Some("all.{schema}.{table}".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            dlqs(&p),
+            some(&[
+                "sim.assets.active.dlq",
+                "cdc.{schema}.{table}.dlq",
+                "hr.{table}.dlq",
+                "orders.unknown.dlq",
+                "outbox.unknown.dlq",
+                "events.dlq",
+                "all.{schema}.{table}.dlq",
+            ])
+        );
+        // No global override.
+        assert_eq!(p.describe().dead_letter_topic, None);
+        // A template is rendered for the event, like the route's topic, `{op}` left out.
+        let p = RoutePlan::new(vec![failing("orders", "cdc.{schema}.{table}.{op}")], None).unwrap();
+        for op in [Op::Insert, Op::Update] {
+            let out = p.render(&row("orders", op, r#"{"n":"x"}"#), NOW).unwrap();
+            assert_eq!(out[0].topic, "cdc.public.orders.dlq");
+        }
+        // A bad row of a content route goes to its fallback's dead-letter topic.
+        let q = RoutePlan::new(
+            vec![KafkaRoute {
+                filter: Some("row.n > 1".into()),
+                ..content(
+                    "orders",
+                    "orders.{row.region}",
+                    Some("orders.unknown"),
+                    None,
+                )
+            }],
+            None,
+        )
+        .unwrap();
+        let out = q
+            .render(
+                &row("orders", Op::Insert, r#"{"n":"x","region":"eu"}"#),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(out[0].topic, "orders.unknown.dlq");
+        assert_eq!(out[0].headers[0].0, "aqueduct-error");
+        assert_eq!(q.stats().snapshot()[0].counts.errors, 1);
+    }
+
+    #[test]
+    fn dead_letter_topic_precedence_is_route_then_sink_then_suffix() {
+        let own = |name: &str, dlq: &str| KafkaRoute {
+            dead_letter_topic: Some(dlq.into()),
+            ..failing(name, &format!("{name}.t"))
+        };
+        let routes = || vec![own("a", "a.errors"), failing("b", "b.t")];
+        let p = RoutePlan::new(routes(), Some("rest".into())).unwrap();
+        assert_eq!(dlqs(&p), some(&["a.errors", "b.t.dlq", "rest.dlq"]));
+        let p = RoutePlan::with_dead_letter(routes(), Some("rest".into()), Some("all.dlq".into()))
+            .unwrap();
+        assert_eq!(dlqs(&p), some(&["a.errors", "all.dlq", "all.dlq"]));
+        assert_eq!(p.describe().dead_letter_topic.as_deref(), Some("all.dlq"));
+        // Records follow it.
+        for (table, want) in [("a", "a.errors"), ("b", "all.dlq")] {
+            let out = p
+                .render(&row(table, Op::Insert, r#"{"n":"x"}"#), NOW)
+                .unwrap();
+            assert_eq!(out[0].topic, want);
+        }
+        // The fixed ones of routes built to dead-letter are opened at startup, once each.
+        assert_eq!(p.dead_letter_topics(), ["a.errors", "all.dlq"]);
+        let p = RoutePlan::new(
+            vec![
+                failing("a", "a.t"),
+                own("b", "a.t.dlq"),
+                named("plain", "x.*", "plain"),
+                failing("tpl", "y.{table}"),
+            ],
+            None,
+        )
+        .unwrap();
+        // `plain` cannot dead-letter, and `y.{table}.dlq` is created on first use.
+        assert_eq!(p.dead_letter_topics(), ["a.t.dlq"]);
+        // The inspector reads every one, templates as globs.
+        assert_eq!(
+            p.topic_globs(),
+            [
+                "a.t",
+                "b.t",
+                "plain",
+                "y.*",
+                "a.t.dlq",
+                "plain.dlq",
+                "y.*.dlq"
+            ]
+        );
+    }
+
+    #[test]
+    fn dead_letter_topics_cannot_be_reached_by_row_values() {
+        let build = |routes: Vec<KafkaRoute>, default: Option<&str>, dlq: Option<&str>| {
+            RoutePlan::with_dead_letter(routes, default.map(Into::into), dlq.map(Into::into))
+                .map(|p| dlqs(&p))
+                .map_err(|e| e.to_string())
+        };
+        let ok = || content("o", "orders.{row.r}", Some("orders.unknown"), None);
+        // `orders.{row.r}` reads as the glob `orders.*`, which matches `orders.unknown.dlq` and
+        // `orders.dlq`; but a row value is one segment without dots and never `dlq`, so it can
+        // render neither: the content route and a static `orders` route keep their defaults.
+        assert_eq!(
+            build(vec![ok(), failing("s", "orders")], None, None),
+            Ok(some(&["orders.unknown.dlq", "orders.dlq"]))
+        );
+        assert_eq!(
+            build(vec![ok()], None, Some("orders.dlq")),
+            Ok(some(&["orders.dlq"]))
+        );
+        // A name a row value, a table or an operation can render is refused, and so are names
+        // that break the other rules: as a route's override, the global one, or a default.
+        type Case<'a> = (Vec<KafkaRoute>, Option<&'a str>, Option<&'a str>, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                vec![
+                    ok(),
+                    KafkaRoute {
+                        dead_letter_topic: Some("orders.eu".into()),
+                        ..failing("s", "s.t")
+                    },
+                ],
+                None,
+                None,
+                "sink route `s`: `dead_letter_topic` `orders.eu` is also a topic events are routed to (`orders.{row.r}`)",
+            ),
+            (
+                vec![ok()],
+                None,
+                Some("orders.eu"),
+                "sink.dead_letter_topic `orders.eu` is also a topic events are routed to",
+            ),
+            // A content template with a fixed `.dlq` suffix renders `orders.x.dlq`, the default
+            // of a static `orders.x` route, and `orders.unknown.dlq`, its own fallback's.
+            (
+                vec![
+                    content("o", "orders.{row.r}.dlq", Some("fb"), None),
+                    failing("s", "orders.x"),
+                ],
+                None,
+                None,
+                "sink route `s`: the dead-letter topic (its `topic` plus `.dlq`) `orders.x.dlq` is also a topic events are routed to (`orders.{row.r}.dlq`); set `dead_letter_topic` on the route or `sink.dead_letter_topic`",
+            ),
+            (
+                vec![KafkaRoute {
+                    filter: Some("row.n > 1".into()),
+                    ..content("o", "orders.{row.r}.dlq", Some("orders.unknown"), None)
+                }],
+                None,
+                None,
+                "the dead-letter topic (its `topic_fallback` plus `.dlq`) `orders.unknown.dlq` is also a topic events are routed to",
+            ),
+            // `{table}` stands for one name: a table named `dlq` would write into `cdc.dlq`.
+            (
+                vec![failing("s", "s.t")],
+                Some("cdc.{table}"),
+                Some("cdc.dlq"),
+                "sink.dead_letter_topic `cdc.dlq` is also a topic events are routed to (`cdc.{table}`)",
+            ),
+            (
+                vec![failing("s", "s.t"), named("ins", "i.*", "s.{op}")],
+                None,
+                Some("s.insert"),
+                "is also a topic events are routed to (`s.{op}`)",
+            ),
+            // A rendered dead-letter template must not overlap a content-routed template.
+            (
+                vec![
+                    content("o", "p.{row.r}.x.dlq", Some("fb"), None),
+                    failing("s", "p.{table}.x"),
+                ],
+                None,
+                None,
+                "`p.{table}.x.dlq` (as the glob `p.*.x.dlq`) overlaps the content-routed `topic` `p.{row.r}.x.dlq`",
+            ),
+            (
+                vec![KafkaRoute {
+                    dead_letter_topic: Some("bad topic".into()),
+                    ..failing("s", "s.t")
+                }],
+                None,
+                None,
+                "sink route `s`: `dead_letter_topic` `bad topic` is not a valid Kafka topic name",
+            ),
+            (
+                vec![KafkaRoute {
+                    dead_letter_topic: Some("{table}.dlq".into()),
+                    ..failing("s", "s.t")
+                }],
+                None,
+                None,
+                "is not a valid Kafka topic name",
+            ),
+            (
+                vec![failing("s", "_s.t")],
+                None,
+                None,
+                "sink route `s`: the dead-letter topic (its `topic` plus `.dlq`) `_s.t.dlq` must not start with `_`",
+            ),
+            (
+                vec![KafkaRoute {
+                    dead_letter_topic: Some("fb".into()),
+                    ..content("o", "o.{row.r}", Some("fb"), None)
+                }],
+                None,
+                None,
+                "`dead_letter_topic` `fb` is also a route's `topic_fallback`",
+            ),
+            (
+                vec![KafkaRoute {
+                    dead_letter_topic: Some("t".into()),
+                    ..failing("s", "s.t")
+                }],
+                Some("t"),
+                None,
+                "`dead_letter_topic` `t` is also a topic events are routed to (`t`)",
+            ),
+            (
+                vec![failing("s", &format!("s.{}", "x".repeat(244)))],
+                None,
+                None,
+                "is not a valid Kafka topic name",
+            ),
+        ];
+        for (routes, default, dlq, want) in cases {
+            let err = build(routes, default, dlq).expect_err(want);
+            assert!(err.contains(want), "{err}\nshould contain: {want}");
+        }
+        // A route that cannot dead-letter gets no dead-letter topic rather than a startup error.
+        assert_eq!(
+            build(vec![named("p", "p.*", "_p")], None, None),
+            Ok(vec![None])
+        );
+    }
+
+    #[test]
+    fn dlq_is_a_reserved_row_value() {
+        // `a.{row.x}.{row.y}` would render `a.foo.dlq` for y = "dlq": such rows go to the fallback.
+        let p = RoutePlan::new(
+            vec![
+                content("o", "a.{row.x}.{row.y}", Some("a.unknown"), None),
+                failing("s", "a.foo"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(dlqs(&p), some(&["a.unknown.dlq", "a.foo.dlq"]));
+        let topic = |json: &str| {
+            p.render(&row("orders", Op::Insert, json), NOW).unwrap()[0]
+                .topic
+                .clone()
+        };
+        assert_eq!(topic(r#"{"x":"foo","y":"dlq"}"#), "a.unknown");
+        assert_eq!(topic(r#"{"x":"dlq","y":"foo"}"#), "a.unknown");
+        // Topic names are case-sensitive, so only `dlq` itself is reserved.
+        assert_eq!(topic(r#"{"x":"foo","y":"DLQ"}"#), "a.foo.DLQ");
+        assert_eq!(p.stats().snapshot()[0].counts.fallback, 2);
+        // Listing it in `topic_values` is refused.
+        let e = RoutePlan::new(
+            vec![content(
+                "o",
+                "a.{row.x}",
+                Some("a.unknown"),
+                Some(&["eu", "dlq"]),
+            )],
+            None,
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("`topic_values` entry `dlq` can never be used: it is reserved"),
+            "{e}"
+        );
+        // Dead-letter topics already on the broker are not counted as content-routed.
+        let q = content_plan(None, 100);
+        assert_eq!(
+            q.add_existing_topics(["orders.eu", "orders.unknown.dlq", "orders.dlq", "rest.dlq"]),
+            1
+        );
+    }
+
+    #[test]
+    fn a_rendered_dead_letter_name_kafka_would_refuse_fails_the_batch() {
+        let p = RoutePlan::new(
+            vec![KafkaRoute {
+                filter: Some("row.n > 1".into()),
+                ..named("r", "*", "{schema}.{table}")
+            }],
+            None,
+        )
+        .unwrap();
+        let mut e = row("orders", Op::Insert, r#"{"n":"x"}"#);
+        e.schema = "_internal".into();
+        let err = p.render(&e, NOW).unwrap_err().to_string();
+        assert!(
+            err.contains("its dead-letter topic `_internal.orders.dlq` is not a usable topic name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn without_op_drops_the_placeholder_and_one_separator() {
+        for (raw, want) in [
+            ("cdc.{table}.{op}", "cdc.{table}"),
+            ("{op}.cdc.{table}", "cdc.{table}"),
+            ("cdc.{op}.{table}", "cdc.{table}"),
+            ("cdc_{op}_{table}", "cdc_{table}"),
+            ("cdc{op}{table}", "cdc{table}"),
+            ("a.{op}.{op}.b", "a.b"),
+            ("{op}", "{op}"),
+            ("cdc.{table}", "cdc.{table}"),
+        ] {
+            assert_eq!(without_op(raw), want, "{raw}");
+        }
     }
 }
