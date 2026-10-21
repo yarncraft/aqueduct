@@ -964,7 +964,7 @@ percentages); every card, routes included, has a step line of its rate over the 
 its detail chart has four, processed, matched, fallback and errors). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
-- a topic (the dead-letter topic too): records Kafka acknowledged, counted by the sink after the broker acknowledged
+- a topic (dead-letter topics have no bar, only their step line): records Kafka acknowledged, counted by the sink after the broker acknowledged
   the produce, so a failed produce never counts and a retried batch counts when it succeeds. A tombstone carries its
   delete's `op` header and counts as a delete. Topic cards also show the acknowledged count;
 - a "+N more" group: the sum over its tables or topics.
@@ -977,11 +977,9 @@ second (nothing animates), with its current, average and maximum rate: a table's
 a topic's acknowledged records per second. A table's and a topic's chart count only the operations toggled on with the
 buttons above it; only operations that have happened for that table or topic get a button (insert, update, delete,
 truncate, read); the selection is shared by the two. A route's chart has no
-operation buttons: it counts every operation from the source tables toggled on. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
+buttons: four lines, processed, matched, fallback and errors, from the route's own counters. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
 operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
-select it), the full table list when the card's `FROM` is cut short, and any other config keys. Its line is the events
-per second from its source tables; with more than one source table, a button per table above the chart picks which
-ones count. A topic's panel lists its acknowledged records per
+select it), the full table list when the card's `FROM` is cut short, and any other config keys.  A topic's panel lists its acknowledged records per
 operation, the routes that write to it (by template or as their `topic_fallback`), **dead letter**: the dead-letter
 topic of each of those routes that can dead-letter a row (a `{table}` template filled in for this topic,
 `cdc.public.orders.dlq`; click one to select it in the graph), and an **Open in inspector** button (shown when the
