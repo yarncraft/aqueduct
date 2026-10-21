@@ -359,6 +359,53 @@ Content routing (#82):
 - **Topic names are checked at startup.** Fixed text must be valid topic characters, and braces must be known
   placeholders. Kafka refuses other names, so this only moves a first-send failure to startup.
 
+## As built (R6)
+
+Field operations (#84). Where the code differs from the text above:
+
+- **The record key gets the field operations.** Since #138 the record key always carries the primary key as a
+  `"key"` object (`{"db", "schema", "table", "key": {...}}`), whatever `partition_by` says, so "declare `key`
+  explicitly under `partition_by = "key"`" no longer protects anything. Instead, a route with field operations and
+  no `key = [...]` applies the same operations to the key object's columns: excluded or not-included columns are
+  removed (an object left empty becomes `"key": null`), masked ones masked, hashed ones HMAC'd with the same key as
+  the value (so per-row partitioning keeps working and the key matches the value), renamed ones renamed. The
+  partition is hashed from the rewritten key. A route with `key = [...]` keeps that key, and validation rejects a key
+  column the route excludes, masks, hashes or leaves out of `include`. A renamed column may be a key column: it is
+  not protected, and the key reads the original row, so it keeps its original name there.
+- **Rename collisions are checked twice.** At startup: a target may not be another renamed column, another target,
+  or an included column. With `include` the output columns are known, so that is complete. Without it, a row that
+  already has a column named like a target is a row-level error: it goes to `sink.dead_letter_topic` (required for
+  `rename` without `include`) with an `aqueduct-error` header naming the columns, never values. Its dead-letter
+  value has the other operations applied under the original names.
+- **Also rejected at startup:** an empty `include`; a column both masked and hashed; a column masked, hashed or
+  renamed that `exclude` drops or `include` leaves out (the operation would have no effect); a rename target listed
+  in `mask`, `hash` or `exclude` (the operations name original columns, so the renamed value would pass through
+  unprotected). `exclude = []` next to `include` is allowed, like an empty `exclude` alone.
+- **A string that cannot be hashed** (not valid Unicode, e.g. a lone `\ud800` escape) is a row error and goes to the
+  dead-letter topic with `before`/`after` null; it never becomes `null` silently.
+- **Later slices:** R7 (`deletes = "row"` and tombstones) must use the rewritten before-image and key, and R8 (outbox)
+  must reject a protected `aggregate_id` or `topic` column; `TODO(R7)` marks the place in `RoutePlan::build`. R8 met
+  its part by refusing field operations on outbox routes altogether (see "As built (R8)").
+- **Dead-letter values** get the route's field operations (§5a), with the `aqueduct-hash-key-id` header when the
+  route hashes. A row that is not a JSON object cannot be rewritten; its dead-letter value has `before`/`after`
+  `null` rather than the unprotected row.
+- **Canonical hash input** for objects and arrays is the JSON as the source wrote it with whitespace outside strings
+  removed (key order and escapes kept), not a re-serialisation.
+- **Hash key.** `AQUEDUCT_HASH_KEY` or `sink.hash_key_file` (one trailing newline trimmed from either), not both; at
+  least 32 bytes; `sink.hash_key_id` (1 to 64 of `A-Z a-z 0-9 . _ : -`) is required with a key and an error without
+  one.
+- **Unseen fields:** every column a field operation names is watched as `row.<column>`. Since R5, `observe` runs on
+  every route, with or without `where`.
+- **Content routing (R4).** A topic template may not read a column the route excludes, masks, hashes or leaves out
+  of `include` (`check_field_ops` over `CompiledRoute::topic_fields`, by `FieldRef::column`, so nested and
+  `before.`/`after.` paths count). `topic_values` constrains those same fields and `topic_fallback` is fixed, so the
+  template check covers them. Field operations run before the topic is chosen: a row they cannot rewrite goes to the
+  dead-letter topic without taking a `max_dynamic_topics` slot, and a fallback record (at render time, or re-routed
+  by `topic_refused` when the broker refuses a create) keeps the rewritten value, key and `aqueduct-hash-key-id`.
+- **Cost** (release, 10-column row updated with before and after, 2-column key, one route): no field operations
+  541 ns/event; include 1.8 µs, exclude 2.2 µs, mask 2.3 µs, rename 2.4 µs, hash of 2 columns 4.5 µs, all together
+  5.4 µs.
+
 ## As built (R8)
 
 Outbox (#86). Where the code differs from §5 "Outbox", which was written before #138 made events Debezium envelopes
@@ -398,11 +445,15 @@ and keys JSON:
   column that is not valid Unicode (a lone surrogate escape), sends the envelope to `sink.dead_letter_topic` with the
   table-only JSON key (R3) and `aqueduct-error` ``route `<r>`: outbox `<key>` column `<col>` is missing or null``. No
   value is ever in the header or the log. These rows take no content-routing cap slot. `dead_letter_topic` is required
-  as soon as a route uses `outbox`.
-- **Mutually exclusive** with `topic` and `key` on the same route, checked at startup. `format` (R7) and the field keys
-  (R6) are not on main yet; whichever of R6/R7 lands after R8 adds them to the same check (`TODO(R6/R7)` in
-  `RoutePlan::with_dead_letter`). R6's rule "no protected column in the outbox `aggregate_id` or `topic`" then reduces
-  to that exclusion: an outbox route has no field operations, so nothing in it is protected.
+  as soon as a route uses `outbox`. Since an outbox route has no field operations, its dead-letter value is the full
+  envelope of the row, the payload included, unlike R6 routes whose dead-letter values are rewritten; restrict the
+  dead-letter topic's readers accordingly.
+- **Mutually exclusive** with `topic`, `key` and every field operation (`include`, `exclude` even when empty,
+  `mask`, `hash`, `rename`) on the same route, checked at startup in `RoutePlan::build`; the error names the keys set.
+  So an outbox route has no field operations and nothing in it is protected, which is all R6's rule "no protected
+  column in the outbox `aggregate_id` or `topic`" needs. The payload is published as the application wrote it, so
+  shape it there. `format` (R7) is not on main yet; `TODO(R7)` marks where it joins this check. Non-outbox routes keep
+  R6's order: field operations run before the topic is chosen.
 - **Unseen fields.** The outbox columns are registered as `after.<col>` (the topic template's fields as usual), so a
   misspelled column is reported after 1000 inserts without it.
 - **Visibility.** `/api/routes` has an `outbox` object (the spec as configured) on outbox routes only; `topic` is the

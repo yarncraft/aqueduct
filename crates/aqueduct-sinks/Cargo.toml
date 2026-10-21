@@ -15,6 +15,8 @@ tracing.workspace = true
 futures = "0.3"
 rskafka = { version = "0.6", features = ["transport-tls"] }
 aqueduct-tls = { path = "../aqueduct-tls" }
+# HMAC for the `hash` field operation; the same ring that rustls already pulls in.
+ring = "0.17"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

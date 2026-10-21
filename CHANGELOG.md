@@ -118,10 +118,28 @@ Notable changes to Aqueduct. Newest first.
   router: a `jsonb` payload that is a bare string loses its quotes, a `text` payload holding JSON reads as JSON, and
   `bytea` arrives as hex text, so use a `jsonb` object or array, or `text`, as the payload. A row
   without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
-  `aqueduct-error` header naming the column. `outbox` excludes `topic` and `key` on the same route. The route's
+  `aqueduct-error` header naming the column. `outbox` excludes `topic`, `key` and the field operations on the same route. The route's
   `topic` key is now optional in the config when `outbox` is set. `/api/routes` shows an `outbox` object, the cockpit
   an `outbox` badge, and `/api/events` now returns each record's headers (only `op`, `lsn`, `aqueduct-error`,
   `aqueduct-hash-key-id`, and the outbox `id`/`type`) and shows non-envelope values raw.
+- **Routing: include, exclude, mask, hash and rename fields to protect personal data** (#84, ADR 0002).
+  `[[sink.routes]]` takes `include` or `exclude` (top-level columns), `mask` (strings become `"***"`, other values
+  `null`), `hash` (HMAC-SHA256 hex over the value's canonical text, so a Postgres `42` and a MongoDB `42` give the
+  same digest) and `rename`. They apply to `before` and `after`, to the route's dead-letter records and, unless the
+  route sets `key`, to the primary-key object in the record key, which the partition is then hashed from. The hash
+  key comes only from `AQUEDUCT_HASH_KEY` or the new `[sink] hash_key_file` (at least 32 bytes; a `hash_key` in the
+  TOML fails startup), and the new `hash_key_id` is sent as the `aqueduct-hash-key-id` header. A `key` column, or
+  a column a content-routed `topic` reads, may not be excluded, masked, hashed or left out of `include`, and a rename target may not be listed in `mask`, `hash`
+  or `exclude`. A row whose renamed column collides goes to `dead_letter_topic`. `/api/routes`
+  lists each route's field operations and the key id, never the key. Additive: routes without these keys are
+  unchanged.
+- **Postgres: sign in with an Azure managed identity** (#140). New `[postgres]` keys `auth` (`password` by default,
+  `azure-workload-identity` for AKS Workload Identity, `azure-container-apps`) and `azure_client_id`. A Microsoft
+  Entra token, cached until 5 minutes before it expires, is the password of every connection (SQL and replication),
+  so no static database secret is needed; every start, including a restart after an error, uses a valid token.
+  Startup refuses an `azure-*` mode with any `ssl_mode` but `verify-full` (the hostname must be checked), with a
+  password in the URL, or without the platform's environment variables. The image is unchanged. See DEPLOYMENT.md,
+  "Azure managed identity".
 - **Routing: choose the topic from the row's contents** (#82, ADR 0002). A route's `topic` can read row fields, such as
   `orders.{row.region}`, and also takes `{op}`. Such a template must start with fixed text and needs a fixed
   `topic_fallback`. An optional `topic_values` allow-list limits the values. No fixed topic in the config may match the
@@ -212,6 +230,12 @@ Notable changes to Aqueduct. Newest first.
   (default 10, `0` disables) an idle source advances the slot to the server's WAL position, never past an event that is
   not yet checkpointed. Optional `heartbeat_action_query` for servers that need a write to move the slot. No action needed
   on upgrade; see DEPLOYMENT.md for the heartbeat-table recipe.
+
+### Security
+
+- **TLS: refuse distrusted intermediate certificates** (RUSTSEC-2026-0382, RUSTSEC-2026-0381). `rustls-webpki` 0.103.16 and
+  `webpki-roots` 1.0.10 replace 0.103.15 and 1.0.9, which could accept distrusted (emSign) intermediates when verifying
+  Postgres, Kafka and Entra certificates. No configuration change.
 
 ### Changed
 
