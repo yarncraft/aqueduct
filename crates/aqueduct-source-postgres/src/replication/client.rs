@@ -95,9 +95,17 @@ impl Target {
             ));
         }
         let host = match cfg.get_hosts() {
+            // tokio-postgres has no unix-socket host on Windows and parses a socket directory as a
+            // TCP host name, so a path is refused here as well.
+            [Host::Tcp(h)] if h.starts_with('/') => {
+                return Err(Error::Config(
+                    "streaming replication needs a TCP host, not a unix socket".into(),
+                ))
+            }
             [Host::Tcp(h)] => h.clone(),
             [] => return Err(Error::Config("postgres url has no host".into())),
-            [_] => {
+            #[cfg(unix)]
+            [Host::Unix(_)] => {
                 return Err(Error::Config(
                     "streaming replication needs a TCP host, not a unix socket".into(),
                 ))
