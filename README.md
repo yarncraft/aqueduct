@@ -383,8 +383,9 @@ copied against the planner estimate, skipped tables, and a Cancel button (`DELET
 counted as `READ` in the operations breakdown, the event-rate chart and the inspector's op filter.
 
 Each table's high-water marks are in its detail panel in the routing graph (click the table): counts per operation
-and share of all events, the newest delivered change's LSN, how long ago that change committed and was delivered, the
-topic's Kafka high-water mark with the offset per partition, when the offsets were read, and the (global) checkpoint.
+and share of all events, the newest delivered change's LSN, how long ago that change committed and was delivered, and
+the (global) checkpoint; it shows nothing Kafka-side. A topic's detail panel shows its Kafka high-water mark with the
+offset per partition and when the offsets were read.
 The last-commit age turns amber when a table is more than 1 minute behind the freshest table and red past 10 minutes,
 only while the pipeline is streaming.
 

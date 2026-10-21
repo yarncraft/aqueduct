@@ -303,8 +303,9 @@ Notable changes to Aqueduct. Newest first.
 - **Cockpit: the event inspector shows a sample, not a feed.** It reads the newest 100 events once when it opens (and
   when its topic filter changes); a **Resample** button reads a fresh sample. Pause and Clear are gone.
 - **Cockpit: per-table high-water marks moved into the table's detail panel.** The separate Tables card is gone; click a
-  table in the routing graph for its counts per operation, last LSN, commit and delivery age, Kafka offsets per
-  partition and the checkpoint. `/api/tables` is unchanged.
+  table in the routing graph for its counts per operation, last LSN, commit and delivery age and the checkpoint (source
+  side only). The Kafka high-water mark and offsets per partition are in the topic's detail panel. `/api/tables` is
+  unchanged.
 - **Cockpit: the event inspector is a pop-up opened from a topic.** A topic's **Open in inspector** button in the
   routing graph opens it over the page, filtered to that topic; Close, Esc or a click outside closes it. It reads
   nothing from Kafka while closed.
