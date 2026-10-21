@@ -1154,11 +1154,13 @@ mod tests {
             missing.is_empty(),
             "ids used by script but absent from admin.html: {missing:?}"
         );
-        assert_eq!(
-            DASHBOARD.matches("class=\"rateop").count(),
-            OP_SLOTS,
-            "one checkbox per op"
-        );
+        // The table panel's op buttons are built from TABLE_OP_LABEL: one per op slot.
+        let labels = DASHBOARD
+            .split("const TABLE_OP_LABEL = [")
+            .nth(1)
+            .and_then(|r| r.split(']').next())
+            .expect("TABLE_OP_LABEL in admin.html");
+        assert_eq!(labels.split(',').count(), OP_SLOTS, "one op button per op");
     }
 
     /// The routing graph reimplements `glob_match` in JS to draw which route claims a table. The page
