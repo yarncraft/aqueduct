@@ -259,7 +259,9 @@ so tables with `REPLICA IDENTITY FULL` are keyed by it like any other. Rows of a
 every `TRUNCATE`, have `"key": null`, so they share the table's partition and a truncate is not ordered against the
 rows on other partitions; do not use it as a barrier. With `partition_by = "table"`, all of a table's changes stay
 ordered. A produce is acknowledged by the broker before the
-checkpoint moves. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
+checkpoint moves. A batch's records for one partition go out in requests of at most about 900 KiB each, one after
+another so their order holds, which keeps each request under the broker's default `message.max.bytes` (1 MiB); a
+single record larger than that still goes alone, and the broker (or the topic's `max.message.bytes`) decides. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
 fails the pipeline instead of being silently dropped. Topics are created on first use, so pre-create them (with the
 replication factor and retention you want) in production.
 
@@ -764,7 +766,8 @@ tags on that row, and the event inspector shows
 row-format values raw and tombstones as `tombstone`, with their `op` and `lsn` headers.
 
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
-`fallback` (sent to `topic_fallback` by content routing) or `errors`. They appear in `/api/metrics` (`routes`),
+`fallback` (sent to `topic_fallback` by content routing) or `errors`. They count a batch once Kafka acknowledged it, so
+a failed batch the pipeline retries is counted once, when it is delivered. They appear in `/api/metrics` (`routes`),
 `/api/routes` and Prometheus:
 
 | Series | Meaning |
