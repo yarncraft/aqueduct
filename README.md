@@ -347,7 +347,7 @@ before/after diff and Copy JSON).
 | `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second; per topic, records Kafka acknowledged per second. The Routing card's step lines; the stream then adds the newest second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
-| `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
+| `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Per-table high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
 Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start without `admin_token`, unless
@@ -382,11 +382,11 @@ When the source reports a table snapshot, a **Snapshot** card shows it: state, t
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
 counted as `READ` in the operations breakdown, the event-rate chart and the inspector's op filter.
 
-The **Tables · high-water marks** card has one row per table that delivered events: its topic, event count, a bar
-of its share of all events split by operation, the newest delivered change's LSN, how long ago that change committed
-and was delivered, and the topic's Kafka high-water mark (click a row for the offset per partition). The last-commit
-age turns amber when a table is more than 1 minute behind the freshest table and red past 10 minutes, only while the
-pipeline is streaming. Click a column header to sort. The checkpoint shown in the card header is global.
+Each table's high-water marks are in its detail panel in the routing graph (click the table): counts per operation
+and share of all events, the newest delivered change's LSN, how long ago that change committed and was delivered, the
+topic's Kafka high-water mark with the offset per partition, when the offsets were read, and the (global) checkpoint.
+The last-commit age turns amber when a table is more than 1 minute behind the freshest table and red past 10 minutes,
+only while the pipeline is streaming.
 
 The **Routing** card draws the sink's routing as a graph, left to right: every table seen, the
 `[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`), and the topics they
