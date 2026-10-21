@@ -53,6 +53,10 @@ async fn produces_all_events_in_per_table_order() {
         sink.send(&ev(n, tables[(n % 3) as usize])).await.unwrap();
     }
     sink.flush().await.unwrap();
+    // The cockpit's per-topic rate counts every record once the broker acknowledged it.
+    let acked = sink.topic_stats().snapshot();
+    assert_eq!(acked.get(&topic).copied(), Some(total));
+    assert_eq!(acked.len(), 1, "{acked:?}");
 
     let client = ClientBuilder::new(brokers).build().await.unwrap();
     let mut seen: Vec<(String, u64, String)> = Vec::new(); // (table, lsn, partition)
@@ -245,6 +249,10 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
         (c.matched, c.produced, c.filtered, c.errors),
         (22, 10, 11, 1)
     );
+    // Acknowledged records per topic: the kept rows, and the dead-lettered one on its topic.
+    let acked = sink.topic_stats().snapshot();
+    assert_eq!(acked.get(&topic).copied(), Some(10));
+    assert_eq!(acked.get(&dlq).copied(), Some(1));
 }
 
 #[tokio::test]
