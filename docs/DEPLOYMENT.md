@@ -246,10 +246,10 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, outbox rows without an `aggregate_id` or `payload`, and rows lacking unchanged TOAST columns on an `unchanged = "dead_letter"` route. Required as soon as a route uses `where`, `outbox`, `unchanged = "dead_letter"`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, outbox rows without an `aggregate_id` or `payload`, and rows lacking unchanged TOAST columns on an `unchanged = "dead_letter"` route. Required as soon as a route's `where` reads row data (`before.`, `after.`, `row.`), or a route uses `outbox`, `unchanged = "dead_letter"`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
 | `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
 | `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `ops` and `where` filter the events the route claims, see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route). Optional `format`, `deletes`, `tombstones` and `unchanged` reshape the records, see [Shaping the output](#shaping-the-output) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `where` filters the events the route claims, operations included (`op in ['insert', 'update']`), see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route). Optional `format`, `deletes`, `tombstones` and `unchanged` reshape the records, see [Shaping the output](#shaping-the-output) |
 
 Records: key and value as above (a route with `format = "row"` or `tombstones = true` changes the value, see
 [Shaping the output](#shaping-the-output)), headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
@@ -279,30 +279,39 @@ topic = "audit"
 
 #### Filtering events per route
 
-A route can drop events before they reach Kafka with `ops` and `where`. Both are checked after `match`, on the
-original event:
+A route can drop events before they reach Kafka with `where`. It is checked after `match`, on the original event,
+and filters operations as well as row values:
 
 ```toml
 [sink]
 brokers = ["kafka:9092"]
 topic = "cdc.{schema}.{table}"
-dead_letter_topic = "aqueduct.dead-letter"   # required once any route uses `where`
+dead_letter_topic = "aqueduct.dead-letter"   # required once a route's `where` reads row data
 
 [[sink.routes]]
 name = "paid-orders"
 match = "public.orders"
-ops = ["insert", "update", "delete"]
-where = "row.status == 'paid' or op == 'delete'"
+where = "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'"
 topic = "orders-paid"
+
+[[sink.routes]]
+name = "audit"
+match = "audit.*"
+where = "op != 'truncate'"                   # no row data: needs no dead_letter_topic
+topic = "audit"
 ```
 
-- **The first matching route owns the event.** If its `ops` or `where` drops the event, or `where` fails on it, the
-  event does not fall through to a later route or to `topic`.
-- **`ops`** lists the operations that pass: `insert`, `update`, `delete`, `truncate`, `read` (snapshot rows). Unset,
-  every op passes. An unknown name or an empty list fails startup.
+- **The first matching route owns the event.** If its `where` drops the event, or fails on it, the event does not
+  fall through to a later route or to `topic`.
+- **Operations** are filtered in `where` through `op`: `op in ['insert', 'update']` keeps inserts and updates,
+  `op != 'read'` drops snapshot rows. `op` is one of `insert`, `update`, `delete`, `truncate` and `read` (snapshot
+  rows), in lower case; any other value fails startup. There is no separate `ops` key: a route that sets one fails
+  startup with the `where` that does the same, such as `where = "op in ['insert', 'update']"`, or
+  `where = "(<your where>) and op in [...]"` when the route already has a `where`.
 - **`where`** is a predicate. Only events it is definitely true for pass; false and unknown are filtered. A syntax
   error fails startup with a message naming the route.
-  - Fields: `op` (`insert`, `update`, `delete`, `truncate`, `read`), `schema`, `table`, `before.<column>`,
+  - Fields: `op` (`insert`, `update`, `delete`, `truncate`, `read`), `schema`, `table` (all three strings, so they
+    compare only with string literals; `op == 1` fails startup), `before.<column>`,
     `after.<column>` and `row.<column>` (`after` if the event has it, else `before`, so a delete reads its
     before-image). A dotted path reads a nested MongoDB field: `after.address.city`.
   - Operators: `==` `!=` `<` `<=` `>` `>=`, `in [..]`, `is null`, `is not null`, `and`, `or`, `not` and parentheses.
@@ -330,25 +339,29 @@ topic = "orders-paid"
   topic if consumers need them.
 - **Type errors go to the dead-letter topic.** A comparison of a mistyped value (`row.amount > 10` on a row where
   `amount` is `'abc'`, `NaN` or a JSON object) is a type error. It wins over true, false and unknown with no
-  short-circuit, so `not (...)` cannot let a mistyped row through. The event is produced to
+  short-circuit, so `not (...)` cannot let a mistyped row through. That includes an `op` test next to it: under
+  `op == 'insert' and row.amount > 10`, a delete whose `amount` is `'abc'` goes to the dead-letter topic, not to
+  `filtered`. The event is produced to
   `sink.dead_letter_topic` instead: value = the event (the same envelope), key = the record key with `"key": null`
   (the table only, no row values), partitioned by that key, headers `op`, `lsn` and `aqueduct-error`. The
   `aqueduct-error` header names the route, the expression and the field with the type it should have, never the value,
   for example ``route `paid-orders`: where `row.amount > 10`: type error: `row.amount` is not a finite number``. The
   first one per route is logged as a warning. The batch is acknowledged as usual once the dead-letter record is
   written too, so one bad row never stops the pipeline or pins the replication slot.
-- **`dead_letter_topic`** is required as soon as any route has `where`. It must be a valid topic name, must not start
+- **`dead_letter_topic`** is required as soon as a route's `where` reads row data (`before.`, `after.` or `row.`). A
+  `where` on `op`, `schema` and `table` alone cannot hit a type error, so it needs none. It must be a valid topic name, must not start
   with `_`, and must not be a topic events are routed to (a route's or `topic`'s name, or a name a `{schema}`/`{table}`
   template could produce). It is opened at startup and created if missing (with `partitions` and
   `replication_factor`), so a dead-letter topic that cannot be created or read fails startup. Pre-create it with the
   retention you want. The event inspector also reads the dead-letter topic.
-- **Check the dead-letter topic's write ACL before you enable `where`.** Startup can only check that the topic exists;
+- **Check the dead-letter topic's write ACL before you enable a `where` on row data.** Startup can only check that the topic exists;
   write permission is first used by the first dead-letter record. If the broker refuses that write, the batch fails,
   nothing is acknowledged and the process exits. After a restart it reads the same row again and fails again, so it
   crash-loops, and the Postgres replication slot (or the MongoDB resume token) stays where it was, pinning WAL, until
   the topic is writable.
 - **Unseen fields.** A misspelled field (`row.stauts`) is not an error: it reads as null and the route filters
-  everything. Aqueduct counts, per route and field path in `where`, `key`, a topic template, a field operation or `outbox`, the rows that had the row the path reads (an
+  everything. Aqueduct counts, per route and row field path in `where` (`op`, `schema` and `table` are never
+  missing), `key`, a topic template, a field operation or `outbox`, the rows that had the row the path reads (an
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
@@ -478,7 +491,7 @@ rename = { cust_id = "customer_id" }
 ```
 
 - **Where they apply.** `before` and `after` of every record the route produces, and of its dead-letter records.
-  `source` and the headers are never rewritten. They run after `ops`, `where`, `key` and `topic`, which read the
+  `source` and the headers are never rewritten. They run after `where`, `key` and `topic`, which read the
   original row.
 - **`include`** keeps only the listed columns, **`exclude`** drops the listed ones; not both on one route. A listed
   column a row does not have is simply absent.
@@ -573,15 +586,17 @@ and `type` headers are opt-in: set `id` and `type` to the columns. Unknown keys 
 misspelled key never falls back to a default column.
 
 - **Inserts, and snapshot rows only on request.** Updates, deletes and truncates of the outbox table never produce a
-  record (even if `ops` lists them) and count as `filtered`, so deleting outbox rows once written is safe. Snapshot
-  rows (`read`) are filtered unless the route's `ops` lists `"read"`, for example `ops = ["insert", "read"]`; they are
-  then published like inserts, with the `op` header `r`. Enable `read` to publish rows that were already in the
-  outbox table before Aqueduct streamed it (a first deployment with `snapshot = "initial"`). The trade-off: every
-  snapshot of the table publishes every row still in it, including rows already published when they were inserted,
-  so consumers see those events twice. Delete outbox rows once written, or snapshot the table only once, to keep
-  that small. `where` still applies if you set it.
-- **Startup refusals.** An `ops` list with neither `insert` nor `read`, and a `where` that reads `before.<column>`
-  (inserts and snapshot rows have no before-image, so it could never be true), fail startup naming the route.
+  record (whatever `where` says) and count as `filtered`, so deleting outbox rows once written is safe. Without a
+  `where`, a route publishes inserts only. Snapshot rows (`read`) are published only when the route has a `where`
+  that is true for them, for example `where = "op in ['insert', 'read']"`; they are then published like inserts,
+  with the `op` header `r`. A `where` on the row applies to inserts and snapshot rows alike, so
+  `where = "row.aggregatetype == 'order'"` publishes the matching snapshot rows too; add `and op == 'insert'` to
+  keep them out. Publish snapshot rows to send rows that were already in the outbox table before Aqueduct streamed
+  it (a first deployment with `snapshot = "initial"`). The trade-off: every snapshot of the table publishes every
+  row still in it, including rows already published when they were inserted, so consumers see those events twice.
+  Delete outbox rows once written, or snapshot the table only once, to keep that small.
+- **Startup refusals.** A `where` that reads `before.<column>` (inserts and snapshot rows have no before-image, so
+  it could never be true) fails startup naming the route.
 - **Key: the raw `aggregate_id` value**, not the JSON record key other routes use. A string is sent as its content
   (unescaped UTF-8: `A-1`, not `"A-1"`), a number or boolean as its JSON text (`42`), an object (a MongoDB `ObjectId`)
   as its JSON (`{"$oid":"..."}`). The partition is the FNV-1a hash of that key, whatever `partition_by` says, so the
@@ -623,7 +638,7 @@ misspelled key never falls back to a default column.
     Debezium (with the JSON converter) delivers a JSON string.
   - A `bytea` payload arrives as Postgres hex text (`\x4869`), not as the raw bytes or base64.
   - Debezium publishes snapshot rows like inserts and only warns on updates; Aqueduct publishes snapshot rows only
-    when `ops` lists `read` and always drops updates.
+    when the route's `where` is true for them and always drops updates.
   - The `id` and `type` headers are opt-in.
 
   Use a `jsonb` object or array as the payload (the same JSON Debezium sends), or `text` (sent as plain text). Avoid
@@ -661,7 +676,7 @@ tombstones = true             # envelope format: a null-value record after every
 Rules, checked at startup:
 
 - `deletes` without `format = "row"`, and `tombstones` with it, fail startup; so do unknown values (case does not
-  matter, as for `ops`).
+  matter).
 - **Null values need a per-row key.** A record with a null value (an envelope tombstone, or a row-format delete
   under `deletes = "tombstone"`) tells a compacted topic to forget every record with that key. So a route that
   produces one needs `key = [...]`, or `partition_by = "key"` (the default): with `partition_by = "table"` and no
@@ -828,7 +843,7 @@ cell's tooltip) but never blocks the cockpit. Offsets need the inspector (`admin
 without it the column shows `–`.
 
 Events and Delivered count every event the source delivered for the table, including events a route filtered
-(`ops`, `where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
+(`where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
 recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
 A table whose route picks the topic per event (`{op}` or a row field in `topic`) has no single topic to read
 offsets from: its Topic column shows the template, and Kafka HWM says `content-routed (see Routing)`.
@@ -857,8 +872,8 @@ The **Routing** card shows where each table's events go:
   while `sink.topic` is unset is listed in red under "no route" (its events fail the pipeline).
 - **Routes** (middle): `[[sink.routes]]` in match order, numbered, then `default` (`sink.topic`, marked `else`). A
   table belongs to the first route whose `match` fits `schema.table` (`*` matches any run of characters, dots
-  included), the same rule the sink uses. Each route shows `match`, its `ops` (or "all ops"), its `where` (hover for
-  the full text, click the route for details), a badge per routing option it sets, and its produced, filtered,
+  included), the same rule the sink uses. Each route shows `match`, its `where` (operations are filtered there too;
+  hover for the full text, click the route for details), a badge per routing option it sets, and its produced, filtered,
   fallback and errors counts with a bar. An amber **never seen** box lists fields its `where` reads that no row has
   had after enough rows (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then
   filters everything.
@@ -869,7 +884,7 @@ The **Routing** card shows where each table's events go:
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
-motion. The line to the dead-letter topic is dashed and appears for routes with a `where` or with errors. Hover a
+motion. The line to the dead-letter topic is dashed and appears for routes whose `where` reads row data, or with errors. Hover a
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
@@ -917,17 +932,17 @@ otherwise. `counts` also has `tombstones_skipped`, which is not an outcome.
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
  "routes": [
-   {"route": "paid-orders", "match": "public.orders", "ops": ["insert", "update", "delete"],
-    "where": "row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
+   {"route": "paid-orders", "match": "public.orders",
+    "where": "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
     "topic_fallback": null, "topic_values": null,
     "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
     "unseen_fields": []},
-   {"route": "regional", "match": "public.customers", "ops": null, "where": null, "key": null,
+   {"route": "regional", "match": "public.customers", "where": null, "key": null,
     "topic": "customers.{row.region}", "topic_fallback": "customers.unknown", "topic_values": ["eu", "us"],
     "format": "row", "deletes": "tombstone",
     "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0, "tombstones_skipped": 0},
     "unseen_fields": []},
-   {"route": "default", "match": null, "ops": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
+   {"route": "default", "match": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
     "topic_fallback": null, "topic_values": null,
     "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
     "unseen_fields": []}]}

@@ -1320,7 +1320,6 @@ Authorization: Bearer {token}
                 "{}.t",
                 name.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
             ),
-            ops: filter.map(|_| vec!["insert".to_string()]),
             filter: filter.map(Into::into),
             ..Default::default()
         };
@@ -1329,7 +1328,7 @@ Authorization: Bearer {token}
                 route(
                     "paid \"orders\"",
                     "public.orders",
-                    Some("row.status == 'paid'"),
+                    Some("op == 'insert' and row.status == 'paid'"),
                 ),
                 route("rest", "public.*", None),
             ],
@@ -1391,8 +1390,8 @@ Authorization: Bearer {token}
         assert_eq!(routes.len(), 3);
         assert_eq!(
             routes[0],
-            json!({"route": "paid \"orders\"", "match": "public.orders", "ops": ["insert"],
-                   "where": "row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
+            json!({"route": "paid \"orders\"", "match": "public.orders",
+                   "where": "op == 'insert' and row.status == 'paid'", "key": null, "topic": "paid--orders-.t", "topic_fallback": null, "topic_values": null,
                    "counts": {"matched": 3, "produced": 1, "filtered": 1, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
                    "unseen_fields": []})
         );

@@ -25,7 +25,7 @@ flowchart LR
     subgraph aq["Aqueduct container (distroless, uid 65532)"]
         SRC["Source<br/>pgoutput decoder / change-stream mapper<br/>snapshot engine (Postgres, MongoDB)"]
         PIPE["run_pipeline<br/>batches of up to 1000 events"]
-        SINK["Kafka sink<br/>route plan: match · ops/where filter · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope (+ tombstones), the row (format = row), or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
+        SINK["Kafka sink<br/>route plan: match · where filter (op, rows) · topic (template, row fields → fallback) · field ops<br/>Debezium-style envelope (+ tombstones), the row (format = row), or outbox payload (inserts)<br/>key: table + primary key or route key columns (JSON), outbox aggregate id · partition = FNV-1a(key)"]
         CK[("checkpoint file<br/>/var/lib/aqueduct")]
         MET["Metrics"]
         ADM["Admin server :8080<br/>/ · /api/* · /metrics · /healthz · /readyz<br/>/api/snapshot requests"]
@@ -226,19 +226,20 @@ match = "*.audit_*"                   # any schema, tables starting with audit_
 topic = "audit"
 ```
 
-A route can also filter what it claims with `ops` and a `where` expression (SQL-style three-valued logic; a field
-that is null or missing makes a comparison unknown, and unknown is filtered). Rows the expression cannot evaluate
-(a type error) go to `dead_letter_topic` with an `aqueduct-error` header instead of stopping the pipeline. The first
-matching route owns the event: nothing falls through. See DEPLOYMENT.md, "Filtering events per route".
+A route can also filter what it claims with a `where` expression (SQL-style three-valued logic; a field that is
+null or missing makes a comparison unknown, and unknown is filtered). It filters operations too, through `op`:
+`where = "op in ['insert', 'update']"`. Rows the expression cannot evaluate (a type error) go to `dead_letter_topic`
+with an `aqueduct-error` header instead of stopping the pipeline; a `where` on `op`, `schema` and `table` alone cannot
+fail and needs no dead-letter topic. The first matching route owns the event: nothing falls through. See
+DEPLOYMENT.md, "Filtering events per route".
 
 ```toml
 [sink]
-dead_letter_topic = "aqueduct.dead-letter"  # required once a route uses `where`
+dead_letter_topic = "aqueduct.dead-letter"  # required once a route's `where` reads row data
 
 [[sink.routes]]
 match = "public.orders"
-ops = ["insert", "update", "delete"]
-where = "row.status == 'paid' or op == 'delete'"
+where = "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'"
 topic = "orders-paid"
 ```
 
@@ -272,7 +273,8 @@ hash = ["email"]
 `outbox = { ... }` on a route publishes an outbox table's inserts as their own events, much like Debezium's outbox
 router: topic from a template such as `outbox.{aggregate_type}`, key = the raw `aggregate_id` value (not the JSON
 table key), value = the `payload` column as is, headers `id` and `type` when configured. Updates and deletes of the
-outbox are dropped, and snapshot rows too unless the route's `ops` lists `read`; a row without an `aggregate_id` or
+outbox are dropped, and snapshot rows too unless the route has a `where` that is true for them (such as
+`where = "op in ['insert', 'read']"`); a row without an `aggregate_id` or
 `payload` goes to the dead-letter topic. Unlike Debezium, a `jsonb` payload that is a bare string loses its quotes, a
 `text` payload holding JSON reads as JSON, and `bytea` arrives as hex text: use a `jsonb` object or array, or `text`,
 as the payload. See DEPLOYMENT.md, "Outbox".
@@ -342,7 +344,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second; per topic, records Kafka acknowledged per second. The Routing card's step lines; the stream then adds the newest second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
@@ -388,8 +390,8 @@ pipeline is streaming. Click a column header to sort. The checkpoint shown in th
 The **Routing** card draws the sink's routing as a graph, left to right: every table seen, the
 `[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`), and the topics they
 write, plus the dead-letter topic in red. A table connects to the first route whose `match` fits it; a route
-connects to the topics it rendered and, when it has a `where` or errors, with a dashed line to the dead-letter topic.
-Each route shows its `match`, `ops` and `where`, its produced / filtered / fallback / errors counts with a bar, and an
+connects to the topics it rendered and, when its `where` reads row data or it has errors, with a dashed line to the
+dead-letter topic. Each route shows its `match` and `where` (which also carries any operation filter), its produced / filtered / fallback / errors counts with a bar, and an
 amber **never seen** warning for fields its `where` reads that no row has had (usually a typo). Line width follows the
 counts and lines with traffic in the last 3 s animate. Hover a table to light up its path, click a route for its
 details and full `where`, click a topic to open it in the event inspector. A route with more than 6 tables or topics
