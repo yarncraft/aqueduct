@@ -453,6 +453,7 @@ Per-route counters: every event a route claims counts as `matched`, then as exac
 |--------|---------|
 | `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
+| `aqueduct_topic_records_total{topic}` | Counter. Records Kafka acknowledged per topic, counted after each produce succeeds (a failed produce counts when its batch is retried). The first 500 topics are counted by name, any further ones under `topic="(other)"` (logged once) |
 
 `route` is the route's `name`, else its `match`; `default` is reserved and cannot be used as a name. Events no route
 claims are counted under `default` when `sink.topic` is set; without `sink.topic` such an event is an error that stops
@@ -463,7 +464,7 @@ or two unnamed routes with the same `match` (the second could never match) fail 
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, a per-operation breakdown, the routing graph, per-table high-water marks and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/routes/history` (per-route and per-topic rates over the last 120 s), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -530,14 +531,40 @@ The **Routing** card shows where each table's events go:
   had after enough rows (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then
   filters everything.
 - **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
-  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count.
+  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count. A
+  template that reads the event (`{op}`, `{row.x}`) lists the topics the sink has produced to since start, and its
+  `topic_fallback`.
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
 motion. The line to the dead-letter topic is dashed and appears for routes with a `where` or with errors. Hover a
-table to highlight its path. Click a topic to open it in the event inspector (only when the inspector is on). The
-plan is read once from `GET /api/routes` when the page loads; counts update every second from the stream. Without
-any `[[sink.routes]]` the graph is all tables → `default` → their topics.
+table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
+second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
+
+**Rates.** Each route and topic shows a step line of its rate over the last 120 s, one sample per second, on one
+shared time axis (nothing animates):
+
+- a route: events produced per second, with filtered (grey), fallback (violet) and errors (red) as thin lines;
+- a topic: records Kafka acknowledged per second, counted by the sink after the broker acknowledged the produce, so
+  a failed produce never counts and a retried batch counts when it succeeds;
+- a "+N more" group: the sum over its tables (events per second) or topics.
+
+Click a route for its details and a larger chart split by outcome. Click a topic for a panel with a larger chart, its
+current, average and maximum rate over the window, the routes that write to it (by template, as their
+`topic_fallback`, or as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
+
+The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
+the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
+order, the topics with records in that second). It needs the admin token like every `/api/*` route. Memory is bounded:
+routes are fixed at startup, and the sink counts at most 500 topics by name and the rest as `(other)`. Topic names can
+contain row values under content routing; they are shown only behind the token, as in the graph. Rates start from
+zero when the process restarts.
+
+```json
+{"seq": 431, "interval_ms": 1000, "len": 120,
+ "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0]}],
+ "topics": {"orders-paid": [3, 0, 5], "aqueduct.dead-letter": [0, 0, 0]}}
+```
 
 ### Routing plan
 

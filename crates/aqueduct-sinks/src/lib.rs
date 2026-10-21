@@ -6,6 +6,7 @@
 mod inspect;
 mod kafka;
 pub mod route;
+mod topic_stats;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, SaslMechanism};
@@ -13,6 +14,7 @@ pub use route::{
     ContentTopic, KafkaRoute, OutRecord, RouteCount, RouteCounts, RouteDescription, RoutePlan,
     RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
 };
+pub use topic_stats::{TopicStats, MAX_TRACKED_TOPICS, OTHER_TOPICS};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;

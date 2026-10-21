@@ -285,6 +285,7 @@ before/after diff and Copy JSON).
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/routes` | The compiled route plan (match, ops, where, key, topic, topic_fallback, topic_values per route, plus `default`) with live per-route counts and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second; per topic, records Kafka acknowledged per second. The Routing card's step lines; the stream then adds the newest second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given). Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Tables · high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
@@ -296,6 +297,11 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 **events contain row data**, so keep the port off untrusted networks.
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
+
+In the routing graph every route and topic carries a small step line of its rate over the last 120 s (a route's
+produced rate, with filtered, fallback and errors as thin lines; a topic's records acknowledged by Kafka), and each
+"+N more" group one for the group as a whole. Click a route or a topic for a larger chart with the current, average and
+maximum rate; a topic's panel also lists the routes that write to it and opens it in the event inspector.
 
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
