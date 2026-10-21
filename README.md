@@ -333,7 +333,7 @@ Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `sn
 
 The HTTP port serves a dark operations console at `/`: whether Aqueduct is **behind its source**, throughput chart, total events, end-to-end lag,
 sink latency, errors, operation breakdown, a **routing graph**, per-table high-water marks, last fault, and an **event inspector**
-(reads the newest events straight from the Kafka topics, nothing is buffered in the pipeline; pick a topic, filter by op/table, search payloads, pause, click a row for a
+(a sample of the newest 100 events read straight from the Kafka topics, nothing is buffered in the pipeline; Resample reads a fresh one; pick a topic, filter by op/table, search payloads, click a row for a
 before/after diff and Copy JSON).
 
 | Route | Purpose |

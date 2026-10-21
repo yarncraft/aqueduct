@@ -300,6 +300,8 @@ Notable changes to Aqueduct. Newest first.
   claimed, the topic with `ELSE` fallback and `ON ERROR` dead-letter topic, and the route key, primary key or table.
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
+- **Cockpit: the event inspector shows a sample, not a feed.** It reads the newest 100 events once when it opens (and
+  when its topic filter changes); a **Resample** button reads a fresh sample. Pause and Clear are gone.
 - **Cockpit: per-table high-water marks moved into the table's detail panel.** The separate Tables card is gone; click a
   table in the routing graph for its counts per operation, last LSN, commit and delivery age, Kafka offsets per
   partition and the checkpoint. `/api/tables` is unchanged.

@@ -747,8 +747,9 @@ Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` onl
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
 
-The inspector adds no work to the pipeline: nothing is buffered in memory. Each refresh (every 3 s while a tab is open,
-shared across tabs for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
+The inspector adds no work to the pipeline: nothing is buffered in memory. It shows a sample, not a feed: the newest
+100 events, read once when it opens, when its topic filter changes and on **Resample**. Each sample (shared across tabs
+for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
 routes to, using its own connection (created on first use). A closed tab costs nothing.
 
 ### Behind source
