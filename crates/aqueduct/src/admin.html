@@ -1076,9 +1076,11 @@ function topicDetail(m, name) {
     // What it serves: each route, and the topics it writes (a template's own topics are the rendered ones).
     const served = dlq.routes.map(x => routeLink(x) + `<span class="mr-3 text-ink-500">${esc(x.topics.size ? [...x.topics.keys()].sort().join(', ') : x.r.topic)}</span>`).join('');
     const rendered = tpl ? dlqTopics(name) : [];
+    // A wider label column, so "dead letter for" stays on one line.
+    const wide = (k, v) => `<div class="flex gap-3"><span class="w-28 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
     $('routedetail').innerHTML = head
-      + row('dead letter for', served)
-      + (tpl ? row('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
+      + wide('dead letter for', served)
+      + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
       + `</div>` + detailChart(legendItem(RATE_LINE.errors, 'records acknowledged / s'));
     return;
   }
