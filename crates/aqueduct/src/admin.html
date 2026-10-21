@@ -97,25 +97,6 @@
     </div>
   </section>
 
-  <!-- Replication health: slot lag and heartbeat (each shows an en dash until the server reports it) -->
-  <section class="grid grid-cols-2 gap-px overflow-hidden rounded-sm border border-ink-600 bg-ink-600 lg:grid-cols-3">
-    <div class="bg-ink-800 p-4">
-      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Slot lag</div>
-      <div id="slotlag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-      <div class="mt-1 truncate font-mono text-[11px] text-ink-300">confirmed flush <span id="flushlsn" class="text-ink-200">–</span></div>
-    </div>
-    <div class="bg-ink-800 p-4">
-      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Last heartbeat</div>
-      <div id="hbage" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-      <div id="hbsub" class="mt-1 font-mono text-[11px] text-ink-300">not reported</div>
-    </div>
-    <div class="bg-ink-800 p-4">
-      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Heartbeat skipped</div>
-      <div id="hbskip" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-      <div id="hbreason" class="mt-1 truncate font-mono text-[11px] text-ink-300">–</div>
-    </div>
-  </section>
-
   <!-- Snapshot progress (hidden until the source reports a snapshot) -->
   <section id="snapshot" hidden class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
@@ -199,8 +180,8 @@
    ["public.*s", "public.users", true], ["public.*s", "public.user", false], ["", "", true], ["*", "", true]]
   </script>
 
-  <!-- Event inspector -->
-  <section id="inspector" class="rounded-sm border border-ink-600 bg-ink-800">
+  <!-- Event inspector: hidden until a topic's "Open in inspector" button in the Routing card opens it -->
+  <section id="inspector" hidden class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
       <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Event inspector</h2>
       <span class="font-mono text-[11px] text-ink-500">from Kafka</span>
@@ -214,6 +195,7 @@
         <select id="evtable" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All tables</option></select>
         <button id="evpause" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Pause</button>
         <button id="evclear" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Clear</button>
+        <button id="evclose" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>
       </div>
     </div>
     <div class="max-h-[34rem] overflow-auto">
@@ -364,36 +346,8 @@ function chart(series, el = $('chart'), colors = OPLINE, H = 220) {
   el.innerHTML = g;
 }
 
-// Slot lag is exact. Heartbeat age is the browser clock minus the server's last beat time, so it keeps
-// counting even if the beat stopped. Fields the server does not send render as an en dash.
+// Big-number tile text; the colour class is appended.
 const TILE = 'mt-2 font-mono text-3xl font-medium tabular-nums ';
-function renderHealth(d) {
-  $('slotlag').textContent = d.slot_lag_bytes == null ? '–' : bytes(d.slot_lag_bytes);
-  $('flushlsn').textContent = d.confirmed_flush_lsn || '–';
-  const h = d.heartbeat;
-  if (!h) {
-    $('hbage').textContent = $('hbskip').textContent = $('hbreason').textContent = '–';
-    $('hbage').className = $('hbskip').className = TILE + 'text-ink-100';
-    $('hbsub').textContent = 'not reported';
-    return;
-  }
-  const every = h.interval_ms == null ? null : h.interval_ms;
-  let age = null, tone = 'text-ink-100';
-  if (every == null) {
-    $('hbage').textContent = 'off';
-  } else if (h.last_ms == null) {
-    $('hbage').textContent = 'waiting';
-  } else {
-    age = Math.max(0, Date.now() - h.last_ms);
-    $('hbage').textContent = (age < 60000 ? ms(age) : dur(Math.floor(age / 1000))) + ' ago';
-    tone = age > 5 * every ? 'text-red' : age > 2 * every ? 'text-amber' : 'text-ink-100';
-  }
-  $('hbage').className = TILE + tone;
-  $('hbsub').textContent = every == null ? 'heartbeats disabled' : 'every ' + ms(every);
-  $('hbskip').textContent = h.skipped_total == null ? '–' : fmt(h.skipped_total);
-  $('hbskip').className = TILE + 'text-ink-100';
-  $('hbreason').textContent = h.last_skip_reason ? 'last: ' + h.last_skip_reason : 'none skipped';
-}
 
 // Snapshot card: hidden until the source reports one, then shows the running or last snapshot.
 const SNAP_BADGE = { running: 'bg-blue/15 text-blue', finished: 'bg-green/15 text-green', cancelled: 'bg-ink-700 text-ink-200' };
@@ -486,7 +440,8 @@ function render(d) {
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
   $('uptime').textContent = dur(d.uptime_secs);
 
-  $('inspector').hidden = !d.inspector;
+  // Opened from a topic's detail panel only; closed for good when the server turns it off.
+  if (!d.inspector) $('inspector').hidden = true;
   const sm = smooth(d.history);
   $('rate').textContent = fmt(Math.round(sm.length ? sm[sm.length - 1] : d.events_per_sec));
   $('rate-now').textContent = fmt(d.events_per_sec);
@@ -508,7 +463,6 @@ function render(d) {
   $('errors').textContent = fmt(d.errors);
   $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
   $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
-  renderHealth(d);
   renderBehind(d);
   renderSnapshot(d);
   lastData = d;
@@ -729,7 +683,8 @@ function syncTopicFilter(topics) {
 }
 
 async function pollEvents() {
-  if (paused) return;
+  // Closed inspector: no Kafka reads at all.
+  if (paused || $('inspector').hidden) return;
   try {
     const r = await fetch('/api/events?limit=' + FETCH_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value), authInit());
     if (r.status === 403 || r.status === 401) {
@@ -778,7 +733,7 @@ $('evpause').addEventListener('click', () => {
 });
 $('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
 const pollTimer = setInterval(pollEvents, 3000);
-pollEvents();
+$('evclose').addEventListener('click', () => { $('inspector').hidden = true; });
 
 // ---- Routing graph ----
 // Tables (stream + /api/tables) → routes in match order, first match wins → topics, and the dead-letter topic.
@@ -1210,6 +1165,7 @@ function inspectTopic(name) {
   const sel = $('evtopic');
   if (![...sel.options].some(o => o.value === name)) sel.add(new Option(name, name));
   sel.value = name;
+  $('inspector').hidden = false;
   pollEvents();
   $('inspector').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
 }
