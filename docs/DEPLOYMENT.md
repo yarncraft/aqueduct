@@ -940,9 +940,11 @@ The **Routing** card shows where each table's events go:
   Below the rows: the step number and route name, the produced, filtered, fallback and errors counts with a bar, and
   the rate line. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
-- **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
-  `cdc.{schema}.{table}` is shown dashed above them), and under **dead letter**, in red, one card per distinct
-  dead-letter topic or template of the routes that show `ON ERROR`, with the errors of the routes that use it. Beyond
+- **Topics** (right): only real topics, never a template: the topics a template rendered for the tables seen, and
+  under **dead letter**, in red, one card per distinct dead-letter topic of the routes that show `ON ERROR` (a
+  `{schema}`/`{table}` dead-letter template shows the dead-letter topics it rendered), with the errors of the routes
+  that use it. A route whose template has not rendered a topic yet has no topic edge. The `default` route
+  (`sink.topic`) is left out until an event reaches it. Beyond
   six, the quietest ones are behind "+N more". A template that reads the event (`{op}`, `{row.x}`) lists the topics the
   sink has produced to since start (not its dead-letter topics), and its `topic_fallback`.
 
