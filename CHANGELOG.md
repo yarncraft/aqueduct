@@ -170,7 +170,7 @@ Notable changes to Aqueduct. Newest first.
   without an `aggregate_id` or `payload` goes to `dead_letter_topic`, which such a route requires, with an
   `aqueduct-error` header naming the column. `outbox` excludes `topic`, `key` and the field operations on the same route. The route's
   `topic` key is now optional in the config when `outbox` is set. `/api/routes` shows an `outbox` object, the cockpit
-  an `outbox` badge, and `/api/events` now returns each record's headers (only `op`, `lsn`, `aqueduct-error`,
+  the outbox columns on the route card, and `/api/events` now returns each record's headers (only `op`, `lsn`, `aqueduct-error`,
   `aqueduct-hash-key-id`, and the outbox `id`/`type`) and shows non-envelope values raw.
 - **Routing: include, exclude, mask, hash and rename fields to protect personal data** (#84, ADR 0002).
   `[[sink.routes]]` takes `include` or `exclude` (top-level columns), `mask` (strings become `"***"`, other values
@@ -293,6 +293,12 @@ Notable changes to Aqueduct. Newest first.
 
 ### Changed
 
+- **Cockpit: each route in the Routing graph reads as SELECT / WHERE / FROM / INTO / PARTITIONED-BY** (#171). Every
+  route card has the same five aligned rows: the fields (`*`, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`,
+  `col AS new`, `ROW` and the shape tags, an outbox's `payload`), the `where`, the `match` glob with the tables it
+  claimed, the topic with `ELSE` fallback and `ON ERROR` dead-letter topic, and the route key, primary key or table.
+  Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
+  follow below; the badge row is gone. No API change: it reads `/api/routes`.
 - **Cockpit: the event inspector is a pop-up opened from a topic.** A topic's **Open in inspector** button in the
   routing graph opens it over the page, filtered to that topic; Close, Esc or a click outside closes it. It reads
   nothing from Kafka while closed.
