@@ -937,8 +937,10 @@ The **Routing** card shows where each table's events go:
   | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). The dead-letter topic is in the route's panel, not on the card | `sink.topic` on `default` |
   | `PARTITIONED-BY` | `key (a, b)` for a route `key`; the `aggregate_id` column for an outbox | `primary key` (`partition_by = "key"`) or `table` |
 
-  Below the rows: the step number and route name, the produced, filtered, fallback and errors counts, and the op bar
-  of its produced events. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
+  The step number and route name are on top, above the rows. Below them, four metrics, each in the colour of its line
+  in the card's step chart: **processed** (blue, every event the route took), **matched** (green, processed minus
+  filtered: the `where` held; a row the `where` could not evaluate also counts here, and under errors), **fallback**
+  (violet, sent to `topic_fallback`) and **errors** (red, sent to the dead-letter topic). Produced is in the panel. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 - **Topics** (right): only real topics, never a template: the topics a template rendered for the tables seen, and
   under **dead letter**, in red, one card per distinct dead-letter topic that has received events (a
@@ -958,9 +960,8 @@ second from the stream. Without any `[[sink.routes]]` the graph is all tables â†
 
 **Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
 start, as shares (insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and
-percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: two lines,
-**matched** in blue, every event it claimed, and **routed** in green, the records it wrote to its topics, produced
-plus fallback; routed is never above matched, and the gap is what was filtered or dead-lettered). The bar counts:
+percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: four lines,
+processed, matched, fallback and errors; matched is never above processed). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
 - a topic (the dead-letter topic too): records Kafka acknowledged, counted by the sink after the broker acknowledged
