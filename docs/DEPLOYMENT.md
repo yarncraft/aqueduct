@@ -782,14 +782,14 @@ or two unnamed routes with the same `match` (the second could never match) fail 
 ## 4. Admin cockpit
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows whether Aqueduct is behind its source
-(backlog, rates and time to catch up), throughput, totals, lag, sink latency, errors, a per-operation breakdown, the
+(backlog, rates and time to catch up), throughput, totals, lag, sink latency, errors, the
 routing graph, per-table high-water marks and an event inspector. The inspector is a pop-up window that opens only from
 a topic's detail panel in the routing graph (**Open in inspector**), filtered to that topic; it reads nothing from
 Kafka while closed, and Close, Esc or a click outside closes it.
 Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
-sink latency, errors, a per-operation breakdown, the routing graph, per-table high-water marks and an event inspector.
+sink latency, errors, the routing graph, per-table high-water marks and an event inspector.
 Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/routes/history` (per-route and per-topic rates over the last 120 s), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
@@ -955,8 +955,8 @@ second from the stream. Without any `[[sink.routes]]` the graph is all tables â†
 **Rates.** Each table, route and topic shows a step line of its rate over the last 120 s, one sample per second, on
 one shared time axis (nothing animates). On table and topic cards it sits on its own line under the name and count:
 
-- a table: events per second the source delivered for it (the same per-table history as the event-rate chart's
-  table filter, `history_ops` in `/api/metrics` and every stream frame);
+- a table: events per second the source delivered for it (`history_ops` in `/api/metrics` and every
+  stream frame);
 - a route: events produced per second, with filtered (grey), fallback (violet) and errors (red) as thin lines;
 - a topic: records Kafka acknowledged per second, counted by the sink after the broker acknowledged the produce, so
   a failed produce never counts and a retried batch counts when it succeeds;

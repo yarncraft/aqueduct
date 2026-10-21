@@ -307,6 +307,8 @@ Notable changes to Aqueduct. Newest first.
   dead-letter topic of the routes writing to it (#177).
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
+- **Cockpit: the global Event rate chart and Operations card are removed.** Per-table rates by operation are in a
+  table's detail panel in the routing graph; the totals per operation stay in `/api/metrics` and Prometheus.
 - **Cockpit: the event inspector shows a sample, not a feed.** It reads the newest 100 events once when it opens (and
   when its topic filter changes); a **Resample** button reads a fresh sample. Pause and Clear are gone.
 - **Cockpit: per-table high-water marks moved into the table's detail panel.** The separate Tables card is gone; click a

@@ -121,41 +121,6 @@
     <div id="snapskipped" hidden class="border-t border-ink-600 px-4 py-2 font-mono text-[11px] text-amber"></div>
   </section>
 
-  <!-- Chart + operations -->
-  <section class="grid gap-4 lg:grid-cols-3">
-    <div class="rounded-sm border border-ink-600 bg-ink-800 lg:col-span-2">
-      <div class="flex items-center justify-between border-b border-ink-600 px-4 py-2.5">
-        <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Event rate</h2>
-        <span class="font-mono text-[11px] text-ink-300">last 120 s · 1 s resolution</span>
-      </div>
-      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2 font-mono text-[11px] text-ink-300">
-        <select id="ratetable" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All tables</option></select>
-        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="0" checked> INSERT</label>
-        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="1" checked> UPDATE</label>
-        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="2" checked> DELETE</label>
-        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="3" checked> TRUNCATE</label>
-        <label class="flex items-center gap-1"><input type="checkbox" class="rateop" value="4" checked> READ</label>
-      </div>
-      <svg id="chart" viewBox="0 0 800 220" preserveAspectRatio="none" class="block h-56 w-full"></svg>
-    </div>
-
-    <div class="rounded-sm border border-ink-600 bg-ink-800">
-      <div class="border-b border-ink-600 px-4 py-2.5">
-        <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Operations</h2>
-      </div>
-      <div class="space-y-4 p-4">
-        <div id="opbar" class="flex h-2 overflow-hidden rounded-sm bg-ink-700"></div>
-        <ul class="space-y-2.5 font-mono text-[12px]">
-          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-green"></i><span class="text-ink-200">INSERT</span><b id="op-inserts" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-inserts" class="w-12 text-right text-ink-300">–</span></li>
-          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-blue"></i><span class="text-ink-200">UPDATE</span><b id="op-updates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-updates" class="w-12 text-right text-ink-300">–</span></li>
-          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-red"></i><span class="text-ink-200">DELETE</span><b id="op-deletes" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-deletes" class="w-12 text-right text-ink-300">–</span></li>
-          <li class="flex items-center"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-violet"></i><span class="text-ink-200">TRUNCATE</span><b id="op-truncates" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-truncates" class="w-12 text-right text-ink-300">–</span></li>
-          <li class="flex items-center" title="Rows copied by a snapshot"><i class="mr-2.5 h-2 w-2 rounded-[1px] bg-amber"></i><span class="text-ink-200">READ</span><b id="op-reads" class="ml-auto font-medium tabular-nums text-ink-100">0</b><span id="pc-reads" class="w-12 text-right text-ink-300">–</span></li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
   <!-- Routing graph: tables → routes in match order → topics. The plan comes from /api/routes, counts from the stream,
        rate step lines from /api/routes/history plus the stream's newest second (tables: the stream's history_ops). -->
   <section id="routing" class="rounded-sm border border-ink-600 bg-ink-800">
@@ -274,31 +239,11 @@ const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
 let lastData = null;
-// One event-rate series per checked op for the selected table (all tables when none is picked).
-function rateSeries(d) {
-  const tb = $('ratetable').value;
-  const per = d.history_ops || {};
-  const names = tb ? [tb] : Object.keys(per);
-  return [...document.querySelectorAll('.rateop')].filter(c => c.checked).map(c => {
-    const o = +c.value;
-    return { op: o, h: d.history.map((_, i) => names.reduce((a, t) => {
-      const row = (per[t] || [])[i - (d.history.length - (per[t] || []).length)];
-      return a + (row ? row[o] : 0);
-    }, 0)) };
-  });
-}
-function syncRateTables(d) {
-  const sel = $('ratetable'), cur = sel.value, names = Object.keys(d.history_ops || {}).sort();
-  if ([...sel.options].slice(1).map(o => o.value).join() === names.join()) return;
-  sel.innerHTML = '<option value="">All tables</option>' + names.map(n => `<option>${esc(n)}</option>`).join('');
-  sel.value = cur;
-}
-
 const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee', '#ec9a3c'];
 // Stepline points: hold each value until the next sample, then jump.
 const stepPts = (h, x, y) => h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
 // Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H).
-function chart(series, el = $('chart'), colors = OPLINE, H = 220) {
+function chart(series, el, colors = OPLINE, H = 220) {
   const W = 800, PL = 34, PR = 8, PT = 10, PB = 8;
   const len = Math.max(0, ...series.map(s => s.h.length));
   const max = Math.max(5, ...series.flatMap(s => s.h));
@@ -440,15 +385,6 @@ function render(d) {
   renderBehind(d);
   renderSnapshot(d);
   lastData = d;
-  syncRateTables(d);
-  chart(rateSeries(d));
-
-  const total = OPS.reduce((a, k) => a + d[k], 0);
-  $('opbar').innerHTML = OPS.map(k => d[k] ? `<div class="${OPBAR[k]}" style="width:${100 * d[k] / total}%"></div>` : '').join('');
-  for (const k of OPS) {
-    $('op-' + k).textContent = fmt(d[k]);
-    $('pc-' + k).textContent = total ? (100 * d[k] / total).toFixed(1) + '%' : '–';
-  }
 
   fillTableMarks();
   appendRates(d.rates);
@@ -621,7 +557,6 @@ $('events').addEventListener('click', ev => {
   openId = openId === tr.dataset.id ? null : tr.dataset.id;
   renderEvents();
 });
-for (const el of [$('ratetable'), ...document.querySelectorAll('.rateop')]) el.addEventListener('input', () => lastData && chart(rateSeries(lastData)));
 $('snapcancel').addEventListener('click', async () => {
   if (!confirm('Cancel the snapshot after the chunk in flight?')) return;
   $('snapcancel').disabled = true;
