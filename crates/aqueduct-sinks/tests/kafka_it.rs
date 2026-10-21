@@ -199,7 +199,7 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     };
     let tpl_dlq = format!("{prefix}.log.dlq");
     let plan = RoutePlan::new(vec![route, templated], None).unwrap();
-    assert_eq!(plan.dead_letter_topics(), [dlq.clone()]);
+    assert_eq!(plan.dead_letter_topics(), std::slice::from_ref(&dlq));
     let stats = plan.stats();
     let mut sink = KafkaSink::connect(brokers.clone(), plan, 2, None, &KafkaSecurity::default())
         .await
