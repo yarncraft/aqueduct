@@ -1,0 +1,1 @@
+- **Cockpit: table and topic step lines are white** (dead-letter topics stay red), so colours only mean route metrics.

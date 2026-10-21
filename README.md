@@ -149,7 +149,7 @@ alongside the regular `docker-compose.yml` (port 8080). Tables are capped at abo
 
 Full deployment guide (Postgres setup, Docker/Kubernetes, every config key, operations, troubleshooting): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-Upgrading? Read [`CHANGELOG.md`](CHANGELOG.md) first: the next release changes the TLS and admin-token defaults.
+Upgrading? Read the breaking changes in [`changelog/unreleased/breaking/`](changelog/unreleased/breaking/) first (see [`CHANGELOG.md`](CHANGELOG.md)): the next release changes the TLS and admin-token defaults.
 
 TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`). See
 `config/aqueduct.example.toml`. Mount your own file over it.
@@ -165,7 +165,7 @@ TOML at `/etc/aqueduct/aqueduct.toml` (override the path with `AQUEDUCT_CONFIG`)
 | `postgres.checkpoint_skip_system_check` | `false` | Skip comparing the checkpoint's cluster and timeline with the server's at startup (the database is still compared). Only for servers that refuse `pg_control_system()`; see DEPLOYMENT.md, "Checkpoint origin check" |
 | `postgres.heartbeat_interval_secs` / `postgres.heartbeat_action_query` | `10` / unset | While idle, the slot is advanced to the server's WAL position this often (never past a checkpointed event), so writes to unpublished tables do not pin WAL. `0` disables it. The optional query (e.g. an upsert into a small published table) runs before each heartbeat; see DEPLOYMENT.md |
 | `source.snapshot` (MongoDB) | `never` | `initial` copies every watched collection on a start without a checkpoint, `on_demand` only on request; documents arrive as `"op": "r"`. Writes watermarks into `<database>.aqueduct_watermarks`. `snapshot_chunk_size` (1024) and `snapshot_max_rows_per_sec` tune it; see DEPLOYMENT.md, "MongoDB snapshots" |
-| `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `CHANGELOG.md`.) Without a `[source]` table, `[postgres]` is used |
+| `source.type` | `postgres` | `postgres` or `mongodb`. (`kafka` was removed; see `changelog/unreleased/breaking/20-the-kafka-source-is-removed.md`.) Without a `[source]` table, `[postgres]` is used |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged source position (LSN or resume token), written atomically |
 | `health_addr` | `0.0.0.0:8080` | HTTP listener for the cockpit and health probe |
 | `admin_insecure_no_auth` | `false` | Opt out of the token requirement on a non-loopback `health_addr` (logs a warning) |
