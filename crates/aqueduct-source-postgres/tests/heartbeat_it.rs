@@ -630,3 +630,43 @@ async fn reports_the_wal_head_and_the_backlog_until_caught_up() {
     }
     f.cleanup(s).await;
 }
+
+/// Transactions that produce no event (here another tool's logical messages; on Postgres < 15
+/// also the empty transactions of unpublished tables) must not stall a capped peek. Heartbeats
+/// are off, so only the source's own progress can move the slot past them; the published row
+/// written after them must still arrive.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn transactions_without_events_do_not_stall_a_capped_peek() {
+    let f = Fixture::new("noevent").await;
+    let mut cfg = f.config(Duration::from_secs(1), None);
+    cfg.heartbeat_interval = None;
+    cfg.batch_size = 10;
+    cfg.logical_messages = true;
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+
+    // 40 transactions of 3 rows each (BEGIN, MESSAGE, COMMIT): twelve times the peek cap.
+    for _ in 0..40 {
+        f.db.batch_execute("SELECT pg_logical_emit_message(true, 'another-tool', 'x')")
+            .await
+            .unwrap();
+    }
+    f.insert_published("after").await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let ev = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the published row never arrived: the peek is stuck behind transactions without events"
+        );
+        if let Some(ev) = drive(&mut s, Duration::from_millis(500)).await {
+            break ev;
+        }
+    };
+    assert_eq!(ev.op, Op::Insert);
+    assert!(
+        f.confirmed().await < lsn(&ev),
+        "the slot must not pass the unacked row"
+    );
+    f.cleanup(s).await;
+}

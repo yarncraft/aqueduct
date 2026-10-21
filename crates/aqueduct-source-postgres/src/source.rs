@@ -925,6 +925,17 @@ impl PostgresSource {
             .ok_or_else(|| Error::Source("source not started".into()))
     }
 
+    /// Advance the slot past transactions that produced no event, or only events that are already
+    /// checkpointed: empty ones (Postgres < 15 sends them for unpublished tables), ones holding only
+    /// another tool's logical messages or our watermarks, and replays after a restart. Nothing
+    /// else would release them before the next ack or heartbeat, and until then a capped peek
+    /// re-reads the same rows from the slot's position; with heartbeats off it never moves again.
+    /// This is heartbeat step 1 ([`heartbeat_targets`]), so an unacknowledged event still holds
+    /// the slot.
+    async fn advance_settled(&mut self) -> Result<()> {
+        self.advance_acked(self.checkpointed).await
+    }
+
     /// Advance the slot past every fully acknowledged transaction (all changes <= `key`).
     async fn advance_acked(&mut self, key: Key) -> Result<()> {
         if let Some(target) = ack_target(&mut self.tx_ends, key) {
@@ -1134,6 +1145,7 @@ impl PostgresSource {
             let fetched = self.transport()?.fetch().await?;
             self.learn_keys(&fetched.messages).await?;
             self.apply(fetched.messages)?;
+            self.advance_settled().await?;
             self.report_stream_positions(fetched.caught_up, fetched.server_wal_end);
             if self.heartbeat_begin().await?.is_some() {
                 match fetched.caught_up {
@@ -1150,6 +1162,7 @@ impl PostgresSource {
         let fetched = self.transport()?.fetch().await?;
         self.learn_keys(&fetched.messages).await?;
         self.apply(fetched.messages)?;
+        self.advance_settled().await?;
         if fetched.drained && self.buffer.is_empty() {
             self.report_delivered(flushed);
         }
