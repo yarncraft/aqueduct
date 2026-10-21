@@ -601,27 +601,163 @@ async fn key_columns_let_a_table_without_primary_key_be_copied() {
     .unwrap();
 }
 
-/// Sends one admin request to the source and waits for its answer while driving it.
+/// How long any single wait of the on-demand tests may take before the test fails (#152).
+const WAIT: Duration = Duration::from_secs(60);
+
+/// How long the on-demand tests wait for an event that must come, e.g. the next chunk. Generous:
+/// it only runs out when the source is stuck, and a busy server can be slow.
+const PROGRESS: Duration = Duration::from_secs(30);
+
+/// Awaits `fut`, failing the test with `what` if it takes longer than [`WAIT`].
+async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(WAIT, fut)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {WAIT:?} waiting for {what}"))
+}
+
+/// A source driven in its own task the way the pipeline drives it: `next`, hand the event on,
+/// ack its checkpoint, and never drop a `next()` part-way. `next()` is not cancel-safe: dropped
+/// by a `timeout` while it answers an admin request it loses the request and its reply (#152:
+/// the old helper then waited for that reply forever), and dropped inside `start_chunk` it
+/// leaves a chunk without its high watermark. The pipeline only drops it on shutdown.
+struct Driven {
+    events: tokio::sync::mpsc::UnboundedReceiver<Result<ChangeEvent, String>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Driven {
+    async fn start(mut s: PostgresSource) -> Self {
+        within("the source to start", s.start(None)).await.unwrap();
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let ev = match s.next().await {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => {
+                        let _ = tx.send(Err("the source ended".into()));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                let checkpoint = ev.checkpoint.clone();
+                if tx.send(Ok(ev)).is_err() {
+                    return;
+                }
+                if let Some(c) = checkpoint {
+                    if let Err(e) = s.ack(c).await {
+                        let _ = tx.send(Err(e.to_string()));
+                        return;
+                    }
+                }
+            }
+        });
+        Self { events, task }
+    }
+
+    fn take(out: &mut Vec<ChangeEvent>, r: Result<ChangeEvent, String>) {
+        let ev = r.unwrap_or_else(|e| panic!("the source failed: {e}"));
+        if ev.op != Op::Heartbeat {
+            out.push(ev);
+        }
+    }
+
+    /// Takes events until `done` says so or nothing arrives for `idle`.
+    async fn collect(
+        &mut self,
+        idle: Duration,
+        mut done: impl FnMut(&[ChangeEvent]) -> bool,
+    ) -> Vec<ChangeEvent> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + WAIT;
+        while !done(&out) {
+            assert!(
+                Instant::now() < deadline,
+                "still collecting after {WAIT:?}: {} events",
+                out.len()
+            );
+            match tokio::time::timeout(idle, self.events.recv()).await {
+                Ok(Some(r)) => Self::take(&mut out, r),
+                Ok(None) => panic!("the source task ended"),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// The events already handed on, without waiting.
+    fn drain(&mut self) -> Vec<ChangeEvent> {
+        let mut out = Vec::new();
+        while let Ok(r) = self.events.try_recv() {
+            Self::take(&mut out, r);
+        }
+        out
+    }
+
+    /// Stops the source and waits until it is dropped, so its slot is free.
+    async fn stop(self) {
+        self.task.abort();
+        let _ = within("the source task to stop", self.task).await;
+    }
+}
+
+/// Sends one admin request to the driven source and waits for its answer.
 async fn request(
-    s: &mut PostgresSource,
     tx: &aqueduct_core::SnapshotSender,
     command: aqueduct_core::SnapshotCommand,
 ) -> Result<String, String> {
-    let (reply, mut answer) = tokio::sync::oneshot::channel();
-    tx.send(aqueduct_core::SnapshotRequest { command, reply })
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    within(
+        "room in the snapshot channel",
+        tx.send(aqueduct_core::SnapshotRequest { command, reply }),
+    )
+    .await
+    .expect("the source dropped the snapshot channel");
+    within("the answer to a snapshot request", answer)
         .await
-        .unwrap();
-    // The source answers between batches: keep taking (and acking) events until it does.
+        .expect("the source dropped a snapshot request without answering it")
+}
+
+/// Starts a snapshot of `table`. Right after a cancel the source refuses while the cancelled
+/// snapshot's last chunk is in flight, so this asks again until it is accepted.
+async fn request_start(tx: &aqueduct_core::SnapshotSender, table: &str) -> String {
+    use aqueduct_core::SnapshotCommand;
+    let deadline = Instant::now() + WAIT;
     loop {
-        if let Ok(a) = answer.try_recv() {
-            return a;
-        }
-        if let Ok(Ok(Some(ev))) = tokio::time::timeout(Duration::from_millis(200), s.next()).await {
-            if let Some(c) = ev.checkpoint.clone() {
-                s.ack(c).await.unwrap();
+        match request(tx, SnapshotCommand::Start(vec![format!("public.{table}")])).await {
+            Ok(id) => return id,
+            Err(e) if e.contains("finishing its last chunk") && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
             }
+            Err(e) => panic!("start refused: {e}"),
         }
     }
+}
+
+/// Inserts a row and checks that its event's checkpoint carries no snapshot, i.e. that the
+/// cancelled snapshot ended.
+async fn assert_snapshot_ended(d: &mut Driven, db: &Client, table: &str, id: i32) {
+    within(
+        "the insert",
+        db.execute(&format!("INSERT INTO {table} VALUES ({id})"), &[]),
+    )
+    .await
+    .unwrap();
+    let tail = d
+        .collect(PROGRESS, |e| e.iter().any(|e| e.op == Op::Insert))
+        .await;
+    let Some(insert) = tail.iter().find(|e| e.op == Op::Insert) else {
+        panic!("the insert of {id} never arrived")
+    };
+    let Some(Position::Text(t)) = &insert.checkpoint else {
+        panic!("text checkpoint")
+    };
+    assert!(
+        !t.contains("snap"),
+        "the cancelled snapshot left the checkpoint: {t}"
+    );
 }
 
 /// `on_demand`: nothing is copied until requested; a request names published tables; a cancel
@@ -630,92 +766,151 @@ async fn request(
 #[ignore = "needs a Postgres server, see the module docs"]
 async fn on_demand_requests_start_and_cancel() {
     use aqueduct_core::SnapshotCommand;
-    let db = connect().await;
+    let db = within("a connection", connect()).await;
     let table = unique("snap_req");
     let publication = unique("snap_req_pub");
     let slot = unique("snap_req");
-    db.batch_execute(&format!(
-        "CREATE TABLE {table} (id int PRIMARY KEY);
-         INSERT INTO {table} SELECT generate_series(1, 5000);
-         CREATE PUBLICATION {publication} FOR TABLE {table};"
-    ))
+    within(
+        "the setup",
+        db.batch_execute(&format!(
+            "CREATE TABLE {table} (id int PRIMARY KEY);
+             INSERT INTO {table} SELECT generate_series(1, 5000);
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
+        )),
+    )
     .await
     .unwrap();
     let (tx, rx) = aqueduct_core::snapshot_channel();
-    let mut s = source(&slot, &publication, SnapshotMode::OnDemand, 50).with_snapshot_control(rx);
-    s.start(None).await.unwrap();
+    let mut d = Driven::start(
+        source(&slot, &publication, SnapshotMode::OnDemand, 50).with_snapshot_control(rx),
+    )
+    .await;
     assert!(
-        collect(&mut s, Duration::from_secs(1), |_| false)
+        d.collect(Duration::from_secs(1), |_| false)
             .await
             .is_empty(),
         "on_demand copies nothing by itself"
     );
 
-    let err = request(
-        &mut s,
-        &tx,
-        SnapshotCommand::Start(vec!["public.nope".into()]),
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains("not in publication"), "{err}");
-    let err = request(&mut s, &tx, SnapshotCommand::Cancel)
+    let err = request(&tx, SnapshotCommand::Start(vec!["public.nope".into()]))
         .await
         .unwrap_err();
+    assert!(err.contains("not in publication"), "{err}");
+    let err = request(&tx, SnapshotCommand::Cancel).await.unwrap_err();
     assert!(err.contains("no snapshot is running"), "{err}");
 
-    let id = request(
-        &mut s,
-        &tx,
-        SnapshotCommand::Start(vec![format!("public.{table}")]),
-    )
-    .await
-    .unwrap();
+    let id = request_start(&tx, &table).await;
     assert!(id.starts_with('s'), "{id}");
-    let some = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 200).await;
+    let some = d.collect(PROGRESS, |e| e.len() >= 200).await;
     assert!(some.iter().all(|e| e.op == Op::Read));
-    assert_eq!(
-        request(&mut s, &tx, SnapshotCommand::Cancel).await,
-        Ok(id.clone())
-    );
-    // At most the chunk in flight still arrives, then nothing more is copied.
-    let rest = collect(&mut s, Duration::from_secs(2), |_| false).await;
+    assert_eq!(request(&tx, SnapshotCommand::Cancel).await, Ok(id.clone()));
+    // Everything handed on before the answer came before the cancel. After it, at most the
+    // chunk in flight still arrives, then nothing more is copied.
+    d.drain();
+    let rest = d.collect(Duration::from_secs(2), |_| false).await;
     assert!(rest.len() <= 50, "{} rows after the cancel", rest.len());
     // Once it ended, a new request starts a new snapshot.
-    let again = request(
-        &mut s,
-        &tx,
-        SnapshotCommand::Start(vec![format!("public.{table}")]),
+    let again = request_start(&tx, &table).await;
+    assert_ne!(again, id);
+    let more = d.collect(PROGRESS, |e| e.len() >= 100).await;
+    assert!(more.iter().any(|e| e.op == Op::Read));
+    assert_eq!(request(&tx, SnapshotCommand::Cancel).await, Ok(again));
+    d.collect(Duration::from_secs(2), |_| false).await;
+    assert_snapshot_ended(&mut d, &db, &table, 9999).await;
+    d.stop().await;
+    within("the slot drop", drop_slot(&db, &slot)).await;
+    within(
+        "the cleanup",
+        db.batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP TABLE {table};"
+        )),
     )
     .await
     .unwrap();
-    assert_ne!(again, id);
-    let more = collect(&mut s, Duration::from_secs(5), |e| e.len() >= 100).await;
-    assert!(more.iter().any(|e| e.op == Op::Read));
-    assert_eq!(
-        request(&mut s, &tx, SnapshotCommand::Cancel).await,
-        Ok(again)
-    );
-    collect(&mut s, Duration::from_secs(2), |_| false).await;
-    db.execute(&format!("INSERT INTO {table} VALUES (9999)"), &[])
-        .await
-        .unwrap();
-    let tail = collect(&mut s, Duration::from_secs(5), |e| {
-        e.iter().any(|e| e.op == Op::Insert)
-    })
+}
+
+/// #152: a cancel ends the snapshot wherever it lands: together with the start (before the
+/// first chunk), right after the start, while a window is open or between chunks. Each round
+/// checks that at most the chunk in flight follows the cancel, that the checkpoint returns to
+/// the plain form, and that the next start is accepted.
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn a_cancel_at_any_step_ends_the_snapshot() {
+    use aqueduct_core::SnapshotCommand;
+    let db = within("a connection", connect()).await;
+    let table = unique("snap_cancel");
+    let publication = unique("snap_cancel_pub");
+    let slot = unique("snap_cancel");
+    within(
+        "the setup",
+        db.batch_execute(&format!(
+            "CREATE TABLE {table} (id int PRIMARY KEY);
+             INSERT INTO {table} SELECT generate_series(1, 5000);
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
+        )),
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = aqueduct_core::snapshot_channel();
+    let mut d = Driven::start(
+        source(&slot, &publication, SnapshotMode::OnDemand, 50).with_snapshot_control(rx),
+    )
     .await;
-    let Some(Position::Text(t)) = &tail.last().unwrap().checkpoint else {
-        panic!("text checkpoint")
-    };
-    assert!(
-        !t.contains("snap"),
-        "the cancelled snapshot left the checkpoint: {t}"
-    );
-    drop(s);
-    drop_slot(&db, &slot).await;
-    db.batch_execute(&format!(
-        "DROP PUBLICATION {publication}; DROP TABLE {table};"
-    ))
+    // `None`: start and cancel are taken in the same round of requests. Otherwise the cancel
+    // goes out once this many rows arrived: 0 lands while the first chunk is being read, the
+    // others at varying points of later windows and between chunks.
+    let rounds = [
+        None,
+        Some(0),
+        Some(1),
+        Some(49),
+        Some(50),
+        Some(75),
+        Some(160),
+    ];
+    let mut ids = Vec::new();
+    for (i, wait_for) in rounds.into_iter().enumerate() {
+        let id = match wait_for {
+            None => {
+                let (started, cancelled) = tokio::join!(
+                    request(&tx, SnapshotCommand::Start(vec![format!("public.{table}")])),
+                    request(&tx, SnapshotCommand::Cancel)
+                );
+                let id = started.unwrap();
+                assert_eq!(cancelled, Ok(id.clone()), "round {i}");
+                id
+            }
+            Some(n) => {
+                let id = request_start(&tx, &table).await;
+                let got = d.collect(PROGRESS, |e| e.len() >= n).await;
+                assert!(got.len() >= n, "round {i}: only {} rows", got.len());
+                assert_eq!(
+                    request(&tx, SnapshotCommand::Cancel).await,
+                    Ok(id.clone()),
+                    "round {i}"
+                );
+                id
+            }
+        };
+        assert!(!ids.contains(&id), "round {i}: snapshot id {id} reused");
+        ids.push(id);
+        d.drain();
+        let rest = d.collect(Duration::from_secs(2), |_| false).await;
+        assert!(
+            rest.len() <= 50,
+            "round {i}: {} rows after the cancel",
+            rest.len()
+        );
+        assert_snapshot_ended(&mut d, &db, &table, 10_000 + i as i32).await;
+    }
+    d.stop().await;
+    within("the slot drop", drop_slot(&db, &slot)).await;
+    within(
+        "the cleanup",
+        db.batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP TABLE {table};"
+        )),
+    )
     .await
     .unwrap();
 }
