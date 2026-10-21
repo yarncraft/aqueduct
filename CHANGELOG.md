@@ -204,6 +204,12 @@ Notable changes to Aqueduct. Newest first.
   not yet checkpointed. Optional `heartbeat_action_query` for servers that need a write to move the slot. No action needed
   on upgrade; see DEPLOYMENT.md for the heartbeat-table recipe.
 
+### Security
+
+- **TLS: refuse distrusted intermediate certificates** (RUSTSEC-2026-0382, RUSTSEC-2026-0381). `rustls-webpki` 0.103.16 and
+  `webpki-roots` 1.0.10 replace 0.103.15 and 1.0.9, which could accept distrusted (emSign) intermediates when verifying
+  Postgres, Kafka and Entra certificates. No configuration change.
+
 ### Changed
 
 - **Snapshots: the cockpit no longer shows primary-key values of the snapshot cursor.** While a snapshot ran, the
