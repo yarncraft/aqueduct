@@ -1023,7 +1023,7 @@ function drawEdges() {
     const on = !hl || hl.has(e.id);
     const width = e.w > 0 ? 1.5 + 4.5 * Math.sqrt(e.w / max) : 1;
     const color = e.dlq ? EDGE_RED : hl && on ? EDGE_HL : EDGE_BASE;
-    out += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width.toFixed(1)}" stroke-opacity="${on ? (e.dlq ? 0.7 : 1) : 0.15}"${e.dlq ? ' stroke-dasharray="5 4"' : ''}/>`;
+    out += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width.toFixed(1)}" stroke-opacity="${on ? (e.dlq ? 0.7 : 1) : 0.15}"/>`;
     // Recent traffic: a dotted line that flows (static when the viewer prefers reduced motion).
     if ((flowUntil[e.id] || 0) > now) out += `<path d="${d}" fill="none" stroke="${e.dlq ? EDGE_RED : EDGE_FLOW}" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 10" stroke-opacity="${on ? 0.9 : 0.15}" class="motion-safe:animate-flow"/>`;
   }
