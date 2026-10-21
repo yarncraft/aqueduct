@@ -688,6 +688,7 @@ Per-route counters: every event a route claims counts as `matched`, then as exac
 | `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
 | `aqueduct_route_tombstones_skipped_total{route}` | Counter. Deletes a `tombstones = true` route produced without a tombstone because the row has no key. Not an outcome: the delete itself counts as `produced` |
+| `aqueduct_topic_records_total{topic}` | Counter. Records Kafka acknowledged per topic, counted after each produce succeeds (a failed produce counts when its batch is retried). Tombstones (null-value records) count like any other record. The first 500 topics are counted by name, any further ones under `topic="(other)"` (logged once) |
 
 `route` is the route's `name`, else its `match`; `default` is reserved and cannot be used as a name. Events no route
 claims are counted under `default` when `sink.topic` is set; without `sink.topic` such an event is an error that stops
@@ -696,9 +697,14 @@ or two unnamed routes with the same `match` (the second could never match) fail 
 
 ## 4. Admin cockpit
 
+Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows whether Aqueduct is behind its source
+(backlog, rates and time to catch up), throughput, totals, lag, sink latency, errors, a per-operation breakdown, the
+routing graph, per-table high-water marks and an event inspector.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, a per-operation breakdown, the routing graph, per-table high-water marks and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/routes/history` (per-route and per-topic rates over the last 120 s), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -706,6 +712,72 @@ with TLS and authentication, or set `inspector = false`.
 The inspector adds no work to the pipeline: nothing is buffered in memory. Each refresh (every 3 s while a tab is open,
 shared across tabs for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
 routes to, using its own connection (created on first use). A closed tab costs nothing.
+
+### Behind source
+
+The **Behind source** card, below the top tiles, answers "is Aqueduct behind its source, and when does it catch up?".
+It compares two positions the source reports:
+
+| | Postgres | MongoDB |
+|---|---|---|
+| Head | The server's WAL head: `pg_current_wal_lsn()` (`pg_last_wal_replay_lsn()` on a standby), read once a second with the slot stats by a task of its own on the SQL connection; with `transport = "stream"` also the WAL end of each keepalive, whichever is newer | The newest majority-committed write, `lastWrite.majorityOpTime` from `hello`, run once a second by a task of its own (falls back to `lastWrite.opTime`, then the reply's `operationTime`) |
+| Delivered | The change LSN of the newest acked event, the commit end the slot was advanced to (also by idle heartbeats), and the WAL flush position (`pg_current_wal_flush_lsn()`, read with the slot stats) as of before a peek that drained the slot, or the WAL end of a keepalive that ended a stream fetch, once everything was handed on | The cluster time of the newest acked event's resume token, and of the postBatchResumeToken of an empty change-stream batch once everything was handed on |
+
+The head is read independently of the pipeline loop, so it keeps moving while the sink holds the pipeline up (a Kafka
+outage, up to the 60 s sink timeout). On Postgres the stats query shares the SQL connection, so it waits behind a peek
+in flight.
+
+Once a second the admin server takes a sample of both; the card is derived from the last 60 samples (one minute):
+
+- **Status.** `caught up` (green) when the backlog is within the threshold: **1 MiB of WAL** for Postgres, **2 s of
+  cluster time** for MongoDB. It is never exactly 0: heartbeat writes, `pg_current_wal_lsn()` running ahead of the
+  delivered commit end, and the batch in flight leave a little, and MongoDB times have one-second resolution with an
+  idle replica set moving its clock only with the 10 s no-op writer. `catching up` (blue) when the delivered position
+  moves faster than the head over the window; `falling behind` (amber) when it does not; `stalled` (red) when there is
+  a backlog over the threshold and nothing was delivered for **30 s** of it while the pipeline is streaming (quiet
+  time before the backlog appeared does not count). `unknown` (grey) until the source has reported both positions
+  (Postgres: the head within a second of start, delivered at the first ack or drained poll; MongoDB: the head within a
+  second of start, delivered at the first ack or empty change-stream batch), while the head was last read more than
+  **3 s** ago (the card then says how long), and while a backlog has less than 2 s of samples to tell its direction.
+- **Backlog.** Postgres: WAL bytes between head and delivered, and the time behind: while there is a backlog, now
+  minus the later of the newest delivered change's commit time and the moment the backlog crossed the threshold (when
+  that happened inside the window), so a burst after a quiet hour reads seconds, not an hour; 0 when caught up.
+  MongoDB: the head's cluster time minus the newest delivered one. A sparkline shows the backlog over the minute (at
+  most 60 values).
+- **Source vs delivered.** How fast the head and the delivered position move over the window: WAL bytes per second,
+  or for MongoDB seconds of cluster time per second (about 1.0 for the source; above 1.0 delivered means catching
+  up). Rates need 2 s of samples.
+- **Time to catch up.** Backlog divided by (delivered rate minus source rate), only while the backlog shrinks; 0 when
+  caught up.
+- **Snapshot row**, while a snapshot runs: rows per second over the minute, rows left (the planner estimate of all its
+  tables minus the rows this process copied, so after a restart it overstates), the ETA (*estimate exceeded* when
+  rows left reaches 0 while the snapshot still runs), and a *throttled by
+  snapshot_max_rows_per_sec* chip when the rate is at 90 % or more of that limit. The live stream's status sits next
+  to it, so a snapshot that makes the stream fall behind shows.
+
+The **End-to-end lag** tile reads `idle` when the status is caught up and nothing was delivered for 10 s, instead of
+counting the idle time up. The Kafka HWM in the Tables card is sink-side (what reached Kafka); it does not say whether
+Aqueduct is behind the source.
+
+`/api/metrics` and `/api/stream` carry the card as `source_lag`, plus `source_head_lsn` (Postgres, `X/Y`) and
+`source_head_time_ms` (MongoDB):
+
+```json
+"source_lag": {"state": "catching_up", "backlog_bytes": 10485760, "behind_secs": 30.0,
+  "ingest_rate": 1048576.0, "process_rate": 3145728.0, "rate_unit": "bytes/s", "eta_secs": 5.0,
+  "window_secs": 60.0, "head_age_secs": 0.4, "threshold": {"backlog_bytes": 1048576, "behind_secs": null, "stalled_after_secs": 30},
+  "history": [10485760, ...],
+  "snapshot": {"rows_per_sec": 480.0, "rows_left": 95200, "rows_left_scope": "all_tables", "eta_secs": 198.3,
+               "throttled": true, "max_rows_per_sec": 500}}
+```
+
+`state` is `unknown`, `caught_up`, `catching_up`, `falling_behind` or `stalled`. `head_age_secs` is how long ago the
+head was read; past 3 s the state is `unknown` and the numbers are `null`. `backlog_bytes` is `null` for
+MongoDB; the rates are `null` for the first 2 s; `eta_secs` is `null` unless the backlog shrinks; `snapshot` is
+`null` unless one runs. Prometheus has `aqueduct_source_backlog_bytes`, `aqueduct_source_behind_seconds`,
+`aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and `aqueduct_snapshot_eta_seconds`, each
+left out while unknown. Like the rest of `/api/*` and `/metrics` they need the admin token; none of them carry row
+data. Samples, rates and the window start over when the process restarts.
 
 `/api/events` returns each record's `topic`, `partition`, `offset`, `timestamp_ms`, `key`, `headers` (as text) and
 `event`: the value parsed as JSON, or its text when it is not JSON, and `null` for a tombstone. A value that is not a
@@ -770,14 +842,40 @@ The **Routing** card shows where each table's events go:
   had after enough rows (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then
   filters everything.
 - **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
-  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count.
+  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count. A
+  template that reads the event (`{op}`, `{row.x}`) lists the topics the sink has produced to since start, and its
+  `topic_fallback`.
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
 motion. The line to the dead-letter topic is dashed and appears for routes with a `where` or with errors. Hover a
-table to highlight its path. Click a topic to open it in the event inspector (only when the inspector is on). The
-plan is read once from `GET /api/routes` when the page loads; counts update every second from the stream. Without
-any `[[sink.routes]]` the graph is all tables → `default` → their topics.
+table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
+second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
+
+**Rates.** Each route and topic shows a step line of its rate over the last 120 s, one sample per second, on one
+shared time axis (nothing animates):
+
+- a route: events produced per second, with filtered (grey), fallback (violet) and errors (red) as thin lines;
+- a topic: records Kafka acknowledged per second, counted by the sink after the broker acknowledged the produce, so
+  a failed produce never counts and a retried batch counts when it succeeds;
+- a "+N more" group: the sum over its tables (events per second) or topics.
+
+Click a route for its details and a larger chart split by outcome. Click a topic for a panel with a larger chart, its
+current, average and maximum rate over the window, the routes that write to it (by template, as their
+`topic_fallback`, or as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
+
+The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
+the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
+order, the topics with records in that second). It needs the admin token like every `/api/*` route. Memory is bounded:
+routes are fixed at startup, and the sink counts at most 500 topics by name and the rest as `(other)`. Topic names can
+contain row values under content routing; they are shown only behind the token, as in the graph. Rates start from
+zero when the process restarts.
+
+```json
+{"seq": 431, "interval_ms": 1000, "len": 120,
+ "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0]}],
+ "topics": {"orders-paid": [3, 0, 5], "aqueduct.dead-letter": [0, 0, 0]}}
+```
 
 ### Routing plan
 
@@ -896,7 +994,7 @@ by default, one per interval); route or ignore that topic downstream. Monitor th
 
 | Field on `/api/metrics` and `/api/stream` | Meaning |
 |-------|---------|
-| `slot_lag_bytes` | WAL between the server head and the slot's `confirmed_flush_lsn`, read every 5 s. `null` when unknown (no slot yet, query failed, or a MongoDB source). |
+| `slot_lag_bytes` | WAL between the server head and the slot's `confirmed_flush_lsn`, read every second. `null` when unknown (no slot yet, query failed, or a MongoDB source). |
 | `confirmed_flush_lsn` | The slot's confirmed position as text, `null` when unknown. |
 | `heartbeat.interval_ms` | The heartbeat interval, `null` when `heartbeat_interval_secs = 0`. |
 | `heartbeat.last_ms` | Unix ms of the last completed heartbeat, `null` before the first. |

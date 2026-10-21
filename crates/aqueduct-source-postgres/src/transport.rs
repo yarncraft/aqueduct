@@ -25,6 +25,9 @@ pub struct Fetched {
     /// Stream transport: the fetch ended on a keepalive with nothing after it, so every
     /// transaction that committed before this WAL position was received.
     pub caught_up: Option<u64>,
+    /// Stream transport: the WAL end of the newest keepalive so far, a position the server has
+    /// reached (a lower bound of its WAL head).
+    pub server_wal_end: Option<u64>,
 }
 
 #[async_trait]
@@ -98,6 +101,7 @@ impl Transport for PeekTransport {
             messages,
             drained,
             caught_up: None,
+            server_wal_end: None,
         })
     }
 
@@ -126,6 +130,8 @@ pub struct StreamTransport {
     /// committed before it has been received. The server sends one when it is idle and our
     /// confirmed position is behind; the heartbeat's own fetch is often empty.
     caught_up: Option<u64>,
+    /// The highest keepalive WAL end seen.
+    server_wal_end: Option<u64>,
 }
 
 impl StreamTransport {
@@ -135,6 +141,7 @@ impl StreamTransport {
             batch,
             wait,
             caught_up: None,
+            server_wal_end: None,
         }
     }
 }
@@ -154,12 +161,16 @@ impl Transport for StreamTransport {
                     messages,
                     drained: false,
                     caught_up: self.caught_up,
+                    server_wal_end: self.server_wal_end,
                 })
             }
         };
         loop {
             match next {
-                Replication::Keepalive { wal_end, .. } => self.caught_up = Some(wal_end),
+                Replication::Keepalive { wal_end, .. } => {
+                    self.caught_up = Some(wal_end);
+                    self.server_wal_end = self.server_wal_end.max(Some(wal_end));
+                }
                 Replication::XLogData {
                     wal_start, data, ..
                 } => {
@@ -186,6 +197,7 @@ impl Transport for StreamTransport {
             messages,
             drained: false,
             caught_up: self.caught_up,
+            server_wal_end: self.server_wal_end,
         })
     }
 
@@ -193,5 +205,65 @@ impl Transport for StreamTransport {
         // Reported with the next status update; the task never reports more than this.
         self.handle.ack(lsn);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication::{streaming, StreamOptions};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn keepalive(wal_end: u64) -> Vec<u8> {
+        let mut k = vec![b'k'];
+        k.extend(wal_end.to_be_bytes());
+        k.extend(0i64.to_be_bytes());
+        k.push(0);
+        let mut m = vec![b'd'];
+        m.extend(((k.len() + 4) as i32).to_be_bytes());
+        m.extend(k);
+        m
+    }
+
+    /// Keepalives report the server's WAL end, which the source takes as its head (#150); it
+    /// only moves forward, and an empty fetch keeps the last one.
+    #[tokio::test]
+    async fn keepalives_report_the_server_wal_end() {
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        let (stream, status) = streaming(Box::new(client));
+        let handle = ReplicationHandle::spawn(
+            stream,
+            status,
+            StreamOptions {
+                buffer_bytes: 1 << 20,
+                status_interval: Duration::from_secs(3600),
+            },
+        );
+        let mut t = StreamTransport::new(handle, 100, Duration::from_millis(200));
+        let mut bytes = keepalive(0x500);
+        bytes.extend(keepalive(0x900));
+        server.write_all(&bytes).await.unwrap();
+        let mut seen = None;
+        for _ in 0..20 {
+            seen = t.fetch().await.unwrap().server_wal_end;
+            if seen == Some(0x900) {
+                break;
+            }
+        }
+        assert_eq!(seen, Some(0x900));
+        // An older WAL end (another walsender's view) never moves it back.
+        server.write_all(&keepalive(0x700)).await.unwrap();
+        let mut f = t.fetch().await.unwrap();
+        for _ in 0..20 {
+            if f.caught_up == Some(0x700) {
+                break;
+            }
+            f = t.fetch().await.unwrap();
+        }
+        assert_eq!(f.caught_up, Some(0x700));
+        assert_eq!(f.server_wal_end, Some(0x900));
+        // Nothing new: the last head is still reported.
+        assert_eq!(t.fetch().await.unwrap().server_wal_end, Some(0x900));
     }
 }

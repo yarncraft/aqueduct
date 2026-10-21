@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -471,17 +472,69 @@ pub struct PostgresSource {
     last_heartbeat: Instant,
     /// Where heartbeats and slot lag are reported, if the host wants them.
     metrics: Option<Arc<Metrics>>,
-    /// When the slot lag was last read.
-    last_slot_stats: Option<Instant>,
+    /// Reads the slot stats and the WAL head once a second, independently of the pipeline loop,
+    /// so the cockpit sees the head move while the sink holds the pipeline up (#150).
+    stats_task: Option<tokio::task::JoinHandle<()>>,
+    /// The server's WAL flush position as of the newest stats read, `0` before the first.
+    flushed: Arc<AtomicU64>,
     /// The connected cluster and database, stamped on every checkpoint. `None` before `start`.
     origin: Option<Origin>,
 }
 
+/// The slot's `confirmed_flush_lsn`, its lag behind the WAL head, the WAL head (write position)
+/// and the WAL flush position, which is what a peek can decode up to. On a standby both are the
+/// replay position. The head row comes back even without the slot.
+const SLOT_STATS_SQL: &str = "SELECT s.confirmed_flush_lsn::text, \
+     pg_wal_lsn_diff(h.lsn, s.confirmed_flush_lsn)::int8, h.lsn::text, h.flushed::text \
+     FROM (SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+     ELSE pg_current_wal_lsn() END AS lsn, \
+     CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+     ELSE pg_current_wal_flush_lsn() END AS flushed) h \
+     LEFT JOIN pg_replication_slots s ON s.slot_name = $1";
+
 /// How long the stream transport waits for a slot another connection still holds.
 const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
 
-/// How often the slot lag is read from `pg_replication_slots`.
-const SLOT_STATS_EVERY: Duration = Duration::from_secs(5);
+/// How often the slot lag and the WAL head are read (one cheap query on the SQL connection).
+/// Once a second, so the cockpit's backlog does not trail a fast catch-up by seconds.
+const SLOT_STATS_EVERY: Duration = Duration::from_secs(1);
+
+/// One read of [`SLOT_STATS_SQL`] into `metrics`, and the flush position into `flushed`.
+/// Telemetry only: a failure clears the slot values and never stops the stream. The query is a
+/// single statement, and nothing on the SQL connection runs inside an explicit transaction, so it
+/// can share the connection with the source (it waits behind a peek in flight).
+async fn read_slot_stats(client: &Client, slot: &str, metrics: &Metrics, flushed: &AtomicU64) {
+    match client.query_one(SLOT_STATS_SQL, &[&slot]).await {
+        Ok(row) => {
+            let flush: Option<String> = row.get(0);
+            let lag: Option<i64> = row.get(1);
+            let lsn = |i: usize| {
+                row.get::<_, Option<String>>(i)
+                    .as_deref()
+                    .and_then(|t| parse_lsn(t).ok())
+            };
+            metrics.set_slot(lag.map(|n| n.max(0) as u64), flush);
+            if let Some(h) = lsn(2) {
+                metrics.report_source_head_lsn(h);
+            }
+            if let Some(f) = lsn(3) {
+                flushed.fetch_max(f, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "slot lag query failed");
+            metrics.set_slot(None, None);
+        }
+    }
+}
+
+impl Drop for PostgresSource {
+    fn drop(&mut self) {
+        if let Some(t) = self.stats_task.take() {
+            t.abort();
+        }
+    }
+}
 
 impl PostgresSource {
     pub fn new(cfg: PostgresSourceConfig) -> Self {
@@ -503,7 +556,8 @@ impl PostgresSource {
             checkpointed: Key::default(),
             last_heartbeat: Instant::now(),
             metrics: None,
-            last_slot_stats: None,
+            stats_task: None,
+            flushed: Arc::new(AtomicU64::new(0)),
             origin: None,
         }
     }
@@ -776,41 +830,31 @@ impl PostgresSource {
         }
     }
 
-    /// Reads the slot's `confirmed_flush_lsn` and its distance from the WAL head, at most once
-    /// per [`SLOT_STATS_EVERY`]. Telemetry only: a failure clears the values and never stops
-    /// the stream.
-    async fn refresh_slot_stats(&mut self) {
-        let Some(metrics) = self.metrics.clone() else {
-            return;
-        };
-        if self
-            .last_slot_stats
-            .is_some_and(|t| t.elapsed() < SLOT_STATS_EVERY)
-        {
-            return;
+    /// Starts (or restarts) the task that reads the slot stats and the WAL head every
+    /// [`SLOT_STATS_EVERY`], when metrics are wanted.
+    fn spawn_stats(&mut self) {
+        if let Some(t) = self.stats_task.take() {
+            t.abort();
         }
-        self.last_slot_stats = Some(Instant::now());
-        let row = match self.client() {
-            Ok(c) => {
-                c.query_opt(
-                    "SELECT confirmed_flush_lsn::text,                      pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()                      ELSE pg_current_wal_lsn() END, confirmed_flush_lsn)::int8                      FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&self.cfg.slot],
-                )
-                .await
-            }
-            Err(_) => return,
+        let (Some(metrics), Some(client)) = (self.metrics.clone(), self.client.clone()) else {
+            return;
         };
-        match row {
-            Ok(Some(row)) => {
-                let flush: Option<String> = row.get(0);
-                let lag: Option<i64> = row.get(1);
-                metrics.set_slot(lag.map(|n| n.max(0) as u64), flush);
+        let slot = self.cfg.slot.clone();
+        let flushed = self.flushed.clone();
+        self.stats_task = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SLOT_STATS_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                read_slot_stats(&client, &slot, &metrics, &flushed).await;
             }
-            Ok(None) => metrics.set_slot(None, None),
-            Err(e) => {
-                tracing::debug!(error = %e, "slot lag query failed");
-                metrics.set_slot(None, None);
-            }
+        }));
+    }
+
+    /// Everything up to `lsn` was delivered, or holds nothing to deliver (#150).
+    fn report_delivered(&self, lsn: u64) {
+        if let (Some(m), true) = (&self.metrics, lsn > 0) {
+            m.report_source_delivered_lsn(lsn);
         }
     }
 
@@ -895,6 +939,7 @@ impl PostgresSource {
         }
         self.transport()?.confirm(lsn).await?;
         self.acked = lsn;
+        self.report_delivered(lsn);
         Ok(())
     }
 
@@ -1084,10 +1129,10 @@ impl PostgresSource {
             // last keepalive's position W, not the server's WAL position: W proves receipt of
             // everything committed below it, while the WAL position on a busy cluster (or after
             // the heartbeat action query) is always past W, and the slot would never move.
-            self.refresh_slot_stats().await;
             let fetched = self.transport()?.fetch().await?;
             self.learn_keys(&fetched.messages).await?;
             self.apply(fetched.messages)?;
+            self.report_stream_positions(fetched.caught_up, fetched.server_wal_end);
             if self.heartbeat_begin().await?.is_some() {
                 match fetched.caught_up {
                     Some(w) => self.heartbeat_end(w, true).await?,
@@ -1097,10 +1142,15 @@ impl PostgresSource {
             return Ok(());
         }
         let heartbeat_wal = self.heartbeat_begin().await?;
-        self.refresh_slot_stats().await;
+        // A flush position read before this peek: a peek decodes up to the flush position as of
+        // its start, so when it drains the slot with nothing new, everything below was handed on.
+        let flushed = self.flushed.load(Ordering::Relaxed);
         let fetched = self.transport()?.fetch().await?;
         self.learn_keys(&fetched.messages).await?;
         self.apply(fetched.messages)?;
+        if fetched.drained && self.buffer.is_empty() {
+            self.report_delivered(flushed);
+        }
         if let Some(wal) = heartbeat_wal {
             // A peek drained the slot; a stream is drained up to the WAL position its last
             // keepalive reported, when nothing followed it.
@@ -1108,6 +1158,18 @@ impl PostgresSource {
             self.heartbeat_end(wal, drained).await?;
         }
         Ok(())
+    }
+
+    /// Stream transport: the newest keepalive's WAL end is a position the server has reached, and
+    /// a fetch that ended on a keepalive with everything handed on has nothing left below it.
+    fn report_stream_positions(&self, caught_up: Option<u64>, server_wal_end: Option<u64>) {
+        let Some(m) = &self.metrics else { return };
+        if let Some(w) = server_wal_end {
+            m.report_source_head_lsn(w);
+        }
+        if let (Some(w), true) = (caught_up, self.buffer.is_empty()) {
+            self.report_delivered(w);
+        }
     }
 
     /// Reads the primary keys of the published tables from the catalog.
@@ -1515,6 +1577,8 @@ impl Source for PostgresSource {
                 check_slot_database(&slot, slot_db.as_deref(), &current)?;
                 let flushed: Option<String> = row.get(0);
                 self.acked = flushed.as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
+                // The slot's confirmed position: everything before it was delivered earlier.
+                self.report_delivered(self.acked);
             }
             None => {
                 if let Some(lsn) = &start {
@@ -1596,6 +1660,7 @@ impl Source for PostgresSource {
             }),
             TransportKind::Stream => Box::new(self.open_stream().await?),
         });
+        self.spawn_stats();
         Ok(())
     }
 
@@ -1647,6 +1712,8 @@ impl Source for PostgresSource {
                     .and_then(|c| parse_checkpoint(&c.pos))
                     .ok_or_else(|| Error::Source(format!("cannot ack position {t:?}")))?;
                 self.checkpointed = self.checkpointed.max(k);
+                // Delivered up to this change; the slot itself moves only at commit ends.
+                self.report_delivered(k.change);
                 self.advance_acked(k).await
             }
             Position::Lsn(l) => Err(Error::Source(format!(

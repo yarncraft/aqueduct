@@ -2,6 +2,7 @@
 mod admin;
 mod checkpoint;
 mod config;
+mod rates;
 mod sink;
 
 use std::sync::Arc;
@@ -60,6 +61,14 @@ async fn main() {
         }
     };
     let metrics = Arc::new(aqueduct_core::Metrics::new());
+    // The cockpit flags a snapshot whose pace this limit sets.
+    metrics.set_snapshot_rate_limit(
+        match &source_cfg {
+            config::SourceConfig::Postgres(p) => p.snapshot_max_rows_per_sec,
+            config::SourceConfig::Mongodb(m) => m.snapshot_max_rows_per_sec,
+        }
+        .filter(|n| *n > 0),
+    );
     // Named in every record's `source` block and key.
     let source_info = match &source_cfg {
         config::SourceConfig::Postgres(p) => aqueduct_sinks::SourceInfo::Postgres {
@@ -81,6 +90,8 @@ async fn main() {
     // The sink's plan: it names each table's topic, and its counters are shared (an `Arc`)
     // with the sink, so the admin server reads what the sink counts.
     admin.set_router(sink.plan().clone());
+    // Records acknowledged per topic, counted by the sink after each produce.
+    admin.set_topic_stats(sink.topic_stats());
     tokio::spawn(admin.clone().sample_forever());
     tokio::spawn(admin::serve(listener, admin.clone()));
 

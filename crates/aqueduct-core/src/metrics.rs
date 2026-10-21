@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::lag::{self, Kind, Sample, SourceLag};
 use crate::{ChangeEvent, Checkpoint, Op, Position};
 
 /// Per-table op counters: `[insert, update, delete, truncate, read]`.
@@ -88,6 +89,18 @@ pub struct Metrics {
     hb_skip_reason: Mutex<Option<String>>,
     /// The running or last snapshot, as the source reports it.
     snapshot: Mutex<Option<SnapshotStatus>>,
+    /// `snapshot_max_rows_per_sec`, `0` when unthrottled.
+    snapshot_limit: AtomicU64,
+    /// Source positions for "behind source" (#150), `0` until reported. Postgres reports LSNs,
+    /// MongoDB cluster times in Unix ms. Each only moves forward.
+    head_lsn: AtomicU64,
+    delivered_lsn: AtomicU64,
+    head_time_ms: AtomicU64,
+    delivered_time_ms: AtomicU64,
+    /// When the head was last reported, ms since `started` plus one; `0` before the first.
+    head_read_ms: AtomicU64,
+    /// One reading of the positions per second, see [`Metrics::sample_source_lag`].
+    lag_ring: Mutex<VecDeque<Sample>>,
 }
 
 impl Default for Metrics {
@@ -131,6 +144,12 @@ pub struct Snapshot {
     pub heartbeat: Option<HeartbeatSnapshot>,
     /// The running or last snapshot (ADR 0001); `None` before the first.
     pub snapshot: Option<SnapshotStatus>,
+    /// Postgres: the server's WAL head as `X/Y`, as last read; `None` for other sources.
+    pub source_head_lsn: Option<String>,
+    /// MongoDB: the newest cluster time the server reported, Unix ms; `None` for other sources.
+    pub source_head_time_ms: Option<u64>,
+    /// Whether Aqueduct is behind its source (#150).
+    pub source_lag: SourceLag,
 }
 
 /// The newest change delivered for one table.
@@ -231,7 +250,86 @@ impl Metrics {
             hb_skipped: AtomicU64::new(0),
             hb_skip_reason: Mutex::new(None),
             snapshot: Mutex::new(None),
+            snapshot_limit: AtomicU64::new(0),
+            head_lsn: AtomicU64::new(0),
+            delivered_lsn: AtomicU64::new(0),
+            head_time_ms: AtomicU64::new(0),
+            delivered_time_ms: AtomicU64::new(0),
+            head_read_ms: AtomicU64::new(0),
+            lag_ring: Mutex::new(VecDeque::with_capacity(lag::LAG_WINDOW)),
         }
+    }
+
+    /// The configured `snapshot_max_rows_per_sec`, so the cockpit can tell when it sets the pace.
+    pub fn set_snapshot_rate_limit(&self, rows_per_sec: Option<u32>) {
+        self.snapshot_limit
+            .store(rows_per_sec.map_or(0, u64::from), Relaxed);
+    }
+
+    /// Postgres: the server's WAL head (or a lower bound of it, such as a keepalive's WAL end).
+    /// Only a newer value is kept.
+    pub fn report_source_head_lsn(&self, lsn: u64) {
+        self.head_lsn.fetch_max(lsn, Relaxed);
+        self.head_read();
+    }
+
+    /// The head was just read (even if it did not move): it is current.
+    fn head_read(&self) {
+        let ms = self.started.elapsed().as_millis() as u64;
+        self.head_read_ms.fetch_max(ms + 1, Relaxed);
+    }
+
+    /// Postgres: an LSN up to which everything has been delivered (or found to hold nothing to
+    /// deliver). Only a newer value is kept.
+    pub fn report_source_delivered_lsn(&self, lsn: u64) {
+        self.delivered_lsn.fetch_max(lsn, Relaxed);
+    }
+
+    /// MongoDB: the newest cluster time the server reported, Unix ms.
+    pub fn report_source_head_time_ms(&self, ms: u64) {
+        self.head_time_ms.fetch_max(ms, Relaxed);
+        self.head_read();
+    }
+
+    /// MongoDB: the cluster time, Unix ms, up to which everything has been delivered.
+    pub fn report_source_delivered_time_ms(&self, ms: u64) {
+        self.delivered_time_ms.fetch_max(ms, Relaxed);
+    }
+
+    /// The positions as of now; LSNs win over times (a source reports one kind).
+    fn lag_sample(&self) -> Sample {
+        let pair = |head: &AtomicU64, delivered: &AtomicU64| {
+            let (h, d) = (head.load(Relaxed), delivered.load(Relaxed));
+            (h > 0 && d > 0).then_some((h.max(d), d))
+        };
+        let (kind, (head, delivered)) = match (
+            pair(&self.head_lsn, &self.delivered_lsn),
+            pair(&self.head_time_ms, &self.delivered_time_ms),
+        ) {
+            (Some(p), _) => (Some(Kind::Lsn), p),
+            (None, Some(p)) => (Some(Kind::Time), p),
+            (None, None) => (None, (0, 0)),
+        };
+        Sample {
+            t_ms: self.started.elapsed().as_millis() as u64,
+            kind,
+            head,
+            delivered,
+            head_read_ms: Some(self.head_read_ms.load(Relaxed))
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms - 1),
+            snapshot: lock(&self.snapshot)
+                .as_ref()
+                .filter(|s| s.state == "running")
+                .map(|s| (s.id.clone(), s.rows)),
+        }
+    }
+
+    /// Records one reading of the source positions; call once a second. Keeps
+    /// [`lag::LAG_WINDOW`] readings.
+    pub fn sample_source_lag(&self) {
+        let s = self.lag_sample();
+        lag::push(&mut lock(&self.lag_ring), s);
     }
 
     /// Record the replication slot's lag; `None` clears it.
@@ -342,6 +440,8 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        // First: it takes the snapshot lock, which the struct literal below holds to its end.
+        let source_lag = self.source_lag();
         let events = self.events.load(Relaxed);
 
         let ts = self.last_commit_ts_micros.load(Relaxed);
@@ -401,7 +501,30 @@ impl Metrics {
                 }
             }),
             snapshot: lock(&self.snapshot).clone(),
+            source_head_lsn: (self.head_lsn.load(Relaxed) > 0)
+                .then(|| Position::Lsn(self.head_lsn.load(Relaxed)).to_string()),
+            source_head_time_ms: Some(self.head_time_ms.load(Relaxed)).filter(|ms| *ms > 0),
+            source_lag,
         }
+    }
+
+    /// Derives [`SourceLag`] from the sampled window plus the current reading.
+    fn source_lag(&self) -> SourceLag {
+        let mut samples: Vec<Sample> = lock(&self.lag_ring).iter().cloned().collect();
+        samples.push(self.lag_sample());
+        let snapshot = lock(&self.snapshot).clone();
+        let ts = self.last_commit_ts_micros.load(Relaxed);
+        let limit = self.snapshot_limit.load(Relaxed);
+        lag::derive(
+            &samples,
+            &lag::Context {
+                running: State::from_u8(self.state.load(Relaxed)) == State::Streaming,
+                last_commit_ms: (ts > 0).then(|| ts.div_euclid(1000)),
+                now_ms: now_ms(),
+                snapshot: snapshot.as_ref(),
+                max_rows_per_sec: (limit > 0).then_some(limit),
+            },
+        )
     }
 }
 
