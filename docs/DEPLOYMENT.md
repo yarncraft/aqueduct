@@ -955,8 +955,10 @@ picks its topic per row (content routing) animates its lines to the topics it wr
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
-**Operation shares.** Each card has a thin stacked bar of its counts per operation since start, as shares (insert
-green, update blue, delete red, truncate violet, read amber); hover it for the counts and percentages:
+**Operation shares and rate.** Each card has a thin stacked bar of its counts per operation since start, as shares
+(insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and percentages), and
+under it a step line of its rate over the last 120 s (a route: produced, with filtered, fallback and errors as thin
+lines). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
 - a route: events it produced to its topic (`counts.ops`); filtered, fallback and dead-lettered events are not in it;

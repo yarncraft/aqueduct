@@ -589,7 +589,7 @@ const EDGE_BASE = '#404854', EDGE_HL = '#4c90f0', EDGE_FLOW = '#abb3bf', EDGE_RE
 // Outcome counters of a route, in the order of the stream's `rates.routes` rows.
 const ROUTE_COUNTS = ['produced', 'filtered', 'fallback', 'errors'];
 // Detail-chart line colours: a route's produced line; the dead-letter topic in red.
-const RATE_LINE = { produced: '#32a467', errors: '#e76a6e' };
+const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
 const TOPIC_LINE = '#32a467', TABLE_LINE = '#4c90f0';
 
 // ---- Rates per route and per topic ----
@@ -666,6 +666,22 @@ const rateStats = h => {
 };
 // A card's op shares: one thin stacked bar (OPBAR colours), filled by fillOpBar on every frame. The wrapper's padding
 // is the hover area of its tooltip.
+// A card's step line over the last 120 s (right-aligned, so a short window starts mid-way).
+// lines: [[series, colour, width]], scaled together.
+const SPARK_N = 120;
+function spark(lines) {
+  const W = 120, H = 20, max = Math.max(1, ...lines.flatMap(l => l[0]));
+  const y = v => H - 1 - (H - 2) * v / max;
+  return lines.map(([h, c, w]) => {
+    if (h.length < 2) return '';
+    const off = SPARK_N - h.length, x = i => W * (i + off) / (SPARK_N - 1);
+    return `<polyline points="${stepPts(h, x, y)}" fill="none" stroke="${c}" stroke-width="${w}" vector-effect="non-scaling-stroke"/>`;
+  }).join('');
+}
+const sparkSvg = (id, cls) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}" aria-hidden="true"></svg>`;
+const NODE_SPARK = 'mt-1 block h-4 w-full';
+// A table's events per second, all ops.
+const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
 const opBar = id => `<div data-opbar="${esc(id)}" class="mt-1 py-0.5"><div class="flex h-1 overflow-hidden rounded-sm bg-ink-700"></div></div>`;
 function fillOpBar(el, row, what) {
   const total = row ? row.reduce((a, n) => a + n, 0) : 0;
@@ -855,8 +871,8 @@ function dlqFor(x, name) {
 }
 
 // Table, topic and "+N more" cards: name and count on one line, the op-share bar below.
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${opBar(t.id)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${opBar(id)}</button>`;
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${opBar(t.id)}${sparkSvg(t.id, NODE_SPARK)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${opBar(id)}${sparkSvg(id, NODE_SPARK)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -945,6 +961,7 @@ function routeNode(x, last) {
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></span>`
     + `<span class="ml-auto flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(k => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</span></div>`
     + opBar(x.id)
+    + `<div class="mt-1" title="Per second, last 120 s: produced (green), filtered (grey), fallback (violet), errors (red)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -954,7 +971,7 @@ function topicNodeHtml(id, name, opts) {
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
   const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
   const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opBar(id)}</div>`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opBar(id)}${sparkSvg(id, NODE_SPARK)}</div>`;
 }
 
 function graphHtml(m) {
@@ -1149,6 +1166,26 @@ function routeDetail(m) {
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
 // routes: produced, topics: acknowledged); and the panel's per-op totals. Without per-op history (an older server)
 // a route or topic line counts every op.
+// Every card's step line from the current rate window.
+function drawCardSparks(m) {
+  const lines = {};
+  for (const x of m.routes) {
+    const rr = routeRate(x.i);
+    // Thin outcome lines under the produced line; an outcome that never happened in the window is left out.
+    if (rr) lines[x.id] = ROUTE_COUNTS.slice(1).filter(k => (rr[k] || []).some(n => n)).map(k => [rr[k], RATE_LINE[k], 1]).concat([[rr.produced || [], RATE_LINE.produced, 1.5]]);
+    for (const t of x.shown) lines[t.id] = [[tableEventsRate(t.name), TABLE_LINE, 1.5]];
+    if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableEventsRate(t.name))), TABLE_LINE, 1.5]];
+  }
+  for (const g of m.groups) {
+    for (const t of g.shown) lines['p:' + t] = [[topicRate(t), TOPIC_LINE, 1.5]];
+    if (g.hidden.length) lines[g.moreId] = [[sumSeries(g.hidden.map(topicRate)), TOPIC_LINE, 1.5]];
+  }
+  for (const t of m.unrouted) lines[t.id] = [[tableEventsRate(t.name), RATE_LINE.errors, 1.5]];
+  for (const d of m.dlqShown) lines[d.id] = [[dlqRate(d.name), RATE_LINE.errors, 1.5]];
+  if (m.dlqHidden.length) lines['pm:dlq'] = [[sumSeries(m.dlqHidden.map(d => dlqRate(d.name))), RATE_LINE.errors, 1.5]];
+  for (const el of document.querySelectorAll('#routing [data-spark]')) { const l = lines[el.dataset.spark]; el.innerHTML = l ? spark(l) : ''; }
+}
+
 function drawDetail(m) {
   const dc = $('detailchart');
   if (!dc) return;
@@ -1206,6 +1243,7 @@ function renderGraph(frame) {
     const id = el.dataset.opbar;
     fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
+  drawCardSparks(m);
   const named = m.routes.filter(x => x.r.match != null).length;
   const topics = m.groups.reduce((a, g) => a + g.topics.size, 0);
   $('routesum').textContent = `${named} ${named === 1 ? 'route' : 'routes'}${m.routes.length > named ? ' + default' : ''} · ${m.routes.reduce((a, x) => a + x.tables.length, 0) + m.unrouted.length} tables · ${topics} ${topics === 1 ? 'topic' : 'topics'}`;
