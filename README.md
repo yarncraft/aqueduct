@@ -370,7 +370,9 @@ delivered rates, the time to catch up, and while a snapshot runs its rows/s, row
 In the routing graph every route and topic carries a small step line of its rate over the last 120 s (a route's
 produced rate, with filtered, fallback and errors as thin lines; a topic's records acknowledged by Kafka), and each
 "+N more" group one for the group as a whole. Click a route or a topic for a larger chart with the current, average and
-maximum rate; a topic's panel also lists the routes that write to it and opens it in the event inspector.
+maximum rate; a topic's panel also lists the routes that write to it and opens it in the event inspector. The inspector is a pop-up
+window over the cockpit that only opens this way (it reads nothing from Kafka while closed); Close, Esc or a click
+outside it closes it.
 
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
@@ -393,7 +395,7 @@ details and full `where`, click a topic to open it in the event inspector. A rou
 shows the busiest and a "+N more" node that expands. Without `[[sink.routes]]` the graph is simply tables →
 `default` → topics.
 
-A second row shows replication health: slot lag in bytes and the confirmed flush LSN, the age of the last heartbeat against its interval (amber past 2x, red past 5x), and how many heartbeats were skipped and why. These come from `slot_lag_bytes`, `confirmed_flush_lsn` and `heartbeat` in the `/api/metrics` and `/api/stream` snapshots. A field the server does not send shows `–`, and `off` means heartbeats are disabled. The age is measured against the browser clock, so a large clock skew between the browser and the container shifts it.
+Slot lag, the confirmed flush LSN and heartbeat state are not shown in the cockpit (the Behind source card answers whether Aqueduct keeps up); they stay in `/api/metrics` and `/api/stream` (`slot_lag_bytes`, `confirmed_flush_lsn`, `heartbeat`) and in Prometheus.
 
 ## Operations
 
