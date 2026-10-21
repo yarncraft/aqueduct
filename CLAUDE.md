@@ -102,7 +102,7 @@ The server is a hand-written tokio HTTP loop (no framework); add routes in `admi
 
 ## Conventions
 
-- Keep README.md and `docs/` current: the short pages (`CONFIGURATION.md`, `COCKPIT.md`, `DEPLOYMENT.md`) stay scannable cheat sheets and the full semantics live in `docs/deep-dive/` in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Update the `docs/ARCHITECTURE.md` diagrams when you add or remove a crate, source, route or pipeline step. User-visible changes get a changelog fragment, `changelog/unreleased/<section>/<issue>-<slug>.md` (see `changelog/README.md`). Breaking changes always need one in `breaking/`, with the upgrade step. Never edit the Unreleased notes in `CHANGELOG.md` directly.
+- Keep README.md and `docs/` current: the short pages (`CONFIGURATION.md`, `COCKPIT.md`, `DEPLOYMENT.md`) stay scannable cheat sheets and the full semantics live in `docs/deep-dive/`. Update both in the same change as any user-visible behaviour: config keys, routes, sinks, ops notes. Update the `docs/ARCHITECTURE.md` diagrams when you add or remove a crate, source, route or pipeline step. User-visible changes get a changelog fragment, `changelog/unreleased/<section>/<issue>-<slug>.md` (see `changelog/README.md`). Breaking changes always need one in `breaking/`, with the upgrade step. Never edit the Unreleased notes in `CHANGELOG.md` directly.
 - Kafka is the only sink by design; do not add others. The inspector reads from Kafka, never from an in-process buffer.
 - Match the surrounding style; no unrelated refactors. Commit messages end with the repo's `Co-Authored-By` line when an agent authored them.
 - Source files may have mixed CRLF/LF line endings (Windows checkout). Normalise before scripted edits.
