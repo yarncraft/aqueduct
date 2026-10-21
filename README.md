@@ -69,15 +69,16 @@ Each record is a Debezium-style change event, keyed by table and primary key:
 ```
 
 `op` is `c`, `u`, `d`, `t` or `r` (snapshot read). Delivery is at-least-once, so consumers should tolerate duplicates.
-Details, keys and value encoding: [Kafka sink](docs/CONFIGURATION.md#kafka-sink).
+Details, keys and value encoding: [Kafka sink](docs/deep-dive/configuration.md#kafka-sink).
 
 ## Documentation
 
 | | |
 |---|---|
-| [Deployment](docs/DEPLOYMENT.md) | Postgres setup, Docker/Kubernetes, operations, snapshots, Azure identity, troubleshooting |
-| [Configuration](docs/CONFIGURATION.md) | Every key: Postgres, MongoDB, Kafka sink, routing, filtering, dead letters, masking, outbox |
+| [Deployment](docs/DEPLOYMENT.md) | Postgres setup, Docker/Kubernetes, operations, troubleshooting |
+| [Configuration](docs/CONFIGURATION.md) | Cheat sheet of every section, including routes |
 | [Cockpit](docs/COCKPIT.md) | The web UI, admin API, `/metrics`, health endpoints |
+| [Deep dives](docs/deep-dive/) | Full reference: [configuration](docs/deep-dive/configuration.md), [routing](docs/deep-dive/routing.md), [snapshots](docs/deep-dive/snapshots.md), [Postgres operations](docs/deep-dive/postgres-operations.md), [Azure identity](docs/deep-dive/azure.md), [cockpit](docs/deep-dive/cockpit.md) |
 | [Architecture](docs/ARCHITECTURE.md) | Components, delivery guarantees, crates |
 | [Runbook](docs/RUNBOOK.md) | Failure handling and recovery |
 | [Changelog](CHANGELOG.md) | Read the breaking changes in [`changelog/unreleased/breaking/`](changelog/unreleased/breaking/) before upgrading |
@@ -85,7 +86,7 @@ Details, keys and value encoding: [Kafka sink](docs/CONFIGURATION.md#kafka-sink)
 ## Limitations
 
 - One instance per slot
-- Rows that exist before the slot are copied only by a [snapshot](docs/DEPLOYMENT.md#snapshots) (off by default)
+- Rows that exist before the slot are copied only by a [snapshot](docs/deep-dive/snapshots.md#snapshots) (off by default)
 - DDL is not streamed
 - Kafka is the only sink
 
