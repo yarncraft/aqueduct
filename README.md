@@ -298,9 +298,10 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
 
 The **Behind source** card compares the source's head (Postgres WAL head, from the slot stats query and stream
-keepalives; MongoDB's newest majority-committed cluster time, from `hello` every 5 s) with the position Aqueduct
+keepalives; MongoDB's newest majority-committed cluster time, from `hello` every second; both read independently of the
+pipeline loop) with the position Aqueduct
 delivered. It shows a status (`caught up` within 1 MiB of WAL or 2 s of cluster time, `catching up`, `falling behind`,
-or `stalled` after 30 s without progress), the backlog in bytes and time with a one-minute sparkline, the source and
+`stalled` after 30 s over the threshold without progress, or `unknown` while the head is more than 3 s old), the backlog in bytes and time with a one-minute sparkline, the source and
 delivered rates, the time to catch up, and while a snapshot runs its rows/s, rows left, ETA and whether
 `snapshot_max_rows_per_sec` sets the pace. The End-to-end lag tile reads `idle` while caught up with nothing new.
 `/api/metrics` and `/api/stream` carry it as `source_lag`; Prometheus as `aqueduct_source_backlog_bytes`,

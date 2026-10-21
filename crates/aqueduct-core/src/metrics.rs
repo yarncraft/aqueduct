@@ -97,6 +97,8 @@ pub struct Metrics {
     delivered_lsn: AtomicU64,
     head_time_ms: AtomicU64,
     delivered_time_ms: AtomicU64,
+    /// When the head was last reported, ms since `started` plus one; `0` before the first.
+    head_read_ms: AtomicU64,
     /// One reading of the positions per second, see [`Metrics::sample_source_lag`].
     lag_ring: Mutex<VecDeque<Sample>>,
 }
@@ -253,6 +255,7 @@ impl Metrics {
             delivered_lsn: AtomicU64::new(0),
             head_time_ms: AtomicU64::new(0),
             delivered_time_ms: AtomicU64::new(0),
+            head_read_ms: AtomicU64::new(0),
             lag_ring: Mutex::new(VecDeque::with_capacity(lag::LAG_WINDOW)),
         }
     }
@@ -267,6 +270,13 @@ impl Metrics {
     /// Only a newer value is kept.
     pub fn report_source_head_lsn(&self, lsn: u64) {
         self.head_lsn.fetch_max(lsn, Relaxed);
+        self.head_read();
+    }
+
+    /// The head was just read (even if it did not move): it is current.
+    fn head_read(&self) {
+        let ms = self.started.elapsed().as_millis() as u64;
+        self.head_read_ms.fetch_max(ms + 1, Relaxed);
     }
 
     /// Postgres: an LSN up to which everything has been delivered (or found to hold nothing to
@@ -278,6 +288,7 @@ impl Metrics {
     /// MongoDB: the newest cluster time the server reported, Unix ms.
     pub fn report_source_head_time_ms(&self, ms: u64) {
         self.head_time_ms.fetch_max(ms, Relaxed);
+        self.head_read();
     }
 
     /// MongoDB: the cluster time, Unix ms, up to which everything has been delivered.
@@ -304,6 +315,9 @@ impl Metrics {
             kind,
             head,
             delivered,
+            head_read_ms: Some(self.head_read_ms.load(Relaxed))
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms - 1),
             snapshot: lock(&self.snapshot)
                 .as_ref()
                 .filter(|s| s.state == "running")

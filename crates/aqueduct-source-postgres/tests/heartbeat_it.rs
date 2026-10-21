@@ -582,13 +582,27 @@ async fn reports_the_wal_head_and_the_backlog_until_caught_up() {
         .await
         .expect("the published rows must arrive");
     s.ack(first.checkpoint.clone().unwrap()).await.unwrap();
-    let snap = metrics.snapshot();
-    let head = parse_lsn(snap.source_head_lsn.as_deref().expect("head reported")).unwrap();
-    assert!(
-        head >= wal,
-        "head {head:x} below the WAL after the insert {wal:x}"
-    );
-    let lag = snap.source_lag;
+    // The stats task reads the head once a second, on its own.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = metrics.snapshot();
+        let head = snap
+            .source_head_lsn
+            .as_deref()
+            .map(|h| parse_lsn(h).unwrap());
+        if head.is_some_and(|h| h >= wal) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "head {head:x?} never reached {wal:x}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Rates need two seconds of samples; until then a backlog is `unknown`.
+    metrics.sample_source_lag();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let lag = metrics.snapshot().source_lag;
     assert!(
         lag.backlog_bytes.unwrap() > CAUGHT_UP_BYTES,
         "a 3 MiB backlog: {lag:?}"

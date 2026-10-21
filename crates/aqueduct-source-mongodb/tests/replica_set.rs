@@ -199,7 +199,15 @@ async fn reports_cluster_times_for_the_behind_source_card() {
     src.ack(ev.checkpoint.clone().unwrap_or_else(|| ev.position.clone()))
         .await
         .unwrap();
-    let snap = metrics.snapshot();
+    // `hello` runs once a second in its own task.
+    let mut snap = metrics.snapshot();
+    for _ in 0..50 {
+        if snap.source_head_time_ms.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        snap = metrics.snapshot();
+    }
     let head = snap
         .source_head_time_ms
         .expect("hello reports the cluster time");

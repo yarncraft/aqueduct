@@ -18,8 +18,8 @@ pub use control::{
 };
 pub use event::{ChangeEvent, Op, Position};
 pub use lag::{
-    LagState, LagThreshold, SnapshotRate, SourceLag, CAUGHT_UP_BYTES, CAUGHT_UP_MS, LAG_WINDOW,
-    STALLED_AFTER_SECS,
+    LagState, LagThreshold, SnapshotRate, SourceLag, CAUGHT_UP_BYTES, CAUGHT_UP_MS, HEAD_STALE_MS,
+    LAG_WINDOW, STALLED_AFTER_SECS,
 };
 pub use metrics::{
     HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State, TableMark, OP_SLOTS,

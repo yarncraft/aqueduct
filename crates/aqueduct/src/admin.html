@@ -419,7 +419,7 @@ const BS_STATE = {
   catching_up: { text: 'catching up', pill: 'border-blue/40 bg-blue/15 text-blue', dot: 'bg-blue', line: '#4c90f0', sub: 'delivery is faster than the source' },
   falling_behind: { text: 'falling behind', pill: 'border-amber/40 bg-amber/15 text-amber', dot: 'bg-amber', line: '#ec9a3c', sub: 'the backlog does not shrink' },
   stalled: { text: 'stalled', pill: 'border-red/40 bg-red/15 text-red', dot: 'bg-red', line: '#e76a6e', sub: 'nothing delivered for 30 s' },
-  unknown: { text: 'unknown', pill: 'border-ink-600 bg-ink-700 text-ink-200', dot: 'bg-ink-300', line: '#738091', sub: 'waiting for the source' },
+  unknown: { text: 'unknown', pill: 'border-ink-500 bg-ink-700 text-ink-200', dot: 'bg-ink-300', line: '#738091', sub: 'waiting for the source' },
 };
 const PILL = 'inline-flex items-center gap-2 rounded-sm border px-3 py-1 font-mono text-lg font-semibold uppercase tracking-wider ';
 const secs = v => v == null ? '–' : v < 1 ? (v > 0 ? '< 1s' : '0s') : dur(Math.round(v));
@@ -436,7 +436,9 @@ function renderBehind(d) {
   $('bsstate').className = PILL + st.pill;
   $('bsdot').className = 'h-2 w-2 rounded-full ' + st.dot;
   $('bsstatetext').textContent = st.text;
-  $('bsstatesub').textContent = l.state === 'unknown' ? st.sub
+  $('bsstatesub').textContent = l.state === 'unknown'
+    ? (l.head_age_secs != null && l.head_age_secs > 3 ? 'source head not read for ' + secs(l.head_age_secs)
+      : l.backlog_bytes != null || l.behind_secs != null ? 'a backlog; rates need 2 s of samples' : st.sub)
     : st.sub + (l.state !== 'caught_up' ? '' : pg ? ' (≤ ' + bytes(l.threshold.backlog_bytes) + ')' : ' (≤ ' + l.threshold.behind_secs + ' s)');
   $('bshead').textContent = d.source_head_lsn ? 'WAL head ' + d.source_head_lsn + ' · ' + Math.round(l.window_secs || 0) + ' s window'
     : d.source_head_time_ms ? 'cluster time ' + isoMs(d.source_head_time_ms) + ' · ' + Math.round(l.window_secs || 0) + ' s window' : 'no head reported yet';
@@ -468,7 +470,7 @@ function renderBehind(d) {
     $('bssnaprate').textContent = s.rows_per_sec == null ? '–' : fmt(Math.round(s.rows_per_sec));
     $('bssnapleft').textContent = s.rows_left == null ? '–' : fmt(s.rows_left);
     $('bssnapleft').title = s.rows_left == null ? 'no planner estimate for a table (run ANALYZE)' : 'planner estimate of all tables minus rows copied by this process';
-    $('bssnapeta').textContent = s.eta_secs == null ? '–' : secs(s.eta_secs);
+    $('bssnapeta').textContent = s.rows_left === 0 ? 'estimate exceeded' : s.eta_secs == null ? '–' : secs(s.eta_secs);
     $('bsthrottled').hidden = !s.throttled;
     $('bsthrottled').textContent = 'throttled by snapshot_max_rows_per_sec' + (s.max_rows_per_sec ? ' = ' + fmt(s.max_rows_per_sec) : '');
     $('bssnaplive').textContent = st.text;

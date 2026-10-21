@@ -29,8 +29,13 @@ pub const CAUGHT_UP_MS: u64 = 2_000;
 /// A backlog with no delivered progress for this long, while the pipeline runs, is `stalled`.
 pub const STALLED_AFTER_SECS: u64 = 30;
 
-/// Rates need at least this much history; until then they are `null`.
+/// Rates need at least this much history; until then they are `null` and a backlog is `unknown`.
 const MIN_RATE_MS: u64 = 2_000;
+
+/// A head read longer ago than this is too old to compare with: the state is `unknown`. Sources
+/// read it once a second independently of the pipeline loop, so only a source that cannot reach
+/// its server (or a Postgres peek that holds the connection) gets here.
+pub const HEAD_STALE_MS: u64 = 3_000;
 
 /// A snapshot is `throttled` while it reads at least this share of `snapshot_max_rows_per_sec`.
 const THROTTLED_SHARE: f64 = 0.9;
@@ -54,6 +59,8 @@ pub(crate) struct Sample {
     /// At least `delivered`: the server cannot be behind what was delivered from it.
     pub head: u64,
     pub delivered: u64,
+    /// When the head was last read, in the same clock as `t_ms`; `None` before the first read.
+    pub head_read_ms: Option<u64>,
     /// The running snapshot's id and rows copied so far.
     pub snapshot: Option<(String, u64)>,
 }
@@ -61,7 +68,8 @@ pub(crate) struct Sample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LagState {
-    /// The source has not reported its head or delivered position (yet).
+    /// The source has not reported its head or delivered position (yet), its head was last read
+    /// more than [`HEAD_STALE_MS`] ago, or a backlog has less than two seconds of samples.
     Unknown,
     /// The backlog is within the threshold.
     CaughtUp,
@@ -89,7 +97,8 @@ pub struct SnapshotRate {
     /// Rows copied per second over the window; `null` until two seconds of samples.
     pub rows_per_sec: Option<f64>,
     /// Planner estimate of all tables minus the rows copied by this process; `null` when a table
-    /// has no estimate. After a restart the rows copied before it are not subtracted.
+    /// has no estimate. After a restart the rows copied before it are not subtracted. 0 while the
+    /// snapshot still runs means the estimate was exceeded.
     pub rows_left: Option<u64>,
     /// `rows_left` covers every table of the snapshot.
     pub rows_left_scope: &'static str,
@@ -106,8 +115,10 @@ pub struct SourceLag {
     /// Postgres: WAL bytes between the server's head and the delivered position. `null` for
     /// MongoDB, whose positions are times.
     pub backlog_bytes: Option<u64>,
-    /// Postgres: while there is a backlog, now minus the commit time of the newest delivered
-    /// change; 0 when caught up. MongoDB: the server's cluster time minus the newest delivered.
+    /// Postgres: while there is a backlog, now minus the later of the newest delivered change's
+    /// commit time and the moment the backlog crossed the threshold (when that is inside the
+    /// window), so a burst after a quiet period does not count the quiet time; 0 when caught up.
+    /// MongoDB: the server's cluster time minus the newest delivered.
     pub behind_secs: Option<f64>,
     /// How fast the source's head moves over the window, in `rate_unit`.
     pub ingest_rate: Option<f64>,
@@ -120,8 +131,11 @@ pub struct SourceLag {
     pub eta_secs: Option<f64>,
     /// Seconds of samples the rates cover.
     pub window_secs: f64,
+    /// Seconds since the source's head was last read; `null` before the first read.
+    pub head_age_secs: Option<f64>,
     pub threshold: LagThreshold,
-    /// The backlog once a second over the window, oldest first: bytes (Postgres) or ms (MongoDB).
+    /// The backlog once a second over the window, oldest first, at most [`LAG_WINDOW`] values:
+    /// bytes (Postgres) or ms (MongoDB).
     pub history: Vec<u64>,
     /// The running snapshot; `null` when none runs.
     pub snapshot: Option<SnapshotRate>,
@@ -156,21 +170,28 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         behind_secs: (kind != Some(Kind::Lsn)).then_some(CAUGHT_UP_MS as f64 / 1000.0),
         stalled_after_secs: STALLED_AFTER_SECS,
     };
-    let (Some(cur), Some(kind)) = (cur, kind) else {
-        return SourceLag {
-            state: LagState::Unknown,
-            backlog_bytes: None,
-            behind_secs: None,
-            ingest_rate: None,
-            process_rate: None,
-            rate_unit: None,
-            eta_secs: None,
-            window_secs: 0.0,
-            threshold,
-            history: Vec::new(),
-            snapshot,
-        };
+    let head_age_ms = cur.and_then(|c| Some(c.t_ms.saturating_sub(c.head_read_ms?)));
+    let unknown = |snapshot| SourceLag {
+        state: LagState::Unknown,
+        backlog_bytes: None,
+        behind_secs: None,
+        ingest_rate: None,
+        process_rate: None,
+        rate_unit: None,
+        eta_secs: None,
+        window_secs: 0.0,
+        head_age_secs: head_age_ms.map(|a| a as f64 / 1000.0),
+        threshold: threshold.clone(),
+        history: Vec::new(),
+        snapshot,
     };
+    let (Some(cur), Some(kind)) = (cur, kind) else {
+        return unknown(snapshot);
+    };
+    // A head that was not read for a while says nothing about now: the server may have moved on.
+    if head_age_ms.is_none_or(|a| a > HEAD_STALE_MS) {
+        return unknown(snapshot);
+    }
     // Only samples of the current kind (a source never changes kind, but be safe).
     let win: Vec<&Sample> = samples.iter().filter(|s| s.kind == Some(kind)).collect();
     let backlog = |s: &Sample| s.head.saturating_sub(s.delivered);
@@ -189,14 +210,24 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         Kind::Lsn => CAUGHT_UP_BYTES,
         Kind::Time => CAUGHT_UP_MS,
     };
-    // How long the delivered position has not moved, within the window.
-    let still_since = win
+    // The current run of samples over the threshold: when it began, and whether it began inside
+    // the window (otherwise its start is not known).
+    let over: Vec<&&Sample> = win
+        .iter()
+        .rev()
+        .take_while(|s| backlog(s) > caught_up_at)
+        .collect();
+    let over_since = over.last().map_or(cur.t_ms, |s| s.t_ms);
+    let over_start_known = over.len() < win.len();
+    // How long nothing was delivered while over the threshold: quiet time before the backlog
+    // appeared does not count.
+    let unchanged_since = win
         .iter()
         .rev()
         .take_while(|s| s.delivered == cur.delivered)
         .last()
         .map_or(cur.t_ms, |s| s.t_ms);
-    let idle_ms = cur.t_ms.saturating_sub(still_since);
+    let idle_ms = cur.t_ms.saturating_sub(unchanged_since.max(over_since));
     let state = if b <= caught_up_at {
         LagState::CaughtUp
     } else if cx.running && idle_ms >= STALLED_AFTER_SECS * 1000 {
@@ -205,8 +236,7 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         match rates {
             Some((ingest, process)) if process > ingest => LagState::CatchingUp,
             Some(_) => LagState::FallingBehind,
-            None if cur.delivered > first.delivered => LagState::CatchingUp,
-            None => LagState::FallingBehind,
+            None => LagState::Unknown,
         }
     };
     let eta_secs = match (state, rates) {
@@ -216,15 +246,25 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
     };
     let behind_secs = match kind {
         Kind::Lsn if state == LagState::CaughtUp => Some(0.0),
-        Kind::Lsn => cx
-            .last_commit_ms
-            .map(|c| (cx.now_ms as i64 - c).max(0) as f64 / 1000.0),
+        Kind::Lsn => {
+            // Wall-clock time the backlog crossed the threshold, when that happened in the window.
+            let crossed = over_start_known.then(|| {
+                cx.now_ms
+                    .saturating_sub(cur.t_ms.saturating_sub(over_since)) as i64
+            });
+            let from = match (cx.last_commit_ms, crossed) {
+                (Some(c), Some(x)) => Some(c.max(x)),
+                (c, x) => c.or(x),
+            };
+            from.map(|f| (cx.now_ms as i64 - f).max(0) as f64 / 1000.0)
+        }
         Kind::Time => Some(b as f64 / 1000.0),
     };
     let (unit, scale) = match kind {
         Kind::Lsn => ("bytes/s", 1.0),
         Kind::Time => ("s/s", 1000.0),
     };
+    let skip = win.len().saturating_sub(LAG_WINDOW);
     SourceLag {
         state,
         backlog_bytes: (kind == Kind::Lsn).then_some(b),
@@ -234,8 +274,9 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         rate_unit: Some(unit),
         eta_secs,
         window_secs: dt_ms as f64 / 1000.0,
+        head_age_secs: head_age_ms.map(|a| a as f64 / 1000.0),
         threshold,
-        history: win.iter().map(|s| backlog(s)).collect(),
+        history: win.iter().skip(skip).map(|s| backlog(s)).collect(),
         snapshot,
     }
 }
@@ -257,9 +298,10 @@ fn snapshot_rate(samples: &[Sample], cx: &Context<'_>) -> Option<SnapshotRate> {
         _ => None,
     };
     let rows_left = st.rows_estimated.map(|e| e.saturating_sub(st.rows));
+    // At 0 rows left the estimate was too low (it is only an estimate) and the snapshot runs on:
+    // no ETA rather than a wrong 0.
     let eta_secs = match (rows_left, rows_per_sec) {
-        (Some(0), _) => Some(0.0),
-        (Some(left), Some(r)) if r > 0.0 => Some(left as f64 / r),
+        (Some(left), Some(r)) if left > 0 && r > 0.0 => Some(left as f64 / r),
         _ => None,
     };
     let throttled = match (cx.max_rows_per_sec, rows_per_sec) {
@@ -307,6 +349,7 @@ mod tests {
                     kind: Some(kind),
                     head: head(i).max(d),
                     delivered: d,
+                    head_read_ms: Some(i * 1000),
                     snapshot: None,
                 }
             })
@@ -322,6 +365,7 @@ mod tests {
             kind: None,
             head: 0,
             delivered: 0,
+            head_read_ms: None,
             snapshot: None,
         };
         let lag = derive(&[s], &cx());
@@ -401,7 +445,7 @@ mod tests {
         let s = series(2, Kind::Lsn, |_| 50 * MIB, |i| i * MIB);
         let lag = derive(&s, &cx());
         assert_eq!((lag.ingest_rate, lag.process_rate), (None, None));
-        assert_eq!(lag.state, LagState::CatchingUp);
+        assert_eq!(lag.state, LagState::Unknown);
         assert_eq!(lag.eta_secs, None);
     }
 
@@ -441,13 +485,18 @@ mod tests {
                     kind: Some(Kind::Lsn),
                     head: i,
                     delivered: i,
+                    head_read_ms: Some(i * 1000),
                     snapshot: None,
                 },
             );
         }
         assert_eq!(ring.len(), LAG_WINDOW);
         assert_eq!(ring.front().unwrap().t_ms, (LAG_WINDOW as u64 * 2) * 1000);
-        let samples: Vec<Sample> = ring.into_iter().collect();
+        // The ring plus the current reading: the sparkline still has one window.
+        let mut samples: Vec<Sample> = ring.into_iter().collect();
+        let mut now = samples.last().unwrap().clone();
+        now.t_ms += 500;
+        samples.push(now);
         assert_eq!(derive(&samples, &cx()).history.len(), LAG_WINDOW);
     }
 
@@ -471,6 +520,7 @@ mod tests {
                 kind: Some(Kind::Lsn),
                 head: 0,
                 delivered: 0,
+                head_read_ms: Some(i * 1000),
                 snapshot: Some(("s1".into(), rows(i))),
             })
             .collect()
@@ -498,6 +548,14 @@ mod tests {
         };
         let r = derive(&s, &c).snapshot.unwrap();
         assert_eq!((r.rows_left, r.eta_secs), (None, None));
+        // Past the estimate the snapshot runs on: no ETA rather than 0.
+        let st = running(25_000, Some(20_000));
+        let c = Context {
+            snapshot: Some(&st),
+            ..cx()
+        };
+        let r = derive(&s, &c).snapshot.unwrap();
+        assert_eq!((r.rows_left, r.eta_secs), (Some(0), None));
         // Samples of another snapshot do not count.
         let mut other = s.clone();
         for x in &mut other {
@@ -539,5 +597,55 @@ mod tests {
         };
         assert_eq!(derive(&s, &c).snapshot, None);
         assert_eq!(derive(&s, &cx()).snapshot, None);
+    }
+
+    /// The pipeline (and its polls) can stop while WAL piles up; a head that is no longer read
+    /// must not keep the card at caught up.
+    #[test]
+    fn a_head_not_read_for_a_while_is_unknown_not_caught_up() {
+        let mut s = series(30, Kind::Lsn, |_| 5 * MIB, |_| 5 * MIB);
+        assert_eq!(derive(&s, &cx()).state, LagState::CaughtUp);
+        // Head and delivered frozen since second 10: the last read is 19 s old.
+        for x in &mut s[10..] {
+            x.head_read_ms = Some(10_000);
+        }
+        let lag = derive(&s, &cx());
+        assert_eq!(lag.state, LagState::Unknown);
+        assert_eq!(lag.backlog_bytes, None);
+        assert_eq!(lag.head_age_secs, Some(19.0));
+        // Never read at all.
+        for x in &mut s {
+            x.head_read_ms = None;
+        }
+        assert_eq!(derive(&s, &cx()).state, LagState::Unknown);
+    }
+
+    /// A long quiet period (nothing delivered because nothing happened), then a burst: the
+    /// quiet time is not "no progress".
+    #[test]
+    fn a_burst_after_a_quiet_minute_is_not_stalled() {
+        let s = series(
+            62,
+            Kind::Lsn,
+            |i| if i < 60 { 10 * MIB } else { 12 * MIB },
+            |_| 10 * MIB,
+        );
+        let lag = derive(&s, &cx());
+        assert_ne!(lag.state, LagState::Stalled, "{lag:?}");
+        assert_eq!(lag.backlog_bytes, Some(2 * MIB));
+        // The last commit was an hour ago, but the backlog is 2 s old: that is the time behind.
+        let quiet = Context {
+            last_commit_ms: Some(1_030_000 - 3_600_000),
+            ..cx()
+        };
+        assert_eq!(derive(&s, &quiet).behind_secs, Some(1.0));
+        // 30 s over the threshold without progress still is.
+        let s = series(
+            95,
+            Kind::Lsn,
+            |i| if i < 60 { 10 * MIB } else { 12 * MIB },
+            |_| 10 * MIB,
+        );
+        assert_eq!(derive(&s, &cx()).state, LagState::Stalled);
     }
 }

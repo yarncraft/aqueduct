@@ -1842,10 +1842,9 @@ Authorization: Bearer {token}
         let lag = &v["source_lag"];
         assert_eq!(lag["backlog_bytes"], 8 * 1024 * 1024);
         assert_eq!(lag["rate_unit"], "bytes/s");
-        assert!(
-            ["catching_up", "falling_behind"].contains(&lag["state"].as_str().unwrap()),
-            "{lag}"
-        );
+        // One sample: a backlog, but no rates yet, so the direction is not known.
+        assert_eq!(lag["state"], "unknown", "{lag}");
+        assert!(lag["head_age_secs"].as_f64().unwrap() < 3.0);
         assert_eq!(lag["history"].as_array().unwrap().len(), 2);
         assert_eq!(v["source_head_lsn"], "0/1800000");
         assert!(get(addr, "/api/metrics").await.starts_with("HTTP/1.1 401"));

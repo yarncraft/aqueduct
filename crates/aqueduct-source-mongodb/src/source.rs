@@ -56,8 +56,17 @@ pub struct MongoSource {
     metrics: Option<Arc<Metrics>>,
     /// Watermark documents to delete: exact ids, or every id of an ended snapshot.
     cleanup: Vec<Cleanup>,
-    /// When the server's newest cluster time was last read, see [`HEAD_EVERY`].
-    last_head: Option<Instant>,
+    /// Reads the server's newest cluster time every [`HEAD_EVERY`], independently of the
+    /// pipeline loop, so the cockpit sees the head move while the sink holds the pipeline up.
+    head_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MongoSource {
+    fn drop(&mut self) {
+        if let Some(t) = self.head_task.take() {
+            t.abort();
+        }
+    }
 }
 
 enum Cleanup {
@@ -73,8 +82,9 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 const MAX_AWAIT: Duration = Duration::from_secs(1);
 
 /// How often `hello` is run to learn the server's newest majority-committed cluster time, the
-/// head the cockpit's "Behind source" card measures against (#150). Only with metrics.
-const HEAD_EVERY: Duration = Duration::from_secs(5);
+/// head the cockpit's "Behind source" card measures against (#150). Only with metrics. Once a
+/// second, well inside the 2 s caught-up threshold, so the backlog is not understated.
+const HEAD_EVERY: Duration = Duration::from_secs(1);
 
 impl MongoSource {
     pub fn new(cfg: MongoConfig) -> Self {
@@ -92,7 +102,7 @@ impl MongoSource {
             last_status: None,
             metrics: None,
             cleanup: Vec::new(),
-            last_head: None,
+            head_task: None,
         }
     }
 
@@ -104,28 +114,35 @@ impl MongoSource {
         }
     }
 
-    /// Reads the server's newest cluster time with `hello`, at most once per [`HEAD_EVERY`].
-    /// Telemetry only: a failure is logged at debug level and never stops the stream.
-    async fn refresh_head(&mut self) {
+    /// Starts (or restarts) the task that reads the server's newest cluster time with `hello`
+    /// every [`HEAD_EVERY`], when metrics are wanted. Telemetry only: a failure is logged at
+    /// debug level and never stops the stream.
+    fn spawn_head(&mut self) {
+        if let Some(t) = self.head_task.take() {
+            t.abort();
+        }
         let (Some(m), Some(client)) = (self.metrics.clone(), self.client.clone()) else {
             return;
         };
-        if self.last_head.is_some_and(|t| t.elapsed() < HEAD_EVERY) {
-            return;
-        }
-        self.last_head = Some(Instant::now());
-        match client
-            .database("admin")
-            .run_command(doc! {"hello": 1})
-            .await
-        {
-            Ok(reply) => {
-                if let Some(ms) = head_time_ms(&reply) {
-                    m.report_source_head_time_ms(ms);
+        self.head_task = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(HEAD_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                match client
+                    .database("admin")
+                    .run_command(doc! {"hello": 1})
+                    .await
+                {
+                    Ok(reply) => {
+                        if let Some(ms) = head_time_ms(&reply) {
+                            m.report_source_head_time_ms(ms);
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "reading the cluster time failed"),
                 }
             }
-            Err(e) => tracing::debug!(error = %e, "reading the cluster time failed"),
-        }
+        }));
     }
 
     /// Override the heartbeat interval (tests).
@@ -755,7 +772,7 @@ fn token_time_ms(text: &str) -> Option<u64> {
     let pos = Checkpoint::decode(text).ok()?.pos;
     let token: Value = serde_json::from_str(&pos).ok()?;
     let data = token.get("_data")?.as_str()?;
-    if data.len() < 10 || !data[..2].eq_ignore_ascii_case("82") {
+    if !data.get(..2).is_some_and(|t| t.eq_ignore_ascii_case("82")) {
         return None;
     }
     let secs = u32::from_str_radix(data.get(2..10)?, 16).ok()?;
@@ -877,6 +894,7 @@ impl Source for MongoSource {
         self.stream = Some(watch.await.map_err(src_err)?.with_type::<Document>());
         self.announce_start = token.is_none();
         self.start_snapshot(resume, token.is_none()).await?;
+        self.spawn_head();
         Ok(())
     }
 
@@ -914,7 +932,6 @@ impl Source for MongoSource {
                 self.chunk_failed(&why);
                 continue;
             }
-            self.refresh_head().await;
             let stream = self
                 .stream
                 .as_mut()
@@ -1009,6 +1026,9 @@ mod tests {
             r#"{"_data":"8265"}"#,
             r#"{"_data":"0165A1B2C300000001"}"#,
             r#"{"other":"826530AA0000000001"}"#,
+            // Not ASCII: slicing by bytes must not panic.
+            "{\"_data\":\"8\u{e9}6530AA0000000001\"}",
+            "{\"_data\":\"\u{e9}\"}",
             "not json",
         ] {
             assert_eq!(token_time_ms(bad), None, "{bad}");
