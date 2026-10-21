@@ -93,7 +93,10 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 
 - Distroless `cc-debian12`, runs as non-root uid 65532, no shell.
 - State directory `/var/lib/aqueduct` (checkpoint) must be on a volume.
-- Port 8080: cockpit, API and health probe. `HEALTHCHECK` runs `aqueduct --healthcheck`, which calls `/healthz`.
+- Port 8080: cockpit, API and health probe. `HEALTHCHECK` runs `aqueduct --healthcheck`, which calls `/healthz` on the
+  port of `health_addr`, read from the same config file (`AQUEDUCT_CONFIG`): a wildcard bind (`0.0.0.0`, `[::]`) is
+  probed on `127.0.0.1` / `[::1]`, any other address as is; without a readable config file it probes `127.0.0.1:8080`.
+  `AQUEDUCT_HEALTH_PROBE=<host:port>` overrides the address. It prints nothing; only the exit code counts.
 - Logs are JSON lines on stdout/stderr (`RUST_LOG=debug` for more detail).
 
 ## 3. Configuration reference
@@ -798,10 +801,24 @@ Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` onl
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
 
+Without `admin_token` (a loopback bind, or `admin_insecure_no_auth`), any web page open in the operator's browser can
+send requests to the port, so `/metrics` and `/api/*` then refuse what only a browser on another site sends: a `Host`
+that is a name other than `localhost` or the host of `health_addr` (DNS rebinding; IP addresses are accepted), an
+`Origin` other than the server's own, and a `POST` without `Content-Type: application/json` (`403`, `403` and `415`).
+Open the cockpit by IP address or `localhost`, and send snapshot requests with `-H 'Content-Type: application/json'`.
+With a token none of this is checked: a page cannot attach the token.
+
+The server takes at most 64 connections at a time. A request head must arrive within 2 s and the whole request within
+5 s, or the connection is closed. Past 64, a small reserve (part of it only for loopback peers, so the image
+`HEALTHCHECK` always gets through) still answers `/healthz` and `/readyz` and gives other routes `503`; past that,
+connections are dropped. At most 16 `/api/stream` streams run at once.
+
 The inspector adds no work to the pipeline: nothing is buffered in memory. It shows a sample, not a feed: the newest
 100 events, read once when it opens, when its topic filter changes and on **Resample**. Each sample (shared across tabs
 for 2 s) makes a separate Kafka read of up to `limit` records per partition from the topics the sink
-routes to, using its own connection (created on first use). A closed tab costs nothing.
+routes to, using its own connection (created on first use), and keeps only the newest `limit` of them. One read runs
+at a time; a read that takes over 10 s answers `504` (Kafka down or stalled) and other routes are not held up. A
+closed tab costs nothing.
 
 ### Behind source
 
@@ -1356,7 +1373,7 @@ With `snapshot = "on_demand"` (or `"initial"`), the admin API starts, inspects a
 token like every `/api/*` route.
 
 ```sh
-curl -H "Authorization: Bearer $TOKEN" -X POST http://host:8080/api/snapshot \
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST http://host:8080/api/snapshot \
      -d '{"tables": ["public.orders", "public.customers"]}'
 # 202 {"id":"s1792…","state":"running","durable":false,"note":"…"}
 curl -H "Authorization: Bearer $TOKEN" http://host:8080/api/snapshot           # progress

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 use aqueduct_core::{Error, Result};
@@ -149,28 +150,19 @@ impl KafkaInspector {
         let names = topics.iter().map(|(n, _)| n.clone()).collect();
         topics.retain(|(n, _)| topic.is_none_or(|t| t == n));
 
-        let mut events = Vec::new();
+        let mut newest = Newest::new(limit);
         for (name, parts) in &topics {
             for &p in parts {
                 let pc = client
                     .partition_client(name, p, UnknownTopicHandling::Error)
                     .await
                     .map_err(|e| Error::Sink(format!("kafka partition client: {e}")))?;
-                tail(&pc, name, p, limit, self.router.has_outbox(), &mut events).await?;
+                tail(&pc, name, p, limit, self.router.has_outbox(), &mut newest).await?;
             }
         }
-        events.sort_by(|a, b| {
-            (b.timestamp_ms, &b.topic, b.partition, b.offset).cmp(&(
-                a.timestamp_ms,
-                &a.topic,
-                a.partition,
-                a.offset,
-            ))
-        });
-        events.truncate(limit);
         Ok(Inspection {
             topics: names,
-            events,
+            events: newest.into_sorted(),
         })
     }
 }
@@ -194,7 +186,83 @@ fn shown_headers(headers: BTreeMap<String, Vec<u8>>, outbox: bool) -> BTreeMap<S
         .collect()
 }
 
-/// Append the last `limit` records of one partition to `out`. `outbox`: also show the outbox
+/// Where an event sorts in an inspection, newest first: by timestamp, then topic, partition
+/// and offset, all descending.
+type Rank<'a> = (i64, &'a str, i32, i64);
+
+fn rank(e: &InspectedEvent) -> Rank<'_> {
+    (e.timestamp_ms, &e.topic, e.partition, e.offset)
+}
+
+/// An [`InspectedEvent`] ordered by [`rank`] alone.
+struct Ranked(InspectedEvent);
+
+impl PartialEq for Ranked {
+    fn eq(&self, o: &Self) -> bool {
+        rank(&self.0) == rank(&o.0)
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Ranked {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        rank(&self.0).cmp(&rank(&o.0))
+    }
+}
+
+/// The newest `limit` events seen so far, across every partition read: memory stays at
+/// `limit` events however many topics and partitions there are, and a record that cannot
+/// make the cut is not parsed.
+struct Newest {
+    limit: usize,
+    /// A min-heap: the top is the oldest event kept, the first to go.
+    heap: BinaryHeap<Reverse<Ranked>>,
+}
+
+impl Newest {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.min(MAX_INSPECT_EVENTS) + 1),
+        }
+    }
+
+    /// Whether an event ranked `at` would be kept.
+    fn admits(&self, at: Rank<'_>) -> bool {
+        self.limit > 0
+            && (self.heap.len() < self.limit
+                || self
+                    .heap
+                    .peek()
+                    .is_some_and(|Reverse(min)| at > rank(&min.0)))
+    }
+
+    fn push(&mut self, e: InspectedEvent) {
+        if !self.admits(rank(&e)) {
+            return;
+        }
+        self.heap.push(Reverse(Ranked(e)));
+        if self.heap.len() > self.limit {
+            self.heap.pop();
+        }
+    }
+
+    /// The events kept, newest first.
+    fn into_sorted(self) -> Vec<InspectedEvent> {
+        // Ascending by `Reverse` is descending by rank.
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(Ranked(e))| e)
+            .collect()
+    }
+}
+
+/// Offer the last `limit` records of one partition to `out`. `outbox`: also show the outbox
 /// headers.
 async fn tail(
     pc: &PartitionClient,
@@ -202,7 +270,7 @@ async fn tail(
     partition: i32,
     limit: usize,
     outbox: bool,
-    out: &mut Vec<InspectedEvent>,
+    out: &mut Newest,
 ) -> Result<()> {
     let e = |what: &str, e: rskafka::client::error::Error| {
         Error::Sink(format!("kafka {what} {topic}/{partition}: {e}"))
@@ -225,6 +293,10 @@ async fn tail(
             break;
         };
         for r in records.into_iter().filter(|r| r.offset < latest) {
+            let at = r.record.timestamp.timestamp_millis();
+            if !out.admits((at, topic, partition, r.offset)) {
+                continue;
+            }
             let event = match r.record.value {
                 None => serde_json::Value::Null,
                 Some(v) => serde_json::from_slice(&v)
@@ -234,7 +306,7 @@ async fn tail(
                 topic: topic.to_string(),
                 partition,
                 offset: r.offset,
-                timestamp_ms: r.record.timestamp.timestamp_millis(),
+                timestamp_ms: at,
                 key: r
                     .record
                     .key
@@ -290,5 +362,64 @@ mod tests {
             ]
         );
         assert_eq!(shown_headers(headers(), true)["type"], "OrderCreated");
+    }
+
+    fn ev(topic: &str, partition: i32, offset: i64, timestamp_ms: i64) -> InspectedEvent {
+        InspectedEvent {
+            topic: topic.into(),
+            partition,
+            offset,
+            timestamp_ms,
+            key: None,
+            event: serde_json::Value::Null,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// The bounded selection keeps what sorting everything and truncating kept, in the same
+    /// order, and refuses an event older than all it holds once full.
+    #[test]
+    fn newest_keeps_the_newest_limit_events_newest_first() {
+        let all: Vec<InspectedEvent> = (0..40)
+            .map(|i| {
+                // Timestamps collide across topics and partitions: ties sort by topic,
+                // partition, then offset.
+                ev(
+                    ["a", "b", "c"][i % 3],
+                    (i % 2) as i32,
+                    i as i64,
+                    (i as i64 * 7) % 11,
+                )
+            })
+            .collect();
+        let key = |v: &[InspectedEvent]| {
+            v.iter()
+                .map(|e| (e.timestamp_ms, e.topic.clone(), e.partition, e.offset))
+                .collect::<Vec<_>>()
+        };
+        for limit in [0, 1, 3, 10, 40, 100] {
+            let mut want = all.clone();
+            want.sort_by(|a, b| {
+                (b.timestamp_ms, &b.topic, b.partition, b.offset).cmp(&(
+                    a.timestamp_ms,
+                    &a.topic,
+                    a.partition,
+                    a.offset,
+                ))
+            });
+            want.truncate(limit);
+            let mut newest = Newest::new(limit);
+            for e in all.iter().cloned() {
+                newest.push(e);
+            }
+            assert_eq!(key(&newest.into_sorted()), key(&want), "limit {limit}");
+        }
+        let mut newest = Newest::new(2);
+        newest.push(ev("a", 0, 5, 100));
+        newest.push(ev("a", 0, 6, 200));
+        assert!(!newest.admits((50, "a", 0, 1)), "older than both");
+        assert!(!newest.admits((100, "a", 0, 5)), "the oldest kept");
+        assert!(newest.admits((100, "a", 0, 7)));
+        assert!(newest.admits((150, "a", 0, 1)));
     }
 }

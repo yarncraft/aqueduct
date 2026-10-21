@@ -473,6 +473,50 @@ fn is_loopback_addr(addr: &str) -> bool {
 fn default_health_addr() -> String {
     "0.0.0.0:8080".into()
 }
+
+/// The address `aqueduct --healthcheck` probes: `AQUEDUCT_HEALTH_PROBE` if set, else derived
+/// from the `health_addr` of the config file (`AQUEDUCT_CONFIG`).
+pub fn health_probe_addr() -> String {
+    if let Some(a) = std::env::var("AQUEDUCT_HEALTH_PROBE")
+        .ok()
+        .filter(|a| !a.trim().is_empty())
+    {
+        return a;
+    }
+    let path =
+        std::env::var("AQUEDUCT_CONFIG").unwrap_or_else(|_| "/etc/aqueduct/aqueduct.toml".into());
+    probe_addr(&health_addr_in(
+        std::fs::read_to_string(path).ok().as_deref(),
+    ))
+}
+
+/// `health_addr` of a config file's text. Reads only that key, and a missing or unreadable
+/// file falls back to the default, so the probe never fails on a config detail the main
+/// process reports itself.
+fn health_addr_in(text: Option<&str>) -> String {
+    #[derive(Deserialize)]
+    struct HealthOnly {
+        #[serde(default = "default_health_addr")]
+        health_addr: String,
+    }
+    text.and_then(|t| toml::from_str::<HealthOnly>(t).ok())
+        .map_or_else(default_health_addr, |c| c.health_addr)
+}
+
+/// Where to connect to reach a server bound to `health_addr`: a wildcard bind (`0.0.0.0`,
+/// `[::]`) on the loopback address of the same family and port; any other address as is.
+pub fn probe_addr(health_addr: &str) -> String {
+    match health_addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) if sa.ip().is_unspecified() => {
+            let ip: std::net::IpAddr = match sa {
+                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            };
+            std::net::SocketAddr::new(ip, sa.port()).to_string()
+        }
+        _ => health_addr.to_string(),
+    }
+}
 fn default_checkpoint_path() -> String {
     "/var/lib/aqueduct/checkpoint".into()
 }
@@ -623,6 +667,33 @@ replication_factor = 2
             c.sink.replication_factor = Some(bad);
             assert!(c.sink.check_replication_factor().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn healthcheck_probes_the_configured_port_on_loopback() {
+        for (bind, probe) in [
+            ("0.0.0.0:9000", "127.0.0.1:9000"),
+            ("[::]:9000", "[::1]:9000"),
+            ("127.0.0.1:8081", "127.0.0.1:8081"),
+            ("10.1.2.3:8080", "10.1.2.3:8080"),
+            ("[::1]:8080", "[::1]:8080"),
+            ("localhost:8080", "localhost:8080"),
+        ] {
+            assert_eq!(probe_addr(bind), probe, "{bind}");
+        }
+        assert_eq!(
+            health_addr_in(Some("health_addr = \"0.0.0.0:9000\"\n[sink]\nbrokers = []")),
+            "0.0.0.0:9000"
+        );
+        // No file, a file without the key, or one that does not parse: the default.
+        for text in [
+            None,
+            Some("[sink]\nbrokers = [\"b:9093\"]"),
+            Some("health_addr = "),
+        ] {
+            assert_eq!(health_addr_in(text), "0.0.0.0:8080", "{text:?}");
+        }
+        assert_eq!(probe_addr(&health_addr_in(None)), "127.0.0.1:8080");
     }
 
     #[test]

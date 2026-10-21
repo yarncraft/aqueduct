@@ -21,8 +21,16 @@
 //! through proxy logs, browser history and Referer. The event inspector (which exposes row
 //! data) reads from the Kafka topics the sink writes to and is only enabled when a token is configured.
 //!
-//! Defensive limits: request read timeout, a cap on concurrent connections and on SSE streams,
-//! write timeouts, constant-time token comparison and standard security headers.
+//! Without a token (a loopback `health_addr`, or `admin_insecure_no_auth`), any web page the
+//! operator visits can send requests here, so `/metrics` and `/api/*` then refuse a `Host` that is
+//! a name other than `localhost` or the `health_addr` host (DNS rebinding), an `Origin` other than
+//! the server's own, and a `POST` that is not `Content-Type: application/json` (a cross-site form
+//! or no-cors request cannot send one).
+//!
+//! Defensive limits: request read timeouts (2 s for the head), a cap on concurrent connections
+//! with a reserve that answers only `/healthz` and `/readyz` (so a flood of idle connections cannot
+//! fail the liveness probe), a cap on SSE streams, write timeouts, a timeout on inspector reads,
+//! constant-time token comparison and standard security headers.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -55,13 +63,30 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 const MAX_CONNECTIONS: usize = 64;
+/// Connections taken once the [`MAX_CONNECTIONS`] slots are full. They answer only `/healthz`
+/// and `/readyz`, so the liveness probe still gets through a flood.
+const PROBE_CONNECTIONS: usize = 8;
+/// Of the probe reserve, the part only loopback peers can take: the image `HEALTHCHECK`
+/// (`aqueduct --healthcheck`) connects from inside the container, so remote clients cannot
+/// starve it. Loopback peers fall back to the shared part.
+const LOOPBACK_PROBE_CONNECTIONS: usize = 4;
 const MAX_STREAMS: usize = 16;
 /// Identical inspector queries within this window share one Kafka read.
 const INSPECT_CACHE: Duration = Duration::from_secs(2);
+/// Longest `/api/events` waits for Kafka; past it the request gets `504`.
+const INSPECT_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// `/api/tables` calls within this window share one read of the Kafka offsets, across tabs.
 const HWM_CACHE: Duration = Duration::from_secs(5);
 /// Longest `/api/tables` waits for Kafka; past it the tables are listed without offsets.
 const HWM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest a connection may take to send its request head: an idle connection gives its slot
+/// back after this.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest a connection may take to send its whole request, body included.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -80,7 +105,14 @@ pub struct Admin {
     detail: Mutex<BTreeMap<String, VecDeque<[u64; OP_SLOTS]>>>,
     streams: AtomicUsize,
     inspector: Option<KafkaInspector>,
-    inspect_cache: tokio::sync::Mutex<Option<(Instant, String, String)>>,
+    /// The last inspector answer: when, for which query, the body. A std lock: never held
+    /// across an await.
+    inspect_cache: Mutex<Option<(Instant, String, String)>>,
+    /// Lets one inspector read run at a time; the others wait (bounded by [`INSPECT_TIMEOUT`])
+    /// and reuse its result when they asked the same.
+    inspect_gate: tokio::sync::Mutex<()>,
+    /// The host part of `health_addr`, also accepted as `Host` when there is no token.
+    health_host: OnceLock<String>,
     /// Where snapshot requests go; unset for a source without snapshots.
     snapshots: OnceLock<SnapshotSender>,
     /// The sink's route plan: names each table's topic, and its counters (shared with the
@@ -118,7 +150,9 @@ impl Admin {
             detail: Mutex::new(BTreeMap::new()),
             streams: AtomicUsize::new(0),
             inspector,
-            inspect_cache: tokio::sync::Mutex::new(None),
+            inspect_cache: Mutex::new(None),
+            inspect_gate: tokio::sync::Mutex::new(()),
+            health_host: OnceLock::new(),
             snapshots: OnceLock::new(),
             router: OnceLock::new(),
             topic_stats: OnceLock::new(),
@@ -341,7 +375,157 @@ impl Admin {
             Some(t) => req.bearer.as_deref().is_some_and(|b| ct_eq(b, t)),
         }
     }
+
+    /// The `health_addr` the server is bound to: its host is accepted as `Host` without a token.
+    pub fn set_health_addr(&self, addr: &str) {
+        let _ = self.health_host.set(host_name(addr).to_string());
+    }
+
+    /// Without a token, refuse what a web page in the operator's browser could send to a
+    /// protected route: a `Host` naming another site (DNS rebinding, which would let the page
+    /// read `/api/*`), an `Origin` other than this server's, and a `POST` a cross-site form or
+    /// no-cors `fetch` can send, which cannot be `application/json`. A `DELETE` from another
+    /// origin needs a CORS preflight this server never grants. With a token none of this is
+    /// needed: a page cannot attach it. The status and the reason when refused.
+    fn browser_check(&self, req: &Request) -> Result<(), (&'static str, &'static str)> {
+        if self.token.is_some() {
+            return Ok(());
+        }
+        if req.host.as_deref().is_some_and(|h| !self.allowed_host(h)) {
+            return Err((
+                "403 Forbidden",
+                "Host not allowed without admin_token: open the cockpit by IP address or \
+                 localhost, or set admin_token",
+            ));
+        }
+        if req
+            .origin
+            .as_deref()
+            .is_some_and(|o| !same_origin(o, req.host.as_deref()))
+        {
+            return Err(("403 Forbidden", "cross-origin request refused"));
+        }
+        if req.method == "POST" && !req.content_type.as_deref().is_some_and(is_json) {
+            return Err((
+                "415 Unsupported Media Type",
+                "send the body as Content-Type: application/json",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A `Host` a rebinding attack cannot produce: an IP address (the attack needs a name it
+    /// controls), `localhost`, or the host of `health_addr`.
+    fn allowed_host(&self, host: &str) -> bool {
+        let name = host_name(host);
+        let name = name
+            .strip_prefix('[')
+            .and_then(|n| n.strip_suffix(']'))
+            .unwrap_or(name);
+        name.parse::<std::net::IpAddr>().is_ok()
+            || name.eq_ignore_ascii_case("localhost")
+            || self
+                .health_host
+                .get()
+                .is_some_and(|h| !h.is_empty() && name.eq_ignore_ascii_case(h))
+    }
+
+    /// The `/api/events` answer: the inspection as JSON, or why there is none. Bounded by
+    /// [`INSPECT_TIMEOUT`], and the cache lock is never held while Kafka is read, so a stalled
+    /// broker slows the inspector down but never queues the server behind it.
+    async fn inspect_events(
+        &self,
+        inspector: &KafkaInspector,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> (&'static str, String) {
+        let key = format!("{}|{limit}", topic.unwrap_or(""));
+        let cached = || {
+            lock(&self.inspect_cache)
+                .as_ref()
+                .filter(|(at, k, _)| *k == key && at.elapsed() < INSPECT_CACHE)
+                .map(|(_, _, body)| body.clone())
+        };
+        if let Some(body) = cached() {
+            return ("200 OK", body);
+        }
+        let read = timeout(INSPECT_TIMEOUT, async {
+            let _gate = self.inspect_gate.lock().await;
+            // Another request may have read the same while this one waited.
+            if let Some(body) = cached() {
+                return Ok(body);
+            }
+            let found = inspector.inspect(topic, limit).await?;
+            let body = serde_json::to_string(&found).unwrap_or_default();
+            *lock(&self.inspect_cache) = Some((Instant::now(), key.clone(), body.clone()));
+            Ok::<_, aqueduct_core::Error>(body)
+        })
+        .await;
+        match read {
+            Ok(Ok(body)) => ("200 OK", body),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "inspector read failed");
+                (
+                    "502 Bad Gateway",
+                    json!({ "error": e.to_string() }).to_string(),
+                )
+            }
+            Err(_) => {
+                let msg = format!(
+                    "Kafka did not answer within {} s",
+                    INSPECT_TIMEOUT.as_secs()
+                );
+                tracing::warn!("inspector read failed: {msg}");
+                ("504 Gateway Timeout", json!({ "error": msg }).to_string())
+            }
+        }
+    }
 }
+
+/// The host part of a `host[:port]` authority (an IPv6 address keeps its brackets).
+fn host_name(authority: &str) -> &str {
+    match authority.rsplit_once(':') {
+        Some((h, p))
+            if !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (!h.contains(':') || h.ends_with(']')) =>
+        {
+            h
+        }
+        _ => authority,
+    }
+}
+
+/// True when `origin` (`scheme://host[:port]`) names the authority the request was sent to.
+fn same_origin(origin: &str, host: Option<&str>) -> bool {
+    let authority = ["http://", "https://"].iter().find_map(|s| {
+        origin
+            .get(..s.len())
+            .filter(|p| p.eq_ignore_ascii_case(s))
+            .map(|_| &origin[s.len()..])
+    });
+    matches!((authority, host), (Some(a), Some(h)) if a.eq_ignore_ascii_case(h))
+}
+
+/// `Content-Type: application/json`, with or without parameters.
+fn is_json(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// The routes that need the token when one is set, and the browser checks when none is.
+const PROTECTED: [&str; 8] = [
+    "/metrics",
+    "/api/metrics",
+    "/api/stream",
+    "/api/events",
+    "/api/snapshot",
+    "/api/tables",
+    "/api/routes",
+    "/api/routes/history",
+];
 
 /// Constant-time string comparison (length is not secret here).
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -356,6 +540,9 @@ struct Request {
     method: String,
     path: String,
     bearer: Option<String>,
+    host: Option<String>,
+    origin: Option<String>,
+    content_type: Option<String>,
     query: String,
     body: String,
 }
@@ -376,19 +563,36 @@ fn parse(raw: &str) -> Option<Request> {
     }
     let target = first.next()?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let bearer = lines.find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.eq_ignore_ascii_case("authorization")
-            .then(|| v.trim().strip_prefix("Bearer ").map(str::to_string))
-            .flatten()
-    });
-    Some(Request {
+    let mut req = Request {
         method: method.to_string(),
         path: path.to_string(),
-        bearer,
+        bearer: None,
+        host: None,
+        origin: None,
+        content_type: None,
         query: query.to_string(),
         body: body.to_string(),
-    })
+    };
+    // The first of each header counts.
+    for (k, v) in lines.filter_map(|l| l.split_once(':')) {
+        let (k, v) = (k.trim(), v.trim());
+        let slot = if k.eq_ignore_ascii_case("authorization") {
+            if req.bearer.is_none() {
+                req.bearer = v.strip_prefix("Bearer ").map(str::to_string);
+            }
+            continue;
+        } else if k.eq_ignore_ascii_case("host") {
+            &mut req.host
+        } else if k.eq_ignore_ascii_case("origin") {
+            &mut req.origin
+        } else if k.eq_ignore_ascii_case("content-type") {
+            &mut req.content_type
+        } else {
+            continue;
+        };
+        slot.get_or_insert_with(|| v.to_string());
+    }
+    Some(req)
 }
 
 /// Where the head ends: the offset of the blank line and its length. Bare `\n` line ends are
@@ -414,14 +618,17 @@ fn content_length(head: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Reads one request: the head up to the blank line, then `Content-Length` bytes of body, all
-/// within [`READ_TIMEOUT`] and [`MAX_REQUEST`]. A request split over several TCP segments is
-/// read whole. `None` for a timeout, a closed socket or an oversized request.
+/// Reads one request: the head up to the blank line within [`HEAD_TIMEOUT`], then
+/// `Content-Length` bytes of body, all within [`READ_TIMEOUT`] and [`MAX_REQUEST`]. A request
+/// split over several TCP segments is read whole. `None` for a timeout, a closed socket or an
+/// oversized request.
 async fn read_request(sock: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::with_capacity(1024);
-    let deadline = Instant::now() + READ_TIMEOUT;
+    let began = Instant::now();
     loop {
+        let mut deadline = began + HEAD_TIMEOUT;
         if let Some((end, len)) = head_end(&buf) {
+            deadline = began + READ_TIMEOUT;
             let head = String::from_utf8_lossy(&buf[..end]).into_owned();
             let want = end + len + content_length(&head);
             if want > MAX_REQUEST {
@@ -914,7 +1121,9 @@ async fn snapshot_api(admin: &Admin, req: &Request) -> (&'static str, String) {
     }
 }
 
-async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
+/// Serves one connection. `probes_only`: it holds a slot of the probe reserve, so it answers
+/// only `/healthz` and `/readyz`.
+async fn handle(admin: Arc<Admin>, mut sock: TcpStream, probes_only: bool) {
     let Some(raw) = read_request(&mut sock).await else {
         return;
     };
@@ -927,6 +1136,16 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
         )
         .await;
     };
+    if probes_only && !(req.method == "GET" && matches!(req.path.as_str(), "/healthz" | "/readyz"))
+    {
+        return respond(
+            &mut sock,
+            "503 Service Unavailable",
+            "text/plain",
+            "too many connections",
+        )
+        .await;
+    }
     if req.method != "GET" && req.path != "/api/snapshot" {
         return respond(
             &mut sock,
@@ -935,6 +1154,11 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             "GET only",
         )
         .await;
+    }
+    if PROTECTED.contains(&req.path.as_str()) {
+        if let Err((status, why)) = admin.browser_check(&req) {
+            return respond(&mut sock, status, "text/plain", why).await;
+        }
     }
     match req.path.as_str() {
         "/" | "/index.html" => {
@@ -963,16 +1187,7 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
                 .await
             }
         }
-        "/metrics"
-        | "/api/metrics"
-        | "/api/stream"
-        | "/api/events"
-        | "/api/snapshot"
-        | "/api/tables"
-        | "/api/routes"
-        | "/api/routes/history"
-            if !admin.authorized(&req) =>
-        {
+        path if PROTECTED.contains(&path) && !admin.authorized(&req) => {
             respond_with(
                 &mut sock,
                 "401 Unauthorized",
@@ -1041,25 +1256,8 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream) {
             let limit = param("limit")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(100);
-            let key = format!("{}|{limit}", topic.unwrap_or(""));
-            let mut cache = admin.inspect_cache.lock().await;
-            if let Some((at, k, body)) = cache.as_ref() {
-                if *k == key && at.elapsed() < INSPECT_CACHE {
-                    return respond(&mut sock, "200 OK", "application/json", body).await;
-                }
-            }
-            match inspector.inspect(topic, limit).await {
-                Ok(found) => {
-                    let body = serde_json::to_string(&found).unwrap_or_default();
-                    respond(&mut sock, "200 OK", "application/json", &body).await;
-                    *cache = Some((Instant::now(), key, body));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "inspector read failed");
-                    let body = json!({ "error": e.to_string() }).to_string();
-                    respond(&mut sock, "502 Bad Gateway", "application/json", &body).await
-                }
-            }
+            let (status, body) = admin.inspect_events(inspector, topic, limit).await;
+            respond(&mut sock, status, "application/json", &body).await
         }
         "/api/stream" => {
             if admin.streams.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
@@ -1097,18 +1295,35 @@ async fn stream(admin: &Admin, sock: &mut TcpStream) {
 
 pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let probes = Arc::new(Semaphore::new(
+        PROBE_CONNECTIONS - LOOPBACK_PROBE_CONNECTIONS,
+    ));
+    let loopback_probes = Arc::new(Semaphore::new(LOOPBACK_PROBE_CONNECTIONS));
     loop {
-        let Ok((sock, _)) = listener.accept().await else {
+        let Ok((sock, peer)) = listener.accept().await else {
             continue;
         };
-        // Shed load instead of queueing: a flood cannot exhaust file descriptors or memory.
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            drop(sock);
-            continue;
+        // Shed load instead of queueing: a flood cannot exhaust file descriptors or memory. Once
+        // the slots are full, a small reserve still answers the health probes.
+        let (permit, probes_only) = match slots.clone().try_acquire_owned() {
+            Ok(p) => (p, false),
+            Err(_) => {
+                let reserve = peer
+                    .ip()
+                    .is_loopback()
+                    .then(|| loopback_probes.clone().try_acquire_owned().ok())
+                    .flatten()
+                    .or_else(|| probes.clone().try_acquire_owned().ok());
+                let Some(p) = reserve else {
+                    drop(sock);
+                    continue;
+                };
+                (p, true)
+            }
         };
         let admin = admin.clone();
         tokio::spawn(async move {
-            handle(admin, sock).await;
+            handle(admin, sock, probes_only).await;
             drop(permit);
         });
     }
@@ -2131,5 +2346,272 @@ Authorization: Bearer {token}
         let s = m.snapshot();
         assert_eq!(s.source_lag.snapshot.as_ref().unwrap().rows_left, Some(90));
         assert!(!prometheus(&s).contains("aqueduct_snapshot_rows_per_second"));
+    }
+
+    /// Sends `head` (request line and headers, without the blank line) and `body`, returns the
+    /// answer.
+    async fn raw(addr: std::net::SocketAddr, head: &str, body: &str) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let req = format!("{head}\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[test]
+    fn parses_host_origin_and_content_type() {
+        let r = parse(
+            "POST /api/snapshot HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nhost: evil\r\n\
+             Origin: http://127.0.0.1:8080\r\nContent-Type: application/json; charset=utf-8\r\n\r\n{}",
+        )
+        .unwrap();
+        assert_eq!(r.host.as_deref(), Some("127.0.0.1:8080"), "the first Host");
+        assert_eq!(r.origin.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(r.content_type.as_deref().is_some_and(is_json));
+        assert!(!is_json("text/plain"));
+        assert!(!is_json("application/jsonp"));
+        for (authority, host) in [
+            ("localhost:8080", "localhost"),
+            ("localhost", "localhost"),
+            ("[::1]:8080", "[::1]"),
+            ("[::1]", "[::1]"),
+            ("::1", "::1"),
+            ("0.0.0.0:9000", "0.0.0.0"),
+        ] {
+            assert_eq!(host_name(authority), host, "{authority}");
+        }
+        assert!(same_origin("http://localhost:8080", Some("localhost:8080")));
+        assert!(same_origin(
+            "HTTPS://LocalHost:8080",
+            Some("localhost:8080")
+        ));
+        assert!(!same_origin("http://evil.example", Some("localhost:8080")));
+        assert!(!same_origin("null", Some("localhost:8080")));
+        assert!(!same_origin("http://localhost:8080", None));
+    }
+
+    #[test]
+    fn without_a_token_only_ips_localhost_and_the_bind_host_are_accepted_as_host() {
+        let admin = Admin::new(Arc::new(Metrics::new()), None, None);
+        admin.set_health_addr("aqueduct.internal:8080");
+        for ok in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "LOCALHOST",
+            "[::1]:8080",
+            "10.1.2.3:8080",
+            "[fd00::1]:8080",
+            "aqueduct.internal:8080",
+        ] {
+            assert!(admin.allowed_host(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "evil.example:8080",
+            "localhost.evil.example:8080",
+            "127.0.0.1.nip.io:8080",
+            "",
+        ] {
+            assert!(!admin.allowed_host(bad), "{bad}");
+        }
+    }
+
+    /// No token: a web page visited by the operator cannot use the API through the browser,
+    /// while the cockpit (same origin) and scripts (no `Origin`) still can.
+    #[tokio::test]
+    async fn without_a_token_cross_site_requests_are_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admin = Admin::new(Arc::new(Metrics::new()), None, None);
+        admin.set_health_addr(&addr.to_string());
+        fake_source(&admin);
+        tokio::spawn(serve(listener, admin));
+        let me = format!("http://{addr}");
+        let status = |r: &str| r.split("\r\n").next().unwrap_or_default().to_string();
+
+        // DNS rebinding: the page's own name as Host.
+        for path in ["/api/metrics", "/metrics", "/api/tables", "/api/snapshot"] {
+            let r = raw(
+                addr,
+                &format!("GET {path} HTTP/1.1\r\nhost: evil.example:{}", addr.port()),
+                "",
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 403"), "{path}: {r}");
+        }
+        for host in [addr.to_string(), format!("localhost:{}", addr.port())] {
+            let r = raw(
+                addr,
+                &format!("GET /api/metrics HTTP/1.1\r\nhost: {host}"),
+                "",
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{host}: {r}");
+        }
+        // HTTP/1.0 without Host cannot come from a browser.
+        assert!(raw(addr, "GET /api/metrics HTTP/1.0", "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        // The page and the probes are not row data: served whatever the Host.
+        for path in ["/", "/healthz"] {
+            let r = raw(
+                addr,
+                &format!("GET {path} HTTP/1.1\r\nhost: evil.example"),
+                "",
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+        }
+
+        let host = format!("host: {addr}");
+        // A cross-site read and a cross-site state change are refused.
+        let r = raw(
+            addr,
+            &format!("GET /api/metrics HTTP/1.1\r\n{host}\r\norigin: http://evil.example"),
+            "",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        for origin in ["http://evil.example", "null"] {
+            let r = raw(
+                addr,
+                &format!("DELETE /api/snapshot HTTP/1.1\r\n{host}\r\norigin: {origin}"),
+                "",
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 403"), "{origin}: {r}");
+        }
+        // A no-cors POST can only be text/plain, form-encoded or multipart.
+        let body = r#"{"tables":["public.a"]}"#;
+        for ctype in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
+            let head = match ctype {
+                Some(c) => format!("POST /api/snapshot HTTP/1.1\r\n{host}\r\ncontent-type: {c}"),
+                None => format!("POST /api/snapshot HTTP/1.1\r\n{host}"),
+            };
+            let r = raw(addr, &head, body).await;
+            assert!(r.starts_with("HTTP/1.1 415"), "{ctype:?}: {r}");
+        }
+        // What the cockpit and a script send is accepted.
+        let r = raw(
+            addr,
+            &format!("POST /api/snapshot HTTP/1.1\r\n{host}\r\norigin: {me}\r\ncontent-type: application/json; charset=utf-8"),
+            body,
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 202"), "{}", status(&r));
+        let r = raw(
+            addr,
+            &format!("DELETE /api/snapshot HTTP/1.1\r\n{host}\r\norigin: {me}"),
+            "",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 202"), "{r}");
+        let r = raw(addr, &format!("GET /api/snapshot HTTP/1.1\r\n{host}"), "").await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    }
+
+    /// With a token the browser checks are not needed (a page cannot attach the token) and
+    /// change nothing: a reverse proxy may rewrite Host, and scripts may post without a type.
+    #[tokio::test]
+    async fn with_a_token_host_origin_and_content_type_are_not_checked() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admin = Admin::new(Arc::new(Metrics::new()), Some("k".into()), None);
+        fake_source(&admin);
+        tokio::spawn(serve(listener, admin));
+        let auth = "authorization: Bearer k";
+        let r = raw(addr, &format!("GET /api/metrics HTTP/1.1\r\nhost: proxy.example\r\norigin: https://cockpit.example\r\n{auth}"), "").await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let r = raw(
+            addr,
+            &format!("POST /api/snapshot HTTP/1.1\r\nhost: proxy.example\r\n{auth}"),
+            r#"{"tables":["public.a"]}"#,
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 202"), "{r}");
+        let r = raw(addr, "GET /api/metrics HTTP/1.1\r\nhost: proxy.example", "").await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+    }
+
+    /// Every slot held by an idle connection: `/healthz` and `/readyz` still answer from the
+    /// reserve, other routes get `503`, and the idle connections are closed after the head
+    /// timeout.
+    #[tokio::test]
+    async fn health_probes_answer_while_every_slot_is_taken() {
+        let addr = start(Some("k")).await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Let the server accept them all.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let began = Instant::now();
+        assert!(get(addr, "/healthz").await.ends_with("ok"));
+        assert!(get(addr, "/readyz").await.ends_with("not streaming"));
+        let r = get_bearer(addr, "/api/metrics", "k").await;
+        assert!(
+            r.starts_with("HTTP/1.1 503") && r.ends_with("too many connections"),
+            "{r}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+        // The idle connections are dropped once the head timeout passes.
+        let mut c = idle.pop().unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(HEAD_TIMEOUT + Duration::from_secs(2), c.read(&mut buf))
+            .await
+            .expect("idle connection still open")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(get_bearer(addr, "/api/metrics", "k")
+            .await
+            .starts_with("HTTP/1.1 200"));
+    }
+
+    /// A broker that accepts connections and never answers: `/api/events` gives up after the
+    /// timeout with `504`, a second request is not queued behind the first, and other routes
+    /// keep answering.
+    #[tokio::test]
+    async fn inspector_reads_time_out_on_a_stalled_broker() {
+        let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker_addr = broker.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = broker.accept().await {
+                held.push(s);
+            }
+        });
+        let stalled = KafkaInspector::new(
+            vec![broker_addr.to_string()],
+            &router(),
+            aqueduct_sinks::KafkaSecurity::default(),
+        );
+        let addr = start_tables(Some(stalled)).await;
+        let began = Instant::now();
+        let first = tokio::spawn(get_bearer(addr, "/api/events?limit=5", "k"));
+        let second = tokio::spawn(get_bearer(addr, "/api/events?limit=5", "k"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(get_bearer(addr, "/api/metrics", "k")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        for r in [first.await.unwrap(), second.await.unwrap()] {
+            assert!(r.starts_with("HTTP/1.1 504"), "{r}");
+            assert!(r.contains("Kafka did not answer within"), "{r}");
+        }
+        assert!(
+            began.elapsed() < INSPECT_TIMEOUT + Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
     }
 }
