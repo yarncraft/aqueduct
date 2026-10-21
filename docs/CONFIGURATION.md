@@ -24,9 +24,9 @@ topic = "cdc.{schema}.{table}"
 
 | Key | Default | |
 |-----|---------|-|
-| `health_addr` | `0.0.0.0:8080` | Cockpit, API and health probes |
+| `health_addr` | `0.0.0.0:8080` | Cockpit, API and health probes. Plain HTTP; a non-loopback bind logs a startup warning |
 | `checkpoint_path` | `/var/lib/aqueduct/checkpoint` | Last acknowledged position. Keep on the state volume |
-| `admin_token` | unset | Bearer token for `/api/*` and `/metrics`. Required unless `health_addr` is loopback; 16+ characters |
+| `admin_token` | unset | Bearer token for `/api/*` and `/metrics`. Required unless `health_addr` is loopback; 16+ characters. Sent over plain HTTP: [put TLS in front](DEPLOYMENT.md#cockpit-over-tls) |
 | `admin_insecure_no_auth` | `false` | Allow a non-loopback bind without a token (logs a warning) |
 | `inspector` | `true` | Event inspector in the cockpit; needs `admin_token` |
 

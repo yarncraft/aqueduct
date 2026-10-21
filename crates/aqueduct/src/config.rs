@@ -664,6 +664,12 @@ impl Config {
         ))
     }
 
+    /// Whether the admin server listens beyond loopback. It speaks plain HTTP, so the bearer token
+    /// and inspector rows then cross the network in clear text unless a TLS proxy sits in front.
+    pub fn admin_exposed_beyond_loopback(&self) -> bool {
+        !is_loopback_addr(&self.health_addr)
+    }
+
     /// Load TOML from `AQUEDUCT_CONFIG` (default `/etc/aqueduct/aqueduct.toml`),
     /// then let `AQUEDUCT_PG_URL` override the Postgres URL.
     pub fn load() -> Result<Self, String> {
@@ -780,6 +786,19 @@ replication_factor = 2
             let c = admin_cfg(&format!("health_addr = \"{a}\""));
             assert_eq!(c.check_admin_exposure(), Ok(false), "{a}");
         }
+    }
+
+    #[test]
+    fn admin_plaintext_warning_only_beyond_loopback() {
+        for a in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            let c = admin_cfg(&format!("health_addr = \"{a}\""));
+            assert!(!c.admin_exposed_beyond_loopback(), "{a}");
+        }
+        for a in ["0.0.0.0:8080", "10.0.0.5:8080", "[::]:8080"] {
+            let c = admin_cfg(&format!("health_addr = \"{a}\""));
+            assert!(c.admin_exposed_beyond_loopback(), "{a}");
+        }
+        assert!(admin_cfg("").admin_exposed_beyond_loopback());
     }
 
     #[test]
