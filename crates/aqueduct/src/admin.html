@@ -194,8 +194,7 @@
         </select>
         <select id="evtopic" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All topics</option></select>
         <select id="evtable" class="max-w-48 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 text-ink-100 focus:border-blue focus:outline-none"><option value="">All tables</option></select>
-        <button id="evpause" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Pause</button>
-        <button id="evclear" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Clear</button>
+        <button id="evresample" type="button" title="Read a fresh sample of the newest 100 events from Kafka" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Resample</button>
         <button id="evclose" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>
       </div>
     </div>
@@ -499,9 +498,12 @@ const OP_BADGE = {
   delete: 'bg-red/15 text-red', truncate: 'bg-violet/15 text-violet',
   read: 'bg-amber/15 text-amber',
 };
-const FETCH_EVENTS = 100;
+// The inspector shows a sample, not a feed: the newest SAMPLE_EVENTS records, read once when it opens, when the topic
+// filter changes, or on Resample.
+const SAMPLE_EVENTS = 100;
 let evs = [];          // newest first, as read from Kafka
-let paused = false;
+let sampledAt = null;  // when the sample was read (browser clock)
+let sampling = false;
 let openId = null;
 
 const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
@@ -555,7 +557,8 @@ function renderEvents() {
   const q = $('evsearch').value.trim().toLowerCase();
   const op = $('evop').value, tb = $('evtable').value;
   const rows = evs.filter(e => (!op || opOf(e) === op) && (!tb || rel(e) === tb) && (!q || JSON.stringify(e.event).toLowerCase().includes(q)));
-  $('evcount').textContent = rows.length === evs.length ? fmt(evs.length) + ' read' : rows.length + ' of ' + evs.length;
+  const when = sampledAt ? ' · sampled ' + new Date(sampledAt).toLocaleTimeString() : '';
+  $('evcount').textContent = (rows.length === evs.length ? fmt(evs.length) + ' events' : rows.length + ' of ' + evs.length) + when;
   $('events').innerHTML = rows.length ? rows.slice(0, 200).map(e => {
     const ev = e.event, id = evid(e);
     const row = `<tr data-id="${esc(id)}" class="cursor-pointer border-b border-ink-700 hover:bg-ink-700/50 ${openId === id ? 'bg-ink-700/50' : ''}"><td class="px-4 py-1.5 tabular-nums text-ink-300">${esc(e.topic)} <span class="text-ink-500">p${esc(e.partition)} @${esc(e.offset)}</span></td><td class="px-4 py-1.5 tabular-nums text-ink-200">${esc(clock(e.timestamp_ms))}</td><td class="px-4 py-1.5"><span class="rounded-sm px-1.5 py-0.5 text-[11px] uppercase ${opBadge(e)}">${esc(opOf(e) || '?')}</span></td><td class="px-4 py-1.5 text-ink-100">${esc(rel(e))}</td><td class="px-4 py-1.5 text-ink-300">${esc(String(lsnOf(e)))}</td><td class="px-4 py-1.5 text-ink-200">${summary(e)}</td></tr>`;
@@ -578,23 +581,31 @@ function syncTopicFilter(topics) {
   sel.value = cur;
 }
 
-async function pollEvents() {
+async function sampleEvents() {
   // Closed inspector: no Kafka reads at all.
-  if (paused || $('inspector').hidden) return;
+  if (sampling || $('inspector').hidden) return;
+  sampling = true;
+  $('evresample').disabled = true;
+  $('evresample').textContent = 'Sampling…';
   try {
-    const r = await fetch('/api/events?limit=' + FETCH_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value), authInit());
+    const r = await fetch('/api/events?limit=' + SAMPLE_EVENTS + '&topic=' + encodeURIComponent($('evtopic').value), authInit());
     if (r.status === 403 || r.status === 401) {
-      paused = true; clearInterval(pollTimer);
       $('events').innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-ink-300">${r.status === 403 ? 'Inspector disabled. Set admin_token to enable it (it exposes row data).' : 'Unauthorized. Open the page once with #token=... (it is moved to session storage and removed from the URL).'}</td></tr>`;
       return;
     }
     if (!r.ok) return;
     const d = await r.json();
     evs = d.events;
+    sampledAt = Date.now();
+    openId = null;
     syncTopicFilter(d.topics);
     syncTableFilter();
     renderEvents();
-  } catch (_) { /* the connection badge covers outages */ }
+  } catch (_) { /* the connection badge covers outages */ } finally {
+    sampling = false;
+    $('evresample').disabled = false;
+    $('evresample').textContent = 'Resample';
+  }
 }
 
 $('events').addEventListener('click', ev => {
@@ -621,14 +632,8 @@ $('snapcancel').addEventListener('click', async () => {
   }
 });
 for (const id of ['evsearch', 'evop', 'evtable']) $(id).addEventListener('input', renderEvents);
-$('evtopic').addEventListener('input', pollEvents);
-$('evpause').addEventListener('click', () => {
-  paused = !paused;
-  $('evpause').textContent = paused ? 'Resume' : 'Pause';
-  if (!paused) pollEvents();
-});
-$('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
-const pollTimer = setInterval(pollEvents, 3000);
+$('evtopic').addEventListener('input', sampleEvents);
+$('evresample').addEventListener('click', sampleEvents);
 // The inspector is a modal pop-up: Close, Esc or a click outside the window closes it.
 function closeInspector() {
   $('inspector').hidden = true;
@@ -1178,7 +1183,7 @@ function inspectTopic(name) {
   $('inspector').hidden = false;
   document.body.classList.add('overflow-hidden');
   $('evsearch').focus();
-  pollEvents();
+  sampleEvents();
 }
 
 $('graph').addEventListener('click', ev => {
