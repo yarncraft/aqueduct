@@ -1,15 +1,19 @@
 //! The compiled routing table and its pure `render` step.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use super::expr::{op_name, EventView, Expr, FieldRef, Template, Tri};
+use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
 use crate::kafka::{glob_match, partition_input, PartitionBy};
-use crate::{encode, key_json, op_code, record_key, table_key, SourceInfo};
+use crate::{
+    encode, encode_rows, key_json, key_object, op_code, record_key, table_key, SourceInfo,
+};
 
 /// Rows of a matched table seen without a field a route references, while the field has never been
 /// seen, before the field is reported as unseen (warn-once log, metric, cockpit).
@@ -41,6 +45,9 @@ pub struct KafkaRoute {
     pub topic_fallback: Option<String>,
     /// The only values a content-routed `topic`'s row fields may substitute.
     pub topic_values: Option<Vec<String>>,
+    /// `include` | `exclude`, `mask`, `hash` and `rename` (ADR 0002 §5 "Fields"), applied to
+    /// `before`, `after` and, without `key`, the record key's `key` object.
+    pub fields: FieldSpec,
 }
 
 /// One Kafka record, before it is handed to the client. Topic and key decide the partition.
@@ -313,6 +320,19 @@ struct CompiledRoute {
     topic_fallback: Option<String>,
     /// The values a content-routed topic's row fields may take; `None` allows any valid segment.
     topic_values: Option<Vec<String>>,
+    /// `None`: no field operation, the record is built exactly as without routing.
+    fields: Option<FieldOps>,
+}
+
+/// `before` and `after` after field operations.
+type Rows = (Option<Box<RawValue>>, Option<Box<RawValue>>);
+
+/// A record's parts after the route's field operations, computed before its topic is chosen.
+struct Rewritten {
+    /// The record key and partition input from the rewritten key object; `None` with `key = [...]`.
+    keys: Option<(String, String)>,
+    rows: Rows,
+    headers: Vec<(&'static str, String)>,
 }
 
 /// A route's `key = [...]`.
@@ -332,7 +352,6 @@ impl CompiledRoute {
     /// The row fields the topic template reads (`row.region`, `after.address.city`, ...); empty
     /// for a topic without content routing. `FieldRef::column` gives each one's top-level column.
     /// Field operations (R6) check these, like [`CompiledRoute::key_columns`].
-    #[allow(dead_code)] // R6 (field operations) checks these; tests use them until then.
     pub(crate) fn topic_fields(&self) -> impl Iterator<Item = &FieldRef> {
         self.topic.parsed.fields().filter(|f| f.column().is_some())
     }
@@ -542,6 +561,9 @@ pub struct RoutesDescription {
     pub dead_letter_topic: Option<String>,
     /// `key` or `table`.
     pub partition_by: &'static str,
+    /// `sink.hash_key_id`, when a hash key is configured. Never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_key_id: Option<String>,
     /// In match order; the `sink.topic` fallback, if any, is last, named `default`.
     pub routes: Vec<RouteDescription>,
 }
@@ -567,6 +589,17 @@ pub struct RouteDescription {
     pub topic_fallback: Option<String>,
     /// The allow-list of a content-routed topic's values; `null` without one.
     pub topic_values: Option<Vec<String>>,
+    /// Field operations: column names (and the rename map), left out when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rename: Option<BTreeMap<String, String>>,
     pub counts: RouteCounts,
     pub unseen_fields: Vec<String>,
 }
@@ -584,6 +617,8 @@ pub struct RoutePlan {
     dynamic: Arc<DynamicTopics>,
     /// [`RoutePlan::static_topics`], computed once.
     fixed: Vec<String>,
+    /// Present when configured; required as soon as a route uses `hash`.
+    hash_key: Option<HashKey>,
 }
 
 /// A Kafka topic name: 1 to 249 of `[A-Za-z0-9._-]`, and not `.` or `..`.
@@ -812,6 +847,59 @@ fn check_collisions(
     Ok(())
 }
 
+/// Startup checks of a route's field operations: `hash` needs the key, `rename` without
+/// `include` needs the dead-letter topic, and no row data may bypass the operations (ADR 0002
+/// §5): `key = [...]` and a content-routed topic read the original row, so neither may name a
+/// column the route removes, masks or hashes. `topic_values` constrains the values of those same
+/// template fields, and `topic_fallback` is a fixed topic, so checking the template's fields covers
+/// both.
+fn check_field_ops(
+    name: &str,
+    r: &CompiledRoute,
+    hash_key: Option<&HashKey>,
+    dead_letter_topic: Option<&str>,
+) -> Result<()> {
+    let Some(f) = &r.fields else {
+        return Ok(());
+    };
+    if f.hashes() && hash_key.is_none() {
+        return Err(Error::Config(format!(
+            "sink route `{name}` uses `hash`, which needs a key: set AQUEDUCT_HASH_KEY or sink.hash_key_file, and sink.hash_key_id"
+        )));
+    }
+    if f.may_collide() && dead_letter_topic.is_none() {
+        return Err(Error::Config(format!(
+            "sink route `{name}` uses `rename` without `include`, which needs `sink.dead_letter_topic`: a row that already has a column named like a rename target goes there instead of stopping the pipeline"
+        )));
+    }
+    for c in r.key_columns().unwrap_or_default() {
+        if let Some(how) = f.protection(c) {
+            return Err(Error::Config(format!(
+                "sink route `{name}`: `key` column `{c}` is {how} by the route's field operations, so the record key would carry it unprotected; key by other columns"
+            )));
+        }
+    }
+    for field in r.topic_fields() {
+        let Some(c) = field.column() else { continue };
+        if let Some(how) = f.protection(c) {
+            let values = if r.topic_values().is_some() {
+                " (and `topic_values`)"
+            } else {
+                ""
+            };
+            return Err(Error::Config(format!(
+                "sink route `{name}`: `topic` reads `{field}`, but column `{c}` is {how} by the route's field operations, so the topic name{values} would carry it unprotected; route by another column"
+            )));
+        }
+    }
+    // TODO(R7): `format = "row"` with `deletes = "row"` must emit the rewritten before-image
+    // (`rewrite_rows`), and envelope `tombstones` must reuse the record's rewritten key
+    // (`rewrite_key` or the route key), never `event.key` as is.
+    // TODO(R8): the outbox `aggregate_id` (the record key) and `topic` columns must be rejected
+    // when `f.protection()` is `Some`, as `key` and the topic template are here.
+    Ok(())
+}
+
 impl RoutePlan {
     /// A plan without a dead-letter topic, so no route may use `where`.
     pub fn new(routes: Vec<KafkaRoute>, default: Option<String>) -> Result<Self> {
@@ -824,6 +912,17 @@ impl RoutePlan {
         routes: Vec<KafkaRoute>,
         default: Option<String>,
         dead_letter_topic: Option<String>,
+    ) -> Result<Self> {
+        Self::build(routes, default, dead_letter_topic, None)
+    }
+
+    /// [`with_dead_letter`](Self::with_dead_letter) with the key for `hash`, which is required
+    /// as soon as a route hashes a column.
+    pub fn build(
+        routes: Vec<KafkaRoute>,
+        default: Option<String>,
+        dead_letter_topic: Option<String>,
+        hash_key: Option<HashKey>,
     ) -> Result<Self> {
         if routes.is_empty() && default.is_none() {
             return Err(Error::Config(
@@ -877,16 +976,20 @@ impl RoutePlan {
             let key = r.key.as_deref().map(|k| parse_key(&name, k)).transpose()?;
             let topic = parse_topic(&format!("sink route `{name}`: `topic`"), &r.topic)?;
             let (topic_fallback, topic_values) = check_content_routing(&name, r, &topic)?;
-            fields.push(
-                filter
-                    .iter()
-                    .flat_map(|f| f.fields())
-                    .chain(key.iter().flat_map(|k| k.fields.iter()))
-                    .chain(topic.parsed.fields())
-                    .cloned()
-                    .collect(),
-            );
-            compiled.push(CompiledRoute {
+            let field_ops = FieldOps::compile(&name, &r.fields)?;
+            let mut watched: Vec<FieldRef> = filter
+                .iter()
+                .flat_map(|f| f.fields())
+                .chain(key.iter().flat_map(|k| k.fields.iter()))
+                .chain(topic.parsed.fields())
+                .cloned()
+                .collect();
+            for c in r.fields.columns() {
+                // Top-level names only (checked by `FieldOps::compile`), so `row.<name>` parses.
+                watched.extend(FieldRef::parse(&format!("row.{c}")).ok());
+            }
+            fields.push(watched);
+            let route = CompiledRoute {
                 pattern: r.pattern.clone(),
                 topic,
                 ops,
@@ -894,7 +997,15 @@ impl RoutePlan {
                 key,
                 topic_fallback,
                 topic_values,
-            });
+                fields: field_ops,
+            };
+            check_field_ops(
+                &name,
+                &route,
+                hash_key.as_ref(),
+                dead_letter_topic.as_deref(),
+            )?;
+            compiled.push(route);
             names.push(name);
         }
         if default.is_some() {
@@ -973,6 +1084,7 @@ impl RoutePlan {
             stats: Arc::new(RouteStats::new(names, fields)),
             dynamic: Arc::new(DynamicTopics::new()),
             fixed: Vec::new(),
+            hash_key,
         };
         plan.fixed = plan.static_topics();
         // A content-routed name must not collide (`.` vs `_`) with a fixed topic either.
@@ -1114,7 +1226,14 @@ impl RoutePlan {
     /// The compiled plan and its live counts, for `/api/routes`.
     pub fn describe(&self) -> RoutesDescription {
         let route = |i: usize, pattern: Option<String>, r: Option<&CompiledRoute>, topic: &str| {
+            let spec = r.and_then(|r| r.fields.as_ref()).map(FieldOps::spec);
+            let list = |v: &Vec<String>| (!v.is_empty()).then(|| v.clone());
             RouteDescription {
+                include: spec.and_then(|s| s.include.clone()),
+                exclude: spec.and_then(|s| s.exclude.as_ref().and_then(list)),
+                mask: spec.and_then(|s| list(&s.mask)),
+                hash: spec.and_then(|s| list(&s.hash)),
+                rename: spec.and_then(|s| (!s.rename.is_empty()).then(|| s.rename.clone())),
                 route: self.stats.names[i].clone(),
                 pattern,
                 ops: r
@@ -1144,6 +1263,7 @@ impl RoutePlan {
             default_topic: self.default_topic().map(str::to_string),
             dead_letter_topic: self.dead_letter.clone(),
             partition_by: self.partition_by.as_str(),
+            hash_key_id: self.hash_key.as_ref().map(|k| k.id().to_string()),
             routes,
         }
     }
@@ -1174,6 +1294,9 @@ impl RoutePlan {
         let view = EventView::new(event);
         // The record key and the partition input, when the route sets its own key.
         let mut route_key = None;
+        // Field operations, applied before the topic is chosen, so a row they cannot rewrite goes
+        // to the dead-letter topic without taking a content-routing cap slot.
+        let mut rewritten = None;
         let mut outcome = &self.stats.produced;
         let mut content = None;
         let topic = match self.routes.get(route) {
@@ -1204,6 +1327,17 @@ impl RoutePlan {
                     }
                 }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
+                if let Some(f) = &r.fields {
+                    match self.rewrite(f, event, route_key.is_none()) {
+                        Ok(w) => rewritten = Some(w),
+                        Err(e) => {
+                            let reason = format!("route `{}`: {e}", self.stats.names[route]);
+                            self.dead_letter(route, reason, event, now_us, out)?;
+                            self.stats.claimed(&self.stats.errors, route);
+                            return Ok(());
+                        }
+                    }
+                }
                 match self.content_topic(route, r, &view) {
                     Ok((topic, from_row)) => {
                         if from_row {
@@ -1221,24 +1355,43 @@ impl RoutePlan {
                 }
             }
         };
-        let (key, partition_key) = match route_key {
+        let rewritten_keys = rewritten.as_mut().and_then(|w| w.keys.take());
+        let (key, partition_key) = match (route_key, rewritten_keys) {
             // A per-route key partitions by the whole key, whatever `partition_by` says.
-            Some(key) => (key.clone(), key),
-            None => {
+            (Some(key), _) => (key.clone(), key),
+            // The key object after field operations, partitioned like the plain key.
+            (None, Some(keys)) => keys,
+            (None, None) => {
                 let key = record_key(event, &self.source);
                 let partition_key = partition_input(event, &key, self.partition_by);
                 (key, partition_key)
             }
         };
+        // The value and headers are fixed here, before the sink may re-route the record to the
+        // fallback (`topic_refused` changes only the topic), so a fallback record carries the
+        // same rewritten value, key and `aqueduct-hash-key-id` as any other.
+        let (value, headers) = match rewritten {
+            None => (encode(event, &self.source, now_us)?, Vec::new()),
+            Some(w) => (
+                encode_rows(
+                    event,
+                    &self.source,
+                    now_us,
+                    w.rows.0.as_deref(),
+                    w.rows.1.as_deref(),
+                )?,
+                w.headers,
+            ),
+        };
         out.push(OutRecord {
             topic,
             partition_key,
             key,
-            value: encode(event, &self.source, now_us)?,
+            value,
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
-            headers: Vec::new(),
+            headers,
             content,
         });
         self.stats.claimed(outcome, route);
@@ -1353,10 +1506,78 @@ impl RoutePlan {
         key_json(event, &self.source, &obj)
     }
 
+    /// The value rows, key and headers of a record of a route with field operations. `own_key`:
+    /// the route has no `key = [...]`, so the key object is rewritten too.
+    fn rewrite(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+        own_key: bool,
+    ) -> std::result::Result<Rewritten, FieldError> {
+        let rows = self.rewrite_rows(fields, event, true)?;
+        let keys = if own_key {
+            let k = self.rewrite_key(fields, event)?;
+            let key = key_json(event, &self.source, k.as_deref().unwrap_or("null"));
+            // Partitioned by the rewritten key, so a hashed key column keeps per-row order.
+            let partition_key = partition_input(event, &key, self.partition_by);
+            Some((key, partition_key))
+        } else {
+            None
+        };
+        Ok(Rewritten {
+            keys,
+            rows,
+            headers: self.hash_headers(fields),
+        })
+    }
+
+    /// `before` and `after` with the route's field operations applied.
+    fn rewrite_rows(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+        renames: bool,
+    ) -> std::result::Result<Rows, FieldError> {
+        let key = self.hash_key.as_ref();
+        let row = |r: &Option<Box<RawValue>>| {
+            r.as_deref()
+                .map(|r| fields.rewrite_raw(r, key, renames))
+                .transpose()
+        };
+        Ok((row(&event.before)?, row(&event.after)?))
+    }
+
+    /// The record key's `key` object with the route's field operations applied: excluded columns
+    /// removed, masked, hashed and renamed ones as in the value. An object left empty is `None`
+    /// (`"key": null`).
+    fn rewrite_key(
+        &self,
+        fields: &FieldOps,
+        event: &ChangeEvent,
+    ) -> std::result::Result<Option<String>, FieldError> {
+        let Some(k) = key_object(event) else {
+            return Ok(None);
+        };
+        let mut out = String::with_capacity(k.len());
+        let n = fields.rewrite(k, self.hash_key.as_ref(), true, &mut out)?;
+        Ok((n > 0).then_some(out))
+    }
+
+    /// `aqueduct-hash-key-id` on every record of a route that hashes.
+    fn hash_headers(&self, fields: &FieldOps) -> Vec<(&'static str, String)> {
+        match &self.hash_key {
+            Some(k) if fields.hashes() => vec![(HASH_KEY_ID_HEADER, k.id().to_string())],
+            _ => Vec::new(),
+        }
+    }
+
     /// The dead-letter record for an event route `route` could not evaluate. `reason` names the
     /// route, the expression and the type problem, never a row value: it becomes the
     /// `aqueduct-error` header and a log line. The key is the table-only record key (no row data),
-    /// and the partition is hashed from it.
+    /// and the partition is hashed from it. The value has the route's field operations applied
+    /// (ADR 0002 §5a), so the dead-letter topic never holds data the route would have removed,
+    /// masked or hashed: renamed if the renames apply, else under the original names, and with
+    /// `before`/`after` null if a row is not an object the operations can rewrite.
     fn dead_letter(
         &self,
         route: usize,
@@ -1371,10 +1592,25 @@ impl RoutePlan {
             ))
         })?;
         let key = table_key(event, &self.source);
-        // R6 (field operations) must apply the route's include/exclude, mask, hash and rename to
-        // this value before it is produced, so the dead-letter topic never holds data the route
-        // would have masked (ADR 0002 §5a). Until then a route has no field operations to apply.
-        let value = encode(event, &self.source, now_us)?;
+        let fields = self.routes.get(route).and_then(|r| r.fields.as_ref());
+        let mut headers = vec![("aqueduct-error", reason.clone())];
+        let value = match fields {
+            None => encode(event, &self.source, now_us)?,
+            Some(f) => {
+                headers.extend(self.hash_headers(f));
+                let (before, after) = self
+                    .rewrite_rows(f, event, true)
+                    .or_else(|_| self.rewrite_rows(f, event, false))
+                    .unwrap_or((None, None));
+                encode_rows(
+                    event,
+                    &self.source,
+                    now_us,
+                    before.as_deref(),
+                    after.as_deref(),
+                )?
+            }
+        };
         out.push(OutRecord {
             topic,
             partition_key: key.clone(),
@@ -1383,7 +1619,7 @@ impl RoutePlan {
             op: op_code(event.op),
             lsn: event.position.to_checkpoint(),
             commit_ts_micros: event.commit_ts_micros,
-            headers: vec![("aqueduct-error", reason.clone())],
+            headers,
             content: None,
         });
         if !self.stats.error_logged[route].swap(true, Ordering::Relaxed) {
@@ -1703,7 +1939,7 @@ mod tests {
             r#"{"db":"app","schema":"public","table":"orders","key":null}"#
         );
         assert_eq!(r.partition_key, r.key);
-        // The value is the envelope (field operations come with R6).
+        // The route has no field operations, so the value is the envelope as is.
         assert_eq!(r.value, encode(&e, &pg(), NOW).unwrap());
         assert_eq!((r.op, r.lsn.as_str()), ("u", "7"));
         assert_eq!(r.headers.len(), 1);
@@ -2850,6 +3086,595 @@ mod tests {
         assert_eq!(q.stats().snapshot()[0].unseen_fields, vec!["row.regoin"]);
     }
 
+    // --- fields: include/exclude, mask, hash, rename (R6) ---------------------------------------
+
+    const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn hash_key() -> HashKey {
+        HashKey::new(SECRET, "k1").unwrap()
+    }
+
+    /// The expected digest of `text`, computed with ring directly.
+    fn hmac_hex(text: &str) -> String {
+        let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, SECRET);
+        ring::hmac::sign(&k, text.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn with_fields(name: &str, p: &str, f: FieldSpec) -> KafkaRoute {
+        KafkaRoute {
+            fields: f,
+            ..named(name, p, &format!("{name}.topic"))
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn fields_plan(routes: Vec<KafkaRoute>) -> RoutePlan {
+        let mut p = RoutePlan::build(
+            routes,
+            Some("rest".into()),
+            Some(DLQ.into()),
+            Some(hash_key()),
+        )
+        .unwrap();
+        p.set_source(pg());
+        p
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn field_ops_rewrite_before_and_after_but_not_source() {
+        let p = fields_plan(vec![with_fields(
+            "people",
+            "public.people",
+            FieldSpec {
+                exclude: Some(strs(&["note"])),
+                mask: strs(&["card", "age"]),
+                hash: strs(&["email"]),
+                rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                ..Default::default()
+            },
+        )]);
+        let mut e = event("public", "people", Op::Update, None, Position::Lsn(7));
+        e.before =
+            raw(r#"{"id":1,"email":"old@x.y","card":"4111","age":40,"note":"n","cust_id":3}"#);
+        e.after = raw(r#"{"id":1,"email":"new@x.y","card":null,"age":41,"note":"n","cust_id":3}"#);
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, "people.topic");
+        let v = json(&r.value);
+        assert_eq!(
+            v["before"],
+            serde_json::json!({"id": 1, "email": hmac_hex("old@x.y"), "card": "***", "age": null, "customer_id": 3})
+        );
+        assert_eq!(
+            v["after"],
+            serde_json::json!({"id": 1, "email": hmac_hex("new@x.y"), "card": null, "age": null, "customer_id": 3})
+        );
+        // `source`, `op` and the times are the envelope's, untouched.
+        let plain = json(&encode(&e, &pg(), NOW).unwrap());
+        for k in ["source", "op", "ts_ms", "ts_us"] {
+            assert_eq!(v[k], plain[k], "{k}");
+        }
+        assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
+        assert!(!r.value.contains("old@x.y") && !r.value.contains("4111"));
+    }
+
+    #[test]
+    fn the_key_object_gets_the_same_field_ops_and_decides_the_partition() {
+        let route = |f: FieldSpec| with_fields("t", "public.t", f);
+        let e = |email: &str| {
+            let mut e = event("public", "t", Op::Insert, None, Position::Lsn(1));
+            e.after = raw(&format!(r#"{{"email":"{email}","id":1,"n":2}}"#));
+            e.key = Some(format!(r#"{{"email":"{email}","id":1}}"#));
+            e
+        };
+        let k = |key: &str| format!(r#"{{"db":"app","schema":"public","table":"t","key":{key}}}"#);
+        let cases: Vec<(FieldSpec, String)> = vec![
+            (
+                FieldSpec {
+                    hash: strs(&["email"]),
+                    ..Default::default()
+                },
+                k(&format!(r#"{{"email":"{}","id":1}}"#, hmac_hex("a@b.c"))),
+            ),
+            (
+                FieldSpec {
+                    mask: strs(&["email"]),
+                    rename: [("id".to_string(), "user_id".to_string())].into(),
+                    ..Default::default()
+                },
+                k(r#"{"email":"***","user_id":1}"#),
+            ),
+            (
+                FieldSpec {
+                    exclude: Some(strs(&["email"])),
+                    ..Default::default()
+                },
+                k(r#"{"id":1}"#),
+            ),
+            // Every key column removed: `"key": null`, so the table's partition.
+            (
+                FieldSpec {
+                    include: Some(strs(&["n"])),
+                    ..Default::default()
+                },
+                k("null"),
+            ),
+        ];
+        for (spec, want) in cases {
+            for by in [PartitionBy::Key, PartitionBy::Table] {
+                let mut p = fields_plan(vec![route(spec.clone())]);
+                p.set_partition_by(by);
+                let r = p.render(&e("a@b.c"), NOW).unwrap().remove(0);
+                assert_eq!(r.key, want, "{spec:?}");
+                assert!(!r.key.contains("a@b.c"), "{}", r.key);
+                let part = match by {
+                    PartitionBy::Key => want.clone(),
+                    PartitionBy::Table => "public.t".to_string(),
+                };
+                assert_eq!(r.partition_key, part, "{spec:?} {by:?}");
+            }
+        }
+        // A hashed key column keeps rows apart and the same row together: per-row order holds.
+        let p = fields_plan(vec![route(FieldSpec {
+            hash: strs(&["email"]),
+            ..Default::default()
+        })]);
+        let pk = |email: &str| p.render(&e(email), NOW).unwrap().remove(0).partition_key;
+        assert_eq!(pk("a@b.c"), pk("a@b.c"));
+        assert_ne!(pk("a@b.c"), pk("x@y.z"));
+        // A MongoDB `_id` object is hashed from its compact JSON, in the key as in the value.
+        let mut p = fields_plan(vec![with_fields(
+            "m",
+            "shop.users",
+            FieldSpec {
+                hash: strs(&["_id"]),
+                ..Default::default()
+            },
+        )]);
+        p.set_source(SourceInfo::Mongodb);
+        let mut m = event(
+            "shop",
+            "users",
+            Op::Insert,
+            None,
+            Position::Text("t".into()),
+        );
+        m.after = raw(r#"{"_id":{"$oid":"6530"},"n":1}"#);
+        m.key = Some(r#"{"_id": {"$oid": "6530"}}"#.into());
+        let r = p.render(&m, NOW).unwrap().remove(0);
+        let digest = hmac_hex(r#"{"$oid":"6530"}"#);
+        assert_eq!(json(&r.key)["key"]["_id"], digest.as_str());
+        assert_eq!(json(&r.value)["after"]["_id"], digest.as_str());
+    }
+
+    #[test]
+    fn dead_letter_values_have_the_field_ops_applied() {
+        let p = fields_plan(vec![KafkaRoute {
+            filter: Some("row.amount > 10".into()),
+            fields: FieldSpec {
+                mask: strs(&["card"]),
+                hash: strs(&["email"]),
+                exclude: Some(strs(&["note"])),
+                ..Default::default()
+            },
+            ..named("o", "public.orders", "orders")
+        }]);
+        let e = row(
+            "orders",
+            Op::Insert,
+            r#"{"amount":"abc","card":"4111","email":"a@b.c","note":"secret"}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            json(&r.value)["after"],
+            serde_json::json!({"amount": "abc", "card": "***", "email": hmac_hex("a@b.c")})
+        );
+        assert!(!r.value.contains("4111") && !r.value.contains("secret"));
+        assert_eq!(r.headers[0].0, "aqueduct-error");
+        assert_eq!(r.headers[1], (HASH_KEY_ID_HEADER, "k1".to_string()));
+        assert_eq!(json(&r.key)["key"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_unhashable_string_goes_to_the_dead_letter_topic_without_the_row() {
+        let p = fields_plan(vec![with_fields(
+            "h",
+            "public.users",
+            FieldSpec {
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+        )]);
+        let e = row(
+            "users",
+            Op::Insert,
+            r#"{"email":"\ud800secret","card":"4111"}"#,
+        );
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            r.headers[0],
+            (
+                "aqueduct-error",
+                "route `h`: hash `email`: the value is a string that is not valid Unicode"
+                    .to_string()
+            )
+        );
+        let v = json(&r.value);
+        assert_eq!(v["after"], serde_json::Value::Null);
+        assert!(!r.value.contains("secret") && !r.value.contains("4111"));
+    }
+
+    #[test]
+    fn a_rename_collision_goes_to_the_dead_letter_topic_with_original_names() {
+        let p = fields_plan(vec![with_fields(
+            "r",
+            "public.users",
+            FieldSpec {
+                mask: strs(&["card"]),
+                rename: [("cust".to_string(), "customer".to_string())].into(),
+                ..Default::default()
+            },
+        )]);
+        let ok = row("users", Op::Insert, r#"{"cust":1,"card":"4111"}"#);
+        assert_eq!(
+            json(&p.render(&ok, NOW).unwrap()[0].value)["after"],
+            serde_json::json!({"customer": 1, "card": "***"})
+        );
+        let clash = row(
+            "users",
+            Op::Insert,
+            r#"{"cust":1,"customer":2,"card":"4111"}"#,
+        );
+        let r = p.render(&clash, NOW).unwrap().remove(0);
+        assert_eq!(r.topic, DLQ);
+        assert_eq!(
+            r.headers,
+            vec![(
+                "aqueduct-error",
+                "route `r`: rename `cust` to `customer`: the row already has a column `customer`"
+                    .to_string()
+            )]
+        );
+        // Masked even though the rename could not apply.
+        assert_eq!(
+            json(&r.value)["after"],
+            serde_json::json!({"cust": 1, "customer": 2, "card": "***"})
+        );
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.errors), (2, 1, 1));
+    }
+
+    #[test]
+    fn field_ops_are_validated_at_startup() {
+        let build = |f: FieldSpec, dlq: Option<&str>, key: Option<HashKey>| {
+            RoutePlan::build(
+                vec![with_fields("r", "public.*", f)],
+                None,
+                dlq.map(Into::into),
+                key,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let hash = FieldSpec {
+            hash: strs(&["email"]),
+            ..Default::default()
+        };
+        let e = build(hash.clone(), None, None).unwrap_err();
+        assert!(
+            e.contains("sink route `r` uses `hash`") && e.contains("AQUEDUCT_HASH_KEY"),
+            "{e}"
+        );
+        assert!(build(hash, None, Some(hash_key())).is_ok());
+        let rename = FieldSpec {
+            rename: [("a".to_string(), "b".to_string())].into(),
+            ..Default::default()
+        };
+        let e = build(rename.clone(), None, None).unwrap_err();
+        assert!(e.contains("`rename` without `include`") && e.contains("dead_letter_topic"));
+        assert!(build(rename, Some(DLQ), None).is_ok());
+        // With `include`, collisions are ruled out at startup, so no dead-letter topic is needed.
+        let included = FieldSpec {
+            include: Some(strs(&["a"])),
+            rename: [("a".to_string(), "b".to_string())].into(),
+            ..Default::default()
+        };
+        assert!(build(included, None, None).is_ok());
+        // Spec errors name the route.
+        let both = FieldSpec {
+            include: Some(strs(&["a"])),
+            exclude: Some(strs(&["b"])),
+            ..Default::default()
+        };
+        let e = build(both, None, None).unwrap_err();
+        assert!(e.contains("sink route `r`: `include` and `exclude`"), "{e}");
+        let dotted = FieldSpec {
+            mask: strs(&["address.city"]),
+            ..Default::default()
+        };
+        assert!(build(dotted, None, None).unwrap_err().contains("dotted"));
+    }
+
+    #[test]
+    fn unseen_field_op_columns_are_reported_without_a_where() {
+        let p = fields_plan(vec![with_fields(
+            "u",
+            "public.users",
+            FieldSpec {
+                mask: strs(&["card_last_4"]),
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+        )]);
+        let ev = row(
+            "users",
+            Op::Insert,
+            r#"{"email":"a@b.c","card_last4":"1234"}"#,
+        );
+        for _ in 0..UNSEEN_FIELD_ROWS {
+            p.render(&ev, NOW).unwrap();
+        }
+        assert_eq!(
+            p.stats().snapshot()[0].unseen_fields,
+            vec!["row.card_last_4"]
+        );
+    }
+
+    #[test]
+    fn describe_lists_field_ops_and_the_key_id_but_never_the_key() {
+        let p = fields_plan(vec![
+            with_fields(
+                "u",
+                "public.users",
+                FieldSpec {
+                    exclude: Some(strs(&["note"])),
+                    mask: strs(&["card"]),
+                    hash: strs(&["email"]),
+                    rename: [("cust".to_string(), "customer".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+            with_fields(
+                "i",
+                "public.items",
+                FieldSpec {
+                    include: Some(strs(&["id"])),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let v = serde_json::to_value(p.describe()).unwrap();
+        assert_eq!(v["hash_key_id"], "k1");
+        let u = &v["routes"][0];
+        assert_eq!(u["exclude"], serde_json::json!(["note"]));
+        assert_eq!(u["mask"], serde_json::json!(["card"]));
+        assert_eq!(u["hash"], serde_json::json!(["email"]));
+        assert_eq!(u["rename"], serde_json::json!({"cust": "customer"}));
+        assert!(u.get("include").is_none());
+        assert_eq!(v["routes"][1]["include"], serde_json::json!(["id"]));
+        assert!(v["routes"][1].get("hash").is_none());
+        let text = v.to_string();
+        assert!(!text.contains("0123456789abcdef"), "{text}");
+        assert!(!format!("{p:?}").contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn a_route_key_may_not_name_a_protected_column() {
+        let build = |key: &[&str], f: FieldSpec| {
+            RoutePlan::build(
+                vec![KafkaRoute {
+                    key: Some(strs(key)),
+                    fields: f,
+                    ..named("r", "public.users", "users")
+                }],
+                None,
+                Some(DLQ.into()),
+                Some(hash_key()),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let cases: Vec<(FieldSpec, &str)> = vec![
+            (
+                FieldSpec {
+                    hash: strs(&["email"]),
+                    ..Default::default()
+                },
+                "hashed",
+            ),
+            (
+                FieldSpec {
+                    mask: strs(&["email"]),
+                    ..Default::default()
+                },
+                "masked",
+            ),
+            (
+                FieldSpec {
+                    exclude: Some(strs(&["email"])),
+                    ..Default::default()
+                },
+                "excluded",
+            ),
+            (
+                FieldSpec {
+                    include: Some(strs(&["id"])),
+                    ..Default::default()
+                },
+                "not included",
+            ),
+        ];
+        for (f, how) in cases {
+            let e = build(&["id", "email"], f.clone()).unwrap_err();
+            assert!(
+                e.contains(&format!("sink route `r`: `key` column `email` is {how}")),
+                "{e}"
+            );
+            // Keying by an unprotected column is fine.
+            assert_eq!(build(&["id"], f), Ok(()));
+        }
+        // A renamed column may key the route: it is not protected.
+        let renamed = FieldSpec {
+            rename: [("id".to_string(), "user_id".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(build(&["id"], renamed), Ok(()));
+    }
+
+    #[test]
+    fn a_route_key_is_kept_and_the_value_rewritten() {
+        let p = fields_plan(vec![KafkaRoute {
+            key: Some(strs(&["id"])),
+            fields: FieldSpec {
+                hash: strs(&["email"]),
+                ..Default::default()
+            },
+            ..named("r", "public.users", "users")
+        }]);
+        let mut e = row("users", Op::Insert, r#"{"id":5,"email":"a@b.c"}"#);
+        e.key = Some(r#"{"email":"a@b.c"}"#.into());
+        let r = p.render(&e, NOW).unwrap().remove(0);
+        assert_eq!(
+            r.key,
+            r#"{"db":"app","schema":"public","table":"users","key":{"id":5}}"#
+        );
+        assert_eq!(r.partition_key, r.key);
+        assert_eq!(json(&r.value)["after"]["email"], hmac_hex("a@b.c").as_str());
+        assert!(!r.key.contains("a@b.c"));
+    }
+
+    #[test]
+    fn a_content_routed_topic_may_not_read_a_protected_column() {
+        let build = |topic: &str, values: Option<&[&str]>, f: FieldSpec| {
+            RoutePlan::build(
+                vec![KafkaRoute {
+                    fields: f,
+                    ..content("r", topic, Some("orders.unknown"), values)
+                }],
+                None,
+                Some(DLQ.into()),
+                Some(hash_key()),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let spec = |how: &str| match how {
+            "hashed" => FieldSpec {
+                hash: strs(&["region"]),
+                ..Default::default()
+            },
+            "masked" => FieldSpec {
+                mask: strs(&["region"]),
+                ..Default::default()
+            },
+            "excluded" => FieldSpec {
+                exclude: Some(strs(&["region"])),
+                ..Default::default()
+            },
+            _ => FieldSpec {
+                include: Some(strs(&["id"])),
+                ..Default::default()
+            },
+        };
+        for how in ["hashed", "masked", "excluded", "not included"] {
+            // Any row path into the column counts: `row.`, `after.`, `before.`, nested too.
+            for path in ["row.region", "after.region", "before.region.code"] {
+                let e = build(&format!("orders.{{{path}}}"), None, spec(how)).unwrap_err();
+                assert!(
+                    e.contains(&format!(
+                        "sink route `r`: `topic` reads `{path}`, but column `region` is {how}"
+                    )),
+                    "{e}"
+                );
+            }
+            // With an allow-list the message says `topic_values` would carry it too.
+            let e = build("orders.{row.region}", Some(&["eu", "us"]), spec(how)).unwrap_err();
+            assert!(e.contains("the topic name (and `topic_values`)"), "{e}");
+            // Routing by an unprotected column is fine.
+            let ok = build("orders.{row.tenant}", None, spec(how));
+            assert_eq!(ok.is_ok(), how != "not included", "{ok:?}");
+        }
+        // `not included` also covers the tenant column in that last case.
+        let e = build("orders.{row.tenant}", None, spec("not included")).unwrap_err();
+        assert!(e.contains("column `tenant` is not included"), "{e}");
+        // A renamed column may route: the template reads the original row.
+        let renamed = FieldSpec {
+            rename: [("region".to_string(), "area".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(build("orders.{row.region}", None, renamed), Ok(()));
+    }
+
+    #[test]
+    fn fallback_records_carry_the_rewritten_value_key_and_key_id() {
+        let mut p = RoutePlan::build(
+            vec![KafkaRoute {
+                fields: FieldSpec {
+                    hash: strs(&["email"]),
+                    mask: strs(&["card"]),
+                    ..Default::default()
+                },
+                ..content("o", "orders.{row.region}", Some("orders.unknown"), None)
+            }],
+            None,
+            None,
+            Some(hash_key()),
+        )
+        .unwrap();
+        p.set_source(pg());
+        let ev = |region: &str| {
+            let mut e = row(
+                "orders",
+                Op::Insert,
+                &format!(r#"{{"email":"a@b.c","card":"4111","region":{region}}}"#),
+            );
+            e.key = Some(r#"{"email":"a@b.c"}"#.into());
+            e
+        };
+        let check = |r: &OutRecord, topic: &str| {
+            assert_eq!(r.topic, topic);
+            let v = json(&r.value);
+            assert_eq!(v["after"]["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(v["after"]["card"], "***");
+            assert_eq!(json(&r.key)["key"]["email"], hmac_hex("a@b.c").as_str());
+            assert_eq!(r.partition_key, r.key);
+            assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
+            assert!(!r.value.contains("a@b.c") && !r.key.contains("a@b.c"));
+            assert!(!r.value.contains("4111"));
+        };
+        // Normal content-routed record.
+        let normal = p.render(&ev(r#""eu""#), NOW).unwrap().remove(0);
+        check(&normal, "orders.eu");
+        // Render-time fallback: a null routing value.
+        let fallback = p.render(&ev("null"), NOW).unwrap().remove(0);
+        check(&fallback, "orders.unknown");
+        // The sink's refusal re-route changes only the topic.
+        let mut refused = p.render(&ev(r#""us""#), NOW).unwrap().remove(0);
+        p.topic_refused(&mut refused, "TopicAuthorizationFailed");
+        check(&refused, "orders.unknown");
+        // Apart from the topic, all three records are the same.
+        for r in [&fallback, &refused] {
+            assert_eq!(
+                (&r.key, &r.headers, r.op),
+                (&normal.key, &normal.headers, normal.op)
+            );
+        }
+        let c = p.stats().snapshot()[0].counts;
+        assert_eq!((c.matched, c.produced, c.fallback), (3, 1, 2));
+    }
+
     // --- golden: byte-identical to the router and record builders this plan replaced ----------
 
     const NOW: i64 = 1_792_502_627_093_140;
@@ -3043,5 +3868,73 @@ mod tests {
         }
         let new = t.elapsed();
         println!("legacy {legacy:?}, plan {new:?} for {n} events (sink {sink})");
+
+        // Field operations, one class at a time, on a 10-column row with a 2-column key.
+        let mut e = event("public", "users", Op::Update, None, Position::Lsn(42));
+        let row = r#"{"id":7,"tenant":3,"email":"ada@example.com","name":"Ada Lovelace","card":"4111111111111111","phone":"+32 470 00 00 00","note":"likes \"engines\"","cust_id":99,"active":true,"created_at":1792502627093140}"#;
+        e.before = raw(row);
+        e.after = raw(row);
+        e.key = Some(r#"{"id":7,"tenant":3}"#.into());
+        let s = strs;
+        let classes: Vec<(&str, FieldSpec)> = vec![
+            ("none", FieldSpec::default()),
+            (
+                "include",
+                FieldSpec {
+                    include: Some(s(&["id", "tenant", "name", "active"])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "exclude",
+                FieldSpec {
+                    exclude: Some(s(&["note", "phone"])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mask",
+                FieldSpec {
+                    mask: s(&["card", "phone"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "hash",
+                FieldSpec {
+                    hash: s(&["email", "phone"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rename",
+                FieldSpec {
+                    rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "all",
+                FieldSpec {
+                    exclude: Some(s(&["note"])),
+                    mask: s(&["card"]),
+                    hash: s(&["email", "phone"]),
+                    rename: [("cust_id".to_string(), "customer_id".to_string())].into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let n = 500_000;
+        for (class, spec) in classes {
+            let plan = fields_plan(vec![with_fields("u", "public.users", spec)]);
+            let t = Instant::now();
+            for _ in 0..n {
+                out.clear();
+                plan.render_into(&e, NOW, &mut out).unwrap();
+                sink += out[0].value.len();
+            }
+            let per = t.elapsed().as_nanos() / n as u128;
+            println!("fields {class:>8}: {per} ns/event (sink {sink})");
+        }
     }
 }
