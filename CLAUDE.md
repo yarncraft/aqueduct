@@ -34,8 +34,9 @@ docker compose up --build         # or: podman-compose up -d --build
 
 - Every PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`.
 - PRs that touch a source, the Kafka sink or the pipeline: the integration suite too, `cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored` and `cargo test --locked -p aqueduct-sinks --test kafka_it`, against local Kafka, MongoDB and Postgres containers (`AQUEDUCT_TEST_KAFKA`, `AQUEDUCT_KAFKA_BROKERS`, `AQUEDUCT_TEST_PG_*`). The passed count must be non-zero; a test that skips itself when its variable is unset does not count.
-- PRs that change `Cargo.lock`: `cargo audit`.
+- PRs that change `Cargo.lock`: `cargo audit` and `cargo deny check` (policy in `deny.toml`: advisories, licenses, bans, sources). Duplicate-version warnings are expected.
 - PRs that change the `Dockerfile` or the image: `podman build .`.
+- Base images in the `Dockerfile` are pinned by digest (tag kept in a comment). To bump, resolve the new multi-arch index digest of the tag (`podman manifest inspect` or the registry's `Docker-Content-Digest`), update both `FROM` lines and build.
 
 On the Windows dev machine, cargo runs with the local toolchain in the `Ubuntu` WSL distro (rustup in `/root/.cargo`,
 with clippy and rustfmt), never in a Rust container: `wsl.exe -d Ubuntu -- bash -l -s` with the commands on stdin, on a
