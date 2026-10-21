@@ -157,7 +157,7 @@
   </section>
 
   <!-- Routing graph: tables → routes in match order → topics. The plan comes from /api/routes, counts from the stream,
-       rate step lines from /api/routes/history plus the stream's newest second. -->
+       rate step lines from /api/routes/history plus the stream's newest second (tables: the stream's history_ops). -->
   <section id="routing" class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2.5">
       <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Routing</h2>
@@ -768,14 +768,15 @@ const ROUTE_BADGES = {
 };
 // Outcome counters of a route, with their tone in the counts row and the bar.
 const ROUTE_COUNTS = [['produced', 'bg-green'], ['filtered', 'bg-ink-500'], ['fallback', 'bg-violet'], ['errors', 'bg-red']];
-// Step-line colours per outcome (filtered in a lighter grey than its bar so the line shows), and for topics.
+// Step-line colours per outcome (filtered in a lighter grey than its bar so the line shows), for topics and tables.
 const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
-const TOPIC_LINE = '#32a467', MORE_LINE = '#abb3bf';
+const TOPIC_LINE = '#32a467', TABLE_LINE = '#4c90f0';
 
 // ---- Rates per route and per topic ----
 // /api/routes/history gives the last 120 s at 1 s (route outcomes, records Kafka acknowledged per topic);
 // each stream frame then carries only the newest second (`rates`), numbered by `seq`. A frame that does
-// not follow the window (a reconnect, a missed second) reloads it. Nothing here animates.
+// not follow the window (a reconnect, a missed second) reloads it. Nothing here animates. A table's events
+// per second come with every frame instead (`history_ops`: the same 120 s at 1 s, sampled in the same tick).
 let rates = null, ratesBusy = false, ratesOff = false;
 async function loadRates() {
   if (ratesBusy || ratesOff) return;
@@ -850,7 +851,7 @@ const isTemplate = tpl => /\{(schema|table)\}/.test(tpl);
 const perEvent = tpl => /\{(?!schema\}|table\})[^}]*\}/.test(tpl);
 const tplGlob = tpl => tpl.replace(/\{[^}]*\}/g, '*');
 let plan = null, planError = null, graphModel = null, graphKey = '';
-let graphSel = null, graphHover = null, topicSel = null;
+let graphSel = null, graphHover = null, topicSel = null, tableSel = null;
 const graphOpen = new Set();        // 'r:<route>' and 'g:<template>' groups shown in full
 const flowUntil = {};               // edge id → time until which it counts as having recent traffic
 let flowPrev = null;
@@ -893,7 +894,7 @@ function graphModelOf(d) {
     x.shown = all.slice(0, cut).sort((a, b) => a.name < b.name ? -1 : 1);
     x.hidden = all.slice(cut);
     x.moreId = 'tm:' + x.i;
-    for (const t of x.shown) values[t.id] = fmt(t.events);
+    for (const t of x.tables) values[t.id] = fmt(t.events);
     if (x.hidden.length) values[x.moreId] = fmt(x.hidden.reduce((a, t) => a + t.events, 0));
     for (const k of ['matched', ...ROUTE_COUNTS.map(c => c[0])]) values[x.id + ':' + k] = fmt(x.c[k] || 0);
   }
@@ -943,12 +944,15 @@ function graphModelOf(d) {
     for (const t of x.tables) tableEdges[t.name].push(x.id + '>' + (t.topic ? topicNode.get(t.topic) : g.id));
     if (dlq && (x.r.where != null || x.c.errors > 0)) x.dlqEdge = edge(x.id, 'dlq', x.c.errors || 0, true);
   }
+  for (const t of unrouted) values[t.id] = fmt(t.events);
   if (dlq) values.dlq = fmt(routes.reduce((a, x) => a + (x.c.errors || 0), 0));
   return { routes, groups: [...groups.values()], unrouted, edges, values, tableEdges, dlq };
 }
 
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="flex items-center gap-2 rounded-sm border border-ink-600 bg-ink-900 px-2 py-1 transition-opacity"><span class="truncate text-ink-100" title="${esc(t.name)}">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="flex w-full items-center gap-2 rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged per second, all of them together' : 'Events per second, all of them together'}">+${n} more ${what}${sparkSvg(id, 'ml-auto h-3.5 w-12 shrink-0')}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="tabular-nums"></span>` : ''}</button>`;
+// Table, topic and "+N more" cards: name and count on one line, the 120 s step line on its own line below.
+const NODE_SPARK = 'mt-1 block h-4 w-full';
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events per second · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${sparkSvg(t.id, NODE_SPARK)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged per second, all of them together' : 'Events per second, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${sparkSvg(id, NODE_SPARK)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 const badgeVal = v => Array.isArray(v) ? v.join(', ') : v && typeof v === 'object' ? Object.keys(v).join(', ') : String(v);
@@ -980,8 +984,8 @@ function topicNodeHtml(id, name, opts) {
   const sel = topicSel === name;
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
   const label = opts.dlq ? '<span class="shrink-0 text-[10px] uppercase tracking-wider text-red">dead letter</span>' : '';
-  const n = opts.dlq ? `<span data-v="dlq" class="tabular-nums text-red"></span>` : '';
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="flex cursor-pointer items-center gap-2 rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(name)} · records acknowledged per second · click for details">${label}<span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${sparkSvg(id, 'ml-auto h-3.5 w-14 shrink-0')}${n}</div>`;
+  const n = opts.dlq ? `<span data-v="dlq" class="ml-auto tabular-nums text-red"></span>` : '';
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(name)} · records acknowledged per second · click for details"><div class="flex items-center gap-2">${label}<span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${sparkSvg(id, NODE_SPARK)}</div>`;
 }
 
 function graphHtml(m) {
@@ -1078,10 +1082,22 @@ function topicDetail(m, name) {
     + `</div>` + detailChart(legendItem(name === m.dlq ? RATE_LINE.errors : TOPIC_LINE, 'records acknowledged / s'));
 }
 
+// A table's panel: the route that claims it (first match wins), its topic, its events and their rate.
+function tableDetail(m, name) {
+  const row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
+  const t = m.routes.flatMap(x => x.tables).concat(m.unrouted).find(t => t.name === name);
+  const x = t && t.route != null ? m.routes[t.route] : null;
+  $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
+    + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
+    + row('topic', esc((t && t.topic) || (x ? x.r.topic : '–')))
+    + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
+    + `</div>` + detailChart(legendItem(TABLE_LINE, 'events / s'));
+}
+
 function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
-  $('routedetail').hidden = !x && topicSel == null;
-  if (!x) { if (topicSel != null) topicDetail(m, topicSel); return; }
+  $('routedetail').hidden = !x && topicSel == null && tableSel == null;
+  if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) tableDetail(m, tableSel); return; }
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const extra = Object.keys(r).filter(k => !['route', 'match', 'ops', 'where', 'topic', 'counts', 'unseen_fields'].includes(k));
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
@@ -1103,12 +1119,14 @@ function drawSparks(m) {
     const rr = routeRate(x.i);
     // Thin outcome lines under the produced line; an outcome that never happened in the window is left out.
     if (rr) lines[x.id] = ROUTE_COUNTS.slice(1).filter(([k]) => rr[k].some(n => n)).map(([k]) => [rr[k], RATE_LINE[k], 1]).concat([[rr.produced, RATE_LINE.produced, 1.5]]);
-    if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableRate(t.name))), MORE_LINE, 1.5]];
+    for (const t of x.shown) lines[t.id] = [[tableRate(t.name), TABLE_LINE, 1.5]];
+    if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableRate(t.name))), TABLE_LINE, 1.5]];
   }
   for (const g of m.groups) {
     for (const t of g.shown) lines['p:' + t] = [[topicRate(t), TOPIC_LINE, 1.5]];
     if (g.hidden.length) lines[g.moreId] = [[sumSeries(g.hidden.map(topicRate)), TOPIC_LINE, 1.5]];
   }
+  for (const t of m.unrouted) lines[t.id] = [[tableRate(t.name), RATE_LINE.errors, 1.5]];
   if (m.dlq) lines.dlq = [[topicRate(m.dlq), RATE_LINE.errors, 1.5]];
   for (const el of document.querySelectorAll('#routing [data-spark]')) { const l = lines[el.dataset.spark]; el.innerHTML = l ? spark(l) : ''; }
   const dc = $('detailchart');
@@ -1116,6 +1134,10 @@ function drawSparks(m) {
   if (topicSel != null) {
     const h = topicRate(topicSel);
     chart([{ op: 0, h }], dc, [topicSel === m.dlq ? RATE_LINE.errors : TOPIC_LINE], 160);
+    $('detailstats').textContent = rateStats(h);
+  } else if (tableSel != null) {
+    const h = tableRate(tableSel);
+    chart([{ op: 0, h }], dc, [TABLE_LINE], 160);
     $('detailstats').textContent = rateStats(h);
   } else if (graphSel != null) {
     const rr = routeRate(graphSel);
@@ -1133,7 +1155,7 @@ function renderGraph(frame) {
   const m = graphModelOf(lastData);
   if (frame) trackFlow(m);
   const key = JSON.stringify([m.routes.map(x => [x.shown.map(t => t.name), x.hidden.length, x.c.unseen_fields]),
-    m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), graphSel, topicSel, [...graphOpen], !!(lastData && lastData.inspector)]);
+    m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector)]);
   graphModel = m;
   if (key !== graphKey) {
     graphKey = key;
@@ -1183,17 +1205,19 @@ function inspectTopic(name) {
 $('graph').addEventListener('click', ev => {
   const open = ev.target.closest('[data-open]');
   if (open) { graphOpen.has(open.dataset.open) ? graphOpen.delete(open.dataset.open) : graphOpen.add(open.dataset.open); renderGraph(); return; }
+  const table = ev.target.closest('[data-table]');
+  if (table) { tableSel = tableSel === table.dataset.table ? null : table.dataset.table; graphSel = topicSel = null; renderGraph(); return; }
   const topic = ev.target.closest('[data-topic]');
-  if (topic) { topicSel = topicSel === topic.dataset.topic ? null : topic.dataset.topic; graphSel = null; renderGraph(); return; }
+  if (topic) { topicSel = topicSel === topic.dataset.topic ? null : topic.dataset.topic; graphSel = tableSel = null; renderGraph(); return; }
   const route = ev.target.closest('[data-route]');
-  if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = null; renderGraph(); }
+  if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
 $('routedetail').addEventListener('click', ev => {
-  if (ev.target.closest('#routeclose')) { graphSel = topicSel = null; renderGraph(); return; }
+  if (ev.target.closest('#routeclose')) { graphSel = topicSel = tableSel = null; renderGraph(); return; }
   const insp = ev.target.closest('[data-inspect]');
   if (insp) { inspectTopic(insp.dataset.inspect); return; }
   const route = ev.target.closest('[data-route]');
-  if (route) { graphSel = +route.dataset.route; topicSel = null; renderGraph(); }
+  if (route) { graphSel = +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
 $('graph').addEventListener('pointerover', ev => {
   const t = ev.target.closest('[data-table]');

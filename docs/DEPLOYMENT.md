@@ -873,15 +873,18 @@ motion. The line to the dead-letter topic is dashed and appears for routes with 
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
-**Rates.** Each route and topic shows a step line of its rate over the last 120 s, one sample per second, on one
-shared time axis (nothing animates):
+**Rates.** Each table, route and topic shows a step line of its rate over the last 120 s, one sample per second, on
+one shared time axis (nothing animates). On table and topic cards it sits on its own line under the name and count:
 
+- a table: events per second the source delivered for it (the same per-table history as the event-rate chart's
+  table filter, `history_ops` in `/api/metrics` and every stream frame);
 - a route: events produced per second, with filtered (grey), fallback (violet) and errors (red) as thin lines;
 - a topic: records Kafka acknowledged per second, counted by the sink after the broker acknowledged the produce, so
   a failed produce never counts and a retried batch counts when it succeeds;
 - a "+N more" group: the sum over its tables (events per second) or topics.
 
-Click a route for its details and a larger chart split by outcome. Click a topic for a panel with a larger chart, its
+Click a route for its details and a larger chart split by outcome. Click a table for a panel with its events per
+second as a larger chart, the current, average and maximum rate, the route that claims it and its topic. Click a topic for a panel with a larger chart, its
 current, average and maximum rate over the window, the routes that write to it (by template, as their
 `topic_fallback`, or as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
 
