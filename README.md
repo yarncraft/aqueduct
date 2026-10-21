@@ -40,7 +40,7 @@ flowchart LR
     MG -- "watch (changes + watermarks)" --> SRC
     SRC -- "snapshot chunks (_id index scan) + watermark inserts" --> MG
     SRC --> PIPE --> SINK --> K
-    SINK -. "type errors: dead-letter topic" .-> K
+    SINK -. "type errors: the route's topic + .dlq" .-> K
     SINK -. "route plan + counts (/api/routes)" .-> ADM
     PIPE -- "save position" --> CK
     PIPE -. "ack(position)" .-> SRC
@@ -228,19 +228,21 @@ topic = "audit"
 
 A route can also filter what it claims with a `where` expression (SQL-style three-valued logic; a field that is
 null or missing makes a comparison unknown, and unknown is filtered). It filters operations too, through `op`:
-`where = "op in ['insert', 'update']"`. Rows the expression cannot evaluate (a type error) go to `dead_letter_topic`
-with an `aqueduct-error` header instead of stopping the pipeline; a `where` on `op`, `schema` and `table` alone cannot
-fail and needs no dead-letter topic. The first matching route owns the event: nothing falls through. See
-DEPLOYMENT.md, "Filtering events per route".
+`where = "op in ['insert', 'update']"`. Rows the expression cannot evaluate (a type error) go to the route's
+dead-letter topic with an `aqueduct-error` header instead of stopping the pipeline; a `where` on `op`, `schema` and
+`table` alone cannot fail. The first matching route owns the event: nothing falls through. See DEPLOYMENT.md,
+"Filtering events per route".
+
+Every route's dead-letter topic is its own topic plus `.dlq` (`orders-paid.dlq` below; `cdc.{schema}.{table}.dlq`,
+rendered per event, for a template; `<topic_fallback>.dlq` for a content-routed or outbox topic). A route's
+`dead_letter_topic`, then `[sink] dead_letter_topic`, override it. See DEPLOYMENT.md, "Dead-letter topics".
 
 ```toml
-[sink]
-dead_letter_topic = "aqueduct.dead-letter"  # required once a route's `where` reads row data
-
 [[sink.routes]]
 match = "public.orders"
 where = "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'"
-topic = "orders-paid"
+topic = "orders-paid"                  # bad rows: orders-paid.dlq
+# dead_letter_topic = "orders.errors"  # optional override
 ```
 
 `key = ["col", ...]` on a route keys its records by those row columns instead of the primary key (deletes by their
@@ -301,7 +303,7 @@ match = "public.customers"
 topic = "customers.compacted"
 format = "row"
 deletes = "tombstone"         # or "drop", "row"
-unchanged = "dead_letter"     # needs sink.dead_letter_topic
+unchanged = "dead_letter"     # to customers.compacted.dlq
 
 [[sink.routes]]
 match = "public.*"
@@ -344,7 +346,7 @@ before/after diff and Copy JSON).
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
-| `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged per route, plus `default`) with live per-route counts (produced also per operation, `counts.ops`) and unseen fields; no row data. Drawn by the Routing card |
+| `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged and the resolved dead_letter_topic per route, plus `default`) with live per-route counts (produced also per operation, `counts.ops`) and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second, and produced per operation; per topic, records Kafka acknowledged per second, also per operation, with per-op totals since start. The Routing card's detail charts and topic op bars; the stream then adds the newest second |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Per-table high-water marks" |
@@ -393,13 +395,13 @@ The last-commit age turns amber when a table is more than 1 minute behind the fr
 only while the pipeline is streaming.
 
 The **Routing** card draws the sink's routing as a graph, left to right: every table seen, the
-`[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`), and the topics they
-write, plus the dead-letter topic in red. A table connects to the first route whose `match` fits it; a route
-connects to the topics it rendered and, when its `where` reads row data or it has errors, with a dashed line to the
-dead-letter topic. Each route card reads like a query, five aligned rows: `SELECT` (the fields: `*` for the
+`[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`, shown once an event reached it),
+and the topics they write (real topics only; templates are not drawn as topics), plus the routes' dead-letter topics in red. A table connects to the first route whose `match` fits it; a route
+connects to the topics it rendered and, when it can dead-letter a row or it has errors, with a dashed line to its own
+dead-letter topic. A topic's panel names the dead-letter topic of the routes writing to it. Each route card reads like a query, five aligned rows: `SELECT` (the fields: `*` for the
 envelope, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`, `col AS new`, `ROW` and the shape options),
 `WHERE` (the `where`, operation filter included), `FROM` (the `match` glob and the tables it claimed), `INTO` (the
-topic, `ELSE` the fallback, `ON ERROR` the dead-letter topic when the route can use it) and `PARTITIONED-BY` (the
+topic, `ELSE` the fallback, `ON ERROR` the route's dead-letter topic when it can use it) and `PARTITIONED-BY` (the
 route `key`, else the primary key or the table). Unset clauses show their default, dimmed. Below them: the step
 number and name, the produced / filtered / fallback / errors counts with a bar, and an
 amber **never seen** warning for fields its `where` reads that no row has had (usually a typo). Line width follows the

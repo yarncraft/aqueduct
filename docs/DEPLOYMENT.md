@@ -246,10 +246,10 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](#routing-by-row-content) |
-| `dead_letter_topic` | unset | Where events go that a route's `where` cannot evaluate (a type error), whose `rename` collides with an existing column, outbox rows without an `aggregate_id` or `payload`, and rows lacking unchanged TOAST columns on an `unchanged = "dead_letter"` route. Required as soon as a route's `where` reads row data (`before.`, `after.`, `row.`), or a route uses `outbox`, `unchanged = "dead_letter"`, or `rename` without `include`; opened (created if missing) at startup. See [Filtering events per route](#filtering-events-per-route) |
+| `dead_letter_topic` | unset | Global override: the dead-letter topic of every route that does not set its own `dead_letter_topic`. Unset, each route uses its own topic plus `.dlq`. See [Dead-letter topics](#dead-letter-topics) |
 | `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](#protecting-fields-per-route) |
 | `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
-| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `where` filters the events the route claims, operations included (`op in ['insert', 'update']`), see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route). Optional `format`, `deletes`, `tombstones` and `unchanged` reshape the records, see [Shaping the output](#shaping-the-output) |
+| `[[sink.routes]]` | none | `match` (`schema.table`, `*` wildcard) and `topic` (or `outbox`). First match wins. Optional `name` (unique) labels the route in per-route stats; it defaults to `match`. Optional `where` filters the events the route claims, operations included (`op in ['insert', 'update']`), see [Filtering events per route](#filtering-events-per-route). Optional `key` sets the record key from row columns, see [Keying a route](#keying-a-route). A `topic` can read row fields with `topic_fallback` and optional `topic_values`, see [Routing by row content](#routing-by-row-content). `outbox` publishes an outbox table's rows as their own events, see [Outbox](#outbox). Topic names are checked at startup. Optional `include`, `exclude`, `mask`, `hash` and `rename` protect personal data, see [Protecting fields per route](#protecting-fields-per-route). Optional `format`, `deletes`, `tombstones` and `unchanged` reshape the records, see [Shaping the output](#shaping-the-output). Optional `dead_letter_topic` (a fixed name) is where the route's rows that cannot be evaluated go; default `sink.dead_letter_topic`, else the route's topic plus `.dlq`, see [Dead-letter topics](#dead-letter-topics) |
 
 Records: key and value as above (a route with `format = "row"` or `tombstones = true` changes the value, see
 [Shaping the output](#shaping-the-output)), headers `op` and `lsn`, timestamp = commit time. The partition is a stable FNV-1a
@@ -286,7 +286,6 @@ and filters operations as well as row values:
 [sink]
 brokers = ["kafka:9092"]
 topic = "cdc.{schema}.{table}"
-dead_letter_topic = "aqueduct.dead-letter"   # required once a route's `where` reads row data
 
 [[sink.routes]]
 name = "paid-orders"
@@ -297,7 +296,7 @@ topic = "orders-paid"
 [[sink.routes]]
 name = "audit"
 match = "audit.*"
-where = "op != 'truncate'"                   # no row data: needs no dead_letter_topic
+where = "op != 'truncate'"                   # no row data: never dead-letters
 topic = "audit"
 ```
 
@@ -341,19 +340,14 @@ topic = "audit"
   `amount` is `'abc'`, `NaN` or a JSON object) is a type error. It wins over true, false and unknown with no
   short-circuit, so `not (...)` cannot let a mistyped row through. That includes an `op` test next to it: under
   `op == 'insert' and row.amount > 10`, a delete whose `amount` is `'abc'` goes to the dead-letter topic, not to
-  `filtered`. The event is produced to
-  `sink.dead_letter_topic` instead: value = the event (the same envelope), key = the record key with `"key": null`
+  `filtered`. The event is produced to the route's
+  [dead-letter topic](#dead-letter-topics) instead (`orders-paid.dlq` above): value = the event (the same envelope), key = the record key with `"key": null`
   (the table only, no row values), partitioned by that key, headers `op`, `lsn` and `aqueduct-error`. The
   `aqueduct-error` header names the route, the expression and the field with the type it should have, never the value,
   for example ``route `paid-orders`: where `row.amount > 10`: type error: `row.amount` is not a finite number``. The
   first one per route is logged as a warning. The batch is acknowledged as usual once the dead-letter record is
   written too, so one bad row never stops the pipeline or pins the replication slot.
-- **`dead_letter_topic`** is required as soon as a route's `where` reads row data (`before.`, `after.` or `row.`). A
-  `where` on `op`, `schema` and `table` alone cannot hit a type error, so it needs none. It must be a valid topic name, must not start
-  with `_`, and must not be a topic events are routed to (a route's or `topic`'s name, or a name a `{schema}`/`{table}`
-  template could produce). It is opened at startup and created if missing (with `partitions` and
-  `replication_factor`), so a dead-letter topic that cannot be created or read fails startup. Pre-create it with the
-  retention you want. The event inspector also reads the dead-letter topic.
+- A `where` on `op`, `schema` and `table` alone cannot hit a type error, so it never dead-letters.
 - **Check the dead-letter topic's write ACL before you enable a `where` on row data.** Startup can only check that the topic exists;
   write permission is first used by the first dead-letter record. If the broker refuses that write, the batch fails,
   nothing is acknowledged and the process exits. After a restart it reads the same row again and fails again, so it
@@ -365,6 +359,63 @@ topic = "audit"
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
+
+#### Dead-letter topics
+
+Every route has a dead-letter topic: where its rows go that it cannot evaluate. That is a type error in `where`, an
+outbox row without an `aggregate_id` or `payload`, a row lacking unchanged TOAST columns under
+`unchanged = "dead_letter"`, a `rename` that collides with an existing column, or a value `hash` cannot hash. No
+setting is required. By convention the dead-letter topic is the route's own topic plus `.dlq`:
+
+| The route's topic | Its dead-letter topic |
+|-------------------|-----------------------|
+| static, `sim.assets.active` | `sim.assets.active.dlq` |
+| `{schema}`/`{table}` template, `cdc.{schema}.{table}` | `cdc.{schema}.{table}.dlq`, rendered for the event (`cdc.public.orders.dlq`) and created on first use, like the topics of the template |
+| a template with `{op}`, `cdc.{table}.{op}` | `cdc.{table}.dlq`: `{op}` is dropped with the separator next to it, so there is one dead-letter topic per table, not one per operation (a topic that is only `{op}` keeps it) |
+| content-routed, `orders.{row.region}` with `topic_fallback = "orders.unknown"` | `orders.unknown.dlq`: the row that failed cannot render the template, so the fallback's name is used |
+| `outbox` | `<outbox topic_fallback>.dlq`, or `<topic>.dlq` for a static outbox topic |
+| the `default` route (`sink.topic`) | the same rules; it never dead-letters a row, as it has no `where` or field operations |
+
+Two settings override it, a route's own first:
+
+```toml
+[sink]
+brokers = ["kafka:9092"]
+dead_letter_topic = "aqueduct.dead-letter"   # optional: every route without its own
+
+[[sink.routes]]
+match = "public.payments"
+where = "row.amount > 0"
+topic = "payments"
+dead_letter_topic = "payments.errors"        # optional: this route only
+```
+
+Precedence: the route's `dead_letter_topic`, then `sink.dead_letter_topic`, then `<topic>.dlq`. Both overrides are
+fixed names (no placeholders).
+
+- **Startup checks.** A dead-letter topic must be a valid topic name (at most 249 characters, so a 246-character topic
+  has no room for `.dlq`) and must not start with `_`. It must not be a route's `topic_fallback`, and no route's topic
+  may be able to produce it: not a static topic or `sink.topic`, not a name `{schema}`/`{table}`/`{op}` could fill
+  (`cdc.dlq` next to `cdc.{table}`; a schema or table name is taken as one name without dots), and not a name a row
+  value could render. A `{table}` dead-letter template also may not overlap a content-routed template read as a glob.
+  A default `<topic>.dlq` that breaks a rule fails startup naming the route, and you set `dead_letter_topic`; on a route
+  that cannot dead-letter a row it is dropped instead (`null` in `/api/routes`).
+- **`dlq` is a reserved row value.** `orders.{row.region}` read as a glob (`orders.*`) matches `orders.dlq` and
+  `orders.unknown.dlq`, but a row value is one segment without dots and never the exact value `dlq` (that row goes to
+  `topic_fallback`, and `topic_values` may not list it). So a content-routed template can never render a name ending in
+  `.dlq` from a placeholder, also not with several placeholders (`a.{row.x}.{row.y}` with `y = "dlq"`), and a route's
+  own `<topic_fallback>.dlq`, or the `.dlq` of a static topic beside it, is accepted. A template with a fixed `.dlq`
+  suffix (`orders.{row.r}.dlq`) can render one, and is refused next to such a name.
+- **Created when.** The fixed dead-letter topics of routes that can dead-letter a row (a `where` on row data, `outbox`,
+  `unchanged = "dead_letter"`, `hash`, or `rename` without `include`) are opened at startup and created if missing
+  (with `partitions` and `replication_factor`), so one that cannot be created or read fails startup; pre-create them
+  with the retention you want. A rendered one (`cdc.public.orders.dlq`) is created on its first record, like any
+  topic; if that fails, the batch fails and is retried, nothing is acknowledged. A rendered name Kafka would refuse
+  (a schema starting with `_`) fails the batch the same way. `sink.dead_letter_topic` is only opened when a route uses
+  it.
+- **Visibility.** `/api/routes` gives each route's `dead_letter_topic` (the template for a `{table}` one; the
+  top-level `dead_letter_topic` is the global override). The event inspector reads every dead-letter topic, and each
+  route counts its rows under `errors`.
 
 #### Keying a route
 
@@ -424,13 +475,14 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   `{schema}`, `{table}` and `{op}` works as before and needs no fallback.
 - **Rules, checked at startup** for a `topic` that reads a row field, so row data cannot pick an arbitrary topic:
   - The template starts with fixed text: `orders.{row.region}` is allowed, `{row.tenant}` and `{schema}.{row.x}` are not.
-    Once any route reads a row field, no topic anywhere in the config (route topics, `sink.topic`, fallbacks, the
-    dead-letter topic) may start with `_` (Kafka's internal topics such as `__consumer_offsets`). Without content
+    Once any route reads a row field, no topic anywhere in the config (route topics, `sink.topic`, fallbacks,
+    dead-letter topics) may start with `_` (Kafka's internal topics such as `__consumer_offsets`). Without content
     routing, such topics are accepted as before.
   - `topic_fallback` is required. It is a fixed topic name (no placeholders), opened (created if missing) at startup.
   - No fixed topic in the config may match the template read as a glob (`orders.{row.region}` is `orders.*`): not
-    another route's `topic`, `sink.topic`, another route's `topic_fallback` or `dead_letter_topic`. Only the route's
-    own fallback may (`orders.unknown` above).
+    another route's `topic`, `sink.topic` or another route's `topic_fallback`. Only the route's own fallback may
+    (`orders.unknown` above). Dead-letter topics are checked by what a row can render instead, see
+    [Dead-letter topics](#dead-letter-topics).
   - The template read as a glob may not overlap another template's glob that has no row field (a route `topic` or
     `sink.topic` with `{schema}`, `{table}` or `{op}`). For example, `cdc.{row.kind}` next to `cdc.{table}` is
     refused: a row with `kind = "customers"` would write into the `cdc.customers` topic of the other route. Give the
@@ -441,6 +493,7 @@ topic_values = ["eu", "us", "apac"]   # optional allow-list
   refused), no spaces, nothing empty. The event goes to `topic_fallback`, and counts under `fallback`, when a field is
   null or missing (a truncate has no row), is an object or array, breaks the segment rule, is not in `topic_values`, the
   topic name would be invalid, or the topic would be new beyond `max_dynamic_topics`. Its key and value are unchanged.
+  The value `dlq` is reserved, so it goes to the fallback too (see [Dead-letter topics](#dead-letter-topics)).
   The first fallback per route is logged once with the reason (the field path, never the value). Content routing
   never sends events to the dead-letter topic.
 - **Topics Kafka refuses go to the fallback too.** Kafka refuses a new topic whose name equals an existing one once
@@ -479,7 +532,6 @@ A route can remove, mask, hash and rename top-level columns before its records l
 [sink]
 hash_key_file = "/run/secrets/aqueduct-hash-key"   # or AQUEDUCT_HASH_KEY; never in this file
 hash_key_id = "2026-10"                            # required with a key
-dead_letter_topic = "aqueduct.dead-letter"         # required for `rename` without `include`
 
 [[sink.routes]]
 match = "public.customers"
@@ -512,14 +564,15 @@ rename = { cust_id = "customer_id" }
   - The text carries no type: `true` and the string `"true"` give the same digest, as do the object `{"a":1}` and
     the string `"{\"a\":1}"`, and the number `42` and the string `"42"`.
   - A string that is not valid Unicode (a lone surrogate escape such as `"\ud800"`) cannot be hashed: the event goes
-    to `dead_letter_topic` with `before` and `after` set to `null`, and the header names the column.
+    to the route's [dead-letter topic](#dead-letter-topics) with `before` and `after` set to `null`, and the header
+    names the column.
 - **`rename`** maps old column names to new ones. A target may not be another renamed column, another target, or a
   column listed in `include`. The other operations name the **original** columns: a target listed in `mask`, `hash`
   or `exclude` fails startup (`rename = { email = "x" }` with `hash = ["x"]` would hash nothing and pass the email
   through as `x`), so list the source column (`hash = ["email"]`) instead. Without `include` the columns are only known when rows arrive, so a row that already
-  has a column named like a target goes to `dead_letter_topic` (value: the operations applied without the renames;
-  header `aqueduct-error`: ``route `customers`: rename `cust_id` to `customer_id`: the row already has a column
-  `customer_id` ``), which is then required. With `include`, collisions are ruled out at startup.
+  has a column named like a target goes to the route's dead-letter topic (value: the operations applied without the
+  renames; header `aqueduct-error`: ``route `customers`: rename `cust_id` to `customer_id`: the row already has a
+  column `customer_id` ``). With `include`, collisions are ruled out at startup.
 - **Names** are top-level columns only and **case-sensitive**: `Email` does not match a column `email`, which matters
   for MongoDB, where field names are not folded. A misspelt or wrongly cased name is reported as an unseen field
   (below). A dotted path (`address.city`) fails startup: nested MongoDB fields cannot be
@@ -562,9 +615,6 @@ router, with the differences listed under "Differences from Debezium" below. The
 each **insert** into one Kafka record whose key is the aggregate id and whose value is the payload:
 
 ```toml
-[sink]
-dead_letter_topic = "aqueduct.dead-letter"   # required once any route uses `outbox`
-
 [[sink.routes]]
 match = "public.outbox"
 outbox = { aggregate_type = "aggregatetype", aggregate_id = "aggregateid", payload = "payload", topic = "outbox.{aggregate_type}", id = "id", type = "type" }
@@ -616,7 +666,8 @@ misspelled key never falls back to a default column.
   `topic_fallback` required, one segment per value, `topic_values`, no collision with fixed topics,
   `max_dynamic_topics`. A null or invalid `aggregate_type` sends the record (same key, value and headers) to the
   fallback. A fixed `topic` such as `outbox.events` needs no fallback.
-- **Rows that cannot be published go to the dead-letter topic:** a null or missing `aggregate_id` or `payload`, or a
+- **Rows that cannot be published go to the dead-letter topic** (`<topic_fallback>.dlq` by default, see
+  [Dead-letter topics](#dead-letter-topics)): a null or missing `aggregate_id` or `payload`, or a
   string in the key, payload or a header column that is not valid Unicode (a lone `\ud800` escape). The dead-letter
   record is the full change-event envelope of the row, the payload included (an outbox route has no field
   operations to apply), keyed by the table only, with an `aqueduct-error` header that names
@@ -651,9 +702,6 @@ By default a record's value is the change-event envelope (`before`, `after`, `so
 change that, after the route's filter, key, topic and field operations:
 
 ```toml
-[sink]
-dead_letter_topic = "aqueduct.dead-letter"   # required by unchanged = "dead_letter"
-
 [[sink.routes]]
 match = "public.customers"
 topic = "customers"
@@ -672,7 +720,7 @@ tombstones = true             # envelope format: a null-value record after every
 | `format` | `envelope` | `row`: the value is `after` (inserts, updates and snapshot reads) after field operations, with no envelope. Truncates have no row: they produce nothing and count as `filtered`. The `op` and `lsn` headers stay, so consumers that need them can still read them |
 | `deletes` | `tombstone` | Only with `format = "row"`. `tombstone`: the delete is a record with a null value and the row's key, which a compacted topic reads as "remove this key". `drop`: no record, counted as `filtered`. `row`: the before-image (after field operations) with `"__deleted": true` added as its last member; a column of the row named `__deleted` is replaced. Under the default replica identity the before-image holds only the primary key |
 | `tombstones` | `false` | Only with the envelope format (with `format = "row"`, `deletes = "tombstone"` already is the tombstone). After every delete, also a null-value record with the same key, on the same partition, right after the delete. The key is the delete's record key after field operations, so a hashed key column stays hashed |
-| `unchanged` | `omit` | What happens to a row the source sent without some columns (see TOAST below). `omit`: produce it as it is. `dead_letter`: send it to `sink.dead_letter_topic` instead (the envelope, with the route's field operations; the `aqueduct-error` header names the columns, never values, with control characters and backticks shown as `?`), counted under `errors`. Columns the route excludes or leaves out of `include` do not count, since the route would not send them anyway. Allowed on any route; needs `dead_letter_topic` |
+| `unchanged` | `omit` | What happens to a row the source sent without some columns (see TOAST below). `omit`: produce it as it is. `dead_letter`: send it to the route's [dead-letter topic](#dead-letter-topics) instead (the envelope, with the route's field operations; the `aqueduct-error` header names the columns, never values, with control characters and backticks shown as `?`), counted under `errors`. Columns the route excludes or leaves out of `include` do not count, since the route would not send them anyway. Allowed on any route |
 
 Rules, checked at startup:
 
@@ -886,20 +934,23 @@ The **Routing** card shows where each table's events go:
   | `SELECT` | What the record value holds: `include` as a column list, `exclude` as `* EXCEPT (a, b)`, then `mask(col)`, `hash(col)` and `col AS new`. `format = "row"` adds `ROW` (`SELECT ROW *`); the delete mode, `tombstones` and `unchanged` are small tags after it. An outbox route shows its `payload` column | `*`, the change-event envelope |
   | `WHERE` | The `where` text, operation filter included. Long text is cut; hover for it all, or click the route | `true` |
   | `FROM` | The `match` glob, then the tables it claimed, ` / `-separated, the first three and `+N` | `* (unmatched)` on `default` |
-  | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). `ON ERROR` and the dead-letter topic, in red, when the route can send rows there: a `where` on row data, `unchanged = "dead_letter"`, an outbox, `hash`, or `rename` without `include` | `sink.topic` on `default` |
+  | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). `ON ERROR` and the route's own dead-letter topic (or its `{table}` template), in red, when the route can send rows there: a `where` on row data, `unchanged = "dead_letter"`, an outbox, `hash`, or `rename` without `include` | `sink.topic` on `default` |
   | `PARTITIONED-BY` | `key (a, b)` for a route `key`; the `aggregate_id` column for an outbox | `primary key` (`partition_by = "key"`) or `table` |
 
   Below the rows: the step number and route name, the produced, filtered, fallback and errors counts, and the op bar
   of its produced events. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
-- **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
-  `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count. A
-  template that reads the event (`{op}`, `{row.x}`) lists the topics the sink has produced to since start, and its
-  `topic_fallback`.
+- **Topics** (right): only real topics, never a template: the topics a template rendered for the tables seen, and
+  under **dead letter**, in red, one card per distinct dead-letter topic of the routes that show `ON ERROR` (a
+  `{schema}`/`{table}` dead-letter template shows the dead-letter topics it rendered), with the errors of the routes
+  that use it. A route whose template has not rendered a topic yet has no topic edge. The `default` route
+  (`sink.topic`) is left out until an event reaches it. Beyond
+  six, the quietest ones are behind "+N more". A template that reads the event (`{op}`, `{row.x}`) lists the topics the
+  sink has produced to since start (not its dead-letter topics), and its `topic_fallback`.
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
-motion. The line to the dead-letter topic is dashed and appears for routes that show `ON ERROR`, or with errors. Hover a
+motion. The line from a route to its dead-letter topic is dashed and appears for routes that show `ON ERROR`, or with errors. Hover a
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
@@ -914,16 +965,20 @@ green, update blue, delete red, truncate violet, read amber); hover it for the c
 - a "+N more" group: the sum over its tables or topics.
 
 Table, route and topic cards keep their counts (events, the route's produced/filtered/fallback/errors, acknowledged
-records).
+records, a dead-letter topic's errors).
 
 **Rates.** Click a table, a route or a topic for a panel with one step line over the last 120 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second, counting only the operations toggled on with the buttons above the chart
 (insert, update, delete, truncate, read). The selection is shared by the three panels, so a table, its route and its
 topic are compared over the same operations. A table's panel names the route that claims it. A route's panel keeps the
-outcome counts and lists its produced events per operation. A topic's panel (the dead-letter topic's works the same)
-lists its acknowledged records per operation, the routes that write to it (by template, as their `topic_fallback`, or
-as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
+outcome counts and lists its produced events per operation. A topic's panel lists its acknowledged records per
+operation, the routes that write to it (by template or as their `topic_fallback`), **dead letter**: the dead-letter
+topic of each of those routes that can dead-letter a row (a `{table}` template filled in for this topic,
+`cdc.public.orders.dlq`; click one to select it in the graph), and an **Open in inspector** button (shown when the
+inspector is on). A dead-letter topic's panel works the same (its line and per-op counts sum every topic a `{table}`
+template rendered) and shows **dead letter for**, the routes it serves and their topics; a `{table}` template's panel
+lists the dead-letter topics it has rendered, each opening the inspector.
 
 The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
 the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
@@ -939,11 +994,11 @@ zero when the process restarts.
 {"seq": 431, "interval_ms": 1000, "len": 120,
  "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0],
              "ops": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 2, 0, 0]]}],
- "topics": {"orders-paid": [3, 0, 7], "aqueduct.dead-letter": [0, 0, 0]},
+ "topics": {"orders-paid": [3, 0, 7], "orders-paid.dlq": [0, 0, 0]},
  "topic_ops": {"orders-paid": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 4, 0, 0]],
-               "aqueduct.dead-letter": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]},
+               "orders-paid.dlq": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]},
  "topic_totals": {"orders-paid": {"insert": 610, "update": 95, "delete": 40, "truncate": 0, "read": 0},
-                  "aqueduct.dead-letter": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}}}
+                  "orders-paid.dlq": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}}}
 ```
 
 ### Routing plan
@@ -959,25 +1014,28 @@ its `deletes` (`tombstone`, `drop` or `row`, the default included), a route with
 `"tombstones": true`, and a route with `unchanged = "dead_letter"` has `"unchanged": "dead_letter"`; each is left out
 otherwise. `counts` also has `tombstones_skipped`, which is not an outcome, and `ops`: the produced events per
 operation (`insert`, `update`, `delete`, `truncate`, `read`; they sum to `produced`, and a delete's tombstone is not
-counted again).
+counted again). Every route has its resolved
+`dead_letter_topic` (a `{schema}`/`{table}` template for one rendered per event, `null` only if the default name is
+unusable on a route that cannot dead-letter); the top-level `dead_letter_topic` is `sink.dead_letter_topic`, `null`
+when unset.
 
 ```json
-{"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
+{"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": null, "partition_by": "key",
  "routes": [
    {"route": "paid-orders", "match": "public.orders",
     "where": "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
-    "topic_fallback": null, "topic_values": null,
+    "topic_fallback": null, "topic_values": null, "dead_letter_topic": "orders-paid.dlq",
     "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1, "tombstones_skipped": 0,
                "ops": {"insert": 50, "update": 20, "delete": 10, "truncate": 0, "read": 0}},
     "unseen_fields": []},
    {"route": "regional", "match": "public.customers", "where": null, "key": null,
     "topic": "customers.{row.region}", "topic_fallback": "customers.unknown", "topic_values": ["eu", "us"],
-    "format": "row", "deletes": "tombstone",
+    "format": "row", "deletes": "tombstone", "dead_letter_topic": "customers.unknown.dlq",
     "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0, "tombstones_skipped": 0,
                "ops": {"insert": 200, "update": 85, "delete": 5, "truncate": 0, "read": 0}},
     "unseen_fields": []},
    {"route": "default", "match": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
-    "topic_fallback": null, "topic_values": null,
+    "topic_fallback": null, "topic_values": null, "dead_letter_topic": "cdc.{schema}.{table}.dlq",
     "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0,
                "ops": {"insert": 3000, "update": 1500, "delete": 500, "truncate": 0, "read": 0}},
     "unseen_fields": []}]}

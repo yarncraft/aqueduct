@@ -725,10 +725,13 @@ function graphModelOf(d) {
     x.topics.set(t.topic, (x.topics.get(t.topic) || 0) + t.events);
   }
   // Per-event templates: the topics the sink acknowledged records on (and the fallback), weighted by the window.
+  // Dead-letter topics are drawn on their own, so a template's glob does not claim them (`orders.*`, `orders.unknown.dlq`).
+  const dlqNames = [...new Set(plan.routes.map(dlqOf).filter(Boolean))];
+  const isDlqTopic = t => dlqNames.some(d => d === t || (d.includes('{') && globMatch(tplGlob(d), t)));
   for (const x of routes.filter(x => perEvent(x.r.topic) && rates)) {
     const glob = tplGlob(x.r.topic);
     for (const [t, h] of Object.entries(rates.topics)) {
-      if (globMatch(glob, t) || t === x.r.topic_fallback) x.topics.set(t, h.reduce((a, n) => a + n, 0));
+      if ((globMatch(glob, t) && !isDlqTopic(t)) || t === x.r.topic_fallback) x.topics.set(t, h.reduce((a, n) => a + n, 0));
     }
   }
   // Tables per route: the busiest few, the rest behind "+N more".
@@ -779,9 +782,29 @@ function graphModelOf(d) {
     if (g.hidden.length) ops[g.moreId] = rates && rates.topic_totals ? addSlots(g.hidden.map(topicTotals)) : null;
   }
   // Edges: table → claiming route, route → each topic it wrote (its produced count split by the tables' events),
-  // route → dead-letter topic.
+  // route → its dead-letter topic: one node per distinct topic or template, the quietest behind "+N more".
   const edge = (from, to, w, dlq) => { const id = from + '>' + to; edges.push({ id, from, to, w, dlq }); return id; };
-  const dlq = plan.dead_letter_topic;
+  const dlqs = new Map();
+  for (const x of routes) {
+    x.dlq = dlqOf(x.r);
+    x.dlqNames = [];
+    if (!x.dlq || !(canDeadLetter(x.r) || x.c.errors > 0)) { x.dlq = null; continue; }
+    // A template shows the dead-letter topics it rendered (none yet: no node); a fixed name shows itself.
+    x.dlqNames = x.dlq.includes('{') ? dlqTopics(x.dlq) : [x.dlq];
+    for (const name of x.dlqNames) {
+      if (!dlqs.has(name)) dlqs.set(name, { name, id: 'dlq:' + name, routes: [], errors: 0 });
+      const d = dlqs.get(name);
+      d.routes.push(x);
+      d.errors += x.dlqNames.length === 1 ? (x.c.errors || 0) : ((rates && rates.topics[name]) || []).reduce((a, n) => a + n, 0);
+    }
+  }
+  const dlqAll = [...dlqs.values()].sort((a, b) => b.errors - a.errors || (a.name < b.name ? -1 : 1));
+  const dlqCut = graphOpen.has('g:dlq') || dlqAll.length <= GRAPH_TOPICS ? dlqAll.length : GRAPH_TOPICS - 1;
+  const dlqShown = dlqAll.slice(0, dlqCut).sort((a, b) => a.name < b.name ? -1 : 1), dlqHidden = dlqAll.slice(dlqCut);
+  for (const d of dlqHidden) d.node = 'pm:dlq';
+  for (const d of dlqShown) d.node = d.id;
+  for (const d of dlqAll) values[d.id] = fmt(d.errors);
+  if (dlqHidden.length) values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
   for (const x of routes) {
     for (const t of x.shown) tableEdges[t.name] = [edge(t.id, x.id, t.events)];
     if (x.hidden.length) {
@@ -791,18 +814,39 @@ function graphModelOf(d) {
     const g = groups.get(x.r.topic);
     const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
     const targets = new Map();
-    if (!x.topics.size) targets.set(g.dynamic ? g.id : topicNode.get(x.r.topic), x.c.produced || 0);
+    if (!x.topics.size && !g.dynamic) targets.set(topicNode.get(x.r.topic), x.c.produced || 0);
     for (const [t, n] of x.topics) {
       const to = topicNode.get(t);
       targets.set(to, (targets.get(to) || 0) + (sum ? (x.c.produced || 0) * n / sum : 0));
     }
     for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
-    for (const t of x.tables) tableEdges[t.name].push(x.id + '>' + (t.topic ? topicNode.get(t.topic) : g.id));
-    if (dlq && (canDeadLetter(x.r) || x.c.errors > 0)) x.dlqEdge = edge(x.id, 'dlq', x.c.errors || 0, true);
+    for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
+    for (const name of x.dlqNames) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true);
   }
   for (const t of unrouted) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
-  if (dlq) { values.dlq = fmt(routes.reduce((a, x) => a + (x.c.errors || 0), 0)); ops.dlq = topicTotals(dlq); }
-  return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlq };
+  for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
+  if (dlqHidden.length) ops['pm:dlq'] = rates && rates.topic_totals ? addSlots(dlqHidden.map(d => ops[d.id])) : null;
+  return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlqs, dlqShown, dlqHidden };
+}
+
+// A route's dead-letter topic (or `{schema}`/`{table}` template) from /api/routes; a server from before per-route
+// dead-letter topics sends only the global `dead_letter_topic`.
+const dlqOf = r => r.dead_letter_topic !== undefined ? r.dead_letter_topic : (plan.dead_letter_topic || null);
+// Records acknowledged per second on a dead-letter topic, or on every topic its template rendered.
+const dlqTopics = name => Object.keys((rates && rates.topics) || {}).filter(t => globMatch(tplGlob(name), t)).sort();
+const dlqRate = name => name.includes('{') ? sumSeries(dlqTopics(name).map(topicRate)) : topicRate(name);
+// A dead-letter topic's records acknowledged per op since start (a template: every topic it rendered); null without
+// per-op data from the server.
+const dlqTotals = name => !(rates && rates.topic_totals) ? null : name.includes('{') ? addSlots(dlqTopics(name).map(topicTotals)) || NO_OPS : topicTotals(name);
+// Rows of records acknowledged per op and second, summed over topics, aligned on their newest sample.
+const sumRows = list => {
+  const n = Math.max(0, ...list.map(a => a.length));
+  return Array.from({ length: n }, (_, i) => list.reduce((acc, a) => { const r = a[i - (n - a.length)]; return r ? acc.map((v, j) => v + (r[j] || 0)) : acc; }, NO_OPS));
+};
+// The dead-letter topic route x uses for its topic `name`: a template is filled from a table the route writes there.
+function dlqFor(x, name) {
+  const t = x.dlq.includes('{') && x.tables.find(t => t.topic === name);
+  return t ? fillTopic(x.dlq, t.name) : x.dlq;
 }
 
 // Table, topic and "+N more" cards: name and count on one line, the op-share bar below.
@@ -867,7 +911,7 @@ function intoClause(r) {
   return sqlText(r.topic, r.match == null, r.match == null ? 'sink.topic: ' + r.topic : r.topic)
     + (vals ? sqlTag(vals.length + (vals.length === 1 ? ' value' : ' values'), 'topic_values: ' + vals.join(', ')) : '')
     + (r.topic_fallback ? `<span class="shrink-0 text-[10px] text-ink-500">ELSE</span>${sqlText(r.topic_fallback, false, 'topic_fallback: ' + r.topic_fallback)}` : '')
-    + (plan.dead_letter_topic && canDeadLetter(r) ? `<span class="shrink-0 text-[10px] text-red">ON ERROR</span><span class="truncate text-red" title="${esc('dead-letter topic: ' + plan.dead_letter_topic)}">${esc(plan.dead_letter_topic)}</span>` : '');
+    + (dlqOf(r) && canDeadLetter(r) ? `<span class="shrink-0 text-[10px] text-red">ON ERROR</span><span class="truncate text-red" title="${esc('dead-letter topic: ' + dlqOf(r))}">${esc(dlqOf(r))}</span>` : '');
 }
 
 // PARTITIONED-BY: the route's `key`, the outbox aggregate id, else `partition_by` (dimmed: the default).
@@ -904,21 +948,22 @@ function routeNode(x, last) {
 function topicNodeHtml(id, name, opts) {
   const sel = topicSel === name;
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
-  const label = opts.dlq ? '<span class="shrink-0 text-[10px] uppercase tracking-wider text-red">dead letter</span>' : '';
   const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(name)} · ${opts.dlq ? 'rows the routes dead-lettered' : 'records acknowledged'} · click for details"><div class="flex items-center gap-2">${label}<span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opBar(id)}</div>`;
+  const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opBar(id)}</div>`;
 }
 
 function graphHtml(m) {
   const tables = m.routes.filter(x => x.tables.length).map(x => `<div class="space-y-1">${x.shown.map(tableNode).join('')}${x.hidden.length ? moreNode(x.moreId, x.id, x.hidden.length, 'tables') : graphOpen.has(x.id) ? lessNode(x.id) : ''}</div>`).join('')
     + (m.unrouted.length ? `<div class="space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">no route · events fail</div>${m.unrouted.map(tableNode).join('')}</div>` : '');
-  const routes = m.routes.map((x, i) => routeNode(x, i === m.routes.length - 1)).join('');
+  // The default route (sink.topic) is left out while nothing has reached it.
+  const routes = m.routes.filter(x => x.r.match != null || x.tables.length || (x.c.matched || 0) > 0).map((x, i, all) => routeNode(x, i === all.length - 1)).join('');
   const topics = m.groups.map(g => `<div class="space-y-1">`
-    + (g.dynamic ? `<div data-node="${esc(g.id)}" class="truncate rounded-sm border border-dashed border-ink-600 px-2 py-1 text-ink-300 transition-opacity" title="Topic template; the topics below are the ones it rendered">${esc(g.tpl)}</div>` : '')
     + g.shown.map(t => topicNodeHtml('p:' + t, t, {})).join('')
     + (g.hidden.length ? moreNode(g.moreId, 'g:' + g.tpl, g.hidden.length, 'topics') : graphOpen.has('g:' + g.tpl) ? lessNode('g:' + g.tpl) : '')
     + `</div>`).join('')
-    + (m.dlq ? `<div class="mt-2">${topicNodeHtml('dlq', m.dlq, { dlq: true })}</div>` : '');
+    + (m.dlqs.size ? `<div class="mt-2 space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">dead letter</div>${m.dlqShown.map(d => topicNodeHtml(d.id, d.name, { dlq: true })).join('')}`
+      + (m.dlqHidden.length ? moreNode('pm:dlq', 'g:dlq', m.dlqHidden.length, 'dead-letter topics') : graphOpen.has('g:dlq') ? lessNode('g:dlq') : '') + `</div>` : '');
   return `<div class="flex flex-col">${colHead('Tables')}<div class="flex flex-1 flex-col justify-center gap-3">${tables || '<div class="text-ink-500">no events yet</div>'}</div></div>`
     + `<div class="flex flex-col">${colHead('Routes', 'first match wins')}<div class="flex flex-1 flex-col justify-center gap-3">${routes}</div></div>`
     + `<div class="flex flex-col">${colHead('Topics')}<div class="flex flex-1 flex-col justify-center gap-3">${topics}</div></div>`;
@@ -985,23 +1030,43 @@ function trackFlow(m) {
 }
 
 // The routes that write to a topic: by its template, as their fallback, or (dead-letter topic) on errors.
-const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name || (name === m.dlq && x.dlqEdge));
+const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name);
 const closeBtn = '<button type="button" id="routeclose" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>';
 // The larger step-line chart in the detail panel; drawn by drawDetail on every frame.
 const detailChart = legend => `<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-300">${legend}<span id="detailstats" class="ml-auto tabular-nums text-ink-200"></span></div>`
   + `<svg id="detailchart" viewBox="0 0 800 160" preserveAspectRatio="none" class="mt-1 block h-40 w-full"></svg>`;
 const legendItem = (color, text) => `<span class="flex items-center gap-1.5"><i class="inline-block h-0.5 w-3" style="background:${color}"></i>${esc(text)}</span>`;
 
+const routeLink = x => `<button type="button" data-route="${x.i}" class="mr-3 text-blue hover:underline">${esc(x.r.route)}</button>`;
+const inspectBtn = name => `<button type="button" data-inspect="${esc(name)}" class="rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Open in inspector</button>`;
 function topicDetail(m, name) {
   const row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const can = !!(lastData && lastData.inspector);
+  const dlq = m.dlqs.get(name), tpl = name.includes('{');
+  const head = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">${dlq ? 'dead-letter topic' + (tpl ? ' template' : '') : 'topic'}</span>`
+    + (tpl ? '' : can ? inspectBtn(name) : '<span class="text-ink-500">inspector off</span>') + closeBtn + `</div><div class="space-y-1">`;
+  if (dlq) {
+    // What it serves: each route, and the topics it writes (a template's own topics are the rendered ones).
+    const served = dlq.routes.map(x => routeLink(x) + `<span class="mr-3 text-ink-500">${esc(x.topics.size ? [...x.topics.keys()].sort().join(', ') : x.r.topic)}</span>`).join('');
+    const rendered = tpl ? dlqTopics(name) : [];
+    // A wider label column, so "dead letter for" stays on one line.
+    const wide = (k, v) => `<div class="flex gap-3"><span class="w-28 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
+    $('routedetail').innerHTML = head
+      + wide('dead letter for', served)
+      + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
+      + wide('acknowledged', '<span id="detailops">–</span>')
+      + `</div>` + detailChart(legendItem(RATE_LINE.errors, 'records acknowledged / s') + opButtons());
+    return;
+  }
   const writers = topicRoutes(m, name);
-  $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">${name === m.dlq ? 'dead-letter topic' : 'topic'}</span>`
-    + (can ? `<button type="button" data-inspect="${esc(name)}" class="rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Open in inspector</button>` : '<span class="text-ink-500">inspector off</span>')
-    + closeBtn + `</div><div class="space-y-1">`
-    + row('written by', writers.length ? writers.map(x => `<button type="button" data-route="${x.i}" class="mr-3 text-blue hover:underline">${esc(x.r.route)}</button>`).join('') : '<span class="text-ink-500">no route seen writing to it</span>')
+  // The dead-letter topic of each route writing here that can dead-letter a row: click to select it in the graph.
+  const dead = [...new Map(writers.filter(x => x.dlq).map(x => [dlqFor(x, name), x.dlq])).entries()];
+  $('routedetail').innerHTML = head
+    + row('written by', writers.length ? writers.map(routeLink).join('') : '<span class="text-ink-500">no route seen writing to it</span>')
+    + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
+      : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(name === m.dlq ? RATE_LINE.errors : TOPIC_LINE, 'records acknowledged / s') + opButtons());
+    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TOPIC_LINE, 'records acknowledged / s') + opButtons());
 }
 
 // The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
@@ -1075,10 +1140,11 @@ function drawDetail(m) {
   if (!dc) return;
   let rows = null, all = [], color = TOPIC_LINE, totals = null;
   if (topicSel != null) {
-    rows = rates && rates.topic_ops ? rates.topic_ops[topicSel] || [] : null;
-    all = topicRate(topicSel);
-    color = topicSel === m.dlq ? RATE_LINE.errors : TOPIC_LINE;
-    totals = topicTotals(topicSel);
+    const dead = m.dlqs.has(topicSel);
+    rows = rates && rates.topic_ops ? (dead && topicSel.includes('{') ? sumRows(dlqTopics(topicSel).map(t => rates.topic_ops[t] || [])) : rates.topic_ops[topicSel] || []) : null;
+    all = dead ? dlqRate(topicSel) : topicRate(topicSel);
+    color = dead ? RATE_LINE.errors : TOPIC_LINE;
+    totals = dead ? dlqTotals(topicSel) : topicTotals(topicSel);
   } else if (tableSel != null) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
@@ -1107,7 +1173,8 @@ function renderGraph(frame) {
   const m = graphModelOf(lastData);
   if (frame) trackFlow(m);
   const key = JSON.stringify([m.routes.map(x => [x.shown.map(t => t.name), x.hidden.length, x.c.unseen_fields]),
-    m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector)]);
+    m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), m.dlqShown.map(d => [d.name, d.routes.length]), m.dlqHidden.length,
+    topicSel && m.dlqs.has(topicSel) && topicSel.includes('{') ? dlqTopics(topicSel) : null, graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector)]);
   graphModel = m;
   if (key !== graphKey) {
     graphKey = key;
@@ -1121,7 +1188,7 @@ function renderGraph(frame) {
   }
   for (const el of document.querySelectorAll('#routing [data-opbar]')) {
     const id = el.dataset.opbar;
-    fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq$)/.test(id) ? 'records acknowledged' : 'events');
+    fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
   const named = m.routes.filter(x => x.r.match != null).length;
   const topics = m.groups.reduce((a, g) => a + g.topics.size, 0);
@@ -1129,7 +1196,10 @@ function renderGraph(frame) {
   const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);
   $('routewarn').hidden = !warn;
   $('routewarn').textContent = warn + (warn === 1 ? ' field never seen' : ' fields never seen');
-  $('routenote').textContent = 'first match wins · partition by ' + plan.partition_by + (plan.dead_letter_topic ? ' · dead letter ' + plan.dead_letter_topic : '');
+  // Dead-letter topics: the global override, else each route's own (`<topic>.dlq` unless the route sets one).
+  const perRoute = plan.routes.some(r => r.dead_letter_topic !== undefined);
+  $('routenote').textContent = 'first match wins · partition by ' + plan.partition_by
+    + (plan.dead_letter_topic ? ' · dead letter ' + plan.dead_letter_topic : perRoute ? ' · dead letter <topic>.dlq per route' : '');
   drawDetail(m);
   drawEdges();
 }
@@ -1178,6 +1248,13 @@ $('routedetail').addEventListener('click', ev => {
     return;
   }
   if (ev.target.closest('#routeclose')) { graphSel = topicSel = tableSel = null; renderGraph(); return; }
+  // A dead-letter topic named in a topic's panel: select its node (opening "+N more" if it is behind it).
+  const dead = ev.target.closest('[data-dlq]');
+  if (dead) {
+    const name = dead.dataset.dlq;
+    if (graphModel && graphModel.dlqHidden.some(d => d.name === name)) graphOpen.add('g:dlq');
+    topicSel = name; graphSel = tableSel = null; renderGraph(); return;
+  }
   const insp = ev.target.closest('[data-inspect]');
   if (insp) { inspectTopic(insp.dataset.inspect); return; }
   const route = ev.target.closest('[data-route]');

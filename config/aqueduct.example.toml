@@ -25,8 +25,13 @@ brokers = ["kafka:9092"]
 topic = "cdc.{schema}.{table}"   # fallback: one topic per table
 partitions = 1
 # replication_factor = 3          # for topics Aqueduct creates; default 3, or 1 on a smaller cluster
+# Rows a route cannot evaluate go to its dead-letter topic: by default the route's topic plus ".dlq"
+# (cdc.public.orders.dlq here). Set one for every route here, or per route below.
+# dead_letter_topic = "aqueduct.dead-letter"
 
 # First match wins; add routes to send tables elsewhere.
 # [[sink.routes]]
 # match = "public.users"
 # topic = "users-events"
+# where = "row.active == true"           # a type error sends the row to users-events.dlq
+# dead_letter_topic = "users-errors"     # optional; overrides both defaults
