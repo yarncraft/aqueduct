@@ -742,7 +742,7 @@ Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` onl
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,
 sink latency, errors, the routing graph, per-table high-water marks and an event inspector.
-Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/routes/history` (per-route and per-topic rates over the last 120 s), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
+Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/routes/history` (per-route and per-topic rates, also per operation, over the last 120 s), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 The inspector shows row data. `admin_token` is required on a non-loopback bind (see `admin_insecure_no_auth`); also publish the port only on a trusted network or behind a reverse proxy
 with TLS and authentication, or set `inspector = false`.
@@ -889,8 +889,8 @@ The **Routing** card shows where each table's events go:
   | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). `ON ERROR` and the dead-letter topic, in red, when the route can send rows there: a `where` on row data, `unchanged = "dead_letter"`, an outbox, `hash`, or `rename` without `include` | `sink.topic` on `default` |
   | `PARTITIONED-BY` | `key (a, b)` for a route `key`; the `aggregate_id` column for an outbox | `primary key` (`partition_by = "key"`) or `table` |
 
-  Below the rows: the step number and route name, the produced, filtered, fallback and errors counts with a bar, and
-  the rate line. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
+  Below the rows: the step number and route name, the produced, filtered, fallback and errors counts, and the op bar
+  of its produced events. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 - **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
   `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count. A
@@ -903,32 +903,47 @@ motion. The line to the dead-letter topic is dashed and appears for routes that 
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
-**Rates.** Each table, route and topic shows a step line of its rate over the last 120 s, one sample per second, on
-one shared time axis (nothing animates). On table and topic cards it sits on its own line under the name and count:
+**Operation shares.** Each card has a thin stacked bar of its counts per operation since start, as shares (insert
+green, update blue, delete red, truncate violet, read amber); hover it for the counts and percentages:
 
-- a table: events per second the source delivered for it (`history_ops` in `/api/metrics` and every
-  stream frame);
-- a route: events produced per second, with filtered (grey), fallback (violet) and errors (red) as thin lines;
-- a topic: records Kafka acknowledged per second, counted by the sink after the broker acknowledged the produce, so
-  a failed produce never counts and a retried batch counts when it succeeds;
-- a "+N more" group: the sum over its tables (events per second) or topics.
+- a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
+- a route: events it produced to its topic (`counts.ops`); filtered, fallback and dead-lettered events are not in it;
+- a topic (the dead-letter topic too): records Kafka acknowledged, counted by the sink after the broker acknowledged
+  the produce, so a failed produce never counts and a retried batch counts when it succeeds. A tombstone carries its
+  delete's `op` header and counts as a delete. Topic cards also show the acknowledged count;
+- a "+N more" group: the sum over its tables or topics.
 
-Click a route for its details and a larger chart split by outcome. Click a table for a panel with its events per
-second as a larger chart, one line counting the operations toggled on with the buttons above it (insert, update, delete, truncate, read), the current, average and maximum rate, the route that claims it and its topic. Click a topic for a panel with a larger chart, its
-current, average and maximum rate over the window, the routes that write to it (by template, as their
-`topic_fallback`, or as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
+Table, route and topic cards keep their counts (events, the route's produced/filtered/fallback/errors, acknowledged
+records).
+
+**Rates.** Click a table, a route or a topic for a panel with one step line over the last 120 s, one sample per
+second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
+a topic's acknowledged records per second, counting only the operations toggled on with the buttons above the chart
+(insert, update, delete, truncate, read). The selection is shared by the three panels, so a table, its route and its
+topic are compared over the same operations. A table's panel names the route that claims it. A route's panel keeps the
+outcome counts and lists its produced events per operation. A topic's panel (the dead-letter topic's works the same)
+lists its acknowledged records per operation, the routes that write to it (by template, as their `topic_fallback`, or
+as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
 
 The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
 the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
-order, the topics with records in that second). It needs the admin token like every `/api/*` route. Memory is bounded:
+order as `routes` and its produced records per op as `route_ops`, the topics with records in that second as `topics`
+and per op as `topic_ops`). Per-op rows are `[insert, update, delete, truncate, read]`. The window adds `ops` per route
+(produced per op and second), `topic_ops` (acknowledged per op and second) and `topic_totals` (acknowledged per op
+since start, up to `seq`). It needs the admin token like every `/api/*` route. Memory is bounded:
 routes are fixed at startup, and the sink counts at most 500 topics by name and the rest as `(other)`. Topic names can
 contain row values under content routing; they are shown only behind the token, as in the graph. Rates start from
 zero when the process restarts.
 
 ```json
 {"seq": 431, "interval_ms": 1000, "len": 120,
- "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0]}],
- "topics": {"orders-paid": [3, 0, 5], "aqueduct.dead-letter": [0, 0, 0]}}
+ "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0],
+             "ops": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 2, 0, 0]]}],
+ "topics": {"orders-paid": [3, 0, 7], "aqueduct.dead-letter": [0, 0, 0]},
+ "topic_ops": {"orders-paid": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 4, 0, 0]],
+               "aqueduct.dead-letter": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]},
+ "topic_totals": {"orders-paid": {"insert": 610, "update": 95, "delete": 40, "truncate": 0, "read": 0},
+                  "aqueduct.dead-letter": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}}}
 ```
 
 ### Routing plan
@@ -942,7 +957,9 @@ unset; with a hash key the top level has `hash_key_id`. The hash key itself is n
 `id` and `type` when set); other routes leave the key out. A route with `format = "row"` has `"format": "row"` and
 its `deletes` (`tombstone`, `drop` or `row`, the default included), a route with `tombstones = true` has
 `"tombstones": true`, and a route with `unchanged = "dead_letter"` has `"unchanged": "dead_letter"`; each is left out
-otherwise. `counts` also has `tombstones_skipped`, which is not an outcome.
+otherwise. `counts` also has `tombstones_skipped`, which is not an outcome, and `ops`: the produced events per
+operation (`insert`, `update`, `delete`, `truncate`, `read`; they sum to `produced`, and a delete's tombstone is not
+counted again).
 
 ```json
 {"default_topic": "cdc.{schema}.{table}", "dead_letter_topic": "aqueduct.dead-letter", "partition_by": "key",
@@ -950,21 +967,24 @@ otherwise. `counts` also has `tombstones_skipped`, which is not an outcome.
    {"route": "paid-orders", "match": "public.orders",
     "where": "op in ['insert', 'update'] and row.status == 'paid' or op == 'delete'", "key": ["order_id"], "topic": "orders-paid",
     "topic_fallback": null, "topic_values": null,
-    "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1, "tombstones_skipped": 0},
+    "counts": {"matched": 120, "produced": 80, "filtered": 39, "fallback": 0, "errors": 1, "tombstones_skipped": 0,
+               "ops": {"insert": 50, "update": 20, "delete": 10, "truncate": 0, "read": 0}},
     "unseen_fields": []},
    {"route": "regional", "match": "public.customers", "where": null, "key": null,
     "topic": "customers.{row.region}", "topic_fallback": "customers.unknown", "topic_values": ["eu", "us"],
     "format": "row", "deletes": "tombstone",
-    "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0, "tombstones_skipped": 0},
+    "counts": {"matched": 300, "produced": 290, "filtered": 0, "fallback": 10, "errors": 0, "tombstones_skipped": 0,
+               "ops": {"insert": 200, "update": 85, "delete": 5, "truncate": 0, "read": 0}},
     "unseen_fields": []},
    {"route": "default", "match": null, "where": null, "key": null, "topic": "cdc.{schema}.{table}",
     "topic_fallback": null, "topic_values": null,
-    "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0},
+    "counts": {"matched": 5000, "produced": 5000, "filtered": 0, "fallback": 0, "errors": 0, "tombstones_skipped": 0,
+               "ops": {"insert": 3000, "update": 1500, "delete": 500, "truncate": 0, "read": 0}},
     "unseen_fields": []}]}
 ```
 
 `/api/metrics` and `/api/stream` carry the same counts flat, as
-`routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "unseen_fields"}]`.
+`routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "ops", "unseen_fields"}]`.
 
 ## 5. Operating Aqueduct
 

@@ -1158,10 +1158,16 @@ mod tests {
             missing.is_empty(),
             "ids used by script but absent from admin.html: {missing:?}"
         );
+        // The detail chart's op buttons index the server's per-op rows, so they follow its slot order.
+        let labels = DASHBOARD
+            .split("const OP_LABEL = [")
+            .nth(1)
+            .and_then(|r| r.split(']').next())
+            .expect("OP_LABEL in admin.html");
+        assert_eq!(labels.split(',').count(), OP_SLOTS, "one button per op");
         assert_eq!(
-            DASHBOARD.matches("class=\"rateop").count(),
-            OP_SLOTS,
-            "one checkbox per op"
+            labels, "'insert', 'update', 'delete', 'truncate', 'read'",
+            "the order of the op slots"
         );
     }
 
