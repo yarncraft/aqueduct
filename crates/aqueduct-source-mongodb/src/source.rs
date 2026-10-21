@@ -432,6 +432,7 @@ impl MongoSource {
                 key: r.key,
                 checkpoint: Some(progress(snap)),
                 unchanged: Vec::new(),
+                after_is_key: false,
             });
         }
         self.last_token = Some(token.to_owned());
@@ -816,6 +817,7 @@ pub(crate) fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
         op,
         before,
         after,
+        after_is_key,
     }) = map_event(&ev)
     else {
         return Ok(None);
@@ -839,6 +841,7 @@ pub(crate) fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
         checkpoint: None,
         // A change stream sends whole documents: nothing is ever left out as unchanged.
         unchanged: Vec::new(),
+        after_is_key,
     }))
 }
 
@@ -1082,6 +1085,21 @@ mod tests {
         assert_eq!(e.position, Position::Text(r#"{"_data":"8265A1"}"#.into()));
         assert!(e.after.unwrap().get().contains("\"n\":\"a\""));
         assert_eq!(e.key.as_deref(), Some(r#"{"_id":1}"#));
+        assert!(!e.after_is_key);
+    }
+
+    #[test]
+    fn an_update_without_its_full_document_says_after_is_the_key() {
+        // What the server sends for an update whose document was deleted before the lookup.
+        let d = doc! {"_id": {"_data": "8265A4"}, "operationType": "update",
+        "ns": {"db": "app", "coll": "u"}, "documentKey": {"_id": 1},
+        "updateDescription": {"updatedFields": {"n": "b"}, "removedFields": []}};
+        let e = to_change_event(&d).unwrap().unwrap();
+        assert_eq!(e.op, Op::Update);
+        // The envelope keeps the key in `after`, as before; the event says it is only the key.
+        assert_eq!(e.after.as_ref().unwrap().get(), r#"{"_id":1}"#);
+        assert!(e.after_is_key);
+        assert!(!serde_json::to_string(&e).unwrap().contains("after_is_key"));
     }
 
     #[test]

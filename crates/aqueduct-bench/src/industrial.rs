@@ -287,6 +287,7 @@ pub fn pool(n: usize) -> Vec<ChangeEvent> {
                 key: None,
                 checkpoint: None,
                 unchanged: Vec::new(),
+                after_is_key: false,
             }
         })
         .collect()

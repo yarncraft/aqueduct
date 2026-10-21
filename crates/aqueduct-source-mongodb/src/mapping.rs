@@ -9,6 +9,9 @@ pub struct Mapped {
     pub op: Op,
     pub before: Option<Map<String, Value>>,
     pub after: Option<Map<String, Value>>,
+    /// `after` holds only the `documentKey`: an update without a `fullDocument` (the document
+    /// was deleted before the lookup). Becomes `ChangeEvent::after_is_key`.
+    pub after_is_key: bool,
 }
 
 /// Map one change-stream document (as extended JSON) to a `Mapped` event.
@@ -29,8 +32,13 @@ pub fn map_event(ev: &Value) -> Option<Mapped> {
     if op == Op::Delete && before.is_none() {
         before = obj("documentKey");
     }
+    // An update whose document is gone has no fullDocument either; the envelope keeps the key in
+    // `after`, and the event says so, so a route that publishes the row alone does not take the
+    // key for the document.
+    let mut after_is_key = false;
     if op != Op::Delete && after.is_none() {
         after = obj("documentKey");
+        after_is_key = after.is_some();
     }
     Some(Mapped {
         schema: ns.get("db")?.as_str()?.to_string(),
@@ -38,6 +46,7 @@ pub fn map_event(ev: &Value) -> Option<Mapped> {
         op,
         before,
         after,
+        after_is_key,
     })
 }
 
@@ -55,6 +64,25 @@ mod tests {
         .unwrap();
         assert_eq!((m.op, m.table.as_str()), (Op::Insert, "u"));
         assert!(m.before.is_none() && m.after.unwrap()["n"] == "a");
+        assert!(!m.after_is_key);
+    }
+
+    #[test]
+    fn update_without_full_document_keeps_the_key_and_says_so() {
+        let m = map_event(
+            &json!({"operationType":"update","ns":{"db":"app","coll":"u"},
+            "documentKey":{"_id":1},"updateDescription":{"updatedFields":{"n":"b"}}}),
+        )
+        .unwrap();
+        assert_eq!(m.op, Op::Update);
+        assert_eq!(m.after, Some(json!({"_id":1}).as_object().unwrap().clone()));
+        assert!(m.after_is_key, "after is only the documentKey");
+        let full = map_event(
+            &json!({"operationType":"update","ns":{"db":"app","coll":"u"},
+            "fullDocument":{"_id":1,"n":"b"},"documentKey":{"_id":1}}),
+        )
+        .unwrap();
+        assert!(!full.after_is_key);
     }
 
     #[test]

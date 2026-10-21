@@ -507,6 +507,18 @@ async fn counted(
     Ok(())
 }
 
+/// Sends a tombstone to its delete's fallback when the broker refused the delete's
+/// content-routed topic (`rerouted`: the refused topic and the fallback), so it stays behind the
+/// delete without a second create attempt. Its count went with the delete.
+fn follow_reroute(out: &mut OutRecord, rerouted: Option<(String, String)>) {
+    if let Some((from, to)) = rerouted {
+        if out.content.as_ref().is_some_and(|c| c.tombstone) && out.topic == from {
+            out.topic = to;
+            out.content = None;
+        }
+    }
+}
+
 /// The events that become Kafka records: heartbeats carry no row and produce nothing.
 fn deliverable(events: &[ChangeEvent]) -> impl Iterator<Item = &ChangeEvent> {
     events.iter().filter(|e| e.op != Op::Heartbeat)
@@ -528,13 +540,19 @@ impl Sink for KafkaSink {
         for event in deliverable(events) {
             rendered.clear();
             self.plan.render_into(event, now_us, &mut rendered)?;
+            // A delete the broker's refusal re-routed: (refused topic, fallback). Its tombstone,
+            // the next record, follows it there without another create attempt.
+            let mut rerouted: Option<(String, String)> = None;
             for mut out in rendered.drain(..) {
+                follow_reroute(&mut out, rerouted.take());
                 if let Err(e) = self.try_open_topic(&out.topic).await {
                     match (out.content.is_some(), e.refused) {
                         // A content-routed topic the broker will never create: its fallback.
                         (true, Some(kind)) => {
+                            let from = out.topic.clone();
                             self.plan.topic_refused(&mut out, kind);
                             self.open_topic(&out.topic).await?;
+                            rerouted = Some((from, out.topic.clone()));
                         }
                         // Passing: the batch fails and is retried, without holding a cap slot.
                         (true, None) => {
@@ -681,6 +699,39 @@ mod tests {
             stats.snapshot().into_iter().collect::<Vec<_>>(),
             vec![("t".to_string(), 3)]
         );
+    }
+
+    #[test]
+    fn a_tombstone_follows_its_rerouted_delete_to_the_fallback() {
+        let rec = |topic: &str, tombstone: bool| OutRecord {
+            topic: topic.into(),
+            key: "k".into(),
+            partition_key: "k".into(),
+            value: None,
+            op: "d",
+            lsn: "1".into(),
+            commit_ts_micros: 0,
+            headers: Vec::new(),
+            content: Some(crate::ContentTopic {
+                route: 0,
+                fallback: "fb".into(),
+                tombstone,
+            }),
+        };
+        let moved = || Some(("orders.eu".to_string(), "fb".to_string()));
+        let mut t = rec("orders.eu", true);
+        follow_reroute(&mut t, moved());
+        assert_eq!((t.topic.as_str(), t.content), ("fb", None));
+        // Nothing re-routed, or not a tombstone, or another topic: unchanged.
+        for (mut r, rerouted) in [
+            (rec("orders.eu", true), None),
+            (rec("orders.eu", false), moved()),
+            (rec("orders.us", true), moved()),
+        ] {
+            let before = r.clone();
+            follow_reroute(&mut r, rerouted);
+            assert_eq!(r, before);
+        }
     }
 
     #[test]

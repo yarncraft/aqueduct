@@ -22,6 +22,7 @@ fn ev(n: u64, table: &str) -> ChangeEvent {
         key: None,
         checkpoint: None,
         unchanged: Vec::new(),
+        after_is_key: false,
     }
 }
 

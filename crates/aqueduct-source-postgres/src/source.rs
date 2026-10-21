@@ -972,6 +972,7 @@ impl PostgresSource {
                 key: row_key,
                 checkpoint: Some(Position::Text(checkpoint)),
                 unchanged,
+                after_is_key: false,
             },
         )
     }
@@ -1040,6 +1041,7 @@ impl PostgresSource {
                     checkpoint: Some(Position::Text(checkpoint)),
                     // A snapshot reads whole rows: nothing is left out.
                     unchanged: Vec::new(),
+                    after_is_key: false,
                 },
             );
         }

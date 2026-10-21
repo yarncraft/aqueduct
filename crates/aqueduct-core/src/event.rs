@@ -75,6 +75,7 @@ impl ChangeEvent {
             key: None,
             checkpoint: None,
             unchanged: Vec::new(),
+            after_is_key: false,
         }
     }
 }
@@ -114,6 +115,12 @@ pub struct ChangeEvent {
     /// always for MongoDB. A route with `unchanged = "dead_letter"` reads it. Not serialised.
     #[serde(skip)]
     pub unchanged: Vec<String>,
+    /// `after` is not the row but only its key: MongoDB sends no `fullDocument` for an update
+    /// whose document was deleted before the lookup, and the mapping puts the `documentKey` in
+    /// `after` so envelope consumers can still tell which row it was. A route that publishes the
+    /// row alone (`format = "row"`) must not mistake it for the document. Not serialised.
+    #[serde(skip)]
+    pub after_is_key: bool,
 }
 
 #[cfg(test)]
@@ -133,6 +140,7 @@ mod tests {
             key: Some("1".into()),
             checkpoint: None,
             unchanged: Vec::new(),
+            after_is_key: false,
         }
     }
 

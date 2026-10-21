@@ -383,6 +383,12 @@ key = ["tenant_id", "order_id"]
   are not supported); anything else fails startup naming the route. A misspelled column is reported as an unseen
   field (above), as `row.<column>`.
 - Dead-letter records keep the table-only key.
+- **Tombstones.** With `tombstones = true`, or `format = "row"` and `deletes = "tombstone"` (see
+  [Shaping the output](#shaping-the-output)), a delete's null-value record carries this key, and a compacted topic
+  then forgets every record with it. The `key` columns must therefore be unique per row and present in the delete's
+  before-image (the replica identity's columns, or all columns under `REPLICA IDENTITY FULL`). A delete with any
+  `key` column null or missing gets no null-value record. Uniqueness cannot be checked: keying by a column several
+  rows share makes their tombstones erase each other.
 
 #### Routing by row content
 
@@ -650,23 +656,36 @@ tombstones = true             # envelope format: a null-value record after every
 | `format` | `envelope` | `row`: the value is `after` (inserts, updates and snapshot reads) after field operations, with no envelope. Truncates have no row: they produce nothing and count as `filtered`. The `op` and `lsn` headers stay, so consumers that need them can still read them |
 | `deletes` | `tombstone` | Only with `format = "row"`. `tombstone`: the delete is a record with a null value and the row's key, which a compacted topic reads as "remove this key". `drop`: no record, counted as `filtered`. `row`: the before-image (after field operations) with `"__deleted": true` added as its last member; a column of the row named `__deleted` is replaced. Under the default replica identity the before-image holds only the primary key |
 | `tombstones` | `false` | Only with the envelope format (with `format = "row"`, `deletes = "tombstone"` already is the tombstone). After every delete, also a null-value record with the same key, on the same partition, right after the delete. The key is the delete's record key after field operations, so a hashed key column stays hashed |
-| `unchanged` | `omit` | What happens to a row the source sent without some columns (see TOAST below). `omit`: produce it as it is. `dead_letter`: send it to `sink.dead_letter_topic` instead (the envelope, with the route's field operations; the `aqueduct-error` header names the columns, never values), counted under `errors`. Allowed on any route; needs `dead_letter_topic` |
+| `unchanged` | `omit` | What happens to a row the source sent without some columns (see TOAST below). `omit`: produce it as it is. `dead_letter`: send it to `sink.dead_letter_topic` instead (the envelope, with the route's field operations; the `aqueduct-error` header names the columns, never values, with control characters and backticks shown as `?`), counted under `errors`. Columns the route excludes or leaves out of `include` do not count, since the route would not send them anyway. Allowed on any route; needs `dead_letter_topic` |
 
 Rules, checked at startup:
 
 - `deletes` without `format = "row"`, and `tombstones` with it, fail startup; so do unknown values (case does not
   matter, as for `ops`).
-- **Tombstones need a per-row key**: the route sets `key = [...]`, or `partition_by = "key"` (the default). With
-  `partition_by = "table"` and no route `key`, a route with `tombstones = true` fails startup.
-- **A delete without a key gets no tombstone.** A table without a primary key (or a route whose field operations
-  remove every key column, or a `key = [...]` whose columns the before-image lacks) has a null `key` in the record key,
-  so a tombstone would stand for the whole table and a compacted topic would drop every row of it. Such a delete is
-  produced without its tombstone, a warning is logged once per route, and `tombstones_skipped` counts it (see the
-  counters below). The same holds for every row-format delete: its tombstone is the delete itself, so give tables
-  behind a compacted row-format topic a primary key.
+- **Null values need a per-row key.** A record with a null value (an envelope tombstone, or a row-format delete
+  under `deletes = "tombstone"`) tells a compacted topic to forget every record with that key. So a route that
+  produces one needs `key = [...]`, or `partition_by = "key"` (the default): with `partition_by = "table"` and no
+  route `key`, a route with `tombstones = true`, or with `format = "row"` and `deletes = "tombstone"` (also when
+  `deletes` is unset), fails startup. Use `deletes = "drop"` or `"row"` there instead.
+- **Each delete is checked too: no null value under a key other rows share.** A delete's key does not name one row
+  when:
+  - the table has no primary key (no `REPLICA IDENTITY` key, or `FULL` without a primary key): the record key's
+    `key` is null and would stand for the whole table;
+  - a route `key = [...]` column is null or missing in the before-image (under the default replica identity the
+    before-image holds only the primary key);
+  - the route's field operations exclude, leave out of `include` or mask any primary-key column (a masked key is
+    `"***"` for every row; a composite key missing a column is shared). Hashing (HMAC) and renaming keep the key
+    unique.
+
+  Then an envelope delete is produced without its tombstone, and a row-format `deletes = "tombstone"` delete produces
+  nothing (counted as `filtered`). Either way a warning is logged once per route and `tombstones_skipped` counts it
+  (see the counters below). Give tables behind a compacted topic a primary key, and key routes by columns that are
+  unique and present in the delete's before-image. Uniqueness of `key = [...]` columns cannot be checked: listing a
+  column that several rows share makes their tombstones erase each other.
 - `outbox` is exclusive with all four keys: an outbox record is the payload as is.
-- A MongoDB update whose document was deleted before the change stream looked it up has no `after`; in row format it
-  produces nothing (counted as `filtered`), and the delete that follows does.
+- A MongoDB update whose document was deleted before the change stream looked it up has no `fullDocument`. The
+  envelope keeps its `documentKey` in `after`, as before; a row-format route does not take that key for the document:
+  it produces nothing (counted as `filtered`, logged once per route), and the delete that follows does.
 
 **TOAST and compaction.** Postgres does not send a large (TOASTed) column that an update left unchanged, so `after`
 lacks that column (the decoder leaves it out rather than guess). In the envelope a consumer can see the column is

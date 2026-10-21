@@ -197,6 +197,7 @@ async fn main() {
         key: None,
         checkpoint: None,
         unchanged: Vec::new(),
+        after_is_key: false,
     };
     let profile = arg("--profile").unwrap_or_else(|| "simple".into());
     let pool = if profile == "industrial" {

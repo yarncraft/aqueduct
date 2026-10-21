@@ -217,6 +217,7 @@ pub(crate) fn sample() -> ChangeEvent {
         key: Some(r#"{"id":1}"#.into()),
         checkpoint: None,
         unchanged: Vec::new(),
+        after_is_key: false,
     }
 }
 

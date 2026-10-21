@@ -1328,6 +1328,7 @@ Authorization: Bearer {token}
             key: None,
             checkpoint: None,
             unchanged: Vec::new(),
+            after_is_key: false,
         };
         for (table, row) in [
             ("orders", r#"{"status":"paid","card":"4111-secret"}"#),
@@ -1748,6 +1749,7 @@ Authorization: Bearer {token}
             key: None,
             checkpoint: None,
             unchanged: Vec::new(),
+            after_is_key: false,
         }
     }
 
