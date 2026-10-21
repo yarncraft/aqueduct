@@ -456,7 +456,8 @@ function renderBehind(d) {
   $('bsinbar').style.width = (top ? 100 * (l.ingest_rate || 0) / top : 0) + '%';
   $('bsoutbar').style.width = (top ? 100 * (l.process_rate || 0) / top : 0) + '%';
   const net = l.ingest_rate == null ? null : l.process_rate - l.ingest_rate;
-  $('bsnet').textContent = net == null ? 'rates need 2 s of samples' : (net >= 0 ? 'shrinking ' : 'growing ') + rate(Math.abs(net));
+  $('bsnet').textContent = net == null ? 'rates need 2 s of samples'
+    : Math.abs(net) < (pg ? 1 : 0.005) ? 'steady' : (net > 0 ? 'shrinking ' : 'growing ') + rate(Math.abs(net));
   $('bseta').textContent = l.state === 'caught_up' ? '0s' : l.eta_secs == null ? '–' : secs(l.eta_secs);
   $('bseta').className = TILE + (l.state === 'stalled' ? 'text-red' : l.state === 'falling_behind' ? 'text-amber' : 'text-ink-100');
   $('bsetasub').textContent = l.state === 'caught_up' ? 'nothing to catch up'
