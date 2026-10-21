@@ -794,7 +794,7 @@ Once a second the admin server takes a sample of both; the card is derived from 
   to it, so a snapshot that makes the stream fall behind shows.
 
 The **End-to-end lag** tile reads `idle` when the status is caught up and nothing was delivered for 10 s, instead of
-counting the idle time up. The Kafka HWM in the Tables card is sink-side (what reached Kafka); it does not say whether
+counting the idle time up. The Kafka HWM in a table's detail panel is sink-side (what reached Kafka); it does not say whether
 Aqueduct is behind the source.
 
 `/api/metrics` and `/api/stream` carry the card as `source_lag`, plus `source_head_lsn` (Postgres, `X/Y`) and
@@ -822,33 +822,34 @@ data. Samples, rates and the window start over when the process restarts.
 change-event envelope (an outbox payload, a `format = "row"` row, a tombstone) is shown raw, with its op and lsn taken
 from the headers; the table of a row or tombstone comes from its JSON record key.
 
-### Tables · high-water marks
+### Per-table high-water marks
 
-The card shows, per table (or collection) that has delivered events since the process started, how far it has got:
+Click a table (or collection) in the routing graph: its detail panel shows how far it has got since the process
+started:
 
-| Column | Source |
+| Field | Source |
 |--------|--------|
 | Topic | The sink route the table matches |
-| Events, Ops | Events delivered by this process, and a bar of the table's share of all events split by `c`/`u`/`d`/`t`/`r` |
+| Events, ops | Events delivered by this process, per operation, and the table's share of all events |
 | Last LSN | LSN of the newest delivered change (`–` for MongoDB, whose resume tokens are not shown per table) |
 | Last commit | How long ago that change committed. Amber when the table is more than 1 minute behind the freshest table, red past 10 minutes; only while the pipeline is streaming. Measured against the freshest table rather than the clock, so a database that is idle as a whole is not flagged; a table that is simply written rarely is |
 | Delivered | How long ago the sink acknowledged it |
-| Kafka HWM | Sum over the topic's partitions of the next offset Kafka will assign; click the row for each partition. A topic several tables share shows `×N` and the whole topic's offsets |
+| Kafka HWM | Sum over the topic's partitions of the next offset Kafka will assign, with each partition's offset. A topic several tables share shows the whole topic's offsets |
 
-The header shows the last checkpointed position, which is global, not per table. While a snapshot runs it is the
+The panel also shows the last checkpointed position, which is global, not per table. While a snapshot runs it is the
 stream position followed by `(snapshot: <table> <i>/<n>)`; the snapshot cursor (the last chunk's primary-key values)
 stays in the checkpoint file and is never shown. Pipeline numbers refresh every second
 with the stream. Kafka offsets come from `GET /api/tables`, polled every 5 s: one offsets request per partition of
 the routed topics (no records are read), with the inspector's connection and TLS/SASL settings, shared across tabs
-for 5 s and abandoned after 3 s, so a Kafka outage leaves the column empty (the reason is in the card header and the
-cell's tooltip) but never blocks the cockpit. Offsets need the inspector (`admin_token` and `inspector = true`);
-without it the column shows `–`.
+for 5 s and abandoned after 3 s, so a Kafka outage leaves the offsets empty (the panel shows the reason) but never blocks the cockpit. Offsets need
+the inspector (`admin_token` and `inspector = true`); without it the panel says so. The routing graph also takes each
+table's topic from `/api/tables`.
 
 Events and Delivered count every event the source delivered for the table, including events a route filtered
 (`where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
 recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
 A table whose route picks the topic per event (`{op}` or a row field in `topic`) has no single topic to read
-offsets from: its Topic column shows the template, and Kafka HWM says `content-routed (see Routing)`.
+offsets from: its topic shows the template, and Kafka HWM says `content-routed (see Routing)`.
 
 `GET /api/tables` (Bearer token) returns:
 

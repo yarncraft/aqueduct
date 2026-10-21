@@ -247,7 +247,7 @@ Notable changes to Aqueduct. Newest first.
   operation, the newest delivered LSN, how long ago it committed and was delivered (amber/red when it falls behind
   the freshest table while streaming), and the topic's Kafka high-water mark per partition. New route
   `GET /api/tables` (Bearer token) and Prometheus series `aqueduct_table_last_commit_timestamp_seconds{table}`;
-  `/api/metrics` and `/api/stream` gain `table_marks` and `checkpoint`. See DEPLOYMENT.md, "Tables · high-water marks".
+  `/api/metrics` and `/api/stream` gain `table_marks` and `checkpoint`. See DEPLOYMENT.md, "Per-table high-water marks".
 - **Postgres snapshots: copy rows that already exist while changes stream** (#74, ADR 0001). New `[postgres]` keys
   `snapshot` (`never` by default, `on_demand`, `initial`), `snapshot_chunk_size`, `snapshot_max_rows_per_sec` and
   `snapshot_key_columns`. Copied rows arrive as `"op": "r"`, encoded like an `insert` of the same row. Needs
@@ -300,6 +300,9 @@ Notable changes to Aqueduct. Newest first.
   claimed, the topic with `ELSE` fallback and `ON ERROR` dead-letter topic, and the route key, primary key or table.
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
+- **Cockpit: per-table high-water marks moved into the table's detail panel.** The separate Tables card is gone; click a
+  table in the routing graph for its counts per operation, last LSN, commit and delivery age, Kafka offsets per
+  partition and the checkpoint. `/api/tables` is unchanged.
 - **Cockpit: the event inspector is a pop-up opened from a topic.** A topic's **Open in inspector** button in the
   routing graph opens it over the page, filtered to that topic; Close, Esc or a click outside closes it. It reads
   nothing from Kafka while closed.
