@@ -1194,7 +1194,10 @@ mod tests {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            assert!(seen.insert(name.clone()), "function {name} is declared twice in admin.html");
+            assert!(
+                seen.insert(name.clone()),
+                "function {name} is declared twice in admin.html"
+            );
         }
         assert!(seen.len() > 10, "{seen:?}");
     }
