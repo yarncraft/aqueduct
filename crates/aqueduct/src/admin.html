@@ -426,7 +426,7 @@ const BS_STATE = {
 };
 const PILL = 'inline-flex items-center gap-2 rounded-sm border px-3 py-1 font-mono text-lg font-semibold uppercase tracking-wider ';
 const secs = v => v == null ? '–' : v < 1 ? (v > 0 ? '< 1s' : '0s') : dur(Math.round(v));
-function spark(h, color) {
+function backlogSpark(h, color) {
   if (!h || h.length < 2) { $('bsspark').innerHTML = ''; return; }
   const max = Math.max(1, ...h), n = h.length;
   const pts = h.map((v, i) => (120 * i / (n - 1)).toFixed(1) + ',' + (22 - 20 * v / max).toFixed(1)).join(' ');
@@ -453,7 +453,7 @@ function renderBehind(d) {
     $('bsbacklog').textContent = l.behind_secs == null ? '–' : secs(l.behind_secs);
     $('bsbehind').textContent = l.behind_secs == null ? '–' : 'of cluster time';
   }
-  spark(l.history, st.line);
+  backlogSpark(l.history, st.line);
   const rate = v => v == null ? '–' : pg ? bytes(Math.round(v)) + '/s' : v.toFixed(2) + ' s/s';
   $('bsin').textContent = rate(l.ingest_rate);
   $('bsout').textContent = rate(l.process_rate);
@@ -1266,7 +1266,12 @@ async function streamLoop() {
           const frame = buf.slice(0, i);
           buf = buf.slice(i + 2);
           const data = frame.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
-          if (data) render(JSON.parse(data));
+          // A drawing bug in one card must not look like a dropped connection: log it and keep streaming.
+          if (data) {
+            let snap;
+            try { snap = JSON.parse(data); } catch (_) { continue; }
+            try { render(snap); } catch (e) { console.error('cockpit render failed', e); }
+          }
         }
       }
     } catch (_) { /* fall through to reconnect */ }
