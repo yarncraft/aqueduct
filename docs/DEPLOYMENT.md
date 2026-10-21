@@ -140,11 +140,48 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 | Kafka: `InvalidTopicException` | A topic name with illegal characters; check route `topic` values and templates |
 | Same transaction delivered twice after a crash | Expected with at-least-once delivery; deduplicate downstream |
 
+## Cockpit over TLS
+
+The cockpit, `/api/*` and `/metrics` are served over **plain HTTP**; Aqueduct has no native TLS. The `Authorization: Bearer`
+token and the rows shown by the event inspector therefore travel in clear text on any hop that is not protected. Either:
+
+- bind to loopback (`health_addr = "127.0.0.1:8080"`) and reach it through `ssh -L`, `kubectl port-forward` or a sidecar; or
+- keep the listener private and put a TLS-terminating reverse proxy in front. Never publish port 8080 directly.
+
+A non-loopback `health_addr` logs a startup warning as a reminder. Inside a container the bind is normally `0.0.0.0`, so
+publish the port only to the proxy (a private Docker network, or `127.0.0.1:8080:8080` on the host). Examples:
+
+```caddy
+# Caddyfile: automatic certificates
+aqueduct.example.com {
+    reverse_proxy aqueduct:8080
+}
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name aqueduct.example.com;
+    ssl_certificate     /etc/ssl/aqueduct.crt;
+    ssl_certificate_key /etc/ssl/aqueduct.key;
+
+    location / {
+        proxy_pass http://aqueduct:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;  # /api/stream is Server-Sent Events
+        proxy_set_header Host $host;
+        proxy_read_timeout 1h;
+    }
+}
+```
+
+Open the cockpit as `https://aqueduct.example.com/#token=...`. Restrict the proxy to trusted networks as well; the token is the only login.
+
 ## Securing connections (checklist)
 
 1. Postgres: `ssl_mode = "verify-full"` and `ssl_root_cert` pointing at your CA; create the Aqueduct role with a strong password and only `REPLICATION` + `SELECT` on the published tables. On Azure, a managed identity (`auth`, see [Azure managed identity](deep-dive/azure.md#azure-managed-identity)) needs no stored password at all.
 2. Kafka: `tls = true`, SASL `scram-sha-512`, and ACLs limiting the principal to `Write`/`Describe`/`Create` on the target topics.
-3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one); never set `admin_insecure_no_auth` in production.
+3. Cockpit: set `admin_token` (startup refuses a non-loopback `health_addr` without one) and [terminate TLS in front of it](#cockpit-over-tls); never set `admin_insecure_no_auth` in production.
 4. Pass credentials through the environment (`AQUEDUCT_PG_URL`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, `AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`) or orchestrator secrets instead of committing them to the TOML file. Secrets in the config are redacted from debug output.
 
 ## Always-on simulation

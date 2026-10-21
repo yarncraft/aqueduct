@@ -53,6 +53,12 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    if cfg.admin_exposed_beyond_loopback() {
+        tracing::info!(
+            addr = %cfg.health_addr,
+            "the admin server speaks plain HTTP: the admin_token and inspector rows cross the network in clear text; put a TLS-terminating proxy in front (see docs/DEPLOYMENT.md, \"Cockpit over TLS\") or bind to 127.0.0.1"
+        );
+    }
     let listener = match TcpListener::bind(&cfg.health_addr).await {
         Ok(l) => l,
         Err(e) => {
