@@ -1181,6 +1181,27 @@ mod tests {
         }
     }
 
+    /// Two top-level `function f(` with the same name in the page: the later one silently replaces the
+    /// earlier, which once broke the cockpit when two cards each brought their own `spark`.
+    #[test]
+    fn dashboard_declares_each_function_once() {
+        let mut seen = std::collections::HashSet::new();
+        for line in DASHBOARD.lines() {
+            let Some(rest) = line.strip_prefix("function ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                seen.insert(name.clone()),
+                "function {name} is declared twice in admin.html"
+            );
+        }
+        assert!(seen.len() > 10, "{seen:?}");
+    }
+
     #[test]
     fn parses_token_from_query_and_header() {
         let r = parse("GET /api/stream?x=1&token=abc HTTP/1.1\r\nhost: a\r\n\r\n").unwrap();
