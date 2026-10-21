@@ -1413,8 +1413,13 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
   another partition than the document's later changes. Sharded clusters are
   not covered by Aqueduct's tests.
 - **In the window:** an insert, update, replace or delete of a document in the chunk drops the chunk's copy of it; a
-  drop or rename of the collection, a rename of another collection onto it, or a dropped database drops the whole
-  chunk; a change without a `documentKey._id` makes the chunk be read again. With a `collections` list, the change
+  drop or rename of the collection, or a dropped database drops the whole chunk; a change without a `documentKey._id`
+  makes the chunk be read again.
+- **Renames onto a collection:** a rename of another collection onto the collection being copied (`renameCollection`
+  with `dropTarget`, or an `$out` aggregation) replaces its documents without any insert events, so its copy starts
+  again at the first `_id`, whether a chunk is in flight or not, and the reset cursor is checkpointed at once. Documents
+  copied before the rename are sent again (duplicates, never gaps). A collection still queued needs nothing; one whose
+  copy already finished is not copied again (request a new snapshot of it). With a `collections` list, the change
   stream also asks for renames into a watched collection and `dropDatabase` for this (neither is forwarded).
 - **Admin requests** while a cancelled snapshot finishes its last chunk get `409` ("try again in a moment").
 - **Checkpoint:** while a snapshot runs, the checkpoint file holds `{"pos": <resume token>, "snap": {...}}`; the last

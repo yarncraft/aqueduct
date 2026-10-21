@@ -499,8 +499,13 @@ impl MongoSource {
                     .get_document("to")
                     .ok()
                     .and_then(|t| Some((t.get_str("db").ok()?, t.get_str("coll").ok()?)));
+                // The target now holds the renamed collection's documents, which no insert
+                // announces: a snapshot of it must copy it again from the start, whether a chunk
+                // is in flight or not.
                 if let Some((db, coll)) = to {
-                    e.observe(&table_id(db, coll), Live::Truncate);
+                    if e.collection_replaced(&table_id(db, coll)) {
+                        self.queue_progress();
+                    }
                 }
             }
             "dropDatabase" => e.database_dropped(),
@@ -1239,6 +1244,47 @@ mod tests {
         let drop = doc! {"_id": {"_data": "06"}, "operationType": "rename",
         "ns": {"db": "app", "coll": "u"}, "to": {"db": "app", "coll": "v"}};
         assert!(!src.observe(&drop, "t").unwrap());
+    }
+
+    #[test]
+    fn a_rename_onto_the_snapshotted_collection_resets_and_saves_its_cursor() {
+        let cursor_at_9 = || {
+            let mut src = MongoSource::new(MongoConfig::new("mongodb://h/", "app"));
+            let cat = Catalog {
+                database: "app".into(),
+                ..Default::default()
+            };
+            let st = SnapState {
+                id: "s1".into(),
+                tables: vec!["app.u".into()],
+                table: 0,
+                after: Some(vec!["9".into()]),
+            };
+            src.snapshot = Engine::new(st, &cat, 10, None);
+            src.last_token = Some("T".into());
+            src
+        };
+        let mut src = cursor_at_9();
+        // Between chunks, so the window alone would never see it.
+        let rename = doc! {"_id": {"_data": "07"}, "operationType": "rename",
+        "ns": {"db": "app", "coll": "tmp"}, "to": {"db": "app", "coll": "u"}};
+        assert!(!src.observe(&rename, "t").unwrap());
+        assert_eq!(src.snapshot.as_ref().unwrap().state().after, None);
+        let hb = src
+            .buffer
+            .pop_front()
+            .expect("the reset cursor is checkpointed");
+        assert_eq!(hb.op, Op::Heartbeat);
+        let Some(Position::Text(cp)) = &hb.checkpoint else {
+            panic!("composite checkpoint expected");
+        };
+        assert_eq!(Checkpoint::decode(cp).unwrap().snap.unwrap().after, None);
+        // A rename onto another database's collection of the same name is not this one.
+        let mut src = cursor_at_9();
+        let other = doc! {"_id": {"_data": "08"}, "operationType": "rename",
+        "ns": {"db": "app", "coll": "tmp"}, "to": {"db": "other", "coll": "u"}};
+        assert!(!src.observe(&other, "t").unwrap());
+        assert!(src.buffer.is_empty());
     }
 
     #[tokio::test]
