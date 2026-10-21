@@ -316,6 +316,8 @@ Notable changes to Aqueduct. Newest first.
   dead-letter topic of the routes writing to it (#177).
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
+- **Cockpit: table and topic charts draw one coloured line per operation.** The op buttons are tinted in their line
+  colour (the legend); only operations that have happened get a button and a line.
 - **Cockpit: a route card has one white step line (processed); its detail chart has four** (processed, matched,
   fallback, errors) and no buttons. Dead-letter topic cards have no op bar.
 - **Cockpit: table and topic step lines are white** (dead-letter topics stay red), so colours only mean route metrics.

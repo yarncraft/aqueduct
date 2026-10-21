@@ -974,7 +974,7 @@ records, a dead-letter topic's errors).
 
 **Rates.** Click a table, a route or a topic for a panel with one step line over the last 120 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
-a topic's acknowledged records per second. A table's and a topic's chart count only the operations toggled on with the
+a topic's acknowledged records per second. A table's and a topic's chart draw one line per operation, in the op colours, for the operations toggled on with the
 buttons above it; only operations that have happened for that table or topic get a button (insert, update, delete,
 truncate, read); the selection is shared by the two. A route's chart has no
 buttons: four lines, processed, matched, fallback and errors, from the route's own counters. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
