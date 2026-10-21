@@ -590,7 +590,8 @@ const EDGE_BASE = '#404854', EDGE_HL = '#4c90f0', EDGE_FLOW = '#abb3bf', EDGE_RE
 const ROUTE_COUNTS = ['produced', 'filtered', 'fallback', 'errors'];
 // Detail-chart line colours: a route's produced line; the dead-letter topic in red.
 const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
-const TOPIC_LINE = '#32a467', TABLE_LINE = '#4c90f0';
+// Source (table) and sink (topic) step lines are white, so colours only mean route metrics; dead-letter lines stay red.
+const TOPIC_LINE = '#e6e9ee', TABLE_LINE = '#e6e9ee';
 // A route card's metrics and step lines: processed (every event it took), matched (processed minus filtered: the
 // `where` held), fallback, errors.
 const CARD_METRICS = [['processed', '#4c90f0'], ['passed', '#32a467', 'matched'], ['fallback', '#ad7bee'], ['errors', '#e76a6e']];
