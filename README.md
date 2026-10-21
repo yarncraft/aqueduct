@@ -1,3 +1,5 @@
+![Aqueduct](docs/assets/banner.png)
+
 # Aqueduct
 
 Change data capture (CDC) to Kafka, written in Rust and built to run **only in a container**. Aqueduct reads changes
