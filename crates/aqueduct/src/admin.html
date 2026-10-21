@@ -758,11 +758,16 @@ function graphModelOf(d) {
   const dlqs = new Map();
   for (const x of routes) {
     x.dlq = dlqOf(x.r);
+    x.dlqNames = [];
     if (!x.dlq || !(canDeadLetter(x.r) || x.c.errors > 0)) { x.dlq = null; continue; }
-    if (!dlqs.has(x.dlq)) dlqs.set(x.dlq, { name: x.dlq, id: 'dlq:' + x.dlq, routes: [], errors: 0 });
-    const d = dlqs.get(x.dlq);
-    d.routes.push(x);
-    d.errors += x.c.errors || 0;
+    // A template shows the dead-letter topics it rendered (none yet: no node); a fixed name shows itself.
+    x.dlqNames = x.dlq.includes('{') ? dlqTopics(x.dlq) : [x.dlq];
+    for (const name of x.dlqNames) {
+      if (!dlqs.has(name)) dlqs.set(name, { name, id: 'dlq:' + name, routes: [], errors: 0 });
+      const d = dlqs.get(name);
+      d.routes.push(x);
+      d.errors += x.dlqNames.length === 1 ? (x.c.errors || 0) : ((rates && rates.topics[name]) || []).reduce((a, n) => a + n, 0);
+    }
   }
   const dlqAll = [...dlqs.values()].sort((a, b) => b.errors - a.errors || (a.name < b.name ? -1 : 1));
   const dlqCut = graphOpen.has('g:dlq') || dlqAll.length <= GRAPH_TOPICS ? dlqAll.length : GRAPH_TOPICS - 1;
@@ -780,14 +785,14 @@ function graphModelOf(d) {
     const g = groups.get(x.r.topic);
     const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
     const targets = new Map();
-    if (!x.topics.size) targets.set(g.dynamic ? g.id : topicNode.get(x.r.topic), x.c.produced || 0);
+    if (!x.topics.size && !g.dynamic) targets.set(topicNode.get(x.r.topic), x.c.produced || 0);
     for (const [t, n] of x.topics) {
       const to = topicNode.get(t);
       targets.set(to, (targets.get(to) || 0) + (sum ? (x.c.produced || 0) * n / sum : 0));
     }
     for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
-    for (const t of x.tables) tableEdges[t.name].push(x.id + '>' + (t.topic ? topicNode.get(t.topic) : g.id));
-    if (x.dlq) x.dlqEdge = edge(x.id, dlqs.get(x.dlq).node, x.c.errors || 0, true);
+    for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
+    for (const name of x.dlqNames) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true);
   }
   for (const t of unrouted) values[t.id] = fmt(t.events);
   return { routes, groups: [...groups.values()], unrouted, edges, values, tableEdges, dlqs, dlqShown, dlqHidden };
@@ -918,9 +923,9 @@ function topicNodeHtml(id, name, opts) {
 function graphHtml(m) {
   const tables = m.routes.filter(x => x.tables.length).map(x => `<div class="space-y-1">${x.shown.map(tableNode).join('')}${x.hidden.length ? moreNode(x.moreId, x.id, x.hidden.length, 'tables') : graphOpen.has(x.id) ? lessNode(x.id) : ''}</div>`).join('')
     + (m.unrouted.length ? `<div class="space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">no route · events fail</div>${m.unrouted.map(tableNode).join('')}</div>` : '');
-  const routes = m.routes.map((x, i) => routeNode(x, i === m.routes.length - 1)).join('');
+  // The default route (sink.topic) is left out while nothing has reached it.
+  const routes = m.routes.filter(x => x.r.match != null || x.tables.length || (x.c.matched || 0) > 0).map((x, i, all) => routeNode(x, i === all.length - 1)).join('');
   const topics = m.groups.map(g => `<div class="space-y-1">`
-    + (g.dynamic ? `<div data-node="${esc(g.id)}" class="truncate rounded-sm border border-dashed border-ink-600 px-2 py-1 text-ink-300 transition-opacity" title="Topic template; the topics below are the ones it rendered">${esc(g.tpl)}</div>` : '')
     + g.shown.map(t => topicNodeHtml('p:' + t, t, {})).join('')
     + (g.hidden.length ? moreNode(g.moreId, 'g:' + g.tpl, g.hidden.length, 'topics') : graphOpen.has('g:' + g.tpl) ? lessNode('g:' + g.tpl) : '')
     + `</div>`).join('')
