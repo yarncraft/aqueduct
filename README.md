@@ -372,8 +372,8 @@ delivered rates, the time to catch up, and while a snapshot runs its rows/s, row
 In the routing graph every table, route and topic carries a small step line of its rate over the last 120 s (a
 table's events per second; a route's produced rate, with filtered, fallback and errors as thin lines; a topic's records
 acknowledged by Kafka), and each "+N more" group one for the group as a whole. Click a table, a route or a topic for a
-larger chart with the current, average and maximum rate; a table's panel also names the route that claims it and draws one line per
-operation (insert, update, delete, truncate, read) with a checkbox each to filter them, and a
+larger chart with the current, average and maximum rate; a table's panel also names the route that claims it and draws one events-per-second
+line, with a toggle button per operation (insert, update, delete, truncate, read) to choose what it counts, and a
 topic's lists the routes that write to it and opens it in the event inspector. The inspector is a pop-up
 window over the cockpit that only opens this way (it reads nothing from Kafka while closed); Close, Esc or a click
 outside it closes it.
