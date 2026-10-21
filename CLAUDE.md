@@ -38,14 +38,12 @@ docker compose up --build         # or: podman-compose up -d --build
 - PRs that change the `Dockerfile` or the image: `podman build .`.
 - Base images in the `Dockerfile` are pinned by digest (tag kept in a comment). To bump, resolve the new multi-arch index digest of the tag (`podman manifest inspect` or the registry's `Docker-Content-Digest`), update both `FROM` lines and build.
 
-On the Windows dev machine, cargo runs with the local toolchain in the `Ubuntu` WSL distro (rustup in `/root/.cargo`,
-with clippy and rustfmt), never in a Rust container: `wsl.exe -d Ubuntu -- bash -l -s` with the commands on stdin, on a
-`git archive` of the commit unpacked in Ubuntu's own filesystem (not `/mnt/c`). Only the services the integration
-suite needs (Kafka, MongoDB, Postgres) run in Podman (`S:\podman\bin`): publish their ports, and Ubuntu reaches them on
-`localhost`, because all WSL2 distros share one network; Ubuntu's `hostname -I` address serves as the non-loopback
-host. `podman build .` still builds the image; pulling `gcr.io` images needs the corporate (Zscaler) root CA trusted
-in the Podman machine. After a WSL restart, `podman machine stop` and `podman machine start` restore the Docker API
-pipe that `docker compose` uses.
+On the Windows dev machine, cargo runs natively with the toolchain on `S:` (`RUSTUP_HOME=S:\rust\rustup`,
+`CARGO_HOME=S:\rust\cargo`, `S:\rust\cargo\bin` on `PATH`, `CARGO_TARGET_DIR=S:\rust\target`), never in a Rust container.
+Only the services the integration suite needs (Kafka, MongoDB, Postgres) run in Podman (`S:\podman\bin`): publish their
+ports and reach them on `localhost`. `podman build .` still builds the image; pulling `gcr.io` images needs the corporate
+(Zscaler) root CA trusted in the Podman machine. After a machine restart, `podman machine stop` and `podman machine start`
+restore the Docker API pipe that `docker compose` uses.
 
 ### Cleanup (always)
 
