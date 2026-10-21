@@ -371,10 +371,10 @@ delivered rates, the time to catch up, and while a snapshot runs its rows/s, row
 `aqueduct_source_behind_seconds`, `aqueduct_source_catch_up_eta_seconds`, `aqueduct_snapshot_rows_per_second` and
 `aqueduct_snapshot_eta_seconds`. See DEPLOYMENT.md, "Behind source".
 
-In the routing graph every table, route and topic card carries a thin bar of its operations' shares (insert green,
+In the routing graph every table and topic card carries a thin bar of its operations' shares (insert green,
 update blue, delete red, truncate violet, read amber; hover for the counts and percentages): a table's events, a
-route's produced events, a topic's records acknowledged by Kafka (a tombstone counts as a delete), and each "+N more"
-group the sum of its members. Under the bar, a step line shows its rate over the last 120 s (a route's produced line
+topic's records acknowledged by Kafka (a tombstone counts as a delete), and each "+N more" group the sum of its
+members. Every card, routes included, shows a step line of its rate over the last 120 s (a route's produced line
 with filtered, fallback and errors as thin lines). Click a table, a route or a topic (the dead-letter topic too) for a chart with one line
 over the last 120 s, with the current, average and maximum rate: events, produced or acknowledged records per second
 of the operations toggled on with the buttons above it. The toggles are shared by the three panels, so following a
