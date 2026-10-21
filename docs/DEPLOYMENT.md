@@ -960,8 +960,8 @@ second from the stream. Without any `[[sink.routes]]` the graph is all tables â†
 
 **Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
 start, as shares (insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and
-percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: four lines,
-processed, matched, fallback and errors; matched is never above processed). The bar counts:
+percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: one line, processed;
+its detail chart has four, processed, matched, fallback and errors). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
 - a topic (the dead-letter topic too): records Kafka acknowledged, counted by the sink after the broker acknowledged

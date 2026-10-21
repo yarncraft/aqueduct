@@ -978,8 +978,8 @@ function routeNode(x, last) {
     + sqlRow('PARTITIONED-BY', partitionClause(r))
     + `</div>`
     // The metrics, each in the colour of its step line below.
-    + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span style="color:${color}">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
-    + `<div class="mt-1" title="Per second, last 120 s: processed (blue), matched (green), fallback (violet), errors (red)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
+    + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
+    + `<div class="mt-1" title="Events processed per second, last 120 s; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -1178,7 +1178,8 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(srcButtons);
+    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, (label || k) + (k === 'processed' || x.tables.length < 2 ? '' : ' (all sources)'))).join('')
+      + (srcButtons ? '<span class="w-full"></span>' + srcButtons : ''));
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1194,7 +1195,7 @@ function drawCardSparks(m) {
     if (rr) {
       const processed = sumSeries(ROUTE_COUNTS.map(k => rr[k] || [])), passed = sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]);
       const series = { processed, passed, fallback: rr.fallback || [], errors: rr.errors || [] };
-      lines[x.id] = CARD_METRICS.map(([k, color]) => [series[k], color, k === 'processed' ? 1.5 : 1.2]);
+      lines[x.id] = [[series.processed, TABLE_LINE, 1.5]];
     }
     for (const t of x.shown) lines[t.id] = [[tableEventsRate(t.name), TABLE_LINE, 1.5]];
     if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableEventsRate(t.name))), TABLE_LINE, 1.5]];
@@ -1223,15 +1224,23 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    // A route: the events per second its source tables (the ones toggled on) delivered, all ops (no op buttons).
+    // A route: four lines. Processed is the events its source tables (the ones toggled on) delivered: every event of a
+    // claimed table is processed by this route. Matched, fallback and errors are counted per route, for all sources.
     const x = m.routes[graphSel];
     if (!x) return;
     const off = routeSrcOff.get(x.id) || new Set(), per = (lastData && lastData.history_ops) || {};
-    rows = sumRows(x.tables.filter(t => !off.has(t.name)).map(t => per[t.name] || []));
-    color = TABLE_LINE;
-    totals = opSlots(x.c.ops);
+    const src = sumRows(x.tables.filter(t => !off.has(t.name)).map(t => per[t.name] || []));
+    const processed = src.map(o => o.reduce((a, n) => a + n, 0));
+    const rr = routeRate(x.i) || {};
+    const series = { processed, passed: sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]), fallback: rr.fallback || [], errors: rr.errors || [] };
+    chart(CARD_METRICS.map(([k], op) => ({ op, h: series[k] })), dc, CARD_METRICS.map(c => c[1]), 160);
+    $('detailstats').textContent = 'processed ' + rateStats(processed);
+    const el = document.getElementById('detailops');
+    const t = opSlots(x.c.ops);
+    if (el) el.textContent = t ? OP_LABEL.map((k, i) => `${k} ${fmt(t[i])}`).join(' · ') : 'no per-operation counts from this server';
+    return;
   } else return;
-  const sel = graphSel != null && topicSel == null && tableSel == null ? [0, 1, 2, 3, 4] : [...detailOps];
+  const sel = [...detailOps];
   const h = rows ? sumSeries(sel.map(op => rows.map(o => o[op] || 0))) : all;
   chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
