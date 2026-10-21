@@ -316,6 +316,11 @@ Notable changes to Aqueduct. Newest first.
   dead-letter topic of the routes writing to it (#177).
   Unset clauses show their default, dimmed. The step number, name, counts, rate line and "never seen" warning
   follow below; the badge row is gone. No API change: it reads `/api/routes`.
+- **Cockpit: route panels show only what the card does not, with source buttons.** A route's detail panel lists the
+  matched count, produced per operation, `topic_fallback`, `topic_values`, the topics a template wrote, the dead-letter
+  topic and the full table list; its chart is the events from its source tables, with a button per table and per
+  operation. `ON ERROR` is no longer on the card, and dead-letter topics without events are not drawn. Fixed: routes
+  that pick their topic per row now animate their lines to the topics they write.
 - **Cockpit: the routing graph draws only real topics.** Topic templates are no longer drawn as topic cards (a
   template's rendered topics are), and the `default` route card is hidden until an event reaches it.
 - **Cockpit: the global Event rate chart and Operations card are removed.** Per-table rates by operation are in a

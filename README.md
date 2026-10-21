@@ -401,7 +401,7 @@ connects to the topics it rendered and, when it can dead-letter a row or it has 
 dead-letter topic. A topic's panel names the dead-letter topic of the routes writing to it. Each route card reads like a query, five aligned rows: `SELECT` (the fields: `*` for the
 envelope, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`, `col AS new`, `ROW` and the shape options),
 `WHERE` (the `where`, operation filter included), `FROM` (the `match` glob and the tables it claimed), `INTO` (the
-topic, `ELSE` the fallback, `ON ERROR` the route's dead-letter topic when it can use it) and `PARTITIONED-BY` (the
+topic and `ELSE` the fallback) and `PARTITIONED-BY` (the
 route `key`, else the primary key or the table). Unset clauses show their default, dimmed. Below them: the step
 number and name, the produced / filtered / fallback / errors counts with a bar, and an
 amber **never seen** warning for fields its `where` reads that no row has had (usually a typo). Line width follows the

@@ -934,23 +934,24 @@ The **Routing** card shows where each table's events go:
   | `SELECT` | What the record value holds: `include` as a column list, `exclude` as `* EXCEPT (a, b)`, then `mask(col)`, `hash(col)` and `col AS new`. `format = "row"` adds `ROW` (`SELECT ROW *`); the delete mode, `tombstones` and `unchanged` are small tags after it. An outbox route shows its `payload` column | `*`, the change-event envelope |
   | `WHERE` | The `where` text, operation filter included. Long text is cut; hover for it all, or click the route | `true` |
   | `FROM` | The `match` glob, then the tables it claimed, ` / `-separated, the first three and `+N` | `* (unmatched)` on `default` |
-  | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). `ON ERROR` and the route's own dead-letter topic (or its `{table}` template), in red, when the route can send rows there: a `where` on row data, `unchanged = "dead_letter"`, an outbox, `hash`, or `rename` without `include` | `sink.topic` on `default` |
+  | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). The dead-letter topic is in the route's panel, not on the card | `sink.topic` on `default` |
   | `PARTITIONED-BY` | `key (a, b)` for a route `key`; the `aggregate_id` column for an outbox | `primary key` (`partition_by = "key"`) or `table` |
 
   Below the rows: the step number and route name, the produced, filtered, fallback and errors counts, and the op bar
   of its produced events. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 - **Topics** (right): only real topics, never a template: the topics a template rendered for the tables seen, and
-  under **dead letter**, in red, one card per distinct dead-letter topic of the routes that show `ON ERROR` (a
+  under **dead letter**, in red, one card per distinct dead-letter topic that has received events (a
   `{schema}`/`{table}` dead-letter template shows the dead-letter topics it rendered), with the errors of the routes
-  that use it. A route whose template has not rendered a topic yet has no topic edge. The `default` route
+  that use it; a dead-letter topic with no events is not drawn. A route whose template has not rendered a topic yet has no topic edge. The `default` route
   (`sink.topic`) is left out until an event reaches it. Beyond
   six, the quietest ones are behind "+N more". A template that reads the event (`{op}`, `{row.x}`) lists the topics the
   sink has produced to since start (not its dead-letter topics), and its `topic_fallback`.
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
-motion. The line from a route to its dead-letter topic is dashed and appears for routes that show `ON ERROR`, or with errors. Hover a
+motion. The line from a route to its dead-letter topic is dashed and appears once that topic has events. A route that
+picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. Hover a
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
@@ -971,8 +972,11 @@ records, a dead-letter topic's errors).
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second, counting only the operations toggled on with the buttons above the chart
 (insert, update, delete, truncate, read). The selection is shared by the three panels, so a table, its route and its
-topic are compared over the same operations. A table's panel names the route that claims it. A route's panel keeps the
-outcome counts and lists its produced events per operation. A topic's panel lists its acknowledged records per
+topic are compared over the same operations. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
+operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
+select it), the full table list when the card's `FROM` is cut short, and any other config keys. Its line is the events
+per second from its source tables; with more than one source table, a button per table above the chart picks which
+ones count. A topic's panel lists its acknowledged records per
 operation, the routes that write to it (by template or as their `topic_fallback`), **dead letter**: the dead-letter
 topic of each of those routes that can dead-letter a row (a `{table}` template filled in for this topic,
 `cdc.public.orders.dlq`; click one to select it in the graph), and an **Open in inspector** button (shown when the
