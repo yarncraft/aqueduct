@@ -6,15 +6,18 @@
 //! so the poll and stream transports cannot number the rows of a COPY or a multi-table TRUNCATE
 //! differently (the #94 row loss).
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aqueduct_core::{Error, Result};
 use async_trait::async_trait;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::Client;
 
 use crate::decoder::{decode, Message};
 use crate::replication::{Replication, ReplicationHandle};
-use crate::source::{parse_lsn, src_err};
+use crate::source::{parse_lsn, src_err, SLOT_BUSY_RETRY};
 
 /// Decoded messages, each with the LSN of its WAL record, in stream order.
 pub struct Fetched {
@@ -61,6 +64,32 @@ pub fn peek_sql(logical_messages: bool) -> &'static str {
     }
 }
 
+/// Runs `query` again while another backend holds the slot (55006, "replication slot is active"),
+/// for up to [`SLOT_BUSY_RETRY`]. After a restart the previous process's peek can still be running
+/// on the server; failing at once would exit the pipeline and restart it until that peek ends (#163).
+/// A failed peek or advance changed nothing, so running it again is safe.
+async fn retry_slot_busy<T, F, Fut>(slot: &str, mut query: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+{
+    let deadline = Instant::now() + SLOT_BUSY_RETRY;
+    let mut logged = false;
+    loop {
+        match query().await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) && Instant::now() < deadline => {
+                if !logged {
+                    tracing::info!(slot, "slot still held by a previous connection; retrying");
+                    logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => return Err(src_err(e)),
+        }
+    }
+}
+
 /// Polls the slot over a plain SQL connection with `pg_logical_slot_peek_binary_changes`, which
 /// does not consume anything, and confirms with `pg_replication_slot_advance`.
 pub struct PeekTransport {
@@ -74,14 +103,15 @@ pub struct PeekTransport {
 #[async_trait]
 impl Transport for PeekTransport {
     async fn fetch(&mut self) -> Result<Fetched> {
-        let rows = self
-            .client
-            .query(
-                peek_sql(self.logical_messages),
-                &[&self.slot, &self.batch_size, &self.publication],
-            )
-            .await
-            .map_err(src_err)?;
+        let rows = retry_slot_busy(&self.slot, || async {
+            self.client
+                .query(
+                    peek_sql(self.logical_messages),
+                    &[&self.slot, &self.batch_size, &self.publication],
+                )
+                .await
+        })
+        .await?;
         // `upto_nchanges` ends a capped peek at the first commit past the limit. Only a peek that
         // returned fewer rows than the cap saw everything. A peek that reached the end can still
         // return `batch_size` rows or more (it stops at a commit boundary); that only delays the
@@ -106,13 +136,16 @@ impl Transport for PeekTransport {
     }
 
     async fn confirm(&mut self, lsn: u64) -> Result<()> {
-        self.client
-            .execute(
-                "SELECT pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
-                &[&self.slot, &aqueduct_core::Position::Lsn(lsn).to_string()],
-            )
-            .await
-            .map_err(src_err)?;
+        let lsn = aqueduct_core::Position::Lsn(lsn).to_string();
+        retry_slot_busy(&self.slot, || async {
+            self.client
+                .execute(
+                    "SELECT pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
+                    &[&self.slot, &lsn],
+                )
+                .await
+        })
+        .await?;
         Ok(())
     }
 }

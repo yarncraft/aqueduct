@@ -492,8 +492,8 @@ const SLOT_STATS_SQL: &str = "SELECT s.confirmed_flush_lsn::text, \
      ELSE pg_current_wal_flush_lsn() END AS flushed) h \
      LEFT JOIN pg_replication_slots s ON s.slot_name = $1";
 
-/// How long the stream transport waits for a slot another connection still holds.
-const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
+/// How long a transport waits for a slot another connection still holds.
+pub(crate) const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
 
 /// How often the slot lag and the WAL head are read (one cheap query on the SQL connection).
 /// Once a second, so the cockpit's backlog does not trail a fast catch-up by seconds.
