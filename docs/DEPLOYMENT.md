@@ -950,7 +950,8 @@ The **Routing** card shows where each table's events go:
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
-motion. The line from a route to its dead-letter topic is dashed and appears once that topic has events. A route that
+motion. The line from a route to its dead-letter topic is solid red (only the moving dots are striped) and appears once
+that topic has events. A route that
 picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. Hover a
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.

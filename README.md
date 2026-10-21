@@ -398,7 +398,7 @@ only while the pipeline is streaming.
 The **Routing** card draws the sink's routing as a graph, left to right: every table seen, the
 `[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`, shown once an event reached it),
 and the topics they write (real topics only; templates are not drawn as topics), plus the routes' dead-letter topics in red. A table connects to the first route whose `match` fits it; a route
-connects to the topics it rendered and, when it can dead-letter a row or it has errors, with a dashed line to its own
+connects to the topics it rendered and, when it can dead-letter a row or it has errors, with a red line to its own
 dead-letter topic. A topic's panel names the dead-letter topic of the routes writing to it. Each route card reads like a query, five aligned rows: `SELECT` (the fields: `*` for the
 envelope, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`, `col AS new`, `ROW` and the shape options),
 `WHERE` (the `where`, operation filter included), `FROM` (the `match` glob and the tables it claimed), `INTO` (the
