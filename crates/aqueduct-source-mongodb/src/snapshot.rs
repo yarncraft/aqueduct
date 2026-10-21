@@ -244,8 +244,9 @@ pub enum Live {
     Key(String),
     /// A change of a document that cannot be told (no `documentKey._id`).
     Unknown,
-    /// The collection was dropped or renamed (either way), or its database dropped: every
-    /// document the chunk read may be gone.
+    /// The collection was dropped or renamed away, or its database dropped: every document the
+    /// chunk read may be gone. (A rename *onto* the collection is
+    /// [`Engine::collection_replaced`]: it brings documents that no live event announces.)
     Truncate,
 }
 
@@ -335,6 +336,9 @@ pub struct Engine {
     skipped: Vec<(String, String)>,
     /// Stop after the chunk in flight (admin `DELETE /api/snapshot`).
     cancelled: bool,
+    /// The collection of the chunk in flight was replaced: closing the chunk restarts the
+    /// collection from its first `_id` instead of moving the cursor.
+    restart: bool,
 }
 
 fn now_micros() -> u64 {
@@ -402,6 +406,7 @@ impl Engine {
             estimates: catalog.estimates.clone(),
             skipped,
             cancelled: false,
+            restart: false,
         })
     }
 
@@ -527,6 +532,8 @@ impl Engine {
     pub async fn start_chunk(&mut self, client: &Client) -> std::result::Result<(), ChunkError> {
         let id = self.next_chunk;
         self.next_chunk += 1;
+        // A replacement seen before this chunk already reset the cursor it reads from.
+        self.restart = false;
         let table = self.state.tables[self.state.table].clone();
         self.window
             .expect(id, &table)
@@ -558,6 +565,7 @@ impl Engine {
         }
         tracing::warn!(table = %table, error = %why, "snapshot chunk read failed {} times; skipping this collection", self.failures);
         self.failures = 0;
+        self.restart = false;
         self.skipped
             .push((table, format!("chunk read failed: {why}")));
         // Out of the list, so a restart does not try it again; the index now names the next one.
@@ -653,6 +661,28 @@ impl Engine {
         }
     }
 
+    /// Another collection was renamed onto `table` (`renameCollection` with `dropTarget`, or an
+    /// `$out` aggregation): it now holds a different set of documents, and no live event
+    /// announces them. If `table` is the collection being read, its copy starts again at its
+    /// first `_id`: the chunk in flight is voided and closes without moving the cursor, and the
+    /// saved cursor is reset now, so a crash also starts it again. Documents already copied are
+    /// copied twice (at-least-once); none is skipped. A queued collection needs nothing, as its
+    /// copy has not started. Returns whether the saved progress changed, to be checkpointed.
+    pub fn collection_replaced(&mut self, table: &str) -> bool {
+        if self.state.tables.get(self.state.table).map(String::as_str) != Some(table) {
+            return false;
+        }
+        tracing::info!(
+            table = %table,
+            "a collection was renamed onto the collection being snapshotted; copying it again from the start"
+        );
+        if self.in_flight.is_some() {
+            self.window.live_truncate(table);
+            self.restart = true;
+        }
+        self.state.after.take().is_some()
+    }
+
     /// The database was dropped: the collection being read is gone.
     pub fn database_dropped(&mut self) {
         if let Some(t) = self.state.tables.get(self.state.table).cloned() {
@@ -698,6 +728,8 @@ impl Engine {
         self.in_flight = None;
         self.retries = 0;
         match last_key {
+            // The collection was replaced while the chunk was read: start it again.
+            _ if std::mem::take(&mut self.restart) => self.state.after = None,
             Some(k) => self.state.after = Some(vec![k]),
             None => {
                 // An empty chunk: the collection is done.
@@ -946,6 +978,53 @@ mod tests {
         assert!(closed.state.is_none(), "finished");
         assert_eq!(e.status("finished").rows, 1);
         assert_eq!(e.status("finished").tables_done, 1);
+    }
+
+    #[test]
+    fn a_rename_onto_the_collection_being_read_starts_it_again() {
+        let mut e = Engine::new(state(&["app.users", "app.orders"]), &catalog(), 2, None).unwrap();
+        let id = open(&mut e, vec![row("1"), row("2")]);
+        e.mark(&wm(id, false)).unwrap();
+        e.mark(&wm(id, true)).unwrap().unwrap();
+        assert_eq!(e.state().after, Some(vec!["2".into()]));
+
+        // In flight: the chunk is voided and the cursor goes back to the start, not to `4`.
+        let id = open(&mut e, vec![row("3"), row("4")]);
+        e.mark(&wm(id, false)).unwrap();
+        assert!(e.collection_replaced("app.users"));
+        assert_eq!(e.state().after, None, "a crash now also starts again");
+        let closed = e.mark(&wm(id, true)).unwrap().unwrap();
+        assert!(closed.rows.is_empty());
+        let st = closed.state.unwrap();
+        assert_eq!((st.table, st.after), (0, None));
+
+        // An empty chunk after the replacement still restarts, rather than finishing the table.
+        let id = open(&mut e, vec![row("1")]);
+        e.mark(&wm(id, false)).unwrap();
+        e.mark(&wm(id, true)).unwrap().unwrap();
+        let id = open(&mut e, vec![]);
+        e.mark(&wm(id, false)).unwrap();
+        e.collection_replaced("app.users");
+        let st = e.mark(&wm(id, true)).unwrap().unwrap().state.unwrap();
+        assert_eq!((st.table, st.after), (0, None));
+
+        // Between chunks: the saved cursor is reset at once, and the next chunk moves on as usual.
+        let id = open(&mut e, vec![row("1")]);
+        e.mark(&wm(id, false)).unwrap();
+        e.mark(&wm(id, true)).unwrap().unwrap();
+        assert!(e.collection_replaced("app.users"));
+        assert_eq!(e.state().after, None);
+        assert!(!e.collection_replaced("app.users"), "nothing more to save");
+        let id = open(&mut e, vec![row("1"), row("2")]);
+        e.mark(&wm(id, false)).unwrap();
+        let closed = e.mark(&wm(id, true)).unwrap().unwrap();
+        assert_eq!(closed.rows.len(), 2);
+        assert_eq!(closed.state.unwrap().after, Some(vec!["2".into()]));
+
+        // A queued collection has not started, and another collection is not this one.
+        assert!(!e.collection_replaced("app.orders"));
+        assert!(!e.collection_replaced("app.other"));
+        assert_eq!(e.state().after, Some(vec!["2".into()]));
     }
 
     #[test]

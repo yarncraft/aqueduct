@@ -200,8 +200,15 @@ snapshot = "never"                  # or "on_demand" / "initial", see "Snapshots
 - On a first start (no checkpoint) the stream opens at "now", and its opening position is checkpointed before
   anything else is read, so a restart soon after the first start does not skip changes made in between.
 - While the stream is idle, or only filtered-out collections change, the checkpoint still follows the stream's resume token (checked every 30 s, saved only when it moved). Nothing is written to Kafka for this, so the checkpoint can advance with no sink output; it keeps the token inside the oplog window.
-- Only insert, update, replace and delete events are forwarded. Drop, rename, dropDatabase and invalidate events are skipped, and `truncate` is never emitted. Changes of `aqueduct_watermarks` are never forwarded, and that name cannot be listed in `collections`.
+- Only insert, update, replace and delete events are forwarded. Drop, rename and dropDatabase events are skipped, and `truncate` is never emitted. Changes of `aqueduct_watermarks` are never forwarded, and that name cannot be listed in `collections`.
 - `pre_images = true` asks for `fullDocumentBeforeChange` on every stream. MongoDB older than 6.0 may reject that option at startup; set `pre_images = false` there (not verified against a server).
+- Dropping the watched database invalidates the change stream. The source then **fails** (`MongoDB invalidated the change
+  stream`) instead of ending or skipping past it, and every restart fails the same way until the checkpoint is reset: see
+  "MongoDB change stream invalidated" in `docs/RUNBOOK.md`.
+- A change event over 16 MB (the document from `updateLookup` plus, with `pre_images`, its pre-image) cannot be returned
+  by the server (`BSONObjectTooLarge`), and the source fails at it on every restart with a message saying so. Keep
+  documents well below 16 MB, or set `pre_images = false` for collections with large documents; Aqueduct does not use
+  `$changeStreamSplitLargeEvent` (MongoDB 7.0+). See "MongoDB change event larger than 16 MB" in `docs/RUNBOOK.md`.
 
 ### `[sink]`
 
@@ -1433,8 +1440,13 @@ exist. `rows_estimated` comes from `estimatedDocumentCount`.
   another partition than the document's later changes. Sharded clusters are
   not covered by Aqueduct's tests.
 - **In the window:** an insert, update, replace or delete of a document in the chunk drops the chunk's copy of it; a
-  drop or rename of the collection, a rename of another collection onto it, or a dropped database drops the whole
-  chunk; a change without a `documentKey._id` makes the chunk be read again. With a `collections` list, the change
+  drop or rename of the collection, or a dropped database drops the whole chunk; a change without a `documentKey._id`
+  makes the chunk be read again.
+- **Renames onto a collection:** a rename of another collection onto the collection being copied (`renameCollection`
+  with `dropTarget`, or an `$out` aggregation) replaces its documents without any insert events, so its copy starts
+  again at the first `_id`, whether a chunk is in flight or not, and the reset cursor is checkpointed at once. Documents
+  copied before the rename are sent again (duplicates, never gaps). A collection still queued needs nothing; one whose
+  copy already finished is not copied again (request a new snapshot of it). With a `collections` list, the change
   stream also asks for renames into a watched collection and `dropDatabase` for this (neither is forwarded).
 - **Admin requests** while a cancelled snapshot finishes its last chunk get `409` ("try again in a moment").
 - **Checkpoint:** while a snapshot runs, the checkpoint file holds `{"pos": <resume token>, "snap": {...}}`; the last
