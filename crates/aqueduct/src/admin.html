@@ -654,7 +654,12 @@ const routeSrcOff = new Map();
 // Toggle buttons that pick those ops.
 const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
 const OP_BTN_ON = OP_BTN + 'border-blue bg-blue/15 text-blue', OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
-const opButtons = () => OP_LABEL.map((label, op) => `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" class="${detailOps.has(op) ? OP_BTN_ON : OP_BTN_OFF}">${label}</button>`).join('');
+// Op buttons for the ops that have happened (totals per op, insert..read); without totals (an older server) all five.
+const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '11111';
+const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
+  + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
+    : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" class="${detailOps.has(op) ? OP_BTN_ON : OP_BTN_OFF}">${label}</button>`).join('')
+  + '</span>';
 // Sum of series, aligned on their newest sample.
 const sumSeries = list => {
   const n = Math.max(0, ...list.map(a => a.length));
@@ -960,7 +965,7 @@ function routeNode(x, last) {
     + `<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5"><span class="flex min-w-0 items-center gap-2"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></span>`
     + `<span class="ml-auto flex flex-wrap gap-x-3 text-[10px]">${ROUTE_COUNTS.map(k => `<span><span class="text-ink-500">${k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(x.c[k] || 0)}</span></span>`).join('')}</span></div>`
-    + `<div class="mt-1" title="Per second, last 120 s: produced (green), filtered (grey), fallback (violet), errors (red)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
+    + `<div class="mt-1" title="Per second, last 120 s: matched (blue, in) and routed to its topics (green, out: produced + fallback; the gap is filtered and dead-lettered)">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -1076,7 +1081,7 @@ function topicDetail(m, name) {
       + wide('dead letter for', served)
       + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
       + wide('acknowledged', '<span id="detailops">–</span>')
-      + `</div>` + detailChart(legendItem(RATE_LINE.errors, 'records acknowledged / s') + opButtons());
+      + `</div>` + detailChart(legendItem(RATE_LINE.errors, 'records acknowledged / s') + opButtons(dlqTotals(name)));
     return;
   }
   const writers = topicRoutes(m, name);
@@ -1087,7 +1092,7 @@ function topicDetail(m, name) {
     + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
       : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TOPIC_LINE, 'records acknowledged / s') + opButtons());
+    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TOPIC_LINE, 'records acknowledged / s') + opButtons(topicTotals(name)));
 }
 
 // The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
@@ -1132,7 +1137,7 @@ function tableDetail(m, name) {
   $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
-    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TABLE_LINE, 'events / s') + opButtons());
+    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(legendItem(TABLE_LINE, 'events / s') + opButtons(((lastData && lastData.table_ops) || {})[name] || null));
 }
 
 function routeDetail(m) {
@@ -1170,8 +1175,12 @@ function drawCardSparks(m) {
   const lines = {};
   for (const x of m.routes) {
     const rr = routeRate(x.i);
-    // Thin outcome lines under the produced line; an outcome that never happened in the window is left out.
-    if (rr) lines[x.id] = ROUTE_COUNTS.slice(1).filter(k => (rr[k] || []).some(n => n)).map(k => [rr[k], RATE_LINE[k], 1]).concat([[rr.produced || [], RATE_LINE.produced, 1.5]]);
+    // Matched (in, blue): every event the route claimed, i.e. produced + filtered + fallback + errors. Routed (out,
+    // green): the records it wrote to its topics, produced + fallback; never above matched.
+    if (rr) {
+      const matched = sumSeries(ROUTE_COUNTS.map(k => rr[k] || [])), routed = sumSeries([rr.produced || [], rr.fallback || []]);
+      lines[x.id] = [[matched, TABLE_LINE, 1.5], [routed, RATE_LINE.produced, 1.5]];
+    }
     for (const t of x.shown) lines[t.id] = [[tableEventsRate(t.name), TABLE_LINE, 1.5]];
     if (x.hidden.length) lines[x.moreId] = [[sumSeries(x.hidden.map(t => tableEventsRate(t.name))), TABLE_LINE, 1.5]];
   }
@@ -1212,6 +1221,12 @@ function drawDetail(m) {
   chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
+  // An op that happens for the first time gets its button without reopening the panel.
+  const btns = document.getElementById('detailopbtns');
+  if (btns && (tableSel != null || topicSel != null)) {
+    const tot = tableSel != null ? ((lastData && lastData.table_ops) || {})[tableSel] || null : totals;
+    if (btns.dataset.mask !== opMask(tot)) btns.outerHTML = opButtons(tot);
+  }
   const el = document.getElementById('detailops');
   if (el) el.textContent = totals ? OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
 }
