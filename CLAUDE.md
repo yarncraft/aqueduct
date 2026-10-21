@@ -47,9 +47,10 @@ itself. Clean up after every check, test run or image build, and say so in the P
 - Remove every pod and container you started (`podman pod rm -f <pod>`, `podman rm -f <name>`), including throwaway
   Kafka, Postgres and MongoDB containers, and the volumes they used (`podman volume rm`).
 - Remove every image you built (`podman rmi aqueduct:check-<sha>`, test images).
-- At the end of a task: `podman container prune -f`, `podman image prune -f` and `podman volume prune -f`. These only
-  remove what nothing uses, so a running simulation or another agent's running test is safe. Never stop or remove
-  containers you did not start.
+- At the end of a task, `podman image prune -f` (dangling layers only) is safe. Do **not** run a blanket
+  `podman container prune` or `podman volume prune`: they also delete stopped containers and their volumes that are not
+  yours, such as the simulation's Postgres data after a machine restart. Remove containers and volumes by name instead.
+  Never stop or remove containers or volumes you did not start.
 - Named cargo cache volumes (`aq-*-target`, registry) are caches: delete yours when the task is done.
 - Check `podman system df` after a batch of work; tens of GB reclaimable means something was left behind.
 - Agents you delegate to get the same rule in their prompt.
