@@ -523,6 +523,49 @@ fn record(out: OutRecord) -> Record {
     }
 }
 
+/// The most record bytes (estimated by [`record_size`]) one produce request carries. A request
+/// above the broker's `message.max.bytes` (default 1 MiB, plus batch framing) is refused whole,
+/// and the retry would rebuild the same request, so a partition's records go out in consecutive
+/// requests under this budget. A single record above it still goes alone; the broker decides.
+const MAX_REQUEST_BYTES: usize = 900 * 1024;
+
+/// An upper estimate of `r`'s size in a record batch: key, value and headers plus the varint
+/// lengths, attributes and timestamp/offset deltas around them.
+fn record_size(r: &Record) -> usize {
+    const RECORD_OVERHEAD: usize = 32;
+    const HEADER_OVERHEAD: usize = 10;
+    let headers: usize = r
+        .headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + HEADER_OVERHEAD)
+        .sum();
+    RECORD_OVERHEAD
+        + r.key.as_ref().map_or(0, Vec::len)
+        + r.value.as_ref().map_or(0, Vec::len)
+        + headers
+}
+
+/// Splits one partition's records, in order, into consecutive requests of at most `budget`
+/// estimated bytes each. A record above `budget` gets a request of its own.
+fn chunk_records(records: Vec<Record>, budget: usize) -> Vec<Vec<Record>> {
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut size = 0;
+    for r in records {
+        let n = record_size(&r);
+        if !chunk.is_empty() && size + n > budget {
+            chunks.push(std::mem::take(&mut chunk));
+            size = 0;
+        }
+        size += n;
+        chunk.push(r);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 /// Awaits `produce` and, once the broker acknowledged it, counts its records (`ops`, per
 /// operation) for `topic`. A failed produce counts nothing: its batch is retried and counted then.
 async fn counted(
@@ -560,9 +603,12 @@ impl Sink for KafkaSink {
     }
 
     /// Group the batch by destination partition (keeping event order inside each) and
-    /// produce every group with one request, all partitions in parallel. Returns once the
-    /// broker has acknowledged all of them.
+    /// produce every group, all partitions in parallel. A group goes out in requests of at most
+    /// [`MAX_REQUEST_BYTES`], one after another, so its order holds. Returns once the broker has
+    /// acknowledged all of them; only then are the batch's route counts applied.
     async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
+        // Counts left by a batch that failed: it is being retried, and counted when delivered.
+        self.plan.discard_counts();
         // Per destination partition: the records, and how many of them carry each op.
         let mut groups: HashMap<(String, usize), (Vec<Record>, OpCounts)> = HashMap::new();
         let mut rendered = Vec::new();
@@ -604,16 +650,19 @@ impl Sink for KafkaSink {
             let client = self.topics[&topic][part].clone();
             async move {
                 let produce = async {
-                    client
-                        .produce(records, Compression::NoCompression)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
+                    for chunk in chunk_records(records, MAX_REQUEST_BYTES) {
+                        client
+                            .produce(chunk, Compression::NoCompression)
+                            .await
+                            .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))?;
+                    }
+                    Ok(())
                 };
                 counted(stats, &topic, &ops, produce).await
             }
         });
         futures::future::try_join_all(sends).await?;
+        self.plan.commit_counts();
         Ok(())
     }
 }
@@ -719,6 +768,45 @@ mod tests {
         assert!(bad
             .apply(ClientBuilder::new(vec!["b:9093".into()]))
             .is_err());
+    }
+
+    fn rec(n: usize) -> Record {
+        Record {
+            key: Some(n.to_string().into_bytes()),
+            value: Some(vec![b'x'; n * 10]),
+            headers: BTreeMap::from([("op".to_string(), b"c".to_vec())]),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn chunks_keep_order_and_stay_under_the_budget() {
+        let records: Vec<Record> = (0..200).map(rec).collect();
+        let total: usize = records.iter().map(record_size).sum();
+        let budget = 2_000;
+        let chunks = chunk_records(records.clone(), budget);
+        assert!(chunks.len() > 1 && chunks.len() < records.len());
+        for c in &chunks {
+            assert!(!c.is_empty());
+            let size: usize = c.iter().map(record_size).sum();
+            assert!(size <= budget || c.len() == 1, "chunk of {size} bytes");
+        }
+        // Nothing lost, nothing reordered.
+        let flat: Vec<Record> = chunks.into_iter().flatten().collect();
+        assert_eq!(flat, records);
+        // Everything fits: one request.
+        assert_eq!(chunk_records(records, total).len(), 1);
+        assert!(chunk_records(Vec::new(), budget).is_empty());
+    }
+
+    #[test]
+    fn a_record_above_the_budget_goes_alone() {
+        let big = rec(500);
+        assert!(record_size(&big) > 1_000);
+        let chunks = chunk_records(vec![rec(1), big.clone(), rec(2), rec(3)], 1_000);
+        let lens: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        assert_eq!(lens, [1, 1, 2]);
+        assert_eq!(chunks[1], [big]);
     }
 
     #[test]

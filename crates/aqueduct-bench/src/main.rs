@@ -48,6 +48,8 @@ impl Sink for RenderSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_micros() as i64);
         self.plan.render_into(event, now_us, &mut self.out)?;
+        // Delivered, as far as this sink goes: count it, as the Kafka sink does after the ack.
+        self.plan.commit_counts();
         self.bytes += self
             .out
             .iter()

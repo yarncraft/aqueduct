@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;
@@ -946,6 +946,31 @@ pub struct RouteStats {
     fallback_logged: Vec<AtomicBool>,
     /// Per route, whether the first refused topic create was logged.
     refused_logged: Vec<AtomicBool>,
+    /// Per route, the counts of the batch being rendered, applied to the counters above only once
+    /// the broker acknowledged the batch ([`RoutePlan::commit_counts`]), so a failed batch the
+    /// pipeline retries is not counted twice.
+    pending: Mutex<Vec<PendingCounts>>,
+}
+
+/// The counts of one route in a batch the broker has not acknowledged yet. Wrapping arithmetic,
+/// so `topic_refused` can move a count from `produced` to `fallback` as a delta.
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingCounts {
+    matched: u64,
+    produced: u64,
+    produced_ops: [u64; 5],
+    filtered: u64,
+    fallback: u64,
+    errors: u64,
+    tombstones_skipped: u64,
+}
+
+/// The final outcome of an event a route claimed, other than `produced`.
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    Filtered,
+    Fallback,
+    Errors,
 }
 
 /// The outcome counters of one route. Every event a route claims counts `matched`, then exactly
@@ -1018,24 +1043,73 @@ impl RouteStats {
             error_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             fallback_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
             refused_logged: names.iter().map(|_| AtomicBool::new(false)).collect(),
+            pending: Mutex::new(vec![PendingCounts::default(); names.len()]),
             names,
         }
     }
 
-    /// Counts an event `route` claimed under `outcome`, together with `matched`. Called only
-    /// once the outcome is final (the record is rendered), so an encode error never leaves
-    /// `matched` above the sum of the outcomes.
-    fn claimed(&self, outcome: &[AtomicU64], route: usize) {
-        self.matched[route].fetch_add(1, Ordering::Relaxed);
-        outcome[route].fetch_add(1, Ordering::Relaxed);
+    /// Updates the pending counts of `route`.
+    fn pend(&self, route: usize, f: impl FnOnce(&mut PendingCounts)) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut pending[route]);
     }
 
-    /// Counts an event `route` produced to its topic: `matched`, `produced` and its op.
+    /// Counts an event `route` claimed under `outcome`, together with `matched`. Called only
+    /// once the outcome is final (the record is rendered), so an encode error never leaves
+    /// `matched` above the sum of the outcomes. Pending until [`commit`](Self::commit).
+    fn claimed(&self, outcome: Outcome, route: usize) {
+        self.pend(route, |p| {
+            p.matched = p.matched.wrapping_add(1);
+            let n = match outcome {
+                Outcome::Filtered => &mut p.filtered,
+                Outcome::Fallback => &mut p.fallback,
+                Outcome::Errors => &mut p.errors,
+            };
+            *n = n.wrapping_add(1);
+        });
+    }
+
+    /// Counts an event `route` produced to its topic: `matched`, `produced` and its op. Pending
+    /// until [`commit`](Self::commit).
     fn produced(&self, route: usize, op: &str) {
-        self.claimed(&self.produced, route);
-        if let Some(i) = OpCounts::slot(op) {
-            self.produced_ops[route][i].fetch_add(1, Ordering::Relaxed);
+        self.pend(route, |p| {
+            p.matched = p.matched.wrapping_add(1);
+            p.produced = p.produced.wrapping_add(1);
+            if let Some(i) = OpCounts::slot(op) {
+                p.produced_ops[i] = p.produced_ops[i].wrapping_add(1);
+            }
+        });
+    }
+
+    /// Applies the pending counts to the counters and clears them.
+    fn commit(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, p) in pending.iter_mut().enumerate() {
+            // `fetch_add` wraps like the deltas, so a moved count (`topic_refused`) nets out.
+            let add = |v: &[AtomicU64], n: u64| {
+                if n != 0 {
+                    v[i].fetch_add(n, Ordering::Relaxed);
+                }
+            };
+            add(&self.matched, p.matched);
+            add(&self.produced, p.produced);
+            add(&self.filtered, p.filtered);
+            add(&self.fallback, p.fallback);
+            add(&self.errors, p.errors);
+            add(&self.tombstones_skipped, p.tombstones_skipped);
+            for (k, &n) in p.produced_ops.iter().enumerate() {
+                if n != 0 {
+                    self.produced_ops[i][k].fetch_add(n, Ordering::Relaxed);
+                }
+            }
+            *p = PendingCounts::default();
         }
+    }
+
+    /// Drops the pending counts: their batch failed, is retried and is counted then.
+    fn discard(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.fill(PendingCounts::default());
     }
 
     fn counts(&self, i: usize) -> RouteCounts {
@@ -2039,7 +2113,8 @@ impl RoutePlan {
 
     /// Appends the records for `event` to `out`. Pure: no I/O, and the clock is the caller's
     /// `now_us` (the envelope's top-level `ts_ms`/`ts_us`). Heartbeats produce nothing. An event
-    /// no route claims is an error, as before.
+    /// no route claims is an error, as before. The route counts stay pending until
+    /// [`commit_counts`](Self::commit_counts), so a batch the broker refused is not counted.
     ///
     /// The first matching route owns the event (ADR 0002 §2): its `where` decides on the original
     /// event. A `where` that is false or unknown filters the event (no record); one that hits a
@@ -2080,7 +2155,7 @@ impl RoutePlan {
                 if r.outbox.is_some()
                     && !(event.op == Op::Insert || (event.op == Op::Read && r.filter.is_some()))
                 {
-                    self.stats.claimed(&self.stats.filtered, route);
+                    self.stats.claimed(Outcome::Filtered, route);
                     return Ok(());
                 }
                 self.stats.observe(route, &view);
@@ -2088,7 +2163,7 @@ impl RoutePlan {
                     match filter.eval(&view) {
                         Ok(Tri::True) => {}
                         Ok(Tri::False | Tri::Unknown) => {
-                            self.stats.claimed(&self.stats.filtered, route);
+                            self.stats.claimed(Outcome::Filtered, route);
                             return Ok(());
                         }
                         Err(e) => {
@@ -2098,7 +2173,7 @@ impl RoutePlan {
                                 filter.source()
                             );
                             self.dead_letter(route, reason, event, now_us, out)?;
-                            self.stats.claimed(&self.stats.errors, route);
+                            self.stats.claimed(Outcome::Errors, route);
                             return Ok(());
                         }
                     }
@@ -2111,7 +2186,7 @@ impl RoutePlan {
                     if event.after_is_key && event.op != Op::Delete {
                         self.key_only_dropped(route);
                     }
-                    self.stats.claimed(&self.stats.filtered, route);
+                    self.stats.claimed(Outcome::Filtered, route);
                     return Ok(());
                 }
                 // A row without its unchanged TOAST columns, where the route wants none: the
@@ -2139,7 +2214,7 @@ impl RoutePlan {
                         cols.join(", ")
                     );
                     self.dead_letter(route, reason, event, now_us, out)?;
-                    self.stats.claimed(&self.stats.errors, route);
+                    self.stats.claimed(Outcome::Errors, route);
                     return Ok(());
                 }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
@@ -2149,7 +2224,7 @@ impl RoutePlan {
                         Err(e) => {
                             let reason = format!("route `{}`: {e}", self.stats.names[route]);
                             self.dead_letter(route, reason, event, now_us, out)?;
-                            self.stats.claimed(&self.stats.errors, route);
+                            self.stats.claimed(Outcome::Errors, route);
                             return Ok(());
                         }
                     }
@@ -2164,7 +2239,7 @@ impl RoutePlan {
                     self.tombstone_skipped(route);
                     if r.shape.format == Format::Row {
                         // The delete is the tombstone itself: nothing safe is left to produce.
-                        self.stats.claimed(&self.stats.filtered, route);
+                        self.stats.claimed(Outcome::Filtered, route);
                         return Ok(());
                     }
                     skip_tombstone = true;
@@ -2239,7 +2314,7 @@ impl RoutePlan {
         out.push(record);
         out.extend(tombstone);
         if fell_back {
-            self.stats.claimed(&self.stats.fallback, route);
+            self.stats.claimed(Outcome::Fallback, route);
         } else {
             self.stats.produced(route, op);
         }
@@ -2280,7 +2355,9 @@ impl RoutePlan {
     /// null-value record: one would erase every row sharing the key (the whole table, for a
     /// null key) from a compacted topic. Counted, and logged once per route.
     fn tombstone_skipped(&self, route: usize) {
-        self.stats.tombstones_skipped[route].fetch_add(1, Ordering::Relaxed);
+        self.stats.pend(route, |p| {
+            p.tombstones_skipped = p.tombstones_skipped.wrapping_add(1)
+        });
         if !self.stats.tombstone_logged[route].swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 route = %self.stats.names[route],
@@ -2385,7 +2462,7 @@ impl RoutePlan {
                 self.stats.names[route]
             );
             self.dead_letter(route, reason, event, now_us, out)?;
-            self.stats.claimed(&self.stats.errors, route);
+            self.stats.claimed(Outcome::Errors, route);
             return Ok(());
         }
         let payload = texts.pop().unwrap_or_default();
@@ -2403,7 +2480,7 @@ impl RoutePlan {
             content,
         });
         if fell_back {
-            self.stats.claimed(&self.stats.fallback, route);
+            self.stats.claimed(Outcome::Fallback, route);
         } else {
             self.stats.produced(route, op_code(event.op));
         }
@@ -2471,11 +2548,13 @@ impl RoutePlan {
         // A delete's tombstone follows it to the fallback; the event was counted once, with
         // the delete.
         if !c.tombstone {
-            self.stats.produced[c.route].fetch_sub(1, Ordering::Relaxed);
-            if let Some(i) = OpCounts::slot(out.op) {
-                self.stats.produced_ops[c.route][i].fetch_sub(1, Ordering::Relaxed);
-            }
-            self.stats.fallback[c.route].fetch_add(1, Ordering::Relaxed);
+            self.stats.pend(c.route, |p| {
+                p.produced = p.produced.wrapping_sub(1);
+                if let Some(i) = OpCounts::slot(out.op) {
+                    p.produced_ops[i] = p.produced_ops[i].wrapping_sub(1);
+                }
+                p.fallback = p.fallback.wrapping_add(1);
+            });
         }
         if !self.stats.refused_logged[c.route].swap(true, Ordering::Relaxed) {
             tracing::warn!(
@@ -2663,11 +2742,25 @@ impl RoutePlan {
         Ok(())
     }
 
-    /// The records for one event.
+    /// The records for one event, counted at once ([`commit_counts`](Self::commit_counts)): for
+    /// callers that deliver nothing. The sink renders with [`render_into`](Self::render_into).
     pub fn render(&self, event: &ChangeEvent, now_us: i64) -> Result<Vec<OutRecord>> {
         let mut out = Vec::with_capacity(1);
         self.render_into(event, now_us, &mut out)?;
+        self.commit_counts();
         Ok(out)
+    }
+
+    /// Applies the route counts of everything rendered since the last commit or discard. The sink
+    /// calls it once the broker acknowledged the batch, so the counters show delivered events.
+    pub fn commit_counts(&self) {
+        self.stats.commit();
+    }
+
+    /// Drops the route counts of everything rendered since the last commit or discard: the batch
+    /// failed and the pipeline retries it, so it is counted when it is delivered.
+    pub fn discard_counts(&self) {
+        self.stats.discard();
     }
 }
 
@@ -3054,6 +3147,40 @@ mod tests {
             assert_eq!(k.matched, k.produced + k.filtered + k.fallback + k.errors);
             assert_eq!(k.ops.total(), k.produced);
         }
+    }
+
+    #[test]
+    fn route_counts_wait_for_the_broker_ack() {
+        let p = plan_with(vec![filtered("o", "public.orders", Some("row.n > 1"))]);
+        let batch = [
+            row("orders", Op::Insert, r#"{"n":2}"#),   // produced
+            row("orders", Op::Insert, r#"{"n":1}"#),   // filtered
+            row("orders", Op::Insert, r#"{"n":"x"}"#), // error
+        ];
+        let render = || {
+            let mut out = Vec::new();
+            for e in &batch {
+                p.render_into(e, NOW, &mut out).unwrap();
+            }
+        };
+        let counts = || p.stats().snapshot()[0].counts;
+        // The sink renders a batch the broker then refuses: nothing is counted, and the retry
+        // starts from a clean slate.
+        render();
+        assert_eq!(counts(), RouteCounts::default());
+        p.discard_counts();
+        p.commit_counts();
+        assert_eq!(counts(), RouteCounts::default());
+        // The retry is acknowledged: the batch counts once.
+        render();
+        p.commit_counts();
+        let c = counts();
+        assert_eq!(
+            (c.matched, c.produced, c.filtered, c.errors, c.ops.insert),
+            (3, 1, 1, 1, 1)
+        );
+        p.commit_counts();
+        assert_eq!(counts(), c);
     }
 
     #[test]
@@ -4043,6 +4170,8 @@ mod tests {
             ("orders.unknown", None)
         );
         assert_eq!(p.dynamic_topic_count(), 0);
+        // The fallback record is acknowledged.
+        p.commit_counts();
         let c = p.stats().snapshot()[0].counts;
         assert_eq!((c.matched, c.produced, c.fallback), (1, 0, 1));
         // Its op leaves the produced breakdown with it.
@@ -5401,6 +5530,7 @@ mod tests {
                 (&normal.key, &normal.headers, normal.op)
             );
         }
+        p.commit_counts();
         let c = p.stats().snapshot()[0].counts;
         assert_eq!((c.matched, c.produced, c.fallback), (3, 1, 2));
     }
@@ -5966,6 +6096,7 @@ mod tests {
         }
         assert_eq!(out[0].topic, out[1].topic);
         assert_eq!(out[1].value, None);
+        p.commit_counts();
         let c = p.stats().snapshot()[0].counts;
         assert_eq!((c.matched, c.produced, c.fallback), (1, 0, 1));
     }
