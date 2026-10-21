@@ -28,6 +28,10 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
                 hash: r.hash.clone(),
                 rename: r.rename.clone(),
             },
+            format: r.format.clone(),
+            deletes: r.deletes.clone(),
+            tombstones: r.tombstones,
+            unchanged: r.unchanged.clone(),
         })
         .collect();
     let mut plan = RoutePlan::build(
@@ -37,7 +41,17 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
         hash_key,
     )?;
     plan.set_max_dynamic_topics(cfg.max_dynamic_topics);
+    let by = partition_by(cfg)?;
+    plan.check_partition_by(by)?;
+    plan.set_partition_by(by);
     Ok(plan)
+}
+
+fn partition_by(cfg: &KafkaConfig) -> Result<PartitionBy> {
+    match &cfg.partition_by {
+        Some(s) => s.parse().map_err(Error::Config),
+        None => Ok(PartitionBy::default()),
+    }
 }
 
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
@@ -70,10 +84,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     let plan = plan(cfg, hash_key)?;
     let security = security(cfg)?;
     let inspector = KafkaInspector::new(cfg.brokers.clone(), &plan, security.clone());
-    let by: PartitionBy = match &cfg.partition_by {
-        Some(s) => s.parse().map_err(Error::Config)?,
-        None => PartitionBy::default(),
-    };
+    let by = partition_by(cfg)?;
     cfg.check_replication_factor().map_err(Error::Config)?;
     let sink = KafkaSink::connect(
         cfg.brokers.clone(),
@@ -324,5 +335,85 @@ outbox = { topic = 'outbox.events' }
 match = 'public.orders'
 ");
         assert!(e.contains("route `public.orders` has no `topic`"), "{e}");
+        let e = err("dead_letter_topic = 'dlq'
+[[routes]]
+match = 'public.outbox'
+outbox = {}
+format = 'row'
+tombstones = true
+");
+        assert!(
+            e.contains("`outbox` and `format`, `tombstones` are mutually exclusive"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn route_shapes_come_from_the_config_and_are_validated() {
+        let cfg = kafka(
+            "dead_letter_topic = 'dlq'
+[[routes]]
+name = 'rows'
+match = 'public.orders'
+topic = 'orders'
+format = 'row'
+deletes = 'row'
+unchanged = 'dead_letter'
+[[routes]]
+name = 'events'
+match = 'public.*'
+topic = 'cdc.{table}'
+tombstones = true
+",
+        );
+        let d = plan(&cfg, None).unwrap().describe();
+        assert_eq!(
+            (
+                d.routes[0].format,
+                d.routes[0].deletes,
+                d.routes[0].unchanged,
+                d.routes[0].tombstones
+            ),
+            (Some("row"), Some("row"), Some("dead_letter"), false)
+        );
+        assert!(d.routes[1].tombstones && d.routes[1].format.is_none());
+
+        let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
+        // Tombstones need a per-row key: `partition_by = "table"` without a route `key` is refused.
+        let e = err("partition_by = 'table'
+[[routes]]
+match = 'public.*'
+topic = 't'
+tombstones = true
+");
+        assert!(
+            e.contains("route `public.*` uses `tombstones`") && e.contains("per-row key"),
+            "{e}"
+        );
+        assert!(plan(
+            &kafka(
+                "partition_by = 'table'
+[[routes]]
+match = 'public.*'
+topic = 't'
+key = ['id']
+tombstones = true
+"
+            ),
+            None
+        )
+        .is_ok());
+        let e = err("[[routes]]
+match = 'public.*'
+topic = 't'
+unchanged = 'dead_letter'
+");
+        assert!(e.contains("dead_letter_topic"), "{e}");
+        let e = err("[[routes]]
+match = 'public.*'
+topic = 't'
+format = 'flat'
+");
+        assert!(e.contains("unknown format `flat`"), "{e}");
     }
 }

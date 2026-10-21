@@ -388,6 +388,20 @@ impl RelationCache {
         RawValue::from_string(out).map_err(|_| DecodeError::Json)
     }
 
+    /// The names of the columns [`row`](Self::row) leaves out of `tuple` because Postgres did not
+    /// send them (unchanged TOAST values), in column order. Empty, without allocating, when every
+    /// column was sent, which is the common case.
+    pub fn unchanged(&self, id: u32, tuple: &Tuple) -> Result<Vec<String>, DecodeError> {
+        let rel = self.get(id)?;
+        Ok(rel
+            .columns
+            .iter()
+            .zip(tuple)
+            .filter(|(_, d)| matches!(d, Datum::Unchanged))
+            .map(|(c, _)| c.name.clone())
+            .collect())
+    }
+
     /// The row's key as a JSON object `{"column": value, ...}` (Debezium's record key), values
     /// encoded as in [`row`](Self::row): the primary-key columns `pk` (from the catalog), or, when
     /// those are unknown or not all in the tuple, the replica-identity columns pgoutput flags
@@ -886,6 +900,26 @@ mod tests {
             insert_key
         );
         assert_eq!(cache.key_with_old(42, &new, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn unchanged_toast_columns_are_named_and_left_out_of_the_row() {
+        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
+            panic!()
+        };
+        let names: Vec<String> = rel.columns.iter().map(|c| c.name.clone()).collect();
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let new = vec![Datum::Text("5".into()), Datum::Unchanged];
+        assert_eq!(cache.unchanged(42, &new).unwrap(), [names[1].clone()]);
+        let row: serde_json::Value =
+            serde_json::from_str(cache.row(42, &new).unwrap().get()).unwrap();
+        assert!(row.get(&names[1]).is_none(), "{row}");
+        // Every column sent: nothing to report.
+        let full = decode_tuple(&[Some("5"), Some("a")]);
+        assert!(cache.unchanged(42, &full).unwrap().is_empty());
+        let null = vec![Datum::Text("5".into()), Datum::Null];
+        assert!(cache.unchanged(42, &null).unwrap().is_empty());
     }
 
     #[test]

@@ -21,6 +21,8 @@ fn ev(n: u64, table: &str) -> ChangeEvent {
         after: Some(to_raw_value(&serde_json::json!({ "n": n })).unwrap()),
         key: None,
         checkpoint: None,
+        unchanged: Vec::new(),
+        after_is_key: false,
     }
 }
 
@@ -728,4 +730,149 @@ async fn outbox_inserts_are_published_raw_and_updates_produce_nothing() {
         assert_eq!(e.headers["op"], "c");
         assert!(e.headers.contains_key("type"));
     }
+}
+
+/// Every record of `topic` in partition order: (partition, key, `op` header, value or `None` for
+/// a tombstone).
+async fn read_partitions(
+    client: &rskafka::client::Client,
+    topic: &str,
+) -> Vec<(i32, String, String, Option<Vec<u8>>)> {
+    let mut parts: Vec<i32> = client
+        .list_topics()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == topic)
+        .unwrap_or_else(|| panic!("topic {topic} does not exist"))
+        .partitions
+        .into_iter()
+        .collect();
+    parts.sort_unstable();
+    let mut out = Vec::new();
+    for p in parts {
+        let pc = client
+            .partition_client(topic, p, UnknownTopicHandling::Error)
+            .await
+            .unwrap();
+        let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+        let mut offset = 0;
+        while offset < end {
+            let (recs, _hw) = pc.fetch_records(offset, 1..1_000_000, 1_000).await.unwrap();
+            if recs.is_empty() {
+                break;
+            }
+            for r in recs {
+                offset = r.offset + 1;
+                out.push((
+                    p,
+                    String::from_utf8(r.record.key.unwrap()).unwrap(),
+                    String::from_utf8(r.record.headers["op"].clone()).unwrap(),
+                    r.record.value,
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn tombstones_follow_their_delete_and_row_format_values_are_the_row() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let events = unique("aqueduct-it-tomb");
+    let rows = unique("aqueduct-it-rows");
+    let routes = vec![
+        KafkaRoute {
+            pattern: "public.orders".into(),
+            topic: events.clone(),
+            tombstones: true,
+            ..Default::default()
+        },
+        KafkaRoute {
+            pattern: "public.items".into(),
+            topic: rows.clone(),
+            format: Some("row".into()),
+            deletes: Some("row".into()),
+            ..Default::default()
+        },
+    ];
+    let plan = RoutePlan::new(routes, None).unwrap();
+    let inspector = KafkaInspector::new(brokers.clone(), &plan, KafkaSecurity::default());
+    let mut sink = KafkaSink::connect(brokers.clone(), plan, 4, None, &KafkaSecurity::default())
+        .await
+        .unwrap();
+    let change = |n: u64, table: &str, op: Op, id: u64| {
+        let mut e = ev(n, table);
+        e.op = op;
+        e.key = Some(format!(r#"{{"id":{id}}}"#));
+        let row = Some(to_raw_value(&serde_json::json!({ "id": id, "n": n })).unwrap());
+        (e.before, e.after) = match op {
+            Op::Delete => (row, None),
+            _ => (None, row),
+        };
+        e
+    };
+    let mut batch = Vec::new();
+    for id in 0..20u64 {
+        batch.push(change(4 * id + 1, "orders", Op::Insert, id));
+        batch.push(change(4 * id + 2, "orders", Op::Delete, id));
+        batch.push(change(4 * id + 3, "items", Op::Insert, id));
+        batch.push(change(4 * id + 4, "items", Op::Delete, id));
+    }
+    sink.send_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+    // Per-topic rates count every acknowledged record, tombstones included (20 inserts, 20 deletes,
+    // 20 tombstones), and row-format deletes once each.
+    let acked = sink.topic_stats().snapshot();
+    assert_eq!((acked[&events], acked[&rows]), (60, 40));
+
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    // Envelope route: per row, insert, delete, then the tombstone, all on one partition.
+    let mut by_key: std::collections::BTreeMap<String, Vec<(i32, String, bool)>> =
+        Default::default();
+    for (p, key, op, value) in read_partitions(&client, &events).await {
+        by_key
+            .entry(key)
+            .or_default()
+            .push((p, op, value.is_none()));
+    }
+    assert_eq!(by_key.len(), 20);
+    for (key, recs) in &by_key {
+        assert_eq!(
+            recs.iter().map(|r| (r.1.as_str(), r.2)).collect::<Vec<_>>(),
+            [("c", false), ("d", false), ("d", true)],
+            "{key}: insert, delete, then its tombstone"
+        );
+        assert!(recs.iter().all(|r| r.0 == recs[0].0), "{key} split");
+    }
+    let used: std::collections::HashSet<i32> = by_key.values().map(|r| r[0].0).collect();
+    assert!(used.len() > 1, "rows spread over partitions");
+
+    // Row format: the value is the row; a delete is the before-image with `__deleted`.
+    let recs = read_partitions(&client, &rows).await;
+    assert_eq!(recs.len(), 40);
+    for (_, key, op, value) in &recs {
+        let k: serde_json::Value = serde_json::from_str(key).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(value.as_ref().unwrap()).unwrap();
+        assert_eq!(v["id"], k["key"]["id"], "the row, keyed by its id");
+        assert!(v.get("source").is_none(), "no envelope");
+        match op.as_str() {
+            "c" => assert!(v.get("__deleted").is_none()),
+            "d" => assert_eq!(v["__deleted"], true),
+            o => panic!("op {o}"),
+        }
+    }
+
+    // The inspector shows tombstones and rows raw, with their headers.
+    let seen = inspector.inspect(Some(&events), 100).await.unwrap();
+    let tombstones: Vec<_> = seen.events.iter().filter(|e| e.event.is_null()).collect();
+    assert_eq!(tombstones.len(), 20);
+    assert!(tombstones.iter().all(|e| e.headers["op"] == "d"));
+    let seen = inspector.inspect(Some(&rows), 100).await.unwrap();
+    assert_eq!(seen.events.len(), 40);
+    assert!(seen.events.iter().all(|e| e.event["id"].is_number()));
 }

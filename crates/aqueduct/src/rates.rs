@@ -147,6 +147,7 @@ mod tests {
                 filtered,
                 fallback,
                 errors,
+                tombstones_skipped: 0,
             },
             unseen_fields: vec![],
         }

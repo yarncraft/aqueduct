@@ -51,7 +51,7 @@ impl Sink for RenderSink {
         self.bytes += self
             .out
             .iter()
-            .map(|r| r.value.len() as u64 + 1)
+            .map(|r| r.value.as_ref().map_or(0, String::len) as u64 + 1)
             .sum::<u64>();
         Ok(())
     }
@@ -196,6 +196,8 @@ async fn main() {
         ),
         key: None,
         checkpoint: None,
+        unchanged: Vec::new(),
+        after_is_key: false,
     };
     let profile = arg("--profile").unwrap_or_else(|| "simple".into());
     let pool = if profile == "industrial" {

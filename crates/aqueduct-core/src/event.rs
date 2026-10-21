@@ -74,6 +74,8 @@ impl ChangeEvent {
             after: None,
             key: None,
             checkpoint: None,
+            unchanged: Vec::new(),
+            after_is_key: false,
         }
     }
 }
@@ -108,6 +110,17 @@ pub struct ChangeEvent {
     /// (Postgres: change LSNs are not commit-ordered) puts its resume key here. Not serialised.
     #[serde(skip)]
     pub checkpoint: Option<Position>,
+    /// Columns the source left out of `after` because their value did not change and was not
+    /// sent (Postgres unchanged TOAST values). Empty in the common case (no allocation), and
+    /// always for MongoDB. A route with `unchanged = "dead_letter"` reads it. Not serialised.
+    #[serde(skip)]
+    pub unchanged: Vec<String>,
+    /// `after` is not the row but only its key: MongoDB sends no `fullDocument` for an update
+    /// whose document was deleted before the lookup, and the mapping puts the `documentKey` in
+    /// `after` so envelope consumers can still tell which row it was. A route that publishes the
+    /// row alone (`format = "row"`) must not mistake it for the document. Not serialised.
+    #[serde(skip)]
+    pub after_is_key: bool,
 }
 
 #[cfg(test)]
@@ -126,6 +139,8 @@ mod tests {
             after: RawValue::from_string(r#"{"id":1}"#.into()).ok(),
             key: Some("1".into()),
             checkpoint: None,
+            unchanged: Vec::new(),
+            after_is_key: false,
         }
     }
 

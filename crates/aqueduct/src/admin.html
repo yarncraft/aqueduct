@@ -656,7 +656,8 @@ let openId = null;
 
 const evid = e => e.topic + '/' + e.partition + '/' + e.offset;
 // Events use Debezium's envelope: op letters, and the table and position in `source`. A value that is not an
-// envelope (an outbox payload, a tombstone) is shown raw, with its op and lsn from the record headers.
+// envelope (an outbox payload, a `format = "row"` row, a tombstone) is shown raw, with its op and lsn from the
+// record headers.
 const OP_NAME = { c: 'insert', u: 'update', d: 'delete', t: 'truncate', r: 'read' };
 const isEnv = ev => !!ev && typeof ev === 'object' && !Array.isArray(ev) && !!ev.source && typeof ev.source === 'object' && typeof ev.op === 'string';
 const hdr = (e, k) => (e.headers || {})[k];
@@ -665,13 +666,16 @@ const opBadge = e => { const o = opOf(e); return Object.hasOwn(OP_BADGE, o) ? OP
 const src = ev => isEnv(ev) ? ev.source : {};
 const lsnOf = e => isEnv(e.event) ? src(e.event).lsn ?? '' : hdr(e, 'lsn') ?? '';
 const rawText = v => typeof v === 'string' ? v : JSON.stringify(v, null, 2) ?? '';
-// The table of an envelope; a value that is not one (an outbox payload) names no table, so its topic stands in.
-const rel = e => !isEnv(e.event) ? e.topic : (src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
+// The table of an envelope. A row-format value or a tombstone names it in its JSON record key ({db, schema, table}
+// or {db, collection}); an outbox payload names no table, so its topic stands in.
+const keyRel = e => { try { const k = JSON.parse(e.key); return k && typeof k === 'object' && typeof k.db === 'string' && (k.table != null || k.collection != null) ? (k.schema ?? k.db) + '.' + (k.table ?? k.collection) : null; } catch (_) { return null; } };
+const rel = e => !isEnv(e.event) ? keyRel(e) || e.topic :(src(e.event).schema || src(e.event).db || '?') + '.' + (src(e.event).table || src(e.event).collection || '?');
 const isoMs = ms => { const d = new Date(ms); return isNaN(d) ? '–' : d.toISOString(); };
 const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ms % 1000).padStart(3, '0');
 const short = v => { const t = typeof v === 'string' ? v : JSON.stringify(v) ?? ''; return t.length > 28 ? t.slice(0, 27) + '…' : t; };
 const summary = e => {
   const ev = e.event;
+  if (ev === null) return '<span class="text-ink-500">tombstone</span>';
   if (!isEnv(ev)) return `<span class="text-ink-500">raw</span> ${esc(short(ev))}`;
   const row = ev.after || ev.before;
   return row ? Object.entries(row).slice(0, 4).map(([k, v]) => `<span class="text-ink-300">${esc(k)}=</span>${esc(short(v))}`).join(' ') : '<span class="text-ink-500">–</span>';
