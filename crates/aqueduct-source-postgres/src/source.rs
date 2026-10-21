@@ -10,6 +10,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, SnapshotStatus};
 
+use crate::azure::{AccessToken, AzureCredential};
 use crate::catalog::read_catalog;
 use crate::decoder::{Message, RelationCache};
 use crate::snapshot::{
@@ -319,6 +320,19 @@ pub struct PostgresSourceConfig {
     pub transport: TransportKind,
     /// Stream transport: bytes of decoded-but-not-taken messages to hold before reading pauses.
     pub stream_buffer_bytes: usize,
+    /// How every connection authenticates. Default: the URL's password.
+    pub auth: SourceAuth,
+}
+
+/// How the source signs in to Postgres.
+#[derive(Debug, Clone, Default)]
+pub enum SourceAuth {
+    /// The password in the URL, if any.
+    #[default]
+    Password,
+    /// A Microsoft Entra access token from an Azure managed identity is the password of every
+    /// connection, the SQL session and the replication connection alike (#140).
+    Azure(AzureCredential),
 }
 
 /// How the source reads the slot.
@@ -369,7 +383,42 @@ impl PostgresSourceConfig {
             snapshot: SnapshotConfig::default(),
             transport: TransportKind::Poll,
             stream_buffer_bytes: crate::replication::DEFAULT_STREAM_BUFFER_BYTES,
+            auth: SourceAuth::Password,
         }
+    }
+
+    /// Fails closed for managed identity sign-in: the URL must name the identity's role and
+    /// carry no password, and the token is only sent under `verify-full` (the default): a
+    /// verified chain without the hostname check would hand the bearer token to anyone with a
+    /// certificate from a trusted CA. Errors never show the URL.
+    pub fn check_auth(&self) -> Result<()> {
+        let SourceAuth::Azure(cred) = &self.auth else {
+            return Ok(());
+        };
+        let name = cred.kind().name();
+        let parsed = tls::parse(&self.url)?;
+        if parsed.config.get_password().is_some() {
+            return Err(Error::Config(format!(
+                "postgres auth = \"{name}\" signs in with a Microsoft Entra token as the \
+                 password, but the postgres url also carries a password; remove it from the url"
+            )));
+        }
+        if parsed.config.get_user().is_none() {
+            return Err(Error::Config(format!(
+                "postgres auth = \"{name}\" needs the url user: the Postgres role of the \
+                 managed identity (its name)"
+            )));
+        }
+        let mode = self.ssl_mode.or(parsed.url_mode).unwrap_or_default();
+        if mode != SslMode::VerifyFull {
+            return Err(Error::Config(format!(
+                "postgres auth = \"{name}\" sends an access token as the password, so the \
+                 server certificate and hostname must be verified; ssl_mode = \"{}\" does not. \
+                 Use \"verify-full\" (the default)",
+                mode.as_str(),
+            )));
+        }
+        Ok(())
     }
 
     /// See [`PostgresSourceConfig::allow_slot_recreate`].
@@ -666,6 +715,7 @@ impl PostgresSource {
                 &ConnectOptions {
                     ssl_mode: self.cfg.ssl_mode,
                     ssl_root_cert: self.cfg.ssl_root_cert.clone(),
+                    password: self.access_token().await?,
                 },
             )
             .await?;
@@ -764,6 +814,15 @@ impl PostgresSource {
         }
     }
 
+    /// The password for a new connection when it is not the URL's: a managed identity's
+    /// access token, cached until shortly before it expires.
+    async fn access_token(&self) -> Result<Option<AccessToken>> {
+        match &self.cfg.auth {
+            SourceAuth::Password => Ok(None),
+            SourceAuth::Azure(cred) => cred.token().await.map(Some),
+        }
+    }
+
     /// Open the SQL connection according to the TLS policy.
     async fn connect(&self) -> Result<Client> {
         let parsed = tls::parse(&self.cfg.url)?;
@@ -772,6 +831,9 @@ impl PostgresSource {
         let local = tls::is_local(&parsed.config);
         let mut pg = parsed.config;
         pg.ssl_mode(mode.pg());
+        if let Some(token) = self.access_token().await? {
+            pg.password(token.secret());
+        }
 
         let client = if mode == SslMode::Disable {
             let (client, conn) = pg.connect(NoTls).await.map_err(src_err)?;
@@ -1378,6 +1440,7 @@ impl Source for PostgresSource {
         self.tx_ends.clear();
         self.last_end = 0;
         self.buffer.clear();
+        self.cfg.check_auth()?;
         let client = self.connect().await?;
         self.client = Some(Arc::new(client));
         if let Some(m) = &self.metrics {
@@ -2176,4 +2239,129 @@ where
             tracing::error!(error = %e, "postgres connection closed");
         }
     });
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn azure(url: &str, mode: Option<SslMode>, root: Option<&str>) -> PostgresSourceConfig {
+        let mut c = PostgresSourceConfig::new(url, "s", "p");
+        c.ssl_mode = mode;
+        c.ssl_root_cert = root.map(str::to_string);
+        c.auth = SourceAuth::Azure(
+            AzureCredential::container_apps("http://localhost:42356/msi/token", "h", None).unwrap(),
+        );
+        c
+    }
+
+    #[test]
+    fn password_auth_is_unchecked() {
+        let mut c = azure("postgres://u:pw@db/app?sslmode=disable", None, None);
+        c.auth = SourceAuth::Password;
+        assert!(c.check_auth().is_ok());
+    }
+
+    #[test]
+    fn azure_auth_needs_verified_tls() {
+        for (url, mode, root) in [
+            ("postgres://id@db/app", None, None),
+            ("postgres://id@db/app?sslmode=verify-full", None, None),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::VerifyFull),
+                Some("/ca.pem"),
+            ),
+            ("postgres://id@db/app?sslrootcert=/ca.pem", None, None),
+            // The config override wins over a weaker URL.
+            (
+                "postgres://id@db/app?sslmode=require",
+                Some(SslMode::VerifyFull),
+                None,
+            ),
+        ] {
+            assert!(
+                azure(url, mode, root).check_auth().is_ok(),
+                "{url} {mode:?}"
+            );
+        }
+        for (url, mode, root, needle) in [
+            (
+                "postgres://id@db/app?sslmode=disable",
+                None,
+                None,
+                "\"disable\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::Disable),
+                None,
+                "\"disable\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::Prefer),
+                None,
+                "\"prefer\"",
+            ),
+            (
+                "postgres://id@db/app?sslmode=require",
+                None,
+                None,
+                "\"require\"",
+            ),
+            // A verified chain without the hostname check is not enough, with or without a CA.
+            (
+                "postgres://id@db/app?sslmode=verify-ca",
+                None,
+                None,
+                "\"verify-ca\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::VerifyCa),
+                Some("/ca.pem"),
+                "\"verify-ca\"",
+            ),
+            (
+                "postgres://id@db/app?sslmode=require&sslrootcert=/ca.pem",
+                None,
+                None,
+                "\"require\"",
+            ),
+            (
+                "postgres://id@db/app",
+                Some(SslMode::Require),
+                Some("/ca.pem"),
+                "\"require\"",
+            ),
+            // The config override wins over a verifying URL.
+            (
+                "postgres://id@db/app?sslmode=verify-full",
+                Some(SslMode::Disable),
+                None,
+                "\"disable\"",
+            ),
+        ] {
+            let e = azure(url, mode, root).check_auth().unwrap_err().to_string();
+            assert!(
+                e.contains(needle) && e.contains("azure-container-apps"),
+                "{url}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_auth_refuses_a_url_password_without_showing_it() {
+        let e = azure("postgres://id:hunter2@db/app", None, None)
+            .check_auth()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("password") && !e.contains("hunter2"), "{e}");
+        let e = azure("host=db dbname=app", None, None)
+            .check_auth()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("url user"), "{e}");
+    }
 }
