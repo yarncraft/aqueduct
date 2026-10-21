@@ -61,6 +61,7 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             deletes: r.deletes.clone(),
             tombstones: r.tombstones,
             unchanged: r.unchanged.clone(),
+            dead_letter_topic: r.dead_letter_topic.clone(),
         })
         .collect();
     let mut plan = RoutePlan::build(
@@ -170,16 +171,43 @@ topic = 'orders'
         .describe();
         assert_eq!(d.dead_letter_topic, None);
 
-        // `where` without a dead-letter topic, and a syntax error, fail naming the route.
-        let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
-        let e = err("[[routes]]
+        // `where` on row data without any `dead_letter_topic`: the route's topic plus `.dlq`. A
+        // route's own `dead_letter_topic` wins over `sink.dead_letter_topic`, which wins over that.
+        let dlqs = |text: &str| -> Vec<Option<String>> {
+            let d = plan(&kafka(text), None).unwrap().describe();
+            d.routes.into_iter().map(|r| r.dead_letter_topic).collect()
+        };
+        let routes = "[[routes]]
 name = 'paid'
 match = 'public.orders'
 where = \"row.status == 'paid'\"
 topic = 'orders'
+[[routes]]
+name = 'own'
+match = 'public.users'
+where = 'row.n > 1'
+topic = 'users'
+dead_letter_topic = 'users.errors'
+";
+        let s = |t: &str| Some(t.to_string());
+        assert_eq!(dlqs(routes), [s("orders.dlq"), s("users.errors")]);
+        assert_eq!(
+            dlqs(&format!(
+                "dead_letter_topic = 'all.dlq'
+{routes}"
+            )),
+            [s("all.dlq"), s("users.errors")]
+        );
+        // A syntax error fails naming the route.
+        let err = |text: &str| plan(&kafka(text), None).unwrap_err().to_string();
+        let e = err("[[routes]]
+name = 'own'
+match = 'public.orders'
+topic = 'orders'
+dead_letter_topic = '_errors'
 ");
         assert!(
-            e.contains("route `paid`") && e.contains("dead_letter_topic"),
+            e.contains("sink route `own`: `dead_letter_topic` `_errors` must not start with `_`"),
             "{e}"
         );
         let e = err("dead_letter_topic = 'dlq'
@@ -408,11 +436,22 @@ outbox = { topic = 'outbox.events' }
             e.contains("`topic` and `outbox` are mutually exclusive"),
             "{e}"
         );
-        let e = err("[[routes]]
+        // Without `dead_letter_topic`, the outbox dead-letters to its topic plus `.dlq`.
+        let d = plan(
+            &kafka(
+                "[[routes]]
 match = 'public.outbox'
 outbox = { topic = 'outbox.events' }
-");
-        assert!(e.contains("dead_letter_topic"), "{e}");
+",
+            ),
+            None,
+        )
+        .unwrap()
+        .describe();
+        assert_eq!(
+            d.routes[0].dead_letter_topic.as_deref(),
+            Some("outbox.events.dlq")
+        );
         let e = err("[[routes]]
 match = 'public.orders'
 ");
@@ -485,12 +524,19 @@ tombstones = true
             None
         )
         .is_ok());
-        let e = err("[[routes]]
+        let d = plan(
+            &kafka(
+                "[[routes]]
 match = 'public.*'
 topic = 't'
 unchanged = 'dead_letter'
-");
-        assert!(e.contains("dead_letter_topic"), "{e}");
+",
+            ),
+            None,
+        )
+        .unwrap()
+        .describe();
+        assert_eq!(d.routes[0].dead_letter_topic.as_deref(), Some("t.dlq"));
         let e = err("[[routes]]
 match = 'public.*'
 topic = 't'

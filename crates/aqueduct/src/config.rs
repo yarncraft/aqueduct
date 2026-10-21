@@ -243,8 +243,8 @@ pub struct KafkaConfig {
     pub partition_by: Option<String>,
     #[serde(default)]
     pub routes: Vec<KafkaRouteConfig>,
-    /// Where events go that a route cannot evaluate (a type error in `where`). Required as soon
-    /// as a route uses `where`; opened (created if missing) at startup.
+    /// Where events go that a route cannot evaluate (a type error in `where`), for every route
+    /// without its own `dead_letter_topic`. Unset: each route's topic plus `.dlq`.
     #[serde(default)]
     pub dead_letter_topic: Option<String>,
     /// Never accepted: the key for `hash` comes from `AQUEDUCT_HASH_KEY` or `hash_key_file`
@@ -394,6 +394,10 @@ pub struct KafkaRouteConfig {
     /// `omit` (default) or `dead_letter`: rows lacking unchanged TOAST columns.
     #[serde(default)]
     pub unchanged: Option<String>,
+    /// This route's dead-letter topic, a fixed name. Unset: `sink.dead_letter_topic`, else the
+    /// route's topic plus `.dlq` (`<topic_fallback>.dlq` for a content-routed topic).
+    #[serde(default)]
+    pub dead_letter_topic: Option<String>,
     /// Publish the rows of an outbox table as their own events: inserts (and snapshot rows when
     /// `where` is true for them, e.g. `op in ['insert', 'read']`), key = the `aggregate_id`
     /// column, value = the `payload` column.
