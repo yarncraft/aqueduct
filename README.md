@@ -391,7 +391,12 @@ The **Routing** card draws the sink's routing as a graph, left to right: every t
 `[[sink.routes]]` in match order (numbered, first match wins, `sink.topic` last as `default`), and the topics they
 write, plus the dead-letter topic in red. A table connects to the first route whose `match` fits it; a route
 connects to the topics it rendered and, when its `where` reads row data or it has errors, with a dashed line to the
-dead-letter topic. Each route shows its `match` and `where` (which also carries any operation filter), its produced / filtered / fallback / errors counts with a bar, and an
+dead-letter topic. Each route card reads like a query, five aligned rows: `SELECT` (the fields: `*` for the
+envelope, `include`, `* EXCEPT (...)`, `mask(col)`, `hash(col)`, `col AS new`, `ROW` and the shape options),
+`WHERE` (the `where`, operation filter included), `FROM` (the `match` glob and the tables it claimed), `INTO` (the
+topic, `ELSE` the fallback, `ON ERROR` the dead-letter topic when the route can use it) and `PARTITIONED-BY` (the
+route `key`, else the primary key or the table). Unset clauses show their default, dimmed. Below them: the step
+number and name, the produced / filtered / fallback / errors counts with a bar, and an
 amber **never seen** warning for fields its `where` reads that no row has had (usually a typo). Line width follows the
 counts and lines with traffic in the last 3 s animate. Hover a table to light up its path, click a route for its
 details and full `where`, click a topic to open it in the event inspector. A route with more than 6 tables or topics

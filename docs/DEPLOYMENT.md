@@ -628,7 +628,8 @@ misspelled key never falls back to a default column.
   payload in the application instead. Column names must be top-level (no dots).
 - **Unseen fields.** The outbox columns are watched like any other field path, as `after.<column>`: a misspelled
   column is reported after 1000 inserts that lack it.
-- The cockpit shows an `outbox` badge on the route. The event inspector shows outbox records as raw values with their
+- The cockpit's route card shows the `payload` column under `SELECT` (tagged `outbox`) and the `aggregate_id` column
+  under `PARTITIONED-BY`. The event inspector shows outbox records as raw values with their
   headers and their topic in place of the table, since they are not envelopes.
 - **Differences from Debezium's outbox event router.** Aqueduct reads the payload from the row's JSON, which does not
   record the column type, so:
@@ -710,7 +711,8 @@ topic (and handle them from the dead-letter topic), or make the consumer merge u
 sends whole documents and never has this case. `REPLICA IDENTITY FULL` does not help yet: filling the column from the
 before-image is a follow-up.
 
-The cockpit shows `format`, `deletes`, `tombstones` and `unchanged` badges on the route, and the event inspector shows
+The cockpit's route card shows `format = "row"` as `SELECT ROW ...` and `deletes`, `tombstones` and `unchanged` as
+tags on that row, and the event inspector shows
 row-format values raw and tombstones as `tombstone`, with their `op` and `lsn` headers.
 
 Per-route counters: every event a route claims counts as `matched`, then as exactly one of `produced`, `filtered`,
@@ -872,11 +874,20 @@ The **Routing** card shows where each table's events go:
   while `sink.topic` is unset is listed in red under "no route" (its events fail the pipeline).
 - **Routes** (middle): `[[sink.routes]]` in match order, numbered, then `default` (`sink.topic`, marked `else`). A
   table belongs to the first route whose `match` fits `schema.table` (`*` matches any run of characters, dots
-  included), the same rule the sink uses. Each route shows `match`, its `where` (operations are filtered there too;
-  hover for the full text, click the route for details), a badge per routing option it sets, and its produced, filtered,
-  fallback and errors counts with a bar. An amber **never seen** box lists fields its `where` reads that no row has
-  had after enough rows (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then
-  filters everything.
+  included), the same rule the sink uses. Each route card has the same five rows, keyword on the left, in this order;
+  a clause the route leaves unset shows its effective default, dimmed:
+
+  | Row | Shows | Default |
+  |-----|-------|---------|
+  | `SELECT` | What the record value holds: `include` as a column list, `exclude` as `* EXCEPT (a, b)`, then `mask(col)`, `hash(col)` and `col AS new`. `format = "row"` adds `ROW` (`SELECT ROW *`); the delete mode, `tombstones` and `unchanged` are small tags after it. An outbox route shows its `payload` column | `*`, the change-event envelope |
+  | `WHERE` | The `where` text, operation filter included. Long text is cut; hover for it all, or click the route | `true` |
+  | `FROM` | The `match` glob, then the tables it claimed, ` / `-separated, the first three and `+N` | `* (unmatched)` on `default` |
+  | `INTO` | The topic template; with content routing, `ELSE` the `topic_fallback` and a tag with the number of `topic_values` (hover for them). `ON ERROR` and the dead-letter topic, in red, when the route can send rows there: a `where` on row data, `unchanged = "dead_letter"`, an outbox, `hash`, or `rename` without `include` | `sink.topic` on `default` |
+  | `PARTITIONED-BY` | `key (a, b)` for a route `key`; the `aggregate_id` column for an outbox | `primary key` (`partition_by = "key"`) or `table` |
+
+  Below the rows: the step number and route name, the produced, filtered, fallback and errors counts with a bar, and
+  the rate line. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
+  (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 - **Topics** (right): per topic template, the topics it rendered for the tables seen (a template such as
   `cdc.{schema}.{table}` is shown dashed above them), and the dead-letter topic in red with the error count. A
   template that reads the event (`{op}`, `{row.x}`) lists the topics the sink has produced to since start, and its
@@ -884,7 +895,7 @@ The **Routing** card shows where each table's events go:
 
 A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
 topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
-motion. The line to the dead-letter topic is dashed and appears for routes whose `where` reads row data, or with errors. Hover a
+motion. The line to the dead-letter topic is dashed and appears for routes that show `ON ERROR`, or with errors. Hover a
 table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
