@@ -910,7 +910,7 @@ one shared time axis (nothing animates). On table and topic cards it sits on its
 - a "+N more" group: the sum over its tables (events per second) or topics.
 
 Click a route for its details and a larger chart split by outcome. Click a table for a panel with its events per
-second as a larger chart, the current, average and maximum rate, the route that claims it and its topic. Click a topic for a panel with a larger chart, its
+second as a larger chart, one line per operation with a checkbox each to filter them (the stats sum the checked ones), the current, average and maximum rate, the route that claims it and its topic. Click a topic for a panel with a larger chart, its
 current, average and maximum rate over the window, the routes that write to it (by template, as their
 `topic_fallback`, or as the dead-letter topic), and an **Open in inspector** button (shown when the inspector is on).
 
