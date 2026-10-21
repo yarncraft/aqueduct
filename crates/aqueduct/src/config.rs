@@ -121,6 +121,14 @@ pub struct PostgresConfig {
     /// Stream transport: bytes of received messages buffered ahead of the sink. Default 64 MiB.
     #[serde(default)]
     pub stream_buffer_bytes: Option<usize>,
+    /// `password` (default): the URL's password. `azure-workload-identity` (AKS) or
+    /// `azure-container-apps`: a Microsoft Entra token from the managed identity is the password.
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// Managed identity client ID: overrides `AZURE_CLIENT_ID` on AKS, and picks a user-assigned
+    /// identity on Container Apps.
+    #[serde(default)]
+    pub azure_client_id: Option<String>,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -129,6 +137,14 @@ fn default_heartbeat_interval_secs() -> u64 {
 
 impl PostgresConfig {
     pub fn source_config(&self) -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
+        self.source_config_with_env(&|k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// [`Self::source_config`] with the managed identity variables read through `env`.
+    pub fn source_config_with_env(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<aqueduct_source_postgres::PostgresSourceConfig, String> {
         let mut c = aqueduct_source_postgres::PostgresSourceConfig::new(
             self.url.clone(),
             self.slot.clone(),
@@ -179,6 +195,28 @@ impl PostgresConfig {
             }
             c.stream_buffer_bytes = n;
         }
+        let client_id = self.azure_client_id.as_deref().filter(|s| !s.is_empty());
+        let auth = self.auth.as_deref().unwrap_or("password");
+        if auth == "password" && client_id.is_some() {
+            return Err(
+                "postgres.azure_client_id is set but postgres.auth is \"password\"; set auth to \
+                 \"azure-workload-identity\" or \"azure-container-apps\""
+                    .into(),
+            );
+        }
+        c.auth = match auth {
+            "password" => aqueduct_source_postgres::SourceAuth::Password,
+            other => {
+                let kind = other
+                    .parse::<aqueduct_source_postgres::AzureIdentity>()
+                    .map_err(|e| format!("postgres.{e}"))?;
+                aqueduct_source_postgres::SourceAuth::Azure(
+                    aqueduct_source_postgres::AzureCredential::from_env(kind, client_id, env)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+        };
+        c.check_auth().map_err(|e| e.to_string())?;
         Ok(c)
     }
 }
@@ -928,10 +966,107 @@ heartbeat_action_query = 'SELECT 1'")
             snapshot_watermark_table: None,
             transport: None,
             stream_buffer_bytes: None,
+            auth: None,
+            azure_client_id: None,
         };
         assert!(p.source_config().is_err());
         p.ssl_mode = Some("verify-full".into());
         assert!(p.source_config().is_ok());
+    }
+
+    #[test]
+    fn azure_managed_identity_auth() {
+        use aqueduct_source_postgres::{AzureIdentity, SourceAuth};
+        let pg = |extra: &str| -> PostgresConfig {
+            toml::from_str(&format!(
+                "url = 'postgres://aqueduct-mi@db.postgres.database.azure.com/app'
+{extra}"
+            ))
+            .unwrap()
+        };
+        let wi = |k: &str| -> Option<String> {
+            match k {
+                "AZURE_CLIENT_ID" => Some("cid".into()),
+                "AZURE_TENANT_ID" => Some("tid".into()),
+                "AZURE_FEDERATED_TOKEN_FILE" => Some("/var/run/secrets/token".into()),
+                _ => None,
+            }
+        };
+        let aca = |k: &str| -> Option<String> {
+            match k {
+                "IDENTITY_ENDPOINT" => Some("http://localhost:42356/msi/token".into()),
+                "IDENTITY_HEADER" => Some("hdr-s3cret".into()),
+                _ => None,
+            }
+        };
+        let none = |_: &str| -> Option<String> { None };
+        // Default: the URL's password, no environment needed.
+        assert!(matches!(
+            pg("").source_config_with_env(&none).unwrap().auth,
+            SourceAuth::Password
+        ));
+        assert!(matches!(
+            pg("auth = 'password'")
+                .source_config_with_env(&none)
+                .unwrap()
+                .auth,
+            SourceAuth::Password
+        ));
+        match pg("auth = 'azure-workload-identity'")
+            .source_config_with_env(&wi)
+            .unwrap()
+            .auth
+        {
+            SourceAuth::Azure(c) => assert_eq!(c.kind(), AzureIdentity::WorkloadIdentity),
+            other => panic!("{other:?}"),
+        }
+        match pg("auth = 'azure-container-apps'
+azure_client_id = 'uami'")
+        .source_config_with_env(&aca)
+        .unwrap()
+        .auth
+        {
+            SourceAuth::Azure(c) => {
+                assert_eq!(c.kind(), AzureIdentity::ContainerApps);
+                assert!(!format!("{c:?}").contains("hdr-s3cret"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // (extra config, env, a substring the error must contain)
+        type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+        let cases: [(&str, Env, &str); 7] = [
+            ("auth = 'azure'", &wi, "expected \"password\""),
+            ("auth = 'azure-workload-identity'", &none, "AZURE_CLIENT_ID"),
+            ("auth = 'azure-container-apps'", &none, "IDENTITY_ENDPOINT"),
+            ("auth = 'azure-container-apps'", &wi, "IDENTITY_ENDPOINT"),
+            ("azure_client_id = 'x'", &wi, "azure_client_id is set"),
+            (
+                "auth = 'azure-workload-identity'
+ssl_mode = 'disable'",
+                &wi,
+                "must be verified",
+            ),
+            (
+                "auth = 'azure-container-apps'
+ssl_mode = 'verify-ca'
+ssl_root_cert = '/ca.pem'",
+                &aca,
+                "\"verify-ca\"",
+            ),
+        ];
+        for (extra, env, needle) in cases {
+            let e = pg(extra).source_config_with_env(env).unwrap_err();
+            assert!(e.contains(needle), "{extra}: {e}");
+            assert!(!e.contains("hdr-s3cret"), "{extra}: {e}");
+        }
+        let e = toml::from_str::<PostgresConfig>(
+            "url = 'postgres://mi:pw@db/app'
+auth = 'azure-container-apps'",
+        )
+        .unwrap()
+        .source_config_with_env(&aca)
+        .unwrap_err();
+        assert!(e.contains("also carries a password"), "{e}");
     }
 
     #[test]
