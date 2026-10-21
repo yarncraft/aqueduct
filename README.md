@@ -341,14 +341,14 @@ before/after diff and Copy JSON).
 | Route | Purpose |
 |-------|---------|
 | `GET /` , `GET /admin.css` | Dashboard (embedded HTML + Tailwind CSS) |
-| `GET /healthz` | `200 ok`, used by the image `HEALTHCHECK` (`aqueduct --healthcheck`) |
+| `GET /healthz` | `200 ok`, used by the image `HEALTHCHECK` (`aqueduct --healthcheck`, which probes the port of `health_addr`; `AQUEDUCT_HEALTH_PROBE` overrides it) |
 | `GET /readyz` | `200` while the pipeline is streaming, else `503` (readiness probe) |
 | `GET /metrics` | Prometheus text exposition (`aqueduct_*` series). Needs the token like `/api/*` |
 | `GET /api/metrics` | One JSON snapshot |
 | `GET /api/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/routes` | The compiled route plan (match, where, key, topic, topic_fallback, topic_values, field operations, outbox, format, deletes, tombstones, unchanged and the resolved dead_letter_topic per route, plus `default`) with live per-route counts (produced also per operation, `counts.ops`) and unseen fields; no row data. Drawn by the Routing card |
 | `GET /api/routes/history` | The last 120 s at 1 s resolution: per route, events produced, filtered, sent to the fallback and dead-lettered per second, and produced per operation; per topic, records Kafka acknowledged per second, also per operation, with per-op totals since start. The Routing card's detail charts and topic op bars; the stream then adds the newest second |
-| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s |
+| `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka (default 100, max 500; all sink topics unless `topic` is given), with their headers. Values that are not an envelope (outbox payloads, row-format rows, tombstones as `null`) come back raw. Cached for 2 s; `504` when Kafka does not answer within 10 s |
 | `GET /api/tables` | Per table high-water marks: topic, counts per op, newest delivered LSN, commit and delivery time, and the topic's Kafka offsets per partition (needs the inspector; cached for 5 s, 3 s timeout), plus the last checkpoint. See DEPLOYMENT.md, "Per-table high-water marks" |
 | `GET` / `POST` / `DELETE /api/snapshot` | State of the running or last table snapshot; start one with `{"tables": ["schema.table", ...]}` (Postgres tables, or `database.collection` for MongoDB; `snapshot = "on_demand"` or `"initial"`); cancel after the chunk in flight. See DEPLOYMENT.md, "Snapshots" |
 
@@ -356,7 +356,10 @@ Aqueduct fails closed: on a non-loopback `health_addr` it refuses to start witho
 `admin_insecure_no_auth = true` (logged as a warning). With a token, `/metrics` and `/api/*` need `Authorization: Bearer <token>`
 (a `?token=` query parameter is rejected; URLs leak into logs, history and Referer). Open the dashboard once as
 `http://host:8080/#token=<token>` (the fragment is never sent to the server; the page moves it into session storage and strips it from the URL; a `?token=` in the page URL is ignored). The page itself is public and
-**events contain row data**, so keep the port off untrusted networks.
+**events contain row data**, so keep the port off untrusted networks. Without a token, `/metrics` and `/api/*` refuse
+what a web page on another site could send through the operator's browser: a `Host` that names another site (DNS
+rebinding; IP addresses and `localhost` are fine), a foreign `Origin`, and a `POST` that is not `application/json`.
+A flood of idle connections cannot fail the health probe: a reserve of connections answers only `/healthz` and `/readyz`.
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
 

@@ -87,6 +87,8 @@ async fn main() {
     let inspector = (cfg.inspector && cfg.admin_token.as_deref().is_some_and(|t| !t.is_empty()))
         .then_some(inspector);
     let admin = admin::Admin::new(metrics.clone(), cfg.admin_token.clone(), inspector);
+    // Without a token, its host is a `Host` the admin server accepts besides IPs and localhost.
+    admin.set_health_addr(&cfg.health_addr);
     // The sink's plan: it names each table's topic, and its counters are shared (an `Arc`)
     // with the sink, so the admin server reads what the sink counts.
     admin.set_router(sink.plan().clone());
@@ -181,9 +183,10 @@ async fn shutdown_signal() {
     }
 }
 
-/// Probe our own health endpoint; returns the process exit code.
+/// Probe our own health endpoint; returns the process exit code. Prints nothing: the
+/// orchestrator only reads the exit code.
 async fn healthcheck() -> i32 {
-    let addr = std::env::var("AQUEDUCT_HEALTH_PROBE").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let addr = config::health_probe_addr();
     let probe = async {
         let mut sock = tokio::net::TcpStream::connect(&addr).await.ok()?;
         sock.write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
