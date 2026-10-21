@@ -283,8 +283,9 @@ Notable changes to Aqueduct. Newest first.
 
 ### Changed
 
-- **Cockpit: the event inspector opens from a topic only.** It is hidden until a topic's **Open in inspector** button
-  in the routing graph opens it, filtered to that topic, and reads nothing from Kafka while closed.
+- **Cockpit: the event inspector is a pop-up opened from a topic.** A topic's **Open in inspector** button in the
+  routing graph opens it over the page, filtered to that topic; Close, Esc or a click outside closes it. It reads
+  nothing from Kafka while closed.
 - **Cockpit: the slot lag, last heartbeat and heartbeat skipped tiles are removed.** The Behind source card covers whether
   Aqueduct keeps up with the source. The numbers remain in `/api/metrics`, `/api/stream` and Prometheus.
 - **Snapshots: the cockpit no longer shows primary-key values of the snapshot cursor.** While a snapshot ran, the

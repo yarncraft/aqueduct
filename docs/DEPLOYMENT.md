@@ -718,8 +718,9 @@ or two unnamed routes with the same `match` (the second could never match) fail 
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows whether Aqueduct is behind its source
 (backlog, rates and time to catch up), throughput, totals, lag, sink latency, errors, a per-operation breakdown, the
-routing graph, per-table high-water marks and an event inspector. The inspector stays hidden, and reads nothing from
-Kafka, until you open a topic in it from the topic's detail panel in the routing graph (**Open in inspector**).
+routing graph, per-table high-water marks and an event inspector. The inspector is a pop-up window that opens only from
+a topic's detail panel in the routing graph (**Open in inspector**), filtered to that topic; it reads nothing from
+Kafka while closed, and Close, Esc or a click outside closes it.
 Routes: `/` and `/admin.css` (page), `/healthz` (liveness), `/readyz` (`200` only while streaming, else `503`), `/metrics` (Prometheus), `/api/metrics`, `/api/stream` (SSE), `/api/events?topic=<t>&limit=<n>` (read from Kafka), `/api/tables` (per table high-water marks), `/api/routes` (the route plan with per-route counts), `/api/snapshot` (`GET`/`POST`/`DELETE`, see [Snapshots](#snapshots)). Only `/api/snapshot` accepts methods other than `GET`.
 
 Open `http://host:8080/` (or `/#token=<admin_token>` when a token is set; the fragment is never sent to the server). It shows throughput, totals, lag,

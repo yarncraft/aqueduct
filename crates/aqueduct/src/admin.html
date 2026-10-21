@@ -180,8 +180,9 @@
    ["public.*s", "public.users", true], ["public.*s", "public.user", false], ["", "", true], ["*", "", true]]
   </script>
 
-  <!-- Event inspector: hidden until a topic's "Open in inspector" button in the Routing card opens it -->
-  <section id="inspector" hidden class="rounded-sm border border-ink-600 bg-ink-800">
+  <!-- Event inspector: a pop-up over the page, opened by a topic's "Open in inspector" button in the Routing card -->
+  <div id="inspector" hidden role="dialog" aria-modal="true" aria-label="Event inspector" class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 sm:p-8">
+  <section id="inspectorpanel" class="w-full max-w-6xl rounded-sm border border-ink-600 bg-ink-800 shadow-2xl">
     <div class="flex flex-wrap items-center gap-3 border-b border-ink-600 px-4 py-2.5">
       <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Event inspector</h2>
       <span class="font-mono text-[11px] text-ink-500">from Kafka</span>
@@ -198,7 +199,7 @@
         <button id="evclose" type="button" class="rounded-sm border border-ink-600 bg-ink-700 px-3 py-1 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>
       </div>
     </div>
-    <div class="max-h-[34rem] overflow-auto">
+    <div class="max-h-[75vh] overflow-auto">
       <table class="w-full text-left">
         <thead class="sticky top-0 bg-ink-800">
           <tr class="border-b border-ink-600 text-[11px] uppercase tracking-widest text-ink-300">
@@ -214,6 +215,7 @@
       </table>
     </div>
   </section>
+  </div>
 
   <!-- Tables: how far each table has got (pipeline side from the stream, Kafka side from /api/tables) -->
   <section class="rounded-sm border border-ink-600 bg-ink-800">
@@ -441,7 +443,7 @@ function render(d) {
   $('uptime').textContent = dur(d.uptime_secs);
 
   // Opened from a topic's detail panel only; closed for good when the server turns it off.
-  if (!d.inspector) $('inspector').hidden = true;
+  if (!d.inspector && !$('inspector').hidden) closeInspector();
   const sm = smooth(d.history);
   $('rate').textContent = fmt(Math.round(sm.length ? sm[sm.length - 1] : d.events_per_sec));
   $('rate-now').textContent = fmt(d.events_per_sec);
@@ -733,7 +735,14 @@ $('evpause').addEventListener('click', () => {
 });
 $('evclear').addEventListener('click', () => { evs = []; openId = null; syncTableFilter(); renderEvents(); });
 const pollTimer = setInterval(pollEvents, 3000);
-$('evclose').addEventListener('click', () => { $('inspector').hidden = true; });
+// The inspector is a modal pop-up: Close, Esc or a click outside the window closes it.
+function closeInspector() {
+  $('inspector').hidden = true;
+  document.body.classList.remove('overflow-hidden');
+}
+$('evclose').addEventListener('click', closeInspector);
+$('inspector').addEventListener('click', ev => { if (ev.target === $('inspector')) closeInspector(); });
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && !$('inspector').hidden) closeInspector(); });
 
 // ---- Routing graph ----
 // Tables (stream + /api/tables) → routes in match order, first match wins → topics, and the dead-letter topic.
@@ -1166,8 +1175,9 @@ function inspectTopic(name) {
   if (![...sel.options].some(o => o.value === name)) sel.add(new Option(name, name));
   sel.value = name;
   $('inspector').hidden = false;
+  document.body.classList.add('overflow-hidden');
+  $('evsearch').focus();
   pollEvents();
-  $('inspector').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
 }
 
 $('graph').addEventListener('click', ev => {
