@@ -332,7 +332,7 @@ Integration tests: `crates/aqueduct-source-mongodb/tests/replica_set.rs` and `sn
 ## Admin cockpit
 
 The HTTP port serves a dark operations console at `/`: whether Aqueduct is **behind its source**, throughput chart, total events, end-to-end lag,
-sink latency, errors, operation breakdown, a **routing graph**, per-table high-water marks, last fault, and an **event inspector**
+sink latency, errors, a **routing graph**, per-table high-water marks, last fault, and an **event inspector**
 (a sample of the newest 100 events read straight from the Kafka topics, nothing is buffered in the pipeline; Resample reads a fresh one; pick a topic, filter by op/table, search payloads, click a row for a
 before/after diff and Copy JSON).
 
@@ -380,7 +380,7 @@ outside it closes it.
 
 When the source reports a table snapshot, a **Snapshot** card shows it: state, tables done, the table being copied, rows
 copied against the planner estimate, skipped tables, and a Cancel button (`DELETE /api/snapshot`). Snapshot rows are
-counted as `READ` in the operations breakdown, the event-rate chart and the inspector's op filter.
+counted as `READ` in the per-table charts and the inspector's op filter.
 
 Each table's high-water marks are in its detail panel in the routing graph (click the table): counts per operation
 and share of all events, the newest delivered change's LSN, how long ago that change committed and was delivered, and
