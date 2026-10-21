@@ -15,7 +15,7 @@ publication = "aqueduct"
 # heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
 # Only for a trusted private network without TLS (compose demo): ssl_mode = "disable"
 # Azure Database for PostgreSQL: sign in with the managed identity instead of a password
-# (url user = the identity's role name, no password). See docs/CONFIGURATION.md.
+# (url user = the identity's role name, no password). See docs/deep-dive/azure.md.
 # auth = "azure-workload-identity"   # AKS; or "azure-container-apps"
 # azure_client_id = "<client ID>"    # optional
 
