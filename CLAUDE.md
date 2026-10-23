@@ -30,16 +30,22 @@ cargo test --workspace            # always run the whole workspace, not one crat
 docker compose up --build         # or: podman-compose up -d --build
 ```
 
-**There is no CI**, local or remote. Before you post a SHA for review, run these yourself (cargo with the local toolchain, see below) and paste the commands and their `test result` lines on the PR:
+**CI is `.github/workflows/ci.yml`**: on Linux, on every PR and push to `main`: `cargo fmt --all --check`, clippy, `cargo test --workspace --locked`, `cargo audit`, `cargo deny check` (policy in `deny.toml`), `docker build`, and the integration suite for PRs that touch `aqueduct-core`, a source, the Kafka sink, `aqueduct-tls`, the binary, `Cargo.*` or the CI files. The Linux run is what shows a change works on the production platform; a Windows-only run does not count for review.
 
-- Every PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`.
-- PRs that touch a source, the Kafka sink or the pipeline: the integration suite too, `cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored` and `cargo test --locked -p aqueduct-sinks --test kafka_it`, against local Kafka, MongoDB and Postgres containers (`AQUEDUCT_TEST_KAFKA`, `AQUEDUCT_KAFKA_BROKERS`, `AQUEDUCT_TEST_PG_*`). The passed count must be non-zero; a test that skips itself when its variable is unset does not count.
-- PRs that change `Cargo.lock`: `cargo audit` and `cargo deny check` (policy in `deny.toml`: advisories, licenses, bans, sources). Duplicate-version warnings are expected.
-- PRs that change the `Dockerfile` or the image: `podman build .`.
+**While GitHub Actions is blocked on billing**, run the same checks on Linux yourself and paste the commands and their `test result` lines on the PR, for the exact head SHA you ask to have reviewed:
+
+```sh
+CT=podman scripts/ci-linux.sh --integration   # fmt, clippy, tests, audit, deny + Kafka/MongoDB/Postgres suite, in containers
+```
+
+- Every PR: `scripts/ci-linux.sh` (fmt, clippy, workspace tests, audit, deny; the script prints the SHA it ran and whether the worktree was dirty).
+- PRs that touch a source, the Kafka sink or the pipeline: add `--integration`, which starts the Kafka, MongoDB and Postgres (TLS, plaintext, trust) containers from `scripts/ci-integration-services.sh` and runs `cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored` and `cargo test --locked -p aqueduct-sinks --test kafka_it`. The passed count must be non-zero; a test that skips itself when its variable is unset does not count.
+- PRs that change the `Dockerfile` or the image: add `--image` (`build .`).
 - Base images in the `Dockerfile` are pinned by digest (tag kept in a comment). To bump, resolve the new multi-arch index digest of the tag (`podman manifest inspect` or the registry's `Docker-Content-Digest`), update both `FROM` lines and build.
+- For quick iteration on the Windows machine, native `cargo fmt`/`clippy`/`test` is fine (below); it does not replace the Linux run before you post a SHA.
 
 On the Windows dev machine, cargo runs natively with the toolchain on `S:` (`RUSTUP_HOME=S:\rust\rustup`,
-`CARGO_HOME=S:\rust\cargo`, `S:\rust\cargo\bin` on `PATH`, `CARGO_TARGET_DIR=S:\rust\target`), never in a Rust container.
+`CARGO_HOME=S:\rust\cargo`, `S:\rust\cargo\bin` on `PATH`, `CARGO_TARGET_DIR=S:\rust\target`). The one exception is `scripts/ci-linux.sh`, which runs cargo in a `rust` container on purpose: that is the Linux run.
 Only the services the integration suite needs (Kafka, MongoDB, Postgres) run in Podman (`S:\podman\bin`): publish their
 ports and reach them on `localhost`. `podman build .` still builds the image; pulling `gcr.io` images needs the corporate
 (Zscaler) root CA trusted in the Podman machine. After a machine restart, `podman machine stop` and `podman machine start`
@@ -57,9 +63,18 @@ itself. Clean up after every check, test run or image build, and say so in the P
   `podman container prune` or `podman volume prune`: they also delete stopped containers and their volumes that are not
   yours, such as the simulation's Postgres data after a machine restart. Remove containers and volumes by name instead.
   Never stop or remove containers or volumes you did not start.
-- Named cargo cache volumes (`aq-*-target`, registry) are caches: delete yours when the task is done.
+- Named cargo cache volumes (`aq-*-target`, registry) are caches: delete yours when the task is done. `scripts/ci-linux.sh` uses `aq-cargo-registry`, `aq-cargo-bin` and one `aq-target-<checksum>` per checkout (`podman volume ls | grep aq-target`); remove yours with `podman volume rm` when you finish (it removes its service containers and the `aq-certs` volume itself).
 - Check `podman system df` after a batch of work; tens of GB reclaimable means something was left behind.
 - Agents you delegate to get the same rule in their prompt.
+
+### Merge rule
+
+Nothing merges without review, and branch protection is not available, so the rule is by convention (accepted by the owner on 2026-10-23, #230):
+
+- There is one named merger, Optimus Prime.
+- Before merging, the merger posts `merging #N at <SHA>`, and merges only the exact head SHA the reviewer (Megatron) approved. A push after the approval voids it.
+- CI (or the pasted Linux run above) must be green on that same SHA.
+- Nobody else merges, and no one merges their own PR without that approval.
 
 ## Invariants (do not break)
 

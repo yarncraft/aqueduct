@@ -1,0 +1,102 @@
+name: ci
+# The same checks run on Linux with `scripts/ci-linux.sh`, for when Actions is unavailable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'changelog/**'
+      - 'LICENSE*'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit
+      - run: cargo deny check
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: aqueduct:ci
+
+  # The integration suite needs live Kafka, MongoDB and Postgres. It runs on every push to main and
+  # on pull requests that touch a source, the Kafka sink, the pipeline (core), the binary or the
+  # workflow itself, so a docs-, UI- or tooling-only PR does not pay for it.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      integration: ${{ github.event_name == 'push' || steps.filter.outputs.integration == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            integration:
+              - 'crates/aqueduct-core/**'
+              - 'crates/aqueduct-source-*/**'
+              - 'crates/aqueduct-sinks/**'
+              - 'crates/aqueduct-tls/**'
+              - 'crates/aqueduct/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/ci-integration-services.sh'
+              - '.github/workflows/ci.yml'
+
+  integration:
+    needs: [rust, changes]
+    if: needs.changes.outputs.integration == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Kafka, MongoDB and Postgres (TLS, plaintext, trust)
+        run: scripts/ci-integration-services.sh up "$RUNNER_TEMP/aqcerts"
+      - name: Integration tests
+        run: |
+          set -a; . "$RUNNER_TEMP/aqcerts/services.env"; set +a
+          export AQUEDUCT_TEST_PG_REMOTE_HOST=$(hostname -I | cut -d" " -f1)
+          cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
+          cargo test --locked -p aqueduct-sinks --test kafka_it
+      - name: Container logs
+        if: always()
+        run: CI_SERVICE_LOGS=/dev/stdout scripts/ci-integration-services.sh down "$RUNNER_TEMP/aqcerts"
