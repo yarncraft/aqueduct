@@ -537,34 +537,19 @@ function spark(lines, n = SPARK_N) {
   }).join('');
 }
 const sparkSvg = (id, cls, style) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}"${style ? ` style="${style}"` : ''} aria-hidden="true"></svg>`;
-// A table or topic card's bottom row: its step line and, beside it, a pie of its op shares.
-const NODE_SPARK_H = 'height:36px';
-const nodeLine = (id, pie = true) => pie
-  ? `<div class="mt-1 flex items-center gap-2">${sparkSvg(id, 'block min-w-0 flex-1', NODE_SPARK_H)}${opPie(id)}</div>`
-  : `<div class="mt-1">${sparkSvg(id, 'block w-full', NODE_SPARK_H)}</div>`;
+// A table or topic card's step line, under its name and count.
+const nodeLine = id => `<div class="mt-1">${sparkSvg(id, 'block w-full', 'height:36px')}</div>`;
 // A table's events per second, all ops.
 const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
-// A card's op shares since start as a pie (the legend's colours, clockwise from the top in OP_LABEL order), filled by
-// fillOpPie on every frame. The wrapper holds the tooltip.
+// A card's op shares since start: a stacked strip down the card's left edge (the legend's colours, top to bottom in
+// OP_LABEL order), filled by fillOpStrip on every frame. A card with a strip is `relative` and padded past it.
 const OP_FILL = ['var(--color-green)', 'var(--color-blue)', 'var(--color-red)', 'var(--color-violet)', 'var(--color-amber)'];
-const opPie = id => `<span data-oppie="${esc(id)}" class="block shrink-0" style="width:28px;height:28px"><svg viewBox="-1 -1 2 2" class="block h-full w-full" aria-hidden="true"></svg></span>`;
-function pieSlices(row, total) {
-  if (!total) return '<circle r="1" fill="var(--color-ink-700)"/>';
-  let a = 0, out = '';
-  row.forEach((n, i) => {
-    if (!n) return;
-    const share = n / total;
-    if (share >= 1) { out += `<circle r="1" fill="${OP_FILL[i]}"/>`; return; }
-    const pt = t => `${Math.sin(2 * Math.PI * t).toFixed(4)} ${(-Math.cos(2 * Math.PI * t)).toFixed(4)}`;
-    out += `<path d="M0 0L${pt(a)}A1 1 0 ${share > 0.5 ? 1 : 0} 1 ${pt(a + share)}Z" fill="${OP_FILL[i]}"/>`;
-    a += share;
-  });
-  return out;
-}
-function fillOpPie(el, row, what) {
+const STRIP_CARD = 'relative overflow-hidden', STRIP_PAD = 'padding-left:14px';
+const opStrip = id => `<span data-opstrip="${esc(id)}" class="absolute top-0 flex flex-col overflow-hidden" style="left:0;bottom:0;width:5px;background:var(--color-ink-700)"></span>`;
+function fillOpStrip(el, row, what) {
   const total = row ? row.reduce((a, n) => a + n, 0) : 0;
-  const svg = el.firstChild, html = pieSlices(row || NO_OPS, total);
-  if (svg.dataset.k !== html) { svg.dataset.k = html; svg.innerHTML = html; }
+  const html = total ? row.map((n, i) => n ? `<span class="block shrink-0" style="height:${(100 * n / total).toFixed(2)}%;background:${OP_FILL[i]}"></span>` : '').join('') : '';
+  if (el.dataset.k !== html) { el.dataset.k = html; el.innerHTML = html; }
   el.title = !row ? 'no per-operation counts from this server'
     : !total ? 'no ' + what + ' yet'
     : what + ' by operation: ' + OP_LABEL.map((k, i) => `${k} ${fmt(row[i])} (${(100 * row[i] / total).toFixed(1)}%)`).join(' · ');
@@ -761,9 +746,9 @@ function dlqFor(x, name) {
   return t ? fillTopic(x.dlq, t.name) : x.dlq;
 }
 
-// Table, topic and "+N more" cards: name and count on one line, the step line and op-share pie below.
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${nodeLine(t.id)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id, id !== 'pm:dlq')}</button>`;
+// Table, topic and "+N more" cards: name and count on one line, the step line below, the op-share strip down the left edge.
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" style="${STRIP_PAD}" title="${esc(t.name)} · events · click for details">${opStrip(t.id)}<div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${nodeLine(t.id)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="${id === 'pm:dlq' ? '' : STRIP_CARD + ' '}block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100"${id === 'pm:dlq' ? '' : ` style="${STRIP_PAD}"`} title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}">${id === 'pm:dlq' ? '' : opStrip(id)}<span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -884,7 +869,7 @@ function topicNodeHtml(id, name, opts) {
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
   const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
   const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${nodeLine(id, !opts.dlq)}</div>`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="${opts.dlq ? '' : STRIP_CARD + ' '}cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue"${opts.dlq ? '' : ` style="${STRIP_PAD}"`} title="${esc(title)}">${opts.dlq ? '' : opStrip(id)}<div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${nodeLine(id)}</div>`;
 }
 
 function graphHtml(m) {
@@ -1198,9 +1183,9 @@ function renderGraph(frame) {
     if (v != null) el.textContent = v;
     if (el.dataset.v.endsWith(':errors')) el.classList.toggle('text-red', v != null && v !== '0');
   }
-  for (const el of document.querySelectorAll('#routing [data-oppie]')) {
-    const id = el.dataset.oppie;
-    fillOpPie(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
+  for (const el of document.querySelectorAll('#routing [data-opstrip]')) {
+    const id = el.dataset.opstrip;
+    fillOpStrip(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
   drawCardSparks(m);
   const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);
