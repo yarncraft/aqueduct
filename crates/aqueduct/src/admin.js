@@ -47,10 +47,21 @@ let lastData = null;
 const OPLINE = ['#22c55e', '#38bdf8', '#ef4444', '#a855f7', '#facc15'];
 // Stepline points: hold each value until the next sample, then jump.
 const stepPts = (h, x, y) => h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
-// Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H).
-function chart(series, el, colors = OPLINE, H = 220) {
+// Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H): one step line each, or with
+// `stacked` filled step bands on top of each other in series order (aligned on their newest sample), so the top edge
+// is their sum.
+function chart(series, el, colors = OPLINE, H = 220, stacked = false) {
   const W = 800, PL = 34, PR = 8, PT = 10, PB = 8;
   const len = Math.max(0, ...series.map(s => s.h.length));
+  if (stacked) {
+    let below = new Array(len).fill(0);
+    series = series.map(({ op, h }) => {
+      const top = below.map((v, i) => v + (h[i - (len - h.length)] || 0));
+      const s = { op, h: top, below };
+      below = top;
+      return s;
+    });
+  }
   const max = Math.max(5, ...series.flatMap(s => s.h));
   const n = Math.max(len, 2);
   const x = i => PL + (W - PL - PR) * i / (n - 1);
@@ -63,7 +74,8 @@ function chart(series, el, colors = OPLINE, H = 220) {
   }
   if (len > 1) {
     // Stepline per op: hold each value until the next sample, then jump.
-    for (const { op, h } of series) {
+    for (const { op, h, below } of series) {
+      if (below) g += `<polygon points="${stepPts(h, x, y)} ${stepPts(below, x, y).split(' ').reverse().join(' ')}" fill="${colors[op]}" fill-opacity="0.45" stroke="none"/>`;
       g += `<polyline points="${stepPts(h, x, y)}" fill="none" stroke="${colors[op]}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
     }
   }
@@ -514,8 +526,12 @@ const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
 const OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
 // Op buttons for the ops that have happened (totals per op, insert..read); without totals (an older server) all five.
 const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '11111';
-// An op button: when on, tinted in its op's line colour (it is the chart's legend); when off, grey.
-const opBtnAttrs = (op, on) => on ? `class="${OP_BTN}" style="border-color:${OPLINE[op]};color:${OPLINE[op]};background-color:${OPLINE[op]}26"` : `class="${OP_BTN_OFF}"`;
+// A toggle button: when on, tinted in its line's colour (it is the chart's legend); when off, grey.
+const toggleAttrs = (color, on) => on ? `class="${OP_BTN}" style="border-color:${color};color:${color};background-color:${color}26"` : `class="${OP_BTN_OFF}"`;
+const opBtnAttrs = (op, on) => toggleAttrs(OPLINE[op], on);
+// The route panel's lines (CARD_METRICS indices) toggled on; kept while you click from route to route.
+const detailLines = new Set([0, 1, 2, 3]);
+const lineBtn = i => `<button type="button" data-line="${i}" aria-pressed="${detailLines.has(i)}" ${toggleAttrs(CARD_METRICS[i][1], detailLines.has(i))}>${CARD_METRICS[i][2] || CARD_METRICS[i][0]}</button>`;
 const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
     : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
@@ -1092,7 +1108,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, label || k)).join('') + opButtons(routeOpTotals(x, routeRate(x.i))));
+    + `</div>` + detailChart(CARD_METRICS.map((_, i) => lineBtn(i)).join('') + '<span class="text-ink-500">|</span>' + opButtons(routeOpTotals(x, routeRate(x.i))));
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1148,14 +1164,22 @@ function drawDetail(m) {
     const x = m.routes[graphSel];
     if (!x) return;
     const rr = routeRate(x.i) || {};
-    const tot = routeOpTotals(x, rr), sel = [...detailOps].filter(op => !tot || tot[op] > 0);
+    const tot = routeOpTotals(x, rr), sel = [...detailOps].filter(op => !tot || tot[op] > 0).sort();
     const pick = (k, rows) => tot ? (rr[rows] || []).map(o => sel.reduce((a, op) => a + (o[op] || 0), 0)) : rr[k] || [];
     const [produced, filtered, fallback, errors] = ['ops', ...ROUTE_OUTCOME_OPS].map((rows, j) => pick(ROUTE_COUNTS[j], rows));
     const processed = sumSeries([produced, filtered, fallback, errors]);
     const series = { processed, passed: sumSeries([produced, fallback, errors]), fallback, errors };
-    chart(CARD_METRICS.map(([k], op) => ({ op, h: series[k] })), dc, CARD_METRICS.map(c => c[1]), 160);
-    $('detailstats').textContent = tot && !sel.length ? 'no operation selected'
-      : (tot ? '' : 'all operations (no per-op history from this server) · ') + 'processed ' + rateStats(processed);
+    const lines = CARD_METRICS.map(([k], op) => ({ op, k, h: series[k] })).filter(s => detailLines.has(s.op));
+    // One outcome and several ops: that outcome stacked by op, in the op colours (the op buttons are its legend).
+    if (tot && lines.length === 1 && sel.length > 1) {
+      const parts = { processed: ['ops', ...ROUTE_OUTCOME_OPS], passed: ['ops', 'fallback_ops', 'errors_ops'], fallback: ['fallback_ops'], errors: ['errors_ops'] }[lines[0].k];
+      const rows = sumRows(parts.map(k => rr[k] || []));
+      chart(sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })), dc, OPLINE, 160, true);
+    } else chart(lines, dc, CARD_METRICS.map(c => c[1]), 160);
+    // The stats follow the first line shown.
+    const first = lines[0];
+    $('detailstats').textContent = !first ? 'no line selected' : tot && !sel.length ? 'no operation selected'
+      : (tot ? '' : 'all operations (no per-op history from this server) · ') + (CARD_METRICS[first.op][2] || first.k) + ' ' + rateStats(first.h);
     refreshOpButtons(tot);
     const el = document.getElementById('detailops');
     const t = opSlots(x.c.ops);
@@ -1168,7 +1192,8 @@ function drawDetail(m) {
   const sel = [...detailOps].filter(op => !seen || seen[op] > 0).sort();
   const perOp = rows ? sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })) : null;
   const h = perOp ? sumSeries(perOp.map(s => s.h)) : all;
-  if (perOp) chart(perOp, dc, OPLINE, 160); else chart([{ op: 0, h }], dc, [color], 160);
+  // Several ops stack (the top edge is their sum); one op is a plain line.
+  if (perOp) chart(perOp, dc, OPLINE, 160, perOp.length > 1); else chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
   refreshOpButtons(seen);
@@ -1259,6 +1284,14 @@ $('routedetail').addEventListener('click', ev => {
     on ? detailOps.add(op) : detailOps.delete(op);
     opBtn.setAttribute('aria-pressed', String(on));
     opBtn.outerHTML = `<button type="button" data-op="${op}" aria-pressed="${on}" ${opBtnAttrs(op, on)}>${OP_LABEL[op]}</button>`;
+    if (graphModel) drawDetail(graphModel);
+    return;
+  }
+  const lineEl = ev.target.closest('[data-line]');
+  if (lineEl) {
+    const i = +lineEl.dataset.line;
+    detailLines.has(i) ? detailLines.delete(i) : detailLines.add(i);
+    lineEl.outerHTML = lineBtn(i);
     if (graphModel) drawDetail(graphModel);
     return;
   }

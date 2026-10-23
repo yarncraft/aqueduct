@@ -205,11 +205,13 @@ records, a dead-letter topic's errors).
 
 **Rates.** Click a table, a route or a topic for a panel with one step line over the last 300 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
-a topic's acknowledged records per second. A table's and a topic's chart draw one line per operation, in the op colours, for the operations toggled on with the
-buttons above it; only operations that have happened for that table or topic get a button (insert, update, delete,
+a topic's acknowledged records per second. A table's and a topic's chart draw the operations toggled on with the buttons above it, in the op colours: one
+operation as a line, several stacked (the top edge is their sum); only operations that have happened for that table or topic get a button (insert, update, delete,
 truncate, read); the selection is shared by every panel. A route's chart has four lines, processed, matched, fallback
-and errors, from the route's own counters, each counting only the operations toggled on; its buttons are the
-operations it has produced since start or taken in the window under any outcome. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
+and errors, from the route's own counters, each toggled on or off with its own button (the stats follow the first one
+shown) and counting only the operations toggled on; with a single line on and several operations, that line is
+stacked by operation instead; its op buttons are the operations it has produced since start or
+taken in the window under any outcome. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
 operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
 select it), the full table list when the card's `FROM` is cut short, and any other config keys.  A topic's panel lists its acknowledged records per
 operation, the routes that write to it (by template or as their `topic_fallback`), **dead letter**: the dead-letter
