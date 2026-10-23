@@ -56,7 +56,7 @@ database = "app"
 collections = ["users", "orders"]   # empty = whole database
 ```
 
-Needs a replica set. `database` becomes `schema`, the collection `table`. Other keys: `pre_images`, `snapshot`,
+Needs a replica set. Plaintext to a non-loopback host is refused unless the URI says `tls=false`. `database` becomes `schema`, the collection `table`. Other keys: `pre_images`, `snapshot`,
 `snapshot_chunk_size`, `snapshot_max_rows_per_sec`. Privileges, resume-token and oplog behaviour:
 [deep dive](deep-dive/configuration.md#source-alternative-sources).
 

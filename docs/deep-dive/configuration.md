@@ -64,7 +64,7 @@ snapshot = "never"                  # or "on_demand" / "initial", see "Snapshots
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `uri` | required | `mongodb://` or `mongodb+srv://`. Credentials and `tls=true` go in the URI. |
+| `uri` | required | `mongodb://` or `mongodb+srv://`. Credentials and `tls=true` go in the URI. Plaintext to a non-loopback host fails startup unless the URI says `tls=false` explicitly, which then logs a warning; so do `tlsInsecure` and `tlsAllowInvalidCertificates`. `mongodb+srv://` uses TLS by default. |
 | `database` | required | Database to watch. It becomes `schema`; the collection becomes `table`. |
 | `collections` | all | Collections to include. |
 | `snapshot` | `never` | `on_demand` or `initial` copy existing documents; see [MongoDB snapshots](DEPLOYMENT.md#mongodb-snapshots). |

@@ -82,7 +82,8 @@ itself. Clean up after every check, test run or image build, and say so in the P
   and never log tokens.
 - **Fail closed**: the admin server refuses a non-loopback `health_addr` without `admin_token` (`Config::check_admin_exposure`,
   opt-out `admin_insecure_no_auth`). Postgres TLS defaults to `verify-full`, and a plaintext session to a non-loopback
-  host aborts startup unless `ssl_mode = "disable"` is explicit (`aqueduct-source-postgres/src/tls.rs`). The admin token is accepted only as `Authorization: Bearer`; never
+  host aborts startup unless `ssl_mode = "disable"` is explicit (`aqueduct-source-postgres/src/tls.rs`). MongoDB likewise
+  refuses a plaintext URI to a non-loopback host unless it says `tls=false` (`aqueduct-source-mongodb/src/config.rs`). The admin token is accepted only as `Authorization: Bearer`; never
   reintroduce a `?token=` fallback (URLs leak into logs). Do not weaken these defaults.
 - The runtime image is distroless: no shell, no curl. The healthcheck is `aqueduct --healthcheck` (GET `/healthz`).
 - The state dir `/var/lib/aqueduct` is pre-created for uid 65532 in the Dockerfile; keep that when editing it.
