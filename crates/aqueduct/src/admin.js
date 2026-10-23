@@ -234,29 +234,27 @@ function render(d) {
 
 // ---- Per-table high-water marks (shown in a table's detail panel in the routing graph) ----
 // Pipeline numbers (counts, last LSN, commit and delivery times) come with every stream frame;
-// the topic and its Kafka offsets come from /api/tables, which the server caches for 5 s, so
-// polling it every 5 s costs Kafka one offsets read however many tabs are open. The routing graph
-// also takes each table's topic from it.
+// each table's topic comes from /api/tables, which the server caches for 5 s. The routing graph
+// takes each table's topic from it; the page does not show its Kafka offsets.
 const HWM_POLL_MS = 5000;
 // Last-commit tone, only while streaming: a table whose newest change is this far behind the
 // freshest table's turns amber / red. Measured against the freshest table, not the clock, so a
 // database that is idle as a whole is not flagged.
 const BEHIND_AMBER_MS = 60000, BEHIND_RED_MS = 600000;
-let hwm = { tables: {}, error: null, read_ms: null };
+let hwm = { tables: {} };
 const ago = t => { const a = Math.max(0, Date.now() - t); return a < 1000 ? 'now' : dur(Math.floor(a / 1000)) + ' ago'; };
 
 async function pollTables() {
   try {
     const r = await fetch('/api/tables', authInit());
-    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); hwm.error = r.status === 401 ? 'unauthorized' : 'disabled'; fillTopicHwm(); return; }
+    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); return; }
     if (!r.ok) return;
     const d = await r.json();
     const byName = {};
     for (const t of d.tables) byName[t.table] = t;
-    hwm = { tables: byName, error: null, read_ms: d.kafka_read_ms };
+    hwm = { tables: byName };
     renderGraph();
     fillTableMarks();
-    fillTopicHwm();
   } catch (_) { /* the connection badge covers outages */ }
 }
 const tablesTimer = setInterval(pollTables, HWM_POLL_MS);
@@ -827,21 +825,35 @@ const CARD_METRIC_HELP = {
   fallback: 'Sent to topic_fallback (content routing could not use the row value)',
   errors: 'Sent to the dead-letter topic',
 };
+// More than COLLAPSE_MIN rules: the header offers to collapse every rule card to its name, counts and line. The
+// choice is kept per browser.
+const COLLAPSE_MIN = 4;
+let rulesCollapsed = false;
+try { rulesCollapsed = localStorage.getItem('aqueduct_rules_collapsed') === '1'; } catch (_) { /* storage blocked */ }
+// Configured rules only: the default route (no match) is not one.
+const ruleCount = () => plan ? plan.routes.filter(r => r.match != null).length : 0;
+const rulesFolded = () => rulesCollapsed && ruleCount() >= COLLAPSE_MIN;
+$('routecollapse').addEventListener('click', () => {
+  rulesCollapsed = !rulesCollapsed;
+  try { localStorage.setItem('aqueduct_rules_collapsed', rulesCollapsed ? '1' : '0'); } catch (_) { /* storage blocked */ }
+  renderGraph();
+});
+
 function routeNode(x, last) {
-  const r = x.r, sel = graphSel === x.i;
+  const r = x.r, sel = graphSel === x.i, folded = rulesFolded();
   const unseen = x.c.unseen_fields || [];
   const counts = { processed: x.c.matched || 0, passed: Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)), fallback: x.c.fallback || 0, errors: x.c.errors || 0 };
   return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
     // Step and name on top.
     + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
-    + `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
-    + sqlRow('SELECT', selectClause(r))
-    + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
-    + sqlRow('FROM', fromClause(x))
-    + sqlRow('INTO', intoClause(r))
-    + sqlRow('PARTITIONED-BY', partitionClause(r))
-    + `</div>`
+    + (folded ? '' : `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
+      + sqlRow('SELECT', selectClause(r))
+      + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
+      + sqlRow('FROM', fromClause(x))
+      + sqlRow('INTO', intoClause(r))
+      + sqlRow('PARTITIONED-BY', partitionClause(r))
+      + `</div>`)
     // The metrics, each in the colour of its step line below.
     + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
     + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
@@ -1012,22 +1024,7 @@ function topicDetail(m, name) {
     + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
       : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(topicTotals(name)));
-}
-
-// The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
-// for the topics tables are routed to; refreshed after every read.
-function fillTopicHwm() {
-  const el = document.getElementById('topichwm');
-  if (!el || topicSel == null) return;
-  const row = (label, v, title) => `<div class="flex gap-3"${title ? ` title="${esc(title)}"` : ''}><span class="w-24 shrink-0 text-ink-500">${label}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
-  const entry = Object.values(hwm.tables).find(t => t.topic === topicSel && t.kafka);
-  const k = entry && entry.kafka;
-  const offsets = k
-    ? `${fmt(k.hwm_total)} <span class="text-ink-500">· ${k.partitions.map(p => 'p' + esc(p.partition) + ' ' + fmt(p.hwm)).join(' · ')}</span>`
-    : `<span class="text-ink-500">${esc(hwm.error || 'only read for topics that tables route to by name')}</span>`;
-  el.innerHTML = row('Kafka HWM', offsets, 'Sum over the topic\'s partitions of the next offset Kafka will assign: the records written to it.')
-    + row('offsets read', hwm.read_ms ? esc(ago(hwm.read_ms)) : '–');
+    + `</div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(topicTotals(name)));
 }
 
 // A table's panel (source side, no Kafka details): the route that claims it, its events, how far it has got, and its
@@ -1046,8 +1043,7 @@ function fillTableMarks() {
     + row('last LSN', esc(m.last_lsn || '–'))
     + row('last commit', m.last_commit_ms ? `<span class="${tone}">${esc(ago(m.last_commit_ms))}</span> <span class="text-ink-500">${esc(isoMs(m.last_commit_ms))}</span>` : '–',
       'Age of the newest delivered change\'s commit. Amber: more than 1 min behind the freshest table, red: more than 10 min (only while streaming).')
-    + row('delivered', m.last_delivered_ms ? `${esc(ago(m.last_delivered_ms))} <span class="text-ink-500">${esc(isoMs(m.last_delivered_ms))}</span>` : '–')
-    + row('checkpoint', `${esc(d.checkpoint || '–')} <span class="text-ink-500">(global, not per table)</span>`);
+    + row('delivered', m.last_delivered_ms ? `${esc(ago(m.last_delivered_ms))} <span class="text-ink-500">${esc(isoMs(m.last_delivered_ms))}</span>` : '–');
 }
 
 function tableDetail(m, name) {
@@ -1063,7 +1059,7 @@ function tableDetail(m, name) {
 function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
   $('routedetail').hidden = !x && topicSel == null && tableSel == null;
-  if (!x) { if (topicSel != null) { topicDetail(m, topicSel); fillTopicHwm(); } else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
+  if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
   // Only what the card does not already show: the card has SELECT/WHERE/FROM/INTO/PARTITIONED-BY, the outcome
   // counts and the op bar.
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
@@ -1167,7 +1163,12 @@ function renderGraph(frame) {
   if (frame) trackFlow(m);
   const key = JSON.stringify([m.routes.map(x => [x.shown.map(t => t.name), x.hidden.length, x.c.unseen_fields]),
     m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), m.dlqShown.map(d => [d.name, d.routes.length]), m.dlqHidden.length,
-    topicSel && m.dlqs.has(topicSel) && topicSel.includes('{') ? dlqTopics(topicSel) : null, graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector)]);
+    topicSel && m.dlqs.has(topicSel) && topicSel.includes('{') ? dlqTopics(topicSel) : null, graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector),
+    rulesFolded()]);
+  const btn = $('routecollapse');
+  btn.hidden = ruleCount() < COLLAPSE_MIN;
+  btn.textContent = rulesFolded() ? 'Expand rules' : 'Collapse rules';
+  btn.setAttribute('aria-pressed', String(rulesFolded()));
   graphModel = m;
   if (key !== graphKey) {
     graphKey = key;

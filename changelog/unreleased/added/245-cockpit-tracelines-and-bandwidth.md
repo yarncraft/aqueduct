@@ -7,4 +7,6 @@
   last minute). The routing graph's lines are sized by bandwidth (from new per-topic `topic_bytes` in
   `/api/routes/history` and the stream), and hovering any card shows each of its lines' bandwidth. The page uses the
   full width of the screen, card lines are 1.5x taller, and a legend names the operation bar colours (in
-  place of the route, table and topic counts next to the Routing title).
+  place of the route, table and topic counts next to the Routing title). With more than 3 rules, **Collapse rules**
+  folds the route cards to their name, counts and line. A table's panel no longer shows the global checkpoint, and a
+  topic's panel no longer shows Kafka offsets (both stay in `/api/tables`).
