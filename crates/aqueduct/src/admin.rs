@@ -12,8 +12,9 @@
 //! - `GET /api/routes`  the compiled route plan with live per-route counts, produced also per
 //!   operation (no row data)
 //! - `GET /api/routes/history` per-route outcome and per-op produced rates, and per-topic
-//!   acknowledged-record rates (also per op, with totals since start) over the last 120 s (the
+//!   acknowledged-record rates (also per op, with totals since start) over the last 300 s (the
 //!   stream carries only the newest second)
+//! - `GET /api/kpis/history` the top tiles' last 300 s, one sample per second
 //! - `GET|POST|DELETE /api/snapshot` state of, start, or cancel a table snapshot (ADR 0001)
 //!
 //! If `admin_token` is configured, `/metrics` and `/api/*` require it as
@@ -38,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::kpis::KpiHistory;
 use crate::rates::RateHistory;
 use aqueduct_core::{
     Metrics, Snapshot, SnapshotCommand, SnapshotRequest, SnapshotSender, State, OP_SLOTS,
@@ -54,7 +56,7 @@ const DASHBOARD: &str = include_str!("admin.html");
 const STYLES: &str = include_str!("admin.css");
 /// The dashboard script, served from `/admin.js` so the CSP needs no inline `script-src`.
 const SCRIPT: &str = include_str!("admin.js");
-const HISTORY_LEN: usize = 120;
+const HISTORY_LEN: usize = 300;
 /// One history sample per this long.
 const SAMPLE_MS: u64 = 1000;
 
@@ -124,6 +126,8 @@ pub struct Admin {
     topic_stats: OnceLock<Arc<TopicStats>>,
     /// Per-route and per-topic rates, sampled on the same tick as `history`.
     rates: Mutex<RateHistory>,
+    /// The top tiles' per-minute means over the last hour, sampled on the same tick as `history`.
+    kpis: Mutex<KpiHistory>,
     /// The last read of the Kafka offsets. A std lock: never held across an await.
     hwm_cache: Mutex<Option<HwmRead>>,
     /// Lets one request at a time read the offsets; the others wait and reuse its result.
@@ -159,6 +163,7 @@ impl Admin {
             router: OnceLock::new(),
             topic_stats: OnceLock::new(),
             rates: Mutex::new(RateHistory::new(HISTORY_LEN)),
+            kpis: Mutex::new(KpiHistory::new(HISTORY_LEN)),
             hwm_cache: Mutex::new(None),
             hwm_gate: tokio::sync::Mutex::new(()),
         })
@@ -173,6 +178,13 @@ impl Admin {
     /// The sink's per-topic counters, for the Routing card's topic rates and `/metrics`.
     pub fn set_topic_stats(&self, stats: Arc<TopicStats>) {
         let _ = self.topic_stats.set(stats);
+    }
+
+    fn topic_bytes(&self) -> BTreeMap<String, u64> {
+        self.topic_stats
+            .get()
+            .map(|s| s.bytes_snapshot())
+            .unwrap_or_default()
     }
 
     fn topic_counts(&self) -> BTreeMap<String, OpCounts> {
@@ -279,12 +291,9 @@ impl Admin {
             })
             .collect();
         // When the offsets shown were read, as Unix ms.
-        let read_ms = hwms.as_ref().map(|(at, _)| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64);
-            now.saturating_sub(at.elapsed().as_millis() as u64)
-        });
+        let read_ms = hwms
+            .as_ref()
+            .map(|(at, _)| unix_ms().saturating_sub(at.elapsed().as_millis() as u64));
         json!({
             "state": snap.state,
             "checkpoint": snap.checkpoint,
@@ -307,20 +316,35 @@ impl Admin {
             .unwrap_or_default()
     }
 
+    /// Key, value and header bytes Kafka acknowledged since start.
+    fn kafka_bytes(&self) -> u64 {
+        self.topic_stats.get().map_or(0, |s| s.bytes())
+    }
+
     /// Sample the throughput once a second.
     pub async fn sample_forever(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_millis(SAMPLE_MS));
         let mut last = self.metrics.events_total();
+        let mut last_bytes = self.kafka_bytes();
         let mut last_ops: BTreeMap<String, [u64; OP_SLOTS]> = BTreeMap::new();
         loop {
             tick.tick().await;
             self.metrics.sample_source_lag();
             let now = self.metrics.events_total();
-            let ops = self.metrics.snapshot().table_ops;
-            self.record_sample(now.saturating_sub(last) as f64, &ops, &last_ops);
-            lock(&self.rates).record(&self.route_counts(), &self.topic_counts());
-            last_ops = ops;
+            let snap = self.metrics.snapshot();
+            let rate = now.saturating_sub(last) as f64;
+            let bytes = self.kafka_bytes();
+            let bytes_rate = bytes.saturating_sub(last_bytes) as f64;
+            self.record_sample(rate, &snap.table_ops, &last_ops);
+            lock(&self.rates).record(
+                &self.route_counts(),
+                &self.topic_counts(),
+                &self.topic_bytes(),
+            );
+            lock(&self.kpis).record(unix_ms(), rate, bytes_rate, &snap);
+            last_ops = snap.table_ops;
             last = now;
+            last_bytes = bytes;
         }
     }
 
@@ -365,6 +389,8 @@ impl Admin {
         v["events_per_sec"] = json!(rate);
         v["history"] = json!(history);
         v["history_ops"] = json!(*lock(&self.detail));
+        v["kafka_bytes_total"] = json!(self.kafka_bytes());
+        v["kpis"] = lock(&self.kpis).window();
         v["inspector"] = json!(self.inspector.is_some());
         v["routes"] = json!(self.route_counts());
         v["rates"] = lock(&self.rates).latest();
@@ -484,6 +510,13 @@ impl Admin {
     }
 }
 
+/// Now, as Unix ms.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// The host part of a `host[:port]` authority (an IPv6 address keeps its brackets).
 fn host_name(authority: &str) -> &str {
     match authority.rsplit_once(':') {
@@ -518,7 +551,7 @@ fn is_json(content_type: &str) -> bool {
 }
 
 /// The routes that need the token when one is set, and the browser checks when none is.
-const PROTECTED: [&str; 8] = [
+const PROTECTED: [&str; 9] = [
     "/metrics",
     "/api/metrics",
     "/api/stream",
@@ -527,6 +560,7 @@ const PROTECTED: [&str; 8] = [
     "/api/tables",
     "/api/routes",
     "/api/routes/history",
+    "/api/kpis/history",
 ];
 
 /// Constant-time string comparison (length is not secret here).
@@ -1212,6 +1246,15 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream, probes_only: bool) {
             let mut body = prometheus(&admin.metrics.snapshot());
             route_metrics(&mut body, &admin.route_counts());
             topic_metrics(&mut body, &admin.topic_counts());
+            if admin.topic_stats.get().is_some() {
+                metric(
+                    &mut body,
+                    "aqueduct_kafka_bytes_total",
+                    "counter",
+                    "Key, value and header bytes of the records Kafka acknowledged.",
+                );
+                let _ = writeln!(body, "aqueduct_kafka_bytes_total {}", admin.kafka_bytes());
+            }
             respond(
                 &mut sock,
                 "200 OK",
@@ -1242,6 +1285,10 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream, probes_only: bool) {
         },
         "/api/routes/history" => {
             let body = lock(&admin.rates).window(SAMPLE_MS).to_string();
+            respond(&mut sock, "200 OK", "application/json", &body).await
+        }
+        "/api/kpis/history" => {
+            let body = lock(&admin.kpis).window().to_string();
             respond(&mut sock, "200 OK", "application/json", &body).await
         }
         "/api/snapshot" => {
@@ -1752,6 +1799,31 @@ Authorization: Bearer {token}
     }
 
     #[tokio::test]
+    async fn kpi_history_needs_the_token_and_carries_the_seconds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admin = Admin::new(Arc::new(Metrics::new()), Some("k".into()), None);
+        tokio::spawn(serve(listener, admin.clone()));
+        lock(&admin.kpis).record(unix_ms(), 7.0, 2_000_000.0, &admin.metrics.snapshot());
+
+        for bad in [
+            get(addr, "/api/kpis/history").await,
+            get_bearer(addr, "/api/kpis/history", "kk").await,
+        ] {
+            assert!(bad.starts_with("HTTP/1.1 401"), "{bad}");
+        }
+        let r = get_bearer(addr, "/api/kpis/history", "k").await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let v: serde_json::Value =
+            serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["len"], HISTORY_LEN);
+        assert_eq!(v["interval_ms"], 1_000);
+        assert_eq!(v["throughput"], json!([7.0]));
+        assert_eq!(v["kafka_mb_per_sec"], json!([2.0]));
+        assert_eq!(v["lag_ms"], json!([null]));
+    }
+
+    #[tokio::test]
     async fn route_history_needs_the_token_and_carries_route_and_topic_rates() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1768,10 +1840,19 @@ Authorization: Bearer {token}
             o
         };
         stats.acked("paid--orders-.t", &ops("c", 1));
-        lock(&admin.rates).record(&admin.route_counts(), &admin.topic_counts());
+        lock(&admin.rates).record(
+            &admin.route_counts(),
+            &admin.topic_counts(),
+            &admin.topic_bytes(),
+        );
         stats.acked("paid--orders-.t", &ops("u", 2));
         stats.acked("cdc.users", &ops("d", 4));
-        lock(&admin.rates).record(&admin.route_counts(), &admin.topic_counts());
+        stats.acked_bytes("cdc.users", 640);
+        lock(&admin.rates).record(
+            &admin.route_counts(),
+            &admin.topic_counts(),
+            &admin.topic_bytes(),
+        );
 
         for bad in [
             get(addr, "/api/routes/history").await,
@@ -1808,6 +1889,7 @@ Authorization: Bearer {token}
             json!({"cdc.users": [[0, 0, 0, 0, 0], [0, 0, 4, 0, 0]],
                    "paid--orders-.t": [[1, 0, 0, 0, 0], [0, 2, 0, 0, 0]]})
         );
+        assert_eq!(v["topic_bytes"], json!({"cdc.users": [0, 640]}));
         assert_eq!(
             v["topic_totals"]["paid--orders-.t"],
             json!({"insert": 1, "update": 2, "delete": 0, "truncate": 0, "read": 0})
@@ -1822,7 +1904,8 @@ Authorization: Bearer {token}
             json!({"seq": 2, "routes": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
                    "route_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
                    "topics": {"cdc.users": 4, "paid--orders-.t": 2},
-                   "topic_ops": {"cdc.users": [0, 0, 4, 0, 0], "paid--orders-.t": [0, 2, 0, 0, 0]}})
+                   "topic_ops": {"cdc.users": [0, 0, 4, 0, 0], "paid--orders-.t": [0, 2, 0, 0, 0]},
+                   "topic_bytes": {"cdc.users": 640}})
         );
         // The stream's per-route totals carry the produced breakdown too.
         assert_eq!(m["routes"][0]["ops"]["insert"], 1);

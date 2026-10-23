@@ -2,6 +2,7 @@
 mod admin;
 mod checkpoint;
 mod config;
+mod kpis;
 mod rates;
 mod sink;
 

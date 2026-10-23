@@ -1,9 +1,10 @@
-//! Records the Kafka sink got acknowledged, per topic and operation. Shared (an `Arc`) between the
-//! sink, which counts after each produce is acknowledged, and the admin server, which samples the
-//! counts into the cockpit's per-topic rates and exports them to Prometheus.
+//! Records the Kafka sink got acknowledged, per topic and operation, and their bytes. Shared (an
+//! `Arc`) between the sink, which counts after each produce is acknowledged, and the admin server,
+//! which samples the counts into the cockpit's per-topic rates and bandwidth and exports them to
+//! Prometheus.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::OpCounts;
@@ -22,6 +23,8 @@ pub const OTHER_TOPICS: &str = "(other)";
 pub struct TopicStats {
     cap: usize,
     counts: Mutex<Counts>,
+    /// Key, value and header bytes of every acknowledged record, all topics together.
+    bytes: AtomicU64,
     warned: AtomicBool,
 }
 
@@ -29,6 +32,9 @@ pub struct TopicStats {
 struct Counts {
     named: BTreeMap<String, OpCounts>,
     other: OpCounts,
+    /// Bytes per topic, under the same names (a topic counts its bytes where it counts its records).
+    named_bytes: BTreeMap<String, u64>,
+    other_bytes: u64,
 }
 
 impl Default for TopicStats {
@@ -52,6 +58,7 @@ impl TopicStats {
         Self {
             cap,
             counts: Mutex::new(Counts::default()),
+            bytes: AtomicU64::new(0),
             warned: AtomicBool::new(false),
         }
     }
@@ -77,6 +84,36 @@ impl TopicStats {
                 );
             }
         }
+    }
+
+    /// The broker acknowledged records carrying `n` bytes of key, value and headers, produced to
+    /// `topic`. Same rule as [`Self::acked`], and called after it: only after the produce succeeded.
+    pub fn acked_bytes(&self, topic: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        let mut c = lock(&self.counts);
+        if c.named.contains_key(topic) {
+            *c.named_bytes.entry(topic.to_string()).or_default() += n;
+        } else {
+            c.other_bytes += n;
+        }
+    }
+
+    /// Bytes acknowledged per topic since start, named like [`Self::snapshot`].
+    pub fn bytes_snapshot(&self) -> BTreeMap<String, u64> {
+        let c = lock(&self.counts);
+        let mut out = c.named_bytes.clone();
+        if c.other_bytes > 0 {
+            out.insert(OTHER_TOPICS.to_string(), c.other_bytes);
+        }
+        out
+    }
+
+    /// Key, value and header bytes acknowledged since start, all topics together.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
     }
 
     /// Records acknowledged per topic and operation since start, plus [`OTHER_TOPICS`] once a
@@ -127,6 +164,21 @@ mod tests {
                 ("a".to_string(), 5),
                 ("b".to_string(), 6),
             ]
+        );
+    }
+
+    #[test]
+    fn counts_bytes_per_topic_where_it_counts_the_records() {
+        let s = TopicStats::with_cap(1);
+        s.acked("a", &ops("c", 1));
+        s.acked_bytes("a", 100);
+        s.acked("b", &ops("c", 1));
+        s.acked_bytes("b", 40);
+        s.acked_bytes("a", 0);
+        assert_eq!(s.bytes(), 140);
+        assert_eq!(
+            s.bytes_snapshot().into_iter().collect::<Vec<_>>(),
+            vec![(OTHER_TOPICS.to_string(), 40), ("a".to_string(), 100)]
         );
     }
 

@@ -256,7 +256,7 @@ impl Metrics {
             head_time_ms: AtomicU64::new(0),
             delivered_time_ms: AtomicU64::new(0),
             head_read_ms: AtomicU64::new(0),
-            lag_ring: Mutex::new(VecDeque::with_capacity(lag::LAG_WINDOW)),
+            lag_ring: Mutex::new(VecDeque::with_capacity(lag::LAG_HISTORY)),
         }
     }
 
@@ -326,7 +326,7 @@ impl Metrics {
     }
 
     /// Records one reading of the source positions; call once a second. Keeps
-    /// [`lag::LAG_WINDOW`] readings.
+    /// [`lag::LAG_HISTORY`] readings.
     pub fn sample_source_lag(&self) {
         let s = self.lag_sample();
         lag::push(&mut lock(&self.lag_ring), s);

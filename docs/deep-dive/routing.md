@@ -499,6 +499,7 @@ a failed batch the pipeline retries is counted once, when it is delivered. They 
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
 | `aqueduct_route_tombstones_skipped_total{route}` | Counter. Deletes a `tombstones = true` route produced without a tombstone because the row has no key. Not an outcome: the delete itself counts as `produced` |
 | `aqueduct_topic_records_total{topic}` | Counter. Records Kafka acknowledged per topic, counted after each produce succeeds (a failed produce counts when its batch is retried). Tombstones (null-value records) count like any other record. The first 500 topics are counted by name, any further ones under `topic="(other)"` (logged once) |
+| `aqueduct_kafka_bytes_total` | Counter. Key, value and header bytes of the records Kafka acknowledged, all topics together, counted like `aqueduct_topic_records_total` |
 
 `route` is the route's `name`, else its `match`; `default` is reserved and cannot be used as a name. Events no route
 claims are counted under `default` when `sink.topic` is set; without `sink.topic` such an event is an error that stops
