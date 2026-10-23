@@ -1374,16 +1374,22 @@ mod tests {
             );
         }
         for src in [DASHBOARD, SCRIPT] {
-            for h in [
-                " onclick=",
-                " onload=",
-                " onerror=",
-                " oninput=",
-                " onchange=",
-                " onsubmit=",
-                "javascript:",
-            ] {
-                assert!(!src.to_ascii_lowercase().contains(h), "inline handler {h}");
+            let lower = src.to_ascii_lowercase();
+            assert!(!lower.contains("javascript:"), "javascript: URL");
+            // An inline handler attribute: whitespace, `on`, letters, `=` (`onclick=`, `onmouseover=`, ...).
+            let b = lower.as_bytes();
+            for i in 1..b.len() {
+                if b[i - 1].is_ascii_whitespace() && b[i..].starts_with(b"on") {
+                    let name = b[i + 2..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_lowercase())
+                        .count();
+                    assert!(
+                        name == 0 || b.get(i + 2 + name) != Some(&b'='),
+                        "inline handler near {:?}",
+                        &lower[i..(i + 24).min(lower.len())]
+                    );
+                }
             }
         }
     }
