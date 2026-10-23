@@ -67,7 +67,7 @@ Delivery stays at-least-once across the switch: events after the last checkpoint
 Rolling back is the same procedure in the other direction. The state stays where it is.
 
 1. Stop the new image gracefully, as in step 4 above.
-2. If the previous build is older than #63, prepare the checkpoint first: see
+2. Postgres source only: if the previous build is older than #63, prepare the checkpoint first, see
    [Rolling back past #94 or #63](#rolling-back-past-94-or-63).
 3. Start the previous image, pinned by its digest, on **the same state volume** with **the same `slot`**.
 4. Check as in step 6 above.
@@ -81,6 +81,10 @@ Rolling back past any entry in `breaking/` undoes that entry too. For example, a
 event format, which every consumer reads. Check each entry between the previous build and this one.
 
 ### Rolling back past #94 or #63
+
+**Postgres sources only.** #94 and #63 do not change the MongoDB checkpoint, so never edit or delete it for a MongoDB
+source: that file holds the resume token, there is no slot behind it, and without it the stream starts at the current
+position and silently skips everything in between.
 
 **Rolling back past #94 brings back a data-loss bug.** Builds before #94 drop rows when transactions overlap, on
 multi-row `COPY` and on multi-table `TRUNCATE`. Do it only if you accept that, and after rolling forward again,
