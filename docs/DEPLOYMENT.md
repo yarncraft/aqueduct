@@ -72,15 +72,25 @@ Podman works too (`podman-compose up -d --build`); build with `--format docker` 
 
 ### Plain `docker run`
 
+Prebuilt images are on GitHub Packages, published by `.github/workflows/image.yml` (linux/amd64):
+
+| Tag | Built from |
+| --- | --- |
+| `ghcr.io/yarncraft/aqueduct:latest`, `:main` | the head of `main` |
+| `ghcr.io/yarncraft/aqueduct:sha-<short>` | that commit |
+| `ghcr.io/yarncraft/aqueduct:<version>`, `:<major>.<minor>` | a `v<version>` tag |
+
+Pin a `sha-` or version tag in production. To build locally instead, `docker build -t aqueduct .` and use `aqueduct`
+as the image name below.
+
 ```sh
-docker build -t aqueduct .
 docker run -d --name aqueduct --restart unless-stopped \
   -e AQUEDUCT_PG_URL='postgres://aqueduct:SECRET@db.internal:5432/app' \
   -e AQUEDUCT_ADMIN_TOKEN='long-random-string' \
   -v aqueduct-state:/var/lib/aqueduct \
   -v ./my-aqueduct.toml:/etc/aqueduct/aqueduct.toml:ro \
   -p 127.0.0.1:8080:8080 \
-  aqueduct
+  ghcr.io/yarncraft/aqueduct:latest
 ```
 
 ### Kubernetes (sketch)
