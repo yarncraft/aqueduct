@@ -33,31 +33,31 @@
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Throughput</div>
       <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="rate">0</span><span class="ml-1 text-xs text-ink-300">evt/s</span></div>
       <div class="mt-1 font-mono text-[11px] text-ink-300">now <span id="rate-now" class="text-ink-200">0</span> · peak (15 s avg) <span id="peak" class="text-ink-200">0</span> /s</div>
-      <div data-kpi="throughput" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block h-5 w-full" aria-hidden="true"></svg></div>
+      <div data-kpi="throughput" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Kafka bandwidth</div>
       <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="kbw">0</span><span class="ml-1 text-xs text-ink-300">MB/s</span></div>
       <div class="mt-1 truncate font-mono text-[11px] text-ink-300">now <span id="kbw-now" class="text-ink-200">0</span> · total <span id="kbw-total" class="text-ink-200">0</span> MB</div>
-      <div data-kpi="kafka_mb_per_sec" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block h-5 w-full" aria-hidden="true"></svg></div>
+      <div data-kpi="kafka_mb_per_sec" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">End-to-end lag</div>
       <div id="lag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div id="lagsub" class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
-      <div data-kpi="lag_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block h-5 w-full" aria-hidden="true"></svg></div>
+      <div data-kpi="lag_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
       <div id="sinkavg" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div id="sinkdet" class="mt-1 font-mono text-[11px] text-ink-300">mean per event</div>
-      <div data-kpi="sink_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block h-5 w-full" aria-hidden="true"></svg></div>
+      <div data-kpi="sink_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
       <div id="errors" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
       <div id="errsub" class="mt-1 font-mono text-[11px] text-ink-300">no faults</div>
-      <div data-kpi="errors" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block h-5 w-full" aria-hidden="true"></svg></div>
+      <div data-kpi="errors" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
   </section>
 
@@ -76,7 +76,7 @@
       <div class="bg-ink-800 p-4" title="Postgres: WAL bytes between the server's WAL head and the newest position delivered; time behind is the commit age of the newest delivered change while there is a backlog. MongoDB: cluster time between the server's newest majority-committed write and the newest delivered change. The line is the backlog over the window.">
         <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Backlog</div>
         <div id="bsbacklog" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-        <div class="mt-1 flex items-center gap-3 font-mono text-[11px] text-ink-300"><span id="bsbehind" class="truncate">–</span><svg id="bsspark" viewBox="0 0 120 24" preserveAspectRatio="none" class="ml-auto h-6 w-28 shrink-0" aria-hidden="true"></svg></div>
+        <div class="mt-1 flex items-center gap-3 font-mono text-[11px] text-ink-300"><span id="bsbehind" class="truncate">–</span><svg id="bsspark" viewBox="0 0 120 24" preserveAspectRatio="none" class="ml-auto w-28 shrink-0" style="height:36px" aria-hidden="true"></svg></div>
       </div>
       <div class="bg-ink-800 p-4" title="Source: how fast the server's head moves (WAL bytes per second, or seconds of cluster time per second). Delivered: how fast Aqueduct's delivered position moves. Both over the window.">
         <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Source vs delivered</div>
@@ -132,7 +132,7 @@
   <section id="routing" class="rounded-sm border border-ink-600 bg-ink-800">
     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-ink-600 px-4 py-2.5">
       <h2 class="text-[11px] font-semibold uppercase tracking-widest text-ink-200">Routing</h2>
-      <span id="routesum" class="font-mono text-[11px] text-ink-300">–</span>
+      <span id="oplegend" class="flex flex-wrap items-center gap-x-3 font-mono text-[11px] text-ink-300" title="The bar under each card: its events or records per operation since start"><span class="inline-flex items-center gap-1.5"><span class="h-1 w-3 rounded-sm bg-green"></span>insert</span><span class="inline-flex items-center gap-1.5"><span class="h-1 w-3 rounded-sm bg-blue"></span>update</span><span class="inline-flex items-center gap-1.5"><span class="h-1 w-3 rounded-sm bg-red"></span>delete</span><span class="inline-flex items-center gap-1.5"><span class="h-1 w-3 rounded-sm bg-violet"></span>truncate</span><span class="inline-flex items-center gap-1.5"><span class="h-1 w-3 rounded-sm bg-amber"></span>read</span></span>
       <span id="routewarn" hidden class="rounded-sm bg-amber/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-amber"></span>
       <span id="routenote" class="ml-auto truncate font-mono text-[11px] text-ink-500">first match wins</span>
     </div>

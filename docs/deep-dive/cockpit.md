@@ -190,7 +190,8 @@ table highlights its whole path, through its route to its topic. The plan is rea
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 **Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
-start, as shares (insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and
+start, as shares (insert green, update blue, delete red, truncate violet, read amber, as the legend next to the
+section title shows; hover a bar for the counts and
 percentages); every card, routes included, has a step line of its rate over the last 300 s (a route: one line, processed;
 its detail chart has four, processed, matched, fallback and errors). The bar counts:
 

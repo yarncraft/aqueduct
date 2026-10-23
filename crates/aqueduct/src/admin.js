@@ -542,8 +542,8 @@ function spark(lines, n = SPARK_N) {
     return `<polyline points="${stepPts(h, x, y)}" fill="none" stroke="${c}" stroke-width="${w}" vector-effect="non-scaling-stroke"/>`;
   }).join('');
 }
-const sparkSvg = (id, cls) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}" aria-hidden="true"></svg>`;
-const NODE_SPARK = 'mt-1 block h-4 w-full';
+const sparkSvg = (id, cls, style) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}"${style ? ` style="${style}"` : ''} aria-hidden="true"></svg>`;
+const NODE_SPARK = 'mt-1 block h-6 w-full';
 // A table's events per second, all ops.
 const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
 const opBar = id => `<div data-opbar="${esc(id)}" class="mt-1 py-0.5"><div class="flex h-1 overflow-hidden rounded-sm bg-ink-700"></div></div>`;
@@ -844,7 +844,7 @@ function routeNode(x, last) {
     + `</div>`
     // The metrics, each in the colour of its step line below.
     + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
-    + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
+    + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -1155,9 +1155,6 @@ function renderGraph(frame) {
     fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
   drawCardSparks(m);
-  const named = m.routes.filter(x => x.r.match != null).length;
-  const topics = m.groups.reduce((a, g) => a + g.topics.size, 0);
-  $('routesum').textContent = `${named} ${named === 1 ? 'route' : 'routes'}${m.routes.length > named ? ' + default' : ''} · ${m.routes.reduce((a, x) => a + x.tables.length, 0) + m.unrouted.length} tables · ${topics} ${topics === 1 ? 'topic' : 'topics'}`;
   const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);
   $('routewarn').hidden = !warn;
   $('routewarn').textContent = warn + (warn === 1 ? ' field never seen' : ' fields never seen');
