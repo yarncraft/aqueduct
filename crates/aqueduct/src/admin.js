@@ -20,8 +20,6 @@ const token = (() => {
   try { return sessionStorage.getItem('aqueduct_token'); } catch (_) { return null; }
 })();
 const authInit = extra => Object.assign({}, extra, token ? { headers: { Authorization: 'Bearer ' + token } } : {});
-const OPS = ['inserts', 'updates', 'deletes', 'truncates', 'reads'];
-const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet', reads: 'bg-amber' };
 const fmt = n => n.toLocaleString('en-US');
 const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
@@ -526,8 +524,6 @@ const rateStats = h => {
   const max = Math.max(0, ...h);
   return `now ${fmt(h.length ? h[h.length - 1] : 0)}/s · avg ${avg(h).toFixed(1)}/s · max ${fmt(max)}/s`;
 };
-// A card's op shares: one thin stacked bar (OPBAR colours), filled by fillOpBar on every frame. The wrapper's padding
-// is the hover area of its tooltip.
 // A card's step line over the last n samples, 300 s by default (right-aligned, so a short window starts mid-way).
 // lines: [[series, colour, width]], scaled together.
 const SPARK_N = 300;
@@ -541,13 +537,34 @@ function spark(lines, n = SPARK_N) {
   }).join('');
 }
 const sparkSvg = (id, cls, style) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}"${style ? ` style="${style}"` : ''} aria-hidden="true"></svg>`;
-const NODE_SPARK = 'mt-1 block h-6 w-full';
+// A table or topic card's bottom row: its step line and, beside it, a pie of its op shares.
+const NODE_SPARK_H = 'height:36px';
+const nodeLine = (id, pie = true) => pie
+  ? `<div class="mt-1 flex items-center gap-2">${sparkSvg(id, 'block min-w-0 flex-1', NODE_SPARK_H)}${opPie(id)}</div>`
+  : `<div class="mt-1">${sparkSvg(id, 'block w-full', NODE_SPARK_H)}</div>`;
 // A table's events per second, all ops.
 const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
-const opBar = id => `<div data-opbar="${esc(id)}" class="mt-1 py-0.5"><div class="flex h-1 overflow-hidden rounded-sm bg-ink-700"></div></div>`;
-function fillOpBar(el, row, what) {
+// A card's op shares since start as a pie (the legend's colours, clockwise from the top in OP_LABEL order), filled by
+// fillOpPie on every frame. The wrapper holds the tooltip.
+const OP_FILL = ['var(--color-green)', 'var(--color-blue)', 'var(--color-red)', 'var(--color-violet)', 'var(--color-amber)'];
+const opPie = id => `<span data-oppie="${esc(id)}" class="block shrink-0" style="width:28px;height:28px"><svg viewBox="-1 -1 2 2" class="block h-full w-full" aria-hidden="true"></svg></span>`;
+function pieSlices(row, total) {
+  if (!total) return '<circle r="1" fill="var(--color-ink-700)"/>';
+  let a = 0, out = '';
+  row.forEach((n, i) => {
+    if (!n) return;
+    const share = n / total;
+    if (share >= 1) { out += `<circle r="1" fill="${OP_FILL[i]}"/>`; return; }
+    const pt = t => `${Math.sin(2 * Math.PI * t).toFixed(4)} ${(-Math.cos(2 * Math.PI * t)).toFixed(4)}`;
+    out += `<path d="M0 0L${pt(a)}A1 1 0 ${share > 0.5 ? 1 : 0} 1 ${pt(a + share)}Z" fill="${OP_FILL[i]}"/>`;
+    a += share;
+  });
+  return out;
+}
+function fillOpPie(el, row, what) {
   const total = row ? row.reduce((a, n) => a + n, 0) : 0;
-  el.firstChild.innerHTML = total ? row.map((n, i) => n ? `<div class="${OPBAR[OPS[i]]}" style="width:${100 * n / total}%"></div>` : '').join('') : '';
+  const svg = el.firstChild, html = pieSlices(row || NO_OPS, total);
+  if (svg.dataset.k !== html) { svg.dataset.k = html; svg.innerHTML = html; }
   el.title = !row ? 'no per-operation counts from this server'
     : !total ? 'no ' + what + ' yet'
     : what + ' by operation: ' + OP_LABEL.map((k, i) => `${k} ${fmt(row[i])} (${(100 * row[i] / total).toFixed(1)}%)`).join(' · ');
@@ -744,9 +761,9 @@ function dlqFor(x, name) {
   return t ? fillTopic(x.dlq, t.name) : x.dlq;
 }
 
-// Table, topic and "+N more" cards: name and count on one line, the op-share bar below.
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${opBar(t.id)}${sparkSvg(t.id, NODE_SPARK)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${id === 'pm:dlq' ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</button>`;
+// Table, topic and "+N more" cards: name and count on one line, the step line and op-share pie below.
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${nodeLine(t.id)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id, id !== 'pm:dlq')}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -855,7 +872,8 @@ function routeNode(x, last) {
       + sqlRow('PARTITIONED-BY', partitionClause(r))
       + `</div>`)
     // The metrics, each in the colour of its step line below.
-    + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
+    // Folded, the header's rule already divides them from the name.
+    + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
     + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
@@ -866,7 +884,7 @@ function topicNodeHtml(id, name, opts) {
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
   const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
   const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opts.dlq ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</div>`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${nodeLine(id, !opts.dlq)}</div>`;
 }
 
 function graphHtml(m) {
@@ -1180,9 +1198,9 @@ function renderGraph(frame) {
     if (v != null) el.textContent = v;
     if (el.dataset.v.endsWith(':errors')) el.classList.toggle('text-red', v != null && v !== '0');
   }
-  for (const el of document.querySelectorAll('#routing [data-opbar]')) {
-    const id = el.dataset.opbar;
-    fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
+  for (const el of document.querySelectorAll('#routing [data-oppie]')) {
+    const id = el.dataset.oppie;
+    fillOpPie(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
   drawCardSparks(m);
   const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);

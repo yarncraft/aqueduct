@@ -187,11 +187,11 @@ picks its topic per row (content routing) animates its lines to the topics it wr
 table highlights its whole path, through its route to its topic. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
-**Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
-start, as shares (insert green, update blue, delete red, truncate violet, read amber, as the legend next to the
-section title shows; hover a bar for the counts and
-percentages); every card, routes included, has a step line of its rate over the last 300 s (a route: one line, processed;
-its detail chart has four, processed, matched, fallback and errors). The bar counts:
+**Operation shares and rate.** Every card, routes included, has a step line of its rate over the last 300 s (a route:
+one line, processed; its detail chart has four, processed, matched, fallback and errors). Beside the line, each table
+and topic card has a small pie of its counts per operation since start, as shares, clockwise from the top (insert
+green, update blue, delete red, truncate violet, read amber, as the legend next to the section title shows; hover the
+pie for the counts and percentages). The pie counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
 - a topic (dead-letter topics have no bar, only their step line): records Kafka acknowledged, counted by the sink after the broker acknowledged
