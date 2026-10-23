@@ -108,6 +108,7 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
   [idle heartbeat](deep-dive/postgres-operations.md#idle-heartbeat), on by default.
 - **Decommissioning.** Drop the slot or it will keep WAL forever: `SELECT pg_drop_replication_slot('aqueduct');`
 - **Restarts and upgrades.** Stop the container, deploy the new image with the same volume, start. It resumes from the slot.
+  Before an upgrade, and to roll back, see [UPGRADING.md](UPGRADING.md).
   Do not delete the state volume; losing the checkpoint only causes replay (the slot still decides what is pending).
 - **Sink outages.** The pipeline stops on a sink failure and the container exits non-zero; `restart: unless-stopped`
   (or your orchestrator) brings it back and delivery resumes from the last acknowledged transaction.
