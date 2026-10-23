@@ -886,9 +886,34 @@ function graphPath(m, node) {
   return on.size > 1 ? on : null;
 }
 
+// The edge layers are redrawn every second; their elements are kept by key and only their attributes change, so the
+// flowing dots keep moving and a hovered card's labels do not blink.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const setAttrs = (el, attrs) => { for (const [k, v] of Object.entries(attrs)) if (el.getAttribute(k) !== String(v)) el.setAttribute(k, v); };
+// A keyed child list of `parent`: get(key, tag) finds or makes the child, done() drops the ones not asked for.
+function keyed(parent) {
+  const old = new Map([...parent.children].map(c => [c.dataset.k, c])), used = new Set();
+  return {
+    get(key, tag) {
+      used.add(key);
+      let el = old.get(key);
+      if (!el) { el = document.createElementNS(SVG_NS, tag); el.dataset.k = key; parent.appendChild(el); }
+      return el;
+    },
+    done() { for (const [k, el] of old) if (!used.has(k)) el.remove(); },
+  };
+}
+// Lines first, the flowing dots over them.
+function edgeLayers(svg) {
+  if (svg.children.length !== 2) svg.innerHTML = '<g></g><g></g>';
+  return [svg.children[0], svg.children[1]];
+}
+
 function drawEdges() {
   const m = graphModel, g = $('graph'), svg = $('graphedges');
   if (!m) { svg.innerHTML = $('graphlabels').innerHTML = ''; return; }
+  const [lineLayer, flowLayer] = edgeLayers(svg);
+  const lines = keyed(lineLayer), flows = keyed(flowLayer), texts = keyed($('graphlabels'));
   const box = g.getBoundingClientRect(), els = {};
   for (const el of g.querySelectorAll('[data-node]')) els[el.dataset.node] = el;
   const at = (id, right) => {
@@ -903,7 +928,6 @@ function drawEdges() {
   const size = e => m.bw ? e.bw : e.w;
   const max = Math.max(...m.edges.map(size), 0) || 1;
   const now = Date.now();
-  let out = '', labels = '';
   for (const e of m.edges) {
     const a = at(e.from, true), b = at(e.to, false);
     if (!a || !b) continue;
@@ -912,17 +936,22 @@ function drawEdges() {
     const on = !hl || hl.has(e.id);
     const width = size(e) > 0 ? 1.5 + 4.5 * Math.sqrt(size(e) / max) : 1;
     const color = e.dlq ? EDGE_RED : hl && on ? EDGE_HL : EDGE_BASE;
-    out += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width.toFixed(1)}" stroke-opacity="${on ? (e.dlq ? 0.7 : 1) : 0.15}"/>`;
+    setAttrs(lines.get(e.id, 'path'), { d, fill: 'none', stroke: color, 'stroke-width': width.toFixed(1), 'stroke-opacity': on ? (e.dlq ? 0.7 : 1) : 0.15 });
     // Recent traffic: a dotted line that flows (static when the viewer prefers reduced motion).
-    if ((flowUntil[e.id] || 0) > now) out += `<path d="${d}" fill="none" stroke="${e.dlq ? EDGE_RED : EDGE_FLOW}" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 10" stroke-opacity="${on ? 0.9 : 0.15}" class="motion-safe:animate-flow"/>`;
+    if ((flowUntil[e.id] || 0) > now) {
+      setAttrs(flows.get(e.id, 'path'), { d, fill: 'none', stroke: e.dlq ? EDGE_RED : EDGE_FLOW, 'stroke-width': 1.5, 'stroke-linecap': 'round',
+        'stroke-dasharray': '2 10', 'stroke-opacity': on ? 0.9 : 0.15, class: 'motion-safe:animate-flow' });
+    }
     // A hovered card's pathways carry their bandwidth at the curve's midpoint, in the gap between the columns, on a
     // layer above the cards. A server that counts no bytes gets no labels.
     if (hl && on && m.bw) {
-      labels += `<text x="${mx}" y="${((a[1] + b[1]) / 2).toFixed(1)}" dy="0.35em" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="${e.dlq ? EDGE_RED : TABLE_LINE}" stroke="var(--color-ink-900)" stroke-width="4" stroke-linejoin="round" paint-order="stroke">${bwText(e.bw)}</text>`;
+      const t = texts.get(e.id, 'text'), s = bwText(e.bw);
+      setAttrs(t, { x: mx, y: ((a[1] + b[1]) / 2).toFixed(1), dy: '0.35em', 'text-anchor': 'middle', 'font-family': 'var(--font-mono)', 'font-size': 10,
+        fill: e.dlq ? EDGE_RED : TABLE_LINE, stroke: 'var(--color-ink-900)', 'stroke-width': 4, 'stroke-linejoin': 'round', 'paint-order': 'stroke' });
+      if (t.textContent !== s) t.textContent = s;
     }
   }
-  svg.innerHTML = out;
-  $('graphlabels').innerHTML = labels;
+  lines.done(); flows.done(); texts.done();
 }
 
 // Marks the edges whose counts moved since the last frame as having recent traffic.
@@ -1222,12 +1251,20 @@ $('routedetail').addEventListener('click', ev => {
   const route = ev.target.closest('[data-route]');
   if (route) { graphSel = +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
+// Hover: a card lights up at once; the gap between two cards keeps the last one lit for a moment, so moving from card
+// to card does not fade every card in and out.
+const HOVER_GRACE_MS = 250;
+let hoverTimer = 0;
+function setHover(node) {
+  clearTimeout(hoverTimer);
+  if (node !== graphHover) { graphHover = node; drawEdges(); }
+}
 $('graph').addEventListener('pointerover', ev => {
   const n = ev.target.closest('[data-node]');
-  const node = n ? n.dataset.node : null;
-  if (node !== graphHover) { graphHover = node; drawEdges(); }
+  if (n) setHover(n.dataset.node);
+  else if (graphHover) { clearTimeout(hoverTimer); hoverTimer = setTimeout(() => setHover(null), HOVER_GRACE_MS); }
 });
-$('graph').addEventListener('pointerleave', () => { if (graphHover) { graphHover = null; drawEdges(); } });
+$('graph').addEventListener('pointerleave', () => setHover(null));
 new ResizeObserver(drawEdges).observe($('graph'));
 loadPlan();
 
