@@ -30,7 +30,7 @@ cargo test --workspace            # always run the whole workspace, not one crat
 docker compose up --build         # or: podman-compose up -d --build
 ```
 
-**CI is `.github/workflows/ci.yml`**: on Linux, on every PR and push to `main`: `cargo fmt --all --check`, clippy, `cargo test --workspace --locked`, `cargo audit`, `cargo deny check` (policy in `deny.toml`), `docker build`, and the integration suite for PRs that touch `aqueduct-core`, a source, the Kafka sink, `aqueduct-tls`, the binary, `Cargo.*` or the CI files. The Linux run is what shows a change works on the production platform; a Windows-only run does not count for review.
+**CI is `.github/workflows/ci.yml`**: on Linux, on every PR and push to `main`: `cargo fmt --all --check`, clippy, `cargo test --workspace --locked`, `cargo audit`, `cargo deny check` (policy in `deny.toml`), `docker build`, and the integration suite for PRs that touch `aqueduct-core`, a source, the Kafka sink, `aqueduct-tls`, the binary, `Cargo.*` or the CI files. **`.github/workflows/image.yml`** publishes the image to `ghcr.io/yarncraft/aqueduct` on every push to `main` (`:main`, `:latest`, `:sha-<short>`) and on `v*` tags (`:<version>`); on PRs that touch the `Dockerfile` it builds without pushing. The Linux run is what shows a change works on the production platform; a Windows-only run does not count for review.
 
 **While GitHub Actions is blocked on billing**, run the same checks on Linux yourself and paste the commands and their `test result` lines on the PR, for the exact head SHA you ask to have reviewed:
 

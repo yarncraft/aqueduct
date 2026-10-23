@@ -30,15 +30,17 @@ For live traffic, `docker-compose.sim.yml` runs a self-contained simulation; see
 
 ## Usage
 
+The image is published to GitHub Packages as `ghcr.io/yarncraft/aqueduct` (`:latest` tracks `main`; release tags
+`v*` also publish `:<version>`). To build it yourself instead, `docker build -t aqueduct .` and run `aqueduct`.
+
 ```sh
-docker build -t aqueduct .
 docker run -d --name aqueduct --restart unless-stopped \
   -e AQUEDUCT_PG_URL='postgres://aqueduct:SECRET@db.internal:5432/app' \
   -e AQUEDUCT_ADMIN_TOKEN="$(openssl rand -hex 32)" \
   -v aqueduct-state:/var/lib/aqueduct \
   -v ./aqueduct.toml:/etc/aqueduct/aqueduct.toml:ro \
   -p 127.0.0.1:8080:8080 \
-  aqueduct
+  ghcr.io/yarncraft/aqueduct:latest
 ```
 
 A minimal `aqueduct.toml` (full example: [`config/aqueduct.example.toml`](config/aqueduct.example.toml)):
