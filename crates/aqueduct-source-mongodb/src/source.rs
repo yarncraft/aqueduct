@@ -903,6 +903,9 @@ pub(crate) fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
 impl Source for MongoSource {
     async fn start(&mut self, start: Option<Position>) -> Result<()> {
         self.cfg.validate().map_err(Error::Config)?;
+        if let Some(w) = self.cfg.transport_warning() {
+            tracing::warn!("{w}");
+        }
         let client = Client::with_uri_str(&self.cfg.uri).await.map_err(src_err)?;
         self.client = Some(client.clone());
         let (token, resume) = match &start {
