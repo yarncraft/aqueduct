@@ -63,7 +63,7 @@ itself. Clean up after every check, test run or image build, and say so in the P
   `podman container prune` or `podman volume prune`: they also delete stopped containers and their volumes that are not
   yours, such as the simulation's Postgres data after a machine restart. Remove containers and volumes by name instead.
   Never stop or remove containers or volumes you did not start.
-- Named cargo cache volumes (`aq-*-target`, registry) are caches: delete yours when the task is done. `scripts/ci-linux.sh` uses `aq-cargo-registry`, `aq-cargo-bin` and `aq-target`; remove them with `podman volume rm` when you finish (it removes its service containers and the `aq-certs` volume itself).
+- Named cargo cache volumes (`aq-*-target`, registry) are caches: delete yours when the task is done. `scripts/ci-linux.sh` uses `aq-cargo-registry`, `aq-cargo-bin` and one `aq-target-<checksum>` per checkout (`podman volume ls | grep aq-target`); remove yours with `podman volume rm` when you finish (it removes its service containers and the `aq-certs` volume itself).
 - Check `podman system df` after a batch of work; tens of GB reclaimable means something was left behind.
 - Agents you delegate to get the same rule in their prompt.
 

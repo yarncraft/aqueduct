@@ -21,13 +21,16 @@ for a in "$@"; do
 done
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
-echo "== $(git rev-parse HEAD) $(git diff --quiet && echo clean || echo 'DIRTY WORKTREE')"
+echo "== $(git rev-parse HEAD) $([ -z "$(git status --porcelain)" ] && echo clean || echo 'DIRTY WORKTREE')"
 src=$(cygpath -w "$here" 2>/dev/null || echo "$here")
+# One target volume per checkout: cargo compares mtimes, so a target shared between checkouts could
+# reuse another checkout's build outputs and report green for code it never compiled.
+target_vol=aq-target-$(printf %s "$here" | cksum | cut -d' ' -f1)
 
 env_args=()
 if [ $integration = 1 ]; then
   certs=$(mktemp -d)
-  trap 'CT=$CT bash scripts/ci-integration-services.sh down "$certs"' EXIT
+  trap 'CT=$CT bash scripts/ci-integration-services.sh down "$certs"; rm -rf "$certs"' EXIT
   CT=$CT bash scripts/ci-integration-services.sh up "$certs"
   # The test container shares the host network so the published service ports are on its localhost.
   # It reads the variables from services.env; the cert paths are the /certs mount, set last so they win.
@@ -39,7 +42,7 @@ fi
 # Cargo state and the target dir live in named volumes: a bind-mounted target is very slow on a
 # Windows host, and the volumes make a re-run incremental.
 $CT run --rm "${env_args[@]}" -v "$src":/src -v aq-cargo-registry:/usr/local/cargo/registry \
-  -v aq-cargo-bin:/usr/local/cargo/bin-extra -v aq-target:/src/target -w /src \
+  -v aq-cargo-bin:/usr/local/cargo/bin-extra -v "$target_vol":/src/target -w /src \
   -e CARGO_TARGET_DIR=/src/target -e "RUN_INTEGRATION=$integration" -e CARGO_TERM_COLOR=never \
   docker.io/library/rust:1 bash -ec '
     export PATH=/usr/local/cargo/bin-extra/bin:$PATH
