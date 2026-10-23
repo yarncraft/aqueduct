@@ -67,8 +67,7 @@ Once a second the admin server takes a sample of both; the card is derived from 
   to it, so a snapshot that makes the stream fall behind shows.
 
 The **End-to-end lag** tile reads `idle` when the status is caught up and nothing was delivered for 10 s, instead of
-counting the idle time up. The Kafka HWM in a table's detail panel is sink-side (what reached Kafka); it does not say whether
-Aqueduct is behind the source.
+counting the idle time up.
 
 `/api/metrics` and `/api/stream` carry the card as `source_lag`, plus `source_head_lsn` (Postgres, `X/Y`) and
 `source_head_time_ms` (MongoDB):
@@ -110,22 +109,17 @@ since the process started (nothing Kafka-side):
 | Last commit | How long ago that change committed. Amber when the table is more than 1 minute behind the freshest table, red past 10 minutes; only while the pipeline is streaming. Measured against the freshest table rather than the clock, so a database that is idle as a whole is not flagged; a table that is simply written rarely is |
 | Delivered | How long ago the sink acknowledged it |
 
-The panel also shows the last checkpointed position, which is global, not per table. While a snapshot runs it is the
-stream position followed by `(snapshot: <table> <i>/<n>)`; the snapshot cursor (the last chunk's primary-key values)
-stays in the checkpoint file and is never shown. Pipeline numbers refresh every second
-with the stream.
+Pipeline numbers refresh every second with the stream. The panel shows no checkpoint (it is global, not per table;
+`/api/tables` carries it as `checkpoint`), and a topic's panel shows no Kafka offsets: they stay in the API only.
 
-The Kafka side is in a topic's detail panel (click the topic): its **Kafka HWM**, the sum over the topic's partitions
-of the next offset Kafka will assign, with each partition's offset, and when the offsets were read. Kafka offsets come
-from `GET /api/tables`, polled every 5 s: one offsets request per partition of
-the routed topics (no records are read), with the inspector's connection and TLS/SASL settings, shared across tabs
-for 5 s and abandoned after 3 s, so a Kafka outage leaves the offsets empty (the topic panel shows the reason) but never blocks the cockpit. Offsets need
-the inspector (`admin_token` and `inspector = true`); without it the panel says so. The routing graph also takes each
-table's topic from `/api/tables`.
+`GET /api/tables` is polled every 5 s; the routing graph takes each table's topic from it. It also reads each routed
+topic's Kafka offsets: one offsets request per partition (no records are read), with the inspector's connection and
+TLS/SASL settings, shared across tabs for 5 s and abandoned after 3 s, so a Kafka outage leaves the offsets empty but
+never blocks the cockpit. Offsets need the inspector (`admin_token` and `inspector = true`).
 
 Events and Delivered count every event the source delivered for the table, including events a route filtered
 (`where`) or sent to the dead-letter topic. A table whose events are all filtered therefore shows events and
-recent deliveries while its topic's Kafka HWM does not move; the per-route counts in `/api/routes` show why.
+recent deliveries while its topic's offsets in `/api/tables` do not move; the per-route counts in `/api/routes` show why.
 A table whose route picks the topic per event (`{op}` or a row field in `topic`) has no single topic to read
 offsets from: in `/api/tables` its topic is the template and `kafka` is null with `content-routed (see Routing)`.
 
@@ -169,6 +163,10 @@ The **Routing** card shows where each table's events go:
   filtered: the `where` held; a row the `where` could not evaluate also counts here, and under errors), **fallback**
   (violet, sent to `topic_fallback`) and **errors** (red, sent to the dead-letter topic). Produced is in the panel. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
+
+  With more than 3 rules (`[[sink.routes]]`; `default` does not count), **Collapse rules** in the card's header folds
+  every route card to its name, metrics and line, without the five rows; **Expand rules** brings them back. The
+  browser remembers the choice.
 - **Topics** (right): only real topics, never a template: the topics a template rendered for the tables seen, and
   under **dead letter**, in red, one card per distinct dead-letter topic that has received events (a
   `{schema}`/`{table}` dead-letter template shows the dead-letter topics it rendered), with the errors of the routes
