@@ -1344,6 +1344,9 @@ impl PostgresSource {
                     if self.is_watermark_table(&name) {
                         continue;
                     }
+                    let new = cache
+                        .fill_unchanged(relation, new, old.as_ref())
+                        .map_err(dec)?;
                     let id = table_id(&name.0, &name.1);
                     let pk = self.pks.get(&id).map(Vec::as_slice);
                     let row_key = cache

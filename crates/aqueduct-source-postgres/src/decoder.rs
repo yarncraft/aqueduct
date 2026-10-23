@@ -403,6 +403,29 @@ impl RelationCache {
             .collect())
     }
 
+    /// Under `REPLICA IDENTITY FULL` the old tuple of an update carries every column, TOASTed ones
+    /// included, so a column the new tuple left as [`Datum::Unchanged`] is filled from it and the
+    /// event's `after` is a complete row. Other identities send only the key in the old tuple (the
+    /// rest is NULL), so `new` is returned as is.
+    pub fn fill_unchanged(
+        &self,
+        id: u32,
+        new: Tuple,
+        old: Option<&Tuple>,
+    ) -> Result<Tuple, DecodeError> {
+        let Some(old) = old.filter(|_| self.get(id).is_ok_and(Relation::identity_full)) else {
+            return Ok(new);
+        };
+        Ok(new
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| match (&d, old.get(i)) {
+                (Datum::Unchanged, Some(o)) if !matches!(o, Datum::Unchanged) => o.clone(),
+                _ => d,
+            })
+            .collect())
+    }
+
     /// The row's key as a JSON object `{"column": value, ...}` (Debezium's record key), values
     /// encoded as in [`row`](Self::row): the primary-key columns `pk` (from the catalog), or, when
     /// those are unknown or not all in the tuple, the replica-identity columns pgoutput flags
@@ -926,6 +949,35 @@ mod tests {
             insert_key
         );
         assert_eq!(cache.key_with_old(42, &new, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn full_identity_fills_unchanged_toast_from_the_old_tuple() {
+        let Message::Relation(rel) = decode(&relation_bytes_with(b'f')).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let new = vec![Datum::Text("5".into()), Datum::Unchanged];
+        let old = vec![Datum::Text("5".into()), Datum::Text("big".into())];
+        let filled = cache.fill_unchanged(42, new, Some(&old)).unwrap();
+        assert_eq!(filled, old);
+        assert!(cache.unchanged(42, &filled).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_full_identity_does_not_fill_from_a_key_only_old_tuple() {
+        let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
+            panic!()
+        };
+        let mut cache = RelationCache::default();
+        cache.insert(rel);
+        let new = vec![Datum::Text("5".into()), Datum::Unchanged];
+        let old = vec![Datum::Text("5".into()), Datum::Null];
+        assert_eq!(
+            cache.fill_unchanged(42, new.clone(), Some(&old)).unwrap(),
+            new
+        );
     }
 
     #[test]
