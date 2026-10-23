@@ -93,7 +93,8 @@ jobs:
         run: scripts/ci-integration-services.sh up "$RUNNER_TEMP/aqcerts"
       - name: Integration tests
         run: |
-          set -a; . "$RUNNER_TEMP/aqcerts/services.env"; set +a
+          # services.env is a KEY=VALUE env-file (MONGO_URI contains `&`), so export it line by line rather than sourcing it.
+          while IFS= read -r line; do export "$line"; done < "$RUNNER_TEMP/aqcerts/services.env"
           export AQUEDUCT_TEST_PG_REMOTE_HOST=$(hostname -I | cut -d" " -f1)
           cargo test --locked -p aqueduct-source-mongodb -p aqueduct-source-postgres -- --ignored
           cargo test --locked -p aqueduct-sinks --test kafka_it

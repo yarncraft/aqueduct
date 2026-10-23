@@ -7,7 +7,7 @@
 #
 # Every run gets its own id: container and volume names carry it and the published ports are free
 # ones, so several runs (several agents on one podman machine) never collide, and `down` cannot
-# remove another run's containers. `up` writes <dir>/services.env: source it for the test variables.
+# remove another run's containers. `up` writes <dir>/services.env: it is an env-file (values contain &), so export it line by line, do not `source` it.
 #
 # CT is the container CLI (docker by default, podman works too).
 set -euo pipefail
