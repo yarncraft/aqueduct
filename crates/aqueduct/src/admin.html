@@ -33,26 +33,31 @@
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Throughput</div>
       <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="rate">0</span><span class="ml-1 text-xs text-ink-300">evt/s</span></div>
       <div class="mt-1 font-mono text-[11px] text-ink-300">now <span id="rate-now" class="text-ink-200">0</span> · peak (15 s avg) <span id="peak" class="text-ink-200">0</span> /s</div>
+      <div data-kpi="throughput" class="mt-2"><svg viewBox="0 0 1440 24" preserveAspectRatio="none" class="block h-6 w-full" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Events delivered</div>
       <div id="total" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
       <div class="mt-1 truncate font-mono text-[11px] text-ink-300">LSN <span id="lsn" class="text-ink-200">–</span></div>
+      <div data-kpi="delivered" class="mt-2"><svg viewBox="0 0 1440 24" preserveAspectRatio="none" class="block h-6 w-full" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">End-to-end lag</div>
       <div id="lag" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div id="lagsub" class="mt-1 font-mono text-[11px] text-ink-300">commit → delivered</div>
+      <div data-kpi="lag_ms" class="mt-2"><svg viewBox="0 0 1440 24" preserveAspectRatio="none" class="block h-6 w-full" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
       <div id="sinkavg" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
       <div id="sinkdet" class="mt-1 font-mono text-[11px] text-ink-300">mean per event</div>
+      <div data-kpi="sink_ms" class="mt-2"><svg viewBox="0 0 1440 24" preserveAspectRatio="none" class="block h-6 w-full" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
       <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
       <div id="errors" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
       <div id="errsub" class="mt-1 font-mono text-[11px] text-ink-300">no faults</div>
+      <div data-kpi="errors" class="mt-2"><svg viewBox="0 0 1440 24" preserveAspectRatio="none" class="block h-6 w-full" aria-hidden="true"></svg></div>
     </div>
   </section>
 

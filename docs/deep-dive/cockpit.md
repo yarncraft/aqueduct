@@ -279,3 +279,30 @@ when unset.
 `routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "ops", "unseen_fields"}]`.
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
+
+## Top tiles: the day
+
+Under each top tile a line shows that tile's last 24 h, one point per wall-clock minute: the mean of the
+once-a-second samples in it. Hover a line for this minute, the day's low and high, and when the line starts.
+
+| Tile | Each minute is |
+| --- | --- |
+| Throughput | events delivered per second |
+| Events delivered | the delivered counter |
+| End-to-end lag | commit to delivery, over the seconds the tile shows a lag (not while it reads `idle`) |
+| Sink latency | sink time per event delivered in that minute |
+| Errors | the error counter |
+
+A minute without a value (no lag shown, nothing delivered) breaks the line. Throughput, lag and latency scale
+from 0; the two counters from their lowest value of the day. The server keeps the minutes in memory
+(1440 minutes of five numbers), so the line is full when the page opens but starts over when Aqueduct restarts;
+minutes the sampler missed (a suspended host) stay empty. The page reloads `GET /api/kpis/history` 2 s after
+each minute closes:
+
+```json
+{"interval_ms": 60000, "len": 1440, "start_ms": 1792778760000,
+ "throughput": [14.8, 15.2], "delivered": [412.5, 1323.0], "lag_ms": [431.0, null],
+ "sink_ms": [3.1, 2.9], "errors": [0.0, 0.0]}
+```
+
+Every series is oldest first and ends with the minute in progress; `start_ms` is when the first one began.

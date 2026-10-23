@@ -159,6 +159,51 @@ function renderBehind(d) {
   }
 }
 
+// ---- The top tiles' day: one mean per minute over the last 24 h, kept by the server (/api/kpis/history) and
+// reloaded every minute; the newest point is the minute in progress. The line spans the whole day, right-aligned, so a younger process draws only its right part.
+// A minute without a value (no lag shown, nothing delivered) breaks the line. Rates and latencies scale from 0;
+// the two counters scale from their lowest value of the day, or they would look flat.
+const KPI_POLL_MS = 60000;
+const KPI = {
+  throughput: { name: 'Throughput', line: '#4c90f0', f: v => fmt(Math.round(v)) + ' evt/s' },
+  delivered: { name: 'Events delivered', line: '#4c90f0', f: v => fmt(Math.round(v)), counter: true },
+  lag_ms: { name: 'End-to-end lag', line: '#ec9a3c', f: ms },
+  sink_ms: { name: 'Sink latency', line: '#ad7bee', f: ms },
+  errors: { name: 'Errors', line: '#e76a6e', f: v => fmt(Math.round(v)), counter: true },
+};
+const hhmm = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+let kpisOff = false;
+function drawKpi(el, k, w) {
+  const h = w[k] || [], c = KPI[k], svg = el.firstElementChild, vals = h.filter(v => v != null);
+  if (!vals.length) { svg.innerHTML = ''; el.title = c.name + ': no per-minute values yet'; return; }
+  const max = Math.max(...vals), min = Math.min(...vals), base = c.counter ? min : 0, span = max - base || 1;
+  const off = w.len - h.length, y = v => (23 - 22 * (v - base) / span).toFixed(1);
+  // Runs of consecutive minutes; a lone minute is drawn one minute wide so it still shows.
+  const runs = [[]];
+  h.forEach((v, i) => v == null ? runs.push([]) : runs[runs.length - 1].push([i + off, y(v)]));
+  svg.innerHTML = runs.filter(r => r.length).map(r => {
+    const pts = r.length > 1 ? r : [r[0], [r[0][0] + 1, r[0][1]]];
+    return `<polyline points="${pts.map(p => p.join(',')).join(' ')}" fill="none" stroke="${c.line}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  }).join('');
+  const now = h[h.length - 1];
+  el.title = `${c.name}, mean per minute since ${hhmm(w.start_ms)} (up to 24 h)\nthis minute ${now == null ? '–' : c.f(now)} · low ${c.f(min)} · high ${c.f(max)}`;
+}
+async function loadKpis() {
+  if (kpisOff) return;
+  try {
+    const r = await fetch('/api/kpis/history', authInit());
+    if (r.status === 401 || r.status === 403 || r.status === 404) { kpisOff = true; return; }
+    if (!r.ok) return;
+    const w = await r.json();
+    for (const el of document.querySelectorAll('[data-kpi]')) drawKpi(el, el.dataset.kpi, w);
+  } catch (_) { /* retried on the next poll */ }
+}
+// Reloaded 2 s after each minute closes, so the newest full minute shows promptly.
+(function kpiTick() {
+  loadKpis();
+  setTimeout(kpiTick, KPI_POLL_MS - Date.now() % KPI_POLL_MS + 2000);
+})();
+
 function render(d) {
   $('state-text').textContent = d.state;
   $('state-dot').className = DOT_BASE + (STATE_DOT[d.state] || 'bg-ink-300');
