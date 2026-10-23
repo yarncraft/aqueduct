@@ -289,6 +289,11 @@ pub struct KafkaConfig {
     /// primary-key values, spreading a table over partitions with per-row ordering.
     #[serde(default)]
     pub partition_by: Option<String>,
+    /// `produce` (default): the Kafka record timestamp is the time Aqueduct produced it, so a
+    /// backlog after a long outage is not deleted by `retention.ms`. `commit`: the source commit
+    /// time (the commit time is always in the envelope's `source.ts_ms`).
+    #[serde(default)]
+    pub record_timestamp: Option<String>,
     #[serde(default)]
     pub routes: Vec<KafkaRouteConfig>,
     /// Where events go that a route cannot evaluate (a type error in `where`), for every route

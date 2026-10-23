@@ -23,7 +23,7 @@ pub struct InspectedEvent {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
-    /// Kafka record timestamp (the source commit time), Unix ms.
+    /// Kafka record timestamp (the produce time; the commit time with `record_timestamp = "commit"`), Unix ms.
     pub timestamp_ms: i64,
     pub key: Option<String>,
     /// The record value parsed as JSON, or the raw text if it is not JSON. Usually the change

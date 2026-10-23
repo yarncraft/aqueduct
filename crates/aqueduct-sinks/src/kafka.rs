@@ -124,6 +124,34 @@ impl PartitionBy {
     }
 }
 
+/// What a record's Kafka timestamp is. With the default `CreateTime` topic setting, a record whose
+/// timestamp is older than `retention.ms` can be deleted within minutes of being written, so a
+/// backlog replayed after a long outage must not carry its (old) commit times.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordTimestamp {
+    /// When the sink produced the record, as Debezium does. The commit time stays in the
+    /// envelope's `source.ts_ms` and `source.ts_us`.
+    #[default]
+    Produce,
+    /// The source commit time. After an outage longer than the topic's `retention.ms`, set the
+    /// topic's `message.timestamp.type` to `LogAppendTime`, or retention may delete the backlog
+    /// before a consumer reads it.
+    Commit,
+}
+
+impl std::str::FromStr for RecordTimestamp {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "produce" => Ok(Self::Produce),
+            "commit" => Ok(Self::Commit),
+            o => Err(format!(
+                "unknown record_timestamp `{o}` (expected produce or commit)"
+            )),
+        }
+    }
+}
+
 /// `*` matches any run of characters (including none and dots); everything else is literal.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
@@ -272,6 +300,7 @@ pub struct KafkaSink {
     create_attempts: AtomicU64,
     /// Records acknowledged per topic, shared with the admin server.
     topic_stats: Arc<TopicStats>,
+    record_timestamp: RecordTimestamp,
 }
 
 fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
@@ -302,6 +331,7 @@ impl KafkaSink {
             topics: HashMap::new(),
             create_attempts: AtomicU64::new(0),
             topic_stats: Arc::new(TopicStats::new()),
+            record_timestamp: RecordTimestamp::default(),
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
         // default like `cdc.{table}` only resolves per event, so it opens on first use).
@@ -365,6 +395,12 @@ impl KafkaSink {
     /// Choose how records are partitioned (default: by key).
     pub fn with_partition_by(mut self, by: PartitionBy) -> Self {
         self.plan.set_partition_by(by);
+        self
+    }
+
+    /// Choose the Kafka record timestamp (default: the produce time).
+    pub fn with_record_timestamp(mut self, stamp: RecordTimestamp) -> Self {
+        self.record_timestamp = stamp;
         self
     }
 
@@ -505,15 +541,19 @@ pub(crate) fn partition_input(event: &ChangeEvent, key: &str, by: PartitionBy) -
     }
 }
 
-fn record(out: OutRecord) -> Record {
+fn record(out: OutRecord, stamp: RecordTimestamp, now: chrono::DateTime<chrono::Utc>) -> Record {
     let mut headers = BTreeMap::new();
     headers.insert("op".to_string(), out.op.as_bytes().to_vec());
     headers.insert("lsn".to_string(), out.lsn.into_bytes());
     for (name, value) in out.headers {
         headers.insert(name.to_string(), value.into_bytes());
     }
-    let timestamp = chrono::DateTime::from_timestamp_micros(out.commit_ts_micros)
-        .unwrap_or_else(chrono::Utc::now);
+    let timestamp = match stamp {
+        RecordTimestamp::Produce => now,
+        RecordTimestamp::Commit => {
+            chrono::DateTime::from_timestamp_micros(out.commit_ts_micros).unwrap_or(now)
+        }
+    };
     Record {
         key: Some(out.key.into_bytes()),
         // `None`: a tombstone (`tombstones = true`, or a row-format delete).
@@ -612,7 +652,8 @@ impl Sink for KafkaSink {
         // Per destination partition: the records, and how many of them carry each op.
         let mut groups: HashMap<(String, usize), (Vec<Record>, OpCounts)> = HashMap::new();
         let mut rendered = Vec::new();
-        let now_us = chrono::Utc::now().timestamp_micros();
+        let now = chrono::Utc::now();
+        let now_us = now.timestamp_micros();
         for event in deliverable(events) {
             rendered.clear();
             self.plan.render_into(event, now_us, &mut rendered)?;
@@ -642,7 +683,7 @@ impl Sink for KafkaSink {
                 let group = groups.entry((out.topic.clone(), part)).or_default();
                 // A tombstone carries its delete's op, so it counts under `delete`.
                 group.1.add(out.op, 1);
-                group.0.push(record(out));
+                group.0.push(record(out, self.record_timestamp, now));
             }
         }
         let stats = &*self.topic_stats;
@@ -896,11 +937,23 @@ mod tests {
         SourceInfo::Postgres { db: "app".into() }
     }
 
+    fn produced_by(plan: &RoutePlan, e: &ChangeEvent) -> Record {
+        record(
+            plan.render(e, 0).unwrap().remove(0),
+            RecordTimestamp::default(),
+            chrono::Utc::now(),
+        )
+    }
+
     /// The record the sink builds for `e` with a one-topic plan.
     fn produced(e: &ChangeEvent) -> Record {
         let mut plan = RoutePlan::new(vec![], Some("t".into())).unwrap();
         plan.set_source(pg());
-        record(plan.render(e, 0).unwrap().remove(0))
+        record(
+            plan.render(e, 0).unwrap().remove(0),
+            RecordTimestamp::Commit,
+            chrono::Utc::now(),
+        )
     }
 
     #[test]
@@ -912,6 +965,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(r.value.as_ref().unwrap()).unwrap();
         assert_eq!(v["op"], "r");
         assert_eq!(v["source"]["snapshot"], "incremental");
+    }
+
+    /// #213: a backlog's commit times are old; the default stamps the produce time so retention
+    /// cannot delete the records the moment they are written.
+    #[test]
+    fn the_record_timestamp_is_the_produce_time_unless_commit_is_chosen() {
+        let mut e = crate::sample();
+        e.commit_ts_micros = 1_700_000_000_000_000;
+        let out = || {
+            let mut plan = RoutePlan::new(vec![], Some("t".into())).unwrap();
+            plan.set_source(pg());
+            plan.render(&e, 0).unwrap().remove(0)
+        };
+        let now = chrono::DateTime::from_timestamp_micros(1_792_000_000_000_000).unwrap();
+        assert_eq!(
+            record(out(), RecordTimestamp::default(), now).timestamp,
+            now
+        );
+        let commit = record(out(), RecordTimestamp::Commit, now).timestamp;
+        assert_eq!(commit.timestamp_micros(), 1_700_000_000_000_000);
+        assert_eq!("produce".parse(), Ok(RecordTimestamp::Produce));
+        assert_eq!("Commit".parse(), Ok(RecordTimestamp::Commit));
+        assert!("x".parse::<RecordTimestamp>().is_err());
     }
 
     #[test]
@@ -937,7 +1013,7 @@ mod tests {
         };
         let mut plan = RoutePlan::with_dead_letter(vec![route], None, Some("dlq".into())).unwrap();
         plan.set_source(pg());
-        let r = record(plan.render(&crate::sample(), 0).unwrap().remove(0));
+        let r = produced_by(&plan, &crate::sample());
         assert_eq!(
             r.headers["aqueduct-error"],
             b"route `public.*`: where `row.name > 1`: type error: `row.name` is not a finite number"

@@ -967,3 +967,70 @@ async fn tombstones_follow_their_delete_and_row_format_values_are_the_row() {
     assert_eq!(seen.events.len(), 40);
     assert!(seen.events.iter().all(|e| e.event["id"].is_number()));
 }
+
+/// The timestamps the broker stored for every record of a one-partition `topic`.
+async fn stored_timestamps(brokers: Vec<String>, topic: &str) -> Vec<i64> {
+    let client = ClientBuilder::new(brokers).build().await.unwrap();
+    let pc = client
+        .partition_client(topic, 0, UnknownTopicHandling::Error)
+        .await
+        .unwrap();
+    let end = pc.get_offset(OffsetAt::Latest).await.unwrap();
+    let (recs, _hw) = pc.fetch_records(0, 1..1_000_000, 1_000).await.unwrap();
+    assert_eq!(recs.len() as i64, end);
+    recs.into_iter()
+        .map(|r| r.record.timestamp.timestamp_millis())
+        .collect()
+}
+
+/// #213: events from a backlog carry old commit times. By default the record timestamp is the
+/// produce time, so time-based retention cannot delete the backlog right after it is written;
+/// `record_timestamp = "commit"` keeps the commit time.
+#[tokio::test]
+async fn a_backlog_is_stamped_with_the_produce_time_not_its_old_commit_time() {
+    let Ok(brokers) = std::env::var("AQUEDUCT_KAFKA_BROKERS") else {
+        eprintln!("AQUEDUCT_KAFKA_BROKERS not set; skipping");
+        return;
+    };
+    let brokers: Vec<String> = brokers.split(',').map(str::to_owned).collect();
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let old_ms = 1_700_000_000_000; // `ev` commits in Nov 2023
+    for (stamp, expect_old) in [
+        (None, false),
+        (Some(aqueduct_sinks::RecordTimestamp::Produce), false),
+        (Some(aqueduct_sinks::RecordTimestamp::Commit), true),
+    ] {
+        let topic = unique("aqueduct-it-ts");
+        let plan = RoutePlan::new(vec![], Some(topic.clone())).unwrap();
+        let mut sink =
+            KafkaSink::connect(brokers.clone(), plan, 1, None, &KafkaSecurity::default())
+                .await
+                .unwrap();
+        if let Some(s) = stamp {
+            sink = sink.with_record_timestamp(s);
+        }
+        let before = now_ms();
+        sink.send_batch(&[ev(1, "users"), ev(2, "users")])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        let after = now_ms();
+        let stored = stored_timestamps(brokers.clone(), &topic).await;
+        assert_eq!(stored.len(), 2, "{stamp:?}");
+        for t in stored {
+            if expect_old {
+                assert_eq!(t, old_ms, "{stamp:?}: the commit time");
+            } else {
+                assert!(
+                    (before - 5_000..=after + 5_000).contains(&t),
+                    "{stamp:?}: {t} is not the produce time ({before}..{after})"
+                );
+            }
+        }
+    }
+}
