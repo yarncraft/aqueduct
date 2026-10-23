@@ -118,3 +118,83 @@ async fn unsent_toast_key_column_keeps_the_insert_key() {
     .await
     .unwrap();
 }
+
+/// Under `REPLICA IDENTITY FULL` the old tuple carries the TOASTed value, so an update that leaves
+/// the column alone must still emit it in `after` (#89).
+#[tokio::test]
+#[ignore = "needs a Postgres server, see the module docs"]
+async fn full_identity_update_fills_unchanged_toast_column() {
+    let url = format!("postgres://postgres:aq@{}/postgres", addr());
+    let (db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let id = format!("{}_{}", std::process::id(), nanos % 1_000_000_000);
+    let table = format!("toast_full_{id}");
+    let publication = format!("aq_toastf_pub_{id}");
+    let slot = format!("aq_toastf_{id}");
+
+    db.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, big text NOT NULL, v text NOT NULL);
+         ALTER TABLE {table} ALTER COLUMN big SET STORAGE EXTERNAL;
+         ALTER TABLE {table} REPLICA IDENTITY FULL;
+         CREATE PUBLICATION {publication} FOR TABLE {table};"
+    ))
+    .await
+    .unwrap();
+
+    let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
+    cfg.ssl_mode = Some(SslMode::Disable);
+    cfg.poll_interval = Duration::from_millis(100);
+    cfg.transport = common::transport();
+    let mut s = PostgresSource::new(cfg);
+    s.start(None).await.unwrap();
+
+    let big = "b".repeat(4000);
+    db.execute(
+        &format!("INSERT INTO {table} (id, big, v) VALUES (1, $1, 'one')"),
+        &[&big],
+    )
+    .await
+    .unwrap();
+    db.execute(&format!("UPDATE {table} SET v = 'two'"), &[])
+        .await
+        .unwrap();
+
+    assert_eq!(next_event(&mut s).await.op, Op::Insert);
+    let update = next_event(&mut s).await;
+    assert_eq!(update.op, Op::Update);
+    let after: serde_json::Value =
+        serde_json::from_str(update.after.as_ref().expect("update has after").get()).unwrap();
+    assert_eq!(after["v"], "two");
+    assert_eq!(
+        after["big"], big,
+        "the unchanged TOAST column must be filled from the old row"
+    );
+
+    // Dropping the source does not close its connection at once, so the slot can still be
+    // active (55006) for a moment; retry instead of failing the test.
+    drop(s);
+    let mut tries = 0;
+    loop {
+        match db
+            .execute("SELECT pg_drop_replication_slot($1::text)", &[&slot])
+            .await
+        {
+            Ok(_) => break,
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("dropping slot {slot}: {e}"),
+        }
+    }
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table};"
+    ))
+    .await
+    .unwrap();
+}
