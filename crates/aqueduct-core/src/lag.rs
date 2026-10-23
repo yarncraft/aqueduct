@@ -4,7 +4,7 @@
 //! A source reports two raw positions to [`crate::Metrics`]: the head (the newest position the
 //! server has; Postgres: the WAL head LSN, MongoDB: the newest cluster time) and the delivered
 //! position (the newest position Aqueduct has delivered, or verified there is nothing left
-//! below). Once a second the admin sampler pushes both into a ring of [`LAG_WINDOW`] samples;
+//! below). Once a second the admin sampler pushes both into a ring of [`LAG_HISTORY`] samples;
 //! everything else is derived from that ring here, so the memory is bounded.
 
 use std::collections::VecDeque;
@@ -13,8 +13,12 @@ use serde::Serialize;
 
 use crate::SnapshotStatus;
 
-/// Samples kept, one per second: the window the rates and the sparkline cover.
+/// The newest samples, one per second, the rates and the state are derived from.
 pub const LAG_WINDOW: usize = 60;
+
+/// Samples kept, one per second: the window the sparkline covers, the same as the cockpit's
+/// other cards.
+pub const LAG_HISTORY: usize = 300;
 
 /// Postgres is caught up while at most this much WAL is left. Never exactly 0: heartbeat
 /// writes, `pg_current_wal_lsn` running ahead of the flushed WAL and the batch in flight leave a
@@ -134,16 +138,16 @@ pub struct SourceLag {
     /// Seconds since the source's head was last read; `null` before the first read.
     pub head_age_secs: Option<f64>,
     pub threshold: LagThreshold,
-    /// The backlog once a second over the window, oldest first, at most [`LAG_WINDOW`] values:
+    /// The backlog once a second, oldest first, at most [`LAG_HISTORY`] values:
     /// bytes (Postgres) or ms (MongoDB).
     pub history: Vec<u64>,
     /// The running snapshot; `null` when none runs.
     pub snapshot: Option<SnapshotRate>,
 }
 
-/// Pushes `s` into `ring`, dropping the oldest beyond [`LAG_WINDOW`].
+/// Pushes `s` into `ring`, dropping the oldest beyond [`LAG_HISTORY`].
 pub(crate) fn push(ring: &mut VecDeque<Sample>, s: Sample) {
-    while ring.len() >= LAG_WINDOW {
+    while ring.len() >= LAG_HISTORY {
         ring.pop_front();
     }
     ring.push_back(s);
@@ -160,8 +164,10 @@ pub(crate) struct Context<'a> {
     pub max_rows_per_sec: Option<u64>,
 }
 
-/// Derives the card from `samples` (oldest first; the last one is the current reading).
-pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
+/// Derives the card from `samples` (oldest first; the last one is the current reading): the
+/// sparkline from all of them, everything else from the newest [`LAG_WINDOW`] and the reading.
+pub(crate) fn derive(all: &[Sample], cx: &Context<'_>) -> SourceLag {
+    let samples = &all[all.len().saturating_sub(LAG_WINDOW + 1)..];
     let snapshot = snapshot_rate(samples, cx);
     let cur = samples.last();
     let kind = cur.and_then(|c| c.kind);
@@ -264,7 +270,8 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         Kind::Lsn => ("bytes/s", 1.0),
         Kind::Time => ("s/s", 1000.0),
     };
-    let skip = win.len().saturating_sub(LAG_WINDOW);
+    let line: Vec<&Sample> = all.iter().filter(|s| s.kind == Some(kind)).collect();
+    let skip = line.len().saturating_sub(LAG_HISTORY);
     SourceLag {
         state,
         backlog_bytes: (kind == Kind::Lsn).then_some(b),
@@ -276,7 +283,7 @@ pub(crate) fn derive(samples: &[Sample], cx: &Context<'_>) -> SourceLag {
         window_secs: dt_ms as f64 / 1000.0,
         head_age_secs: head_age_ms.map(|a| a as f64 / 1000.0),
         threshold,
-        history: win.iter().skip(skip).map(|s| backlog(s)).collect(),
+        history: line.iter().skip(skip).map(|s| backlog(s)).collect(),
         snapshot,
     }
 }
@@ -475,9 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn the_ring_keeps_one_window() {
+    fn the_ring_keeps_the_sparkline_and_rates_use_the_newest_minute() {
         let mut ring = VecDeque::new();
-        for i in 0..(LAG_WINDOW as u64 * 3) {
+        for i in 0..(LAG_HISTORY as u64 * 3) {
             push(
                 &mut ring,
                 Sample {
@@ -490,14 +497,17 @@ mod tests {
                 },
             );
         }
-        assert_eq!(ring.len(), LAG_WINDOW);
-        assert_eq!(ring.front().unwrap().t_ms, (LAG_WINDOW as u64 * 2) * 1000);
+        assert_eq!(ring.len(), LAG_HISTORY);
+        assert_eq!(ring.front().unwrap().t_ms, (LAG_HISTORY as u64 * 2) * 1000);
         // The ring plus the current reading: the sparkline still has one window.
         let mut samples: Vec<Sample> = ring.into_iter().collect();
         let mut now = samples.last().unwrap().clone();
         now.t_ms += 500;
         samples.push(now);
-        assert_eq!(derive(&samples, &cx()).history.len(), LAG_WINDOW);
+        let lag = derive(&samples, &cx());
+        assert_eq!(lag.history.len(), LAG_HISTORY);
+        // The rates span the newest LAG_WINDOW samples and the reading half a second later.
+        assert_eq!(lag.window_secs, (LAG_WINDOW - 1) as f64 + 0.5);
     }
 
     fn running(rows: u64, estimated: Option<u64>) -> SnapshotStatus {

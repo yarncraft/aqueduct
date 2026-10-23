@@ -585,6 +585,13 @@ fn record_size(r: &Record) -> usize {
         + headers
 }
 
+/// The bytes `r` carries: key, value and header names and values (no batch framing), as the
+/// cockpit's Kafka bandwidth counts them.
+fn payload_size(r: &Record) -> u64 {
+    let headers: usize = r.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    (r.key.as_ref().map_or(0, Vec::len) + r.value.as_ref().map_or(0, Vec::len) + headers) as u64
+}
+
 /// Splits one partition's records, in order, into consecutive requests of at most `budget`
 /// estimated bytes each. A record above `budget` gets a request of its own.
 fn chunk_records(records: Vec<Record>, budget: usize) -> Vec<Vec<Record>> {
@@ -607,15 +614,18 @@ fn chunk_records(records: Vec<Record>, budget: usize) -> Vec<Vec<Record>> {
 }
 
 /// Awaits `produce` and, once the broker acknowledged it, counts its records (`ops`, per
-/// operation) for `topic`. A failed produce counts nothing: its batch is retried and counted then.
+/// operation) for `topic` and their `bytes`. A failed produce counts nothing: its batch is retried
+/// and counted then.
 async fn counted(
     stats: &TopicStats,
     topic: &str,
     ops: &OpCounts,
+    bytes: u64,
     produce: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     produce.await?;
     stats.acked(topic, ops);
+    stats.acked_bytes(topic, bytes);
     Ok(())
 }
 
@@ -690,6 +700,7 @@ impl Sink for KafkaSink {
         let sends = groups.into_iter().map(|((topic, part), (records, ops))| {
             let client = self.topics[&topic][part].clone();
             async move {
+                let bytes = records.iter().map(payload_size).sum();
                 let produce = async {
                     for chunk in chunk_records(records, MAX_REQUEST_BYTES) {
                         client
@@ -699,7 +710,7 @@ impl Sink for KafkaSink {
                     }
                     Ok(())
                 };
-                counted(stats, &topic, &ops, produce).await
+                counted(stats, &topic, &ops, bytes, produce).await
             }
         });
         futures::future::try_join_all(sends).await?;
@@ -821,6 +832,17 @@ mod tests {
     }
 
     #[test]
+    fn payload_size_counts_key_value_and_headers_only() {
+        // Key "12", 120 value bytes, header "op" = "c".
+        assert_eq!(payload_size(&rec(12)), 2 + 120 + 3);
+        let tombstone = Record {
+            value: None,
+            ..rec(7)
+        };
+        assert_eq!(payload_size(&tombstone), 1 + 3);
+    }
+
+    #[test]
     fn chunks_keep_order_and_stay_under_the_budget() {
         let records: Vec<Record> = (0..200).map(rec).collect();
         let total: usize = records.iter().map(record_size).sum();
@@ -870,18 +892,20 @@ mod tests {
             }
             o
         };
-        counted(&stats, "t", &ops(&[("c", 2), ("d", 1)]), async { Ok(()) })
-            .await
-            .unwrap();
-        let failed = counted(&stats, "t", &ops(&[("u", 5)]), async {
+        counted(&stats, "t", &ops(&[("c", 2), ("d", 1)]), 300, async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let failed = counted(&stats, "t", &ops(&[("u", 5)]), 500, async {
             Err(Error::Sink("kafka produce to t: broker down".into()))
         })
         .await;
         assert!(failed.is_err());
-        counted(&stats, "u", &OpCounts::default(), async { Ok(()) })
+        counted(&stats, "u", &OpCounts::default(), 0, async { Ok(()) })
             .await
             .unwrap();
-        let failed_new = counted(&stats, "v", &ops(&[("c", 2)]), async {
+        let failed_new = counted(&stats, "v", &ops(&[("c", 2)]), 200, async {
             Err(Error::Sink("x".into()))
         })
         .await;
@@ -890,6 +914,8 @@ mod tests {
             stats.snapshot().into_iter().collect::<Vec<_>>(),
             vec![("t".to_string(), ops(&[("c", 2), ("d", 1)]))]
         );
+        assert_eq!(stats.bytes(), 300, "failed produces send no counted bytes");
+        assert_eq!(stats.bytes_snapshot()["t"], 300);
     }
 
     #[test]

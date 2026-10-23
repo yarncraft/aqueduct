@@ -18,8 +18,8 @@ The recording uses the compose stack with generated demo rows.
 | `GET /readyz` | `200` while streaming, else `503` |
 | `GET /metrics` | Prometheus (`aqueduct_*` series) |
 | `GET /api/metrics`, `/api/stream` | JSON snapshot; Server-Sent Events, one per second |
-| `GET /api/routes`, `/api/routes/history` | Compiled route plan with live counts; the last 120 s of rates |
-| `GET /api/kpis/history` | The top tiles' per-minute means over the last 24 h |
+| `GET /api/routes`, `/api/routes/history` | Compiled route plan with live counts; the last 300 s of rates |
+| `GET /api/kpis/history` | The top tiles' last 300 s, one sample per second |
 | `GET /api/tables` | Per-table high-water marks and topic offsets |
 | `GET /api/events?topic=<t>&limit=<n>` | Newest events read from Kafka |
 | `GET`/`POST`/`DELETE /api/snapshot` | Snapshot status, start (`{"tables": [...]}`), cancel |

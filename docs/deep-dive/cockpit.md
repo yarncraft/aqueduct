@@ -53,7 +53,7 @@ Once a second the admin server takes a sample of both; the card is derived from 
 - **Backlog.** Postgres: WAL bytes between head and delivered, and the time behind: while there is a backlog, now
   minus the later of the newest delivered change's commit time and the moment the backlog crossed the threshold (when
   that happened inside the window), so a burst after a quiet hour reads seconds, not an hour; 0 when caught up.
-  MongoDB: the head's cluster time minus the newest delivered one. A sparkline shows the backlog over the minute (at
+  MongoDB: the head's cluster time minus the newest delivered one. A sparkline shows the backlog over the last 5 minutes, like the other cards (at
   most 60 values).
 - **Source vs delivered.** How fast the head and the delivered position move over the window: WAL bytes per second,
   or for MongoDB seconds of cluster time per second (about 1.0 for the source; above 1.0 delivered means catching
@@ -177,17 +177,21 @@ The **Routing** card shows where each table's events go:
   six, the quietest ones are behind "+N more". A template that reads the event (`{op}`, `{row.x}`) lists the topics the
   sink has produced to since start (not its dead-letter topics), and its `topic_fallback`.
 
-A line's width follows its count (table events in, the route's produced count out, errors to the dead-letter
-topic); lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
+A line's width follows its bandwidth: bytes per second now (the last 15 s), relative to the busiest line. The sink
+counts bytes per topic, not per route or table, so a line's bandwidth is its records per second times the bytes per
+record its topic averaged over the last 300 s: a route's line to a topic carries the route's produced records there,
+its line to the dead-letter topic its errors, and a table's line its share (by events) of what its route produces.
+Hover any card to light up its lines and show each one's bandwidth on it. A server from before
+per-topic bytes sizes the lines by their counts since start instead. Lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
 motion. The line from a route to its dead-letter topic is solid red (only the moving dots are striped) and appears once
 that topic has events. A route that
-picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. Hover a
-table to highlight its path. The plan is read once from `GET /api/routes` when the page loads; counts update every
+picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. Hovering a
+table highlights its whole path, through its route to its topic. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 **Operation shares and rate.** Each table and topic card has a thin stacked bar of its counts per operation since
 start, as shares (insert green, update blue, delete red, truncate violet, read amber; hover it for the counts and
-percentages); every card, routes included, has a step line of its rate over the last 120 s (a route: one line, processed;
+percentages); every card, routes included, has a step line of its rate over the last 300 s (a route: one line, processed;
 its detail chart has four, processed, matched, fallback and errors). The bar counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
@@ -199,7 +203,7 @@ its detail chart has four, processed, matched, fallback and errors). The bar cou
 Table, route and topic cards keep their counts (events, the route's produced/filtered/fallback/errors, acknowledged
 records, a dead-letter topic's errors).
 
-**Rates.** Click a table, a route or a topic for a panel with one step line over the last 120 s, one sample per
+**Rates.** Click a table, a route or a topic for a panel with one step line over the last 300 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second. A table's and a topic's chart draw one line per operation, in the op colours, for the operations toggled on with the
 buttons above it; only operations that have happened for that table or topic get a button (insert, update, delete,
@@ -217,9 +221,9 @@ lists the dead-letter topics it has rendered, each opening the inspector.
 The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
 the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
 order as `routes` and its produced records per op as `route_ops`, the topics with records in that second as `topics`
-and per op as `topic_ops`). Per-op rows are `[insert, update, delete, truncate, read]`. The window adds `ops` per route
-(produced per op and second), `topic_ops` (acknowledged per op and second) and `topic_totals` (acknowledged per op
-since start, up to `seq`). It needs the admin token like every `/api/*` route. Memory is bounded:
+and per op as `topic_ops`, and their key, value and header bytes as `topic_bytes`). Per-op rows are `[insert, update, delete, truncate, read]`. The window adds `ops` per route
+(produced per op and second), `topic_ops` (acknowledged per op and second), `topic_bytes` (acknowledged bytes per
+second) and `topic_totals` (acknowledged per op since start, up to `seq`). It needs the admin token like every `/api/*` route. Memory is bounded:
 routes are fixed at startup, and the sink counts at most 500 topics by name and the rest as `(other)`. Topic names can
 contain row values under content routing; they are shown only behind the token, as in the graph. Rates start from
 zero when the process restarts.
@@ -232,7 +236,8 @@ zero when the process restarts.
  "topic_ops": {"orders-paid": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 4, 0, 0]],
                "orders-paid.dlq": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]},
  "topic_totals": {"orders-paid": {"insert": 610, "update": 95, "delete": 40, "truncate": 0, "read": 0},
-                  "orders-paid.dlq": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}}}
+                  "orders-paid.dlq": {"insert": 1, "update": 0, "delete": 0, "truncate": 0, "read": 0}},
+ "topic_bytes": {"orders-paid": [1260, 0, 2940], "orders-paid.dlq": [0, 0, 0]}}
 ```
 
 ## Routing plan
@@ -280,29 +285,32 @@ when unset.
 
 The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
 
-## Top tiles: the day
+## Top tiles: the last five minutes
 
-Under each top tile a line shows that tile's last 24 h, one point per wall-clock minute: the mean of the
-once-a-second samples in it. Hover a line for this minute, the day's low and high, and when the line starts.
+Under each top tile a line shows that tile over the last 300 s, one sample per second, the same window as the routing
+cards' lines; nothing is averaged. Hover a line for the newest second and the window's low and high.
 
-| Tile | Each minute is |
+| Tile | Each second is |
 | --- | --- |
-| Throughput | events delivered per second |
-| Events delivered | the delivered counter |
-| End-to-end lag | commit to delivery, over the seconds the tile shows a lag (not while it reads `idle`) |
-| Sink latency | sink time per event delivered in that minute |
+| Throughput | events delivered |
+| Kafka bandwidth | key, value and header MB (10^6 bytes) Kafka acknowledged |
+| End-to-end lag | commit to delivery, while the tile shows a lag (not while it reads `idle`) |
+| Sink latency | sink time per event delivered in that second |
 | Errors | the error counter |
 
-A minute without a value (no lag shown, nothing delivered) breaks the line. Throughput, lag and latency scale
-from 0; the two counters from their lowest value of the day. The server keeps the minutes in memory
-(1440 minutes of five numbers), so the line is full when the page opens but starts over when Aqueduct restarts;
-minutes the sampler missed (a suspended host) stay empty. The page reloads `GET /api/kpis/history` 2 s after
-each minute closes:
+The Kafka bandwidth tile itself shows the mean of the last 15 s, the last second, and the MB acknowledged since start
+(also `aqueduct_kafka_bytes_total` in `/metrics`). Bytes count after the broker acknowledged the produce, like the
+per-topic records.
+
+The lines are drawn like the routing cards' lines: a step line from 0, right-aligned over the window. A second
+without a value (`null` in the API: lag while idle, latency with nothing delivered) is drawn as 0. The server keeps
+the window in memory (300 samples of five numbers), so the line is full when the page opens but starts over when
+Aqueduct restarts. Every stream frame carries the window as `kpis`; `GET /api/kpis/history` returns the same:
 
 ```json
-{"interval_ms": 60000, "len": 1440, "start_ms": 1792778760000,
- "throughput": [14.8, 15.2], "delivered": [412.5, 1323.0], "lag_ms": [431.0, null],
- "sink_ms": [3.1, 2.9], "errors": [0.0, 0.0]}
+{"interval_ms": 1000, "len": 300,
+ "throughput": [14.0, 16.0], "kafka_mb_per_sec": [0.0068, 0.0078], "lag_ms": [431.0, null],
+ "sink_ms": [3.1, null], "errors": [0.0, 0.0]}
 ```
 
-Every series is oldest first and ends with the minute in progress; `start_ms` is when the first one began.
+Every series is oldest first and ends with the newest second.

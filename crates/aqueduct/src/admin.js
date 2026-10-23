@@ -94,7 +94,8 @@ function renderSnapshot(d) {
 }
 
 // ---- Behind source (#150) ----
-// Everything is derived on the server from one sample a second over the last minute; the page only formats it.
+// Everything is derived on the server from one sample a second: the rates and state over the last minute, the backlog
+// line over the last 5 min. The page only formats it.
 const BS_STATE = {
   caught_up: { text: 'caught up', pill: 'border-green/40 bg-green/15 text-green', dot: 'bg-green', line: '#32a467', sub: 'backlog within the threshold' },
   catching_up: { text: 'catching up', pill: 'border-blue/40 bg-blue/15 text-blue', dot: 'bg-blue', line: '#4c90f0', sub: 'delivery is faster than the source' },
@@ -159,50 +160,33 @@ function renderBehind(d) {
   }
 }
 
-// ---- The top tiles' day: one mean per minute over the last 24 h, kept by the server (/api/kpis/history) and
-// reloaded every minute; the newest point is the minute in progress. The line spans the whole day, right-aligned, so a younger process draws only its right part.
-// A minute without a value (no lag shown, nothing delivered) breaks the line. Rates and latencies scale from 0;
-// the two counters scale from their lowest value of the day, or they would look flat.
-const KPI_POLL_MS = 60000;
+// ---- The top tiles' lines: the last 300 s, one sample per second, the same window as the routing cards, kept by the
+// server (/api/kpis/history) and sent with every stream frame (`kpis`). Drawn like the routing cards' lines (spark):
+// a step line from 0 over the whole window, right-aligned, so a younger process draws only its right part. A second
+// without a value (lag while idle, latency with nothing delivered) is drawn as 0.
 const KPI = {
-  throughput: { name: 'Throughput', line: '#4c90f0', f: v => fmt(Math.round(v)) + ' evt/s' },
-  delivered: { name: 'Events delivered', line: '#4c90f0', f: v => fmt(Math.round(v)), counter: true },
-  lag_ms: { name: 'End-to-end lag', line: '#ec9a3c', f: ms },
-  sink_ms: { name: 'Sink latency', line: '#ad7bee', f: ms },
-  errors: { name: 'Errors', line: '#e76a6e', f: v => fmt(Math.round(v)), counter: true },
+  throughput: { name: 'Throughput', f: v => fmt(Math.round(v)) + ' evt/s' },
+  kafka_mb_per_sec: { name: 'Kafka bandwidth', f: v => mbps(v) },
+  lag_ms: { name: 'End-to-end lag', f: ms },
+  sink_ms: { name: 'Sink latency', f: ms },
+  errors: { name: 'Errors', f: v => fmt(Math.round(v)) },
 };
-const hhmm = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-let kpisOff = false;
+// MB (10^6 bytes) per second: two decimals below 10, one below 100, none above.
+const mb = v => v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : fmt(Math.round(v));
+const mbps = v => mb(v) + ' MB/s';
 function drawKpi(el, k, w) {
   const h = w[k] || [], c = KPI[k], svg = el.firstElementChild, vals = h.filter(v => v != null);
-  if (!vals.length) { svg.innerHTML = ''; el.title = c.name + ': no per-minute values yet'; return; }
-  const max = Math.max(...vals), min = Math.min(...vals), base = c.counter ? min : 0, span = max - base || 1;
-  const off = w.len - h.length, y = v => (23 - 22 * (v - base) / span).toFixed(1);
-  // Runs of consecutive minutes; a lone minute is drawn one minute wide so it still shows.
-  const runs = [[]];
-  h.forEach((v, i) => v == null ? runs.push([]) : runs[runs.length - 1].push([i + off, y(v)]));
-  svg.innerHTML = runs.filter(r => r.length).map(r => {
-    const pts = r.length > 1 ? r : [r[0], [r[0][0] + 1, r[0][1]]];
-    return `<polyline points="${pts.map(p => p.join(',')).join(' ')}" fill="none" stroke="${c.line}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
-  }).join('');
+  if (!vals.length) { svg.innerHTML = ''; el.title = c.name + ': no values yet'; return; }
+  const max = Math.max(...vals), min = Math.min(...vals);
+  svg.innerHTML = spark([[h.map(v => v ?? 0), TABLE_LINE, 1.5]], w.len);
   const now = h[h.length - 1];
-  el.title = `${c.name}, mean per minute since ${hhmm(w.start_ms)} (up to 24 h)\nthis minute ${now == null ? '–' : c.f(now)} · low ${c.f(min)} · high ${c.f(max)}`;
+  el.title = `${c.name}, last ${Math.round(w.len * w.interval_ms / 1000)} s\nnow ${now == null ? '–' : c.f(now)} · low ${c.f(min)} · high ${c.f(max)}`;
 }
-async function loadKpis() {
-  if (kpisOff) return;
-  try {
-    const r = await fetch('/api/kpis/history', authInit());
-    if (r.status === 401 || r.status === 403 || r.status === 404) { kpisOff = true; return; }
-    if (!r.ok) return;
-    const w = await r.json();
-    for (const el of document.querySelectorAll('[data-kpi]')) drawKpi(el, el.dataset.kpi, w);
-  } catch (_) { /* retried on the next poll */ }
+// An older server sends no `kpis`: the tiles keep their numbers, without lines.
+function drawKpis(w) {
+  if (!w) return;
+  for (const el of document.querySelectorAll('[data-kpi]')) drawKpi(el, el.dataset.kpi, w);
 }
-// Reloaded 2 s after each minute closes, so the newest full minute shows promptly.
-(function kpiTick() {
-  loadKpis();
-  setTimeout(kpiTick, KPI_POLL_MS - Date.now() % KPI_POLL_MS + 2000);
-})();
 
 function render(d) {
   $('state-text').textContent = d.state;
@@ -215,8 +199,12 @@ function render(d) {
   $('rate').textContent = fmt(Math.round(sm.length ? sm[sm.length - 1] : d.events_per_sec));
   $('rate-now').textContent = fmt(d.events_per_sec);
   $('peak').textContent = fmt(Math.round(Math.max(0, ...sm)));
-  $('total').textContent = fmt(d.events_total);
-  $('lsn').textContent = d.last_lsn || '–';
+  // Bandwidth: bytes Kafka acknowledged, smoothed over the same window as the throughput.
+  const bw = ((d.kpis && d.kpis.kafka_mb_per_sec) || []).slice(-SMOOTH_WINDOW);
+  $('kbw').textContent = mb(avg(bw));
+  $('kbw-now').textContent = mb(bw.length ? bw[bw.length - 1] : 0);
+  $('kbw-total').textContent = fmt(Math.round((d.kafka_bytes_total || 0) / 1e6));
+  drawKpis(d.kpis);
   if (lastTotal !== null && d.events_total > lastTotal) {
     sinkSamples.push(d.sink_last_ms);
     if (sinkSamples.length > SMOOTH_WINDOW) sinkSamples.shift();
@@ -446,12 +434,12 @@ const TOPIC_LINE = '#e6e9ee', TABLE_LINE = '#e6e9ee';
 const CARD_METRICS = [['processed', '#4c90f0'], ['passed', '#32a467', 'matched'], ['fallback', '#ad7bee'], ['errors', '#e76a6e']];
 
 // ---- Rates per route and per topic ----
-// /api/routes/history gives the last 120 s at 1 s (route outcomes and produced records per op, records Kafka
+// /api/routes/history gives the last 300 s at 1 s (route outcomes and produced records per op, records Kafka
 // acknowledged per topic and per op, and each topic's per-op totals since start); each stream frame then carries
 // only the newest second (`rates`), numbered by `seq`, which is also added to the topic totals. An older server
 // sends no per-op data: the route and topic lines then count every op, and their op bars stay empty. A frame that does
 // not follow the window (a reconnect, a missed second) reloads it. Nothing here animates. A table's events
-// per second come with every frame instead (`history_ops`: the same 120 s at 1 s, sampled in the same tick).
+// per second come with every frame instead (`history_ops`: the same 300 s at 1 s, sampled in the same tick).
 let rates = null, ratesBusy = false, ratesOff = false;
 async function loadRates() {
   if (ratesBusy || ratesOff) return;
@@ -485,11 +473,29 @@ function appendRates(f) {
       OP_LABEL.forEach((k, j) => { tot[k] = (tot[k] || 0) + (o[j] || 0); });
     }
   }
+  if (rates.topic_bytes && f.topic_bytes) {
+    for (const t of Object.keys(f.topic_bytes)) if (!rates.topic_bytes[t]) rates.topic_bytes[t] = new Array(filled - 1).fill(0);
+    for (const [t, a] of Object.entries(rates.topic_bytes)) add(a, f.topic_bytes[t] || 0);
+  }
   rates.seq = f.seq;
 }
 // A route's window by outcome, if the history matches the plan; a topic's acknowledged records per second.
 const routeRate = i => rates && plan && rates.routes[i] && rates.routes[i].route === plan.routes[i].route ? rates.routes[i] : null;
 const topicRate = name => (rates && rates.topics[name]) || [];
+// Pathway bandwidth. The sink counts bytes per topic (`topic_bytes`; an older server sends none), not per route or
+// table, so a pathway's bandwidth is its records per second (mean of the last SMOOTH_WINDOW s) times the bytes per
+// record its topics averaged over the window. A table's pathway carries its share (by events) of what its route
+// produces.
+const bwKnown = () => !!(rates && rates.topic_bytes);
+const recent = h => avg((h || []).slice(-SMOOTH_WINDOW));
+const total = h => (h || []).reduce((a, n) => a + n, 0);
+const bytesPerRecord = names => {
+  if (!bwKnown()) return 0;
+  let b = 0, n = 0;
+  for (const t of names) { b += total(rates.topic_bytes[t]); n += total(rates.topics[t]); }
+  return n ? b / n : 0;
+};
+const bwText = b => b >= 1e5 ? mbps(b / 1e6) : b >= 1e3 ? (b / 1e3).toFixed(1) + ' kB/s' : Math.round(b) + ' B/s';
 // Per-op rows and totals are [insert, update, delete, truncate, read], the keys of the server's op counts.
 const OP_LABEL = ['insert', 'update', 'delete', 'truncate', 'read'];
 const NO_OPS = [0, 0, 0, 0, 0];
@@ -524,15 +530,15 @@ const rateStats = h => {
 };
 // A card's op shares: one thin stacked bar (OPBAR colours), filled by fillOpBar on every frame. The wrapper's padding
 // is the hover area of its tooltip.
-// A card's step line over the last 120 s (right-aligned, so a short window starts mid-way).
+// A card's step line over the last n samples, 300 s by default (right-aligned, so a short window starts mid-way).
 // lines: [[series, colour, width]], scaled together.
-const SPARK_N = 120;
-function spark(lines) {
+const SPARK_N = 300;
+function spark(lines, n = SPARK_N) {
   const W = 120, H = 20, max = Math.max(1, ...lines.flatMap(l => l[0]));
   const y = v => H - 1 - (H - 2) * v / max;
   return lines.map(([h, c, w]) => {
     if (h.length < 2) return '';
-    const off = SPARK_N - h.length, x = i => W * (i + off) / (SPARK_N - 1);
+    const off = n - h.length, x = i => W * (i + off) / (n - 1);
     return `<polyline points="${stepPts(h, x, y)}" fill="none" stroke="${c}" stroke-width="${w}" vector-effect="non-scaling-stroke"/>`;
   }).join('');
 }
@@ -661,7 +667,8 @@ function graphModelOf(d) {
   }
   // Edges: table → claiming route, route → each topic it wrote (its produced count split by the tables' events),
   // route → its dead-letter topic: one node per distinct topic or template, the quietest behind "+N more".
-  const edge = (from, to, w, dlq) => { const id = from + '>' + to; edges.push({ id, from, to, w, dlq }); return id; };
+  // w: records since start (the width without bandwidth data); bw: bytes per second now.
+  const edge = (from, to, w, dlq, bw = 0) => { const id = from + '>' + to; edges.push({ id, from, to, w, dlq, bw }); return id; };
   const dlqs = new Map();
   for (const x of routes) {
     x.dlq = dlqOf(x.r);
@@ -687,27 +694,36 @@ function graphModelOf(d) {
   for (const d of dlqAll) values[d.id] = fmt(d.errors);
   if (dlqHidden.length) values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
   for (const x of routes) {
-    for (const t of x.shown) tableEdges[t.name] = [edge(t.id, x.id, t.events)];
-    if (x.hidden.length) {
-      const id = edge(x.moreId, x.id, x.hidden.reduce((a, t) => a + t.events, 0));
-      for (const t of x.hidden) tableEdges[t.name] = [id];
-    }
     const g = groups.get(x.r.topic);
     const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
+    const rr = routeRate(x.i), now = k => rr ? recent(rr[k]) : 0;
+    const produced = now('produced'), errs = now('errors');
+    // Per topic node: [records since start, bytes/s].
     const targets = new Map();
-    if (!x.topics.size && !g.dynamic) targets.set(topicNode.get(x.r.topic), x.c.produced || 0);
-    for (const [t, n] of x.topics) {
-      const to = topicNode.get(t);
-      targets.set(to, (targets.get(to) || 0) + (sum ? (x.c.produced || 0) * n / sum : 0));
+    const target = (to, t, share) => {
+      const v = targets.get(to) || [0, 0];
+      targets.set(to, [v[0] + (x.c.produced || 0) * share, v[1] + produced * share * bytesPerRecord([t])]);
+    };
+    if (!x.topics.size && !g.dynamic) target(topicNode.get(x.r.topic), x.r.topic, 1);
+    for (const [t, n] of x.topics) target(topicNode.get(t), t, sum ? n / sum : 0);
+    const dlqBw = errs * bytesPerRecord(x.dlqNames);
+    // The bytes the route's tables become, shared out by their events.
+    const outBw = [...targets.values()].reduce((a, v) => a + v[1], 0) + dlqBw;
+    const evAll = x.tables.reduce((a, t) => a + t.events, 0);
+    const share = list => evAll ? list.reduce((a, t) => a + t.events, 0) / evAll : 0;
+    for (const t of x.shown) tableEdges[t.name] = [edge(t.id, x.id, t.events, false, outBw * share([t]))];
+    if (x.hidden.length) {
+      const id = edge(x.moreId, x.id, x.hidden.reduce((a, t) => a + t.events, 0), false, outBw * share(x.hidden));
+      for (const t of x.hidden) tableEdges[t.name] = [id];
     }
-    for (const [to, w] of targets) x.out.push({ to, id: edge(x.id, to, w) });
+    for (const [to, [w, bw]] of targets) x.out.push({ to, id: edge(x.id, to, w, false, bw) });
     for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
-    for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true);
+    for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true, dlqBw);
   }
   for (const t of unrouted) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
   if (dlqHidden.length) ops['pm:dlq'] = rates && rates.topic_totals ? addSlots(dlqHidden.map(d => ops[d.id])) : null;
-  return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlqs, dlqShown, dlqHidden };
+  return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlqs, dlqShown, dlqHidden, bw: bwKnown() };
 }
 
 // A route's dead-letter topic (or `{schema}`/`{table}` template) from /api/routes; a server from before per-route
@@ -828,7 +844,7 @@ function routeNode(x, last) {
     + `</div>`
     // The metrics, each in the colour of its step line below.
     + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
-    + `<div class="mt-1" title="Events processed per second, last 120 s; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
+    + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block h-5 w-full')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
 }
@@ -857,18 +873,22 @@ function graphHtml(m) {
     + `<div class="flex flex-col">${colHead('Topics')}<div class="flex flex-1 flex-col justify-center gap-3">${topics}</div></div>`;
 }
 
-// What hovering a table lights up: its edge to its route, the route, the route's edge to its topic, the topic.
-function graphPath(m, name) {
-  const ids = m.tableEdges[name];
-  if (!ids) return null;
-  const on = new Set(['t:' + name]);
-  for (const id of ids) { on.add(id); for (const n of id.split('>')) on.add(n); }
-  return on;
+// What hovering a card lights up. A table: its edge to its route, the route, the route's edge to its topic, the topic.
+// Any other card: its own edges and the cards at their other end.
+function graphPath(m, node) {
+  const on = new Set([node]);
+  const ids = node.startsWith('t:') && m.tableEdges[node.slice(2)];
+  if (ids) {
+    for (const id of ids) { on.add(id); for (const n of id.split('>')) on.add(n); }
+    return on;
+  }
+  for (const e of m.edges) if (e.from === node || e.to === node) { on.add(e.id); on.add(e.from); on.add(e.to); }
+  return on.size > 1 ? on : null;
 }
 
 function drawEdges() {
   const m = graphModel, g = $('graph'), svg = $('graphedges');
-  if (!m) { svg.innerHTML = ''; return; }
+  if (!m) { svg.innerHTML = $('graphlabels').innerHTML = ''; return; }
   const box = g.getBoundingClientRect(), els = {};
   for (const el of g.querySelectorAll('[data-node]')) els[el.dataset.node] = el;
   const at = (id, right) => {
@@ -879,22 +899,30 @@ function drawEdges() {
   };
   const hl = graphHover && graphPath(m, graphHover);
   for (const [id, el] of Object.entries(els)) el.classList.toggle('opacity-40', !!hl && !hl.has(id));
-  const max = Math.max(1, ...m.edges.map(e => e.w));
+  // Widths follow bandwidth (bytes per second now), or, from a server that counts no bytes, records since start.
+  const size = e => m.bw ? e.bw : e.w;
+  const max = Math.max(...m.edges.map(size), 0) || 1;
   const now = Date.now();
-  let out = '';
+  let out = '', labels = '';
   for (const e of m.edges) {
     const a = at(e.from, true), b = at(e.to, false);
     if (!a || !b) continue;
     const mx = ((a[0] + b[0]) / 2).toFixed(1);
     const d = `M${a[0].toFixed(1)},${a[1].toFixed(1)} C${mx},${a[1].toFixed(1)} ${mx},${b[1].toFixed(1)} ${b[0].toFixed(1)},${b[1].toFixed(1)}`;
     const on = !hl || hl.has(e.id);
-    const width = e.w > 0 ? 1.5 + 4.5 * Math.sqrt(e.w / max) : 1;
+    const width = size(e) > 0 ? 1.5 + 4.5 * Math.sqrt(size(e) / max) : 1;
     const color = e.dlq ? EDGE_RED : hl && on ? EDGE_HL : EDGE_BASE;
     out += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width.toFixed(1)}" stroke-opacity="${on ? (e.dlq ? 0.7 : 1) : 0.15}"/>`;
     // Recent traffic: a dotted line that flows (static when the viewer prefers reduced motion).
     if ((flowUntil[e.id] || 0) > now) out += `<path d="${d}" fill="none" stroke="${e.dlq ? EDGE_RED : EDGE_FLOW}" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 10" stroke-opacity="${on ? 0.9 : 0.15}" class="motion-safe:animate-flow"/>`;
+    // A hovered card's pathways carry their bandwidth at the curve's midpoint, in the gap between the columns, on a
+    // layer above the cards. A server that counts no bytes gets no labels.
+    if (hl && on && m.bw) {
+      labels += `<text x="${mx}" y="${((a[1] + b[1]) / 2).toFixed(1)}" dy="0.35em" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="${e.dlq ? EDGE_RED : TABLE_LINE}" stroke="var(--color-ink-900)" stroke-width="4" stroke-linejoin="round" paint-order="stroke">${bwText(e.bw)}</text>`;
+    }
   }
   svg.innerHTML = out;
+  $('graphlabels').innerHTML = labels;
 }
 
 // Marks the edges whose counts moved since the last frame as having recent traffic.
@@ -1103,7 +1131,7 @@ function drawDetail(m) {
 function renderGraph(frame) {
   if (!plan) {
     $('graphcols').textContent = planError || 'loading route plan…';
-    $('graphedges').innerHTML = '';
+    $('graphedges').innerHTML = $('graphlabels').innerHTML = '';
     return;
   }
   const m = graphModelOf(lastData);
@@ -1198,9 +1226,9 @@ $('routedetail').addEventListener('click', ev => {
   if (route) { graphSel = +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
 $('graph').addEventListener('pointerover', ev => {
-  const t = ev.target.closest('[data-table]');
-  const name = t ? t.dataset.table : null;
-  if (name !== graphHover) { graphHover = name; drawEdges(); }
+  const n = ev.target.closest('[data-node]');
+  const node = n ? n.dataset.node : null;
+  if (node !== graphHover) { graphHover = node; drawEdges(); }
 });
 $('graph').addEventListener('pointerleave', () => { if (graphHover) { graphHover = null; drawEdges(); } });
 new ResizeObserver(drawEdges).observe($('graph'));

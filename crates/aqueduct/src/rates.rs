@@ -1,7 +1,7 @@
 //! Per-route and per-topic rate history for the cockpit's Routing card: one sample per second
 //! of the route outcome counters and produced records per operation ([`RouteCount`]), and of the
-//! records Kafka acknowledged per topic and operation ([`aqueduct_sinks::TopicStats`]), kept over
-//! the same window as the event-rate history.
+//! records and bytes Kafka acknowledged per topic and operation ([`aqueduct_sinks::TopicStats`]),
+//! kept over the same window as the event-rate history.
 //!
 //! Bounded: the routes are fixed at startup, and the topic counters already fold every topic
 //! past [`aqueduct_sinks::MAX_TRACKED_TOPICS`] into one bucket, so at most that many plus one
@@ -40,9 +40,13 @@ pub struct RateHistory {
     topics: BTreeMap<String, VecDeque<Ops>>,
     /// The acknowledged totals since start, per topic and op.
     last_topics: BTreeMap<String, OpCounts>,
+    /// Per topic: acknowledged key, value and header bytes, each second; and their totals.
+    topic_bytes: BTreeMap<String, VecDeque<u64>>,
+    last_topic_bytes: BTreeMap<String, u64>,
     /// The newest sample, for the stream: every route, and only the topics that moved.
     latest_routes: Vec<(Outcomes, Ops)>,
     latest_topics: BTreeMap<String, Ops>,
+    latest_topic_bytes: BTreeMap<String, u64>,
 }
 
 impl RateHistory {
@@ -55,13 +59,21 @@ impl RateHistory {
             last_routes: Vec::new(),
             topics: BTreeMap::new(),
             last_topics: BTreeMap::new(),
+            topic_bytes: BTreeMap::new(),
+            last_topic_bytes: BTreeMap::new(),
             latest_routes: Vec::new(),
             latest_topics: BTreeMap::new(),
+            latest_topic_bytes: BTreeMap::new(),
         }
     }
 
     /// Adds one second: the increase of every counter since the previous sample.
-    pub fn record(&mut self, routes: &[RouteCount], topics: &BTreeMap<String, OpCounts>) {
+    pub fn record(
+        &mut self,
+        routes: &[RouteCount],
+        topics: &BTreeMap<String, OpCounts>,
+        bytes: &BTreeMap<String, u64>,
+    ) {
         self.seq += 1;
         self.filled = (self.filled + 1).min(self.len);
         let names_changed = self.routes.len() != routes.len()
@@ -95,11 +107,25 @@ impl RateHistory {
         }
         // A topic is never forgotten by the counters, so every series got its sample above.
         self.last_topics.clone_from(topics);
+        self.latest_topic_bytes.clear();
+        for (t, &n) in bytes {
+            let d = n.saturating_sub(self.last_topic_bytes.get(t).copied().unwrap_or(0));
+            if d > 0 {
+                self.latest_topic_bytes.insert(t.clone(), d);
+            }
+            push(
+                self.topic_bytes.entry(t.clone()).or_default(),
+                d,
+                self.filled,
+                self.len,
+            );
+        }
+        self.last_topic_bytes.clone_from(bytes);
     }
 
     /// The newest sample for each stream frame: `seq`, every route's outcomes and produced
     /// records per op in plan order, and the topics with records in that second (their total and
-    /// per op).
+    /// per op, and their bytes).
     pub fn latest(&self) -> Value {
         let topics: BTreeMap<&String, u64> = self
             .latest_topics
@@ -112,13 +138,15 @@ impl RateHistory {
             "route_ops": self.latest_routes.iter().map(|r| r.1).collect::<Vec<_>>(),
             "topics": topics,
             "topic_ops": self.latest_topics,
+            "topic_bytes": self.latest_topic_bytes,
         })
     }
 
     /// The whole window, for `/api/routes/history`. Every series has the same length, oldest
     /// first, and ends with the sample numbered `seq`. Per-op series are rows of
     /// `[insert, update, delete, truncate, read]`; `topic_totals` are the acknowledged records
-    /// per topic and op since start, up to and including that sample.
+    /// per topic and op since start, up to and including that sample; `topic_bytes` the bytes
+    /// acknowledged per topic and second.
     pub fn window(&self, interval_ms: u64) -> Value {
         let routes: Vec<Value> = self
             .routes
@@ -148,6 +176,7 @@ impl RateHistory {
             "topics": topics,
             "topic_ops": self.topics,
             "topic_totals": self.last_topics,
+            "topic_bytes": self.topic_bytes,
         })
     }
 }
@@ -216,10 +245,12 @@ mod tests {
         h.record(
             &[route("a", 5, 1, 0, 0), route("default", 0, 0, 0, 0)],
             &topics(&[("t", 5)]),
+            &BTreeMap::new(),
         );
         h.record(
             &[route("a", 7, 1, 0, 2), route("default", 1, 0, 0, 0)],
             &topics(&[("t", 7), ("u", 1)]),
+            &BTreeMap::new(),
         );
         let l = h.latest();
         assert_eq!(l["seq"], 2);
@@ -234,12 +265,14 @@ mod tests {
         h.record(
             &[route("a", 7, 1, 0, 2), route("default", 1, 0, 0, 0)],
             &topics(&[("t", 7), ("u", 1)]),
+            &BTreeMap::new(),
         );
         assert_eq!(h.latest()["topics"], json!({}));
         assert_eq!(h.latest()["topic_ops"], json!({}));
         h.record(
             &[route("a", 8, 1, 0, 2), route("default", 1, 0, 0, 0)],
             &topics(&[("t", 9), ("u", 1)]),
+            &BTreeMap::new(),
         );
         let w = h.window(1000);
         assert_eq!((w["seq"].as_u64(), w["len"].as_u64()), (Some(4), Some(3)));
@@ -264,8 +297,8 @@ mod tests {
             json!({"insert": 9, "update": 0, "delete": 0, "truncate": 0, "read": 0})
         );
         let mut h = RateHistory::new(3);
-        h.record(&[], &topics(&[("t", 1)]));
-        h.record(&[], &topics(&[("t", 1), ("late", 4)]));
+        h.record(&[], &topics(&[("t", 1)]), &BTreeMap::new());
+        h.record(&[], &topics(&[("t", 1), ("late", 4)]), &BTreeMap::new());
         assert_eq!(h.window(1000)["topics"]["late"], json!([0, 4]));
         assert_eq!(
             h.window(1000)["topic_ops"]["late"],
@@ -285,14 +318,16 @@ mod tests {
         };
         let mut t = BTreeMap::new();
         t.insert("orders".to_string(), ops(3, 1, 0, 0, 0));
-        h.record(&[route_ops("a", [4, 0, 0, 0], 1)], &t);
+        h.record(&[route_ops("a", [4, 0, 0, 0], 1)], &t, &BTreeMap::new());
         // Next second: two deletes, each with its tombstone on the topic, and two snapshot reads.
         t.insert("orders".to_string(), ops(3, 1, 4, 0, 2));
-        h.record(&[route_ops("a", [8, 0, 0, 0], 3)], &t);
+        let bytes = BTreeMap::from([("orders".to_string(), 1_000)]);
+        h.record(&[route_ops("a", [8, 0, 0, 0], 3)], &t, &bytes);
         let l = h.latest();
         assert_eq!(l["route_ops"], json!([[2, 0, 2, 0, 0]]));
         assert_eq!(l["topics"], json!({"orders": 6}));
         assert_eq!(l["topic_ops"], json!({"orders": [0, 0, 4, 0, 2]}));
+        assert_eq!(l["topic_bytes"], json!({"orders": 1_000}));
         let w = h.window(1000);
         assert_eq!(
             w["routes"][0]["ops"],
@@ -300,6 +335,8 @@ mod tests {
         );
         assert_eq!(w["topics"]["orders"], json!([4, 6]));
         assert_eq!(w["topic_totals"]["orders"]["delete"], 4);
+        // Bytes first seen in the second sample: zero-filled back to the window start.
+        assert_eq!(w["topic_bytes"]["orders"], json!([0, 1_000]));
     }
 
     #[test]
@@ -315,7 +352,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            h.record(&[route("a", i, 0, 0, 0)], &t);
+            h.record(&[route("a", i, 0, 0, 0)], &t, &BTreeMap::new());
         }
         assert_eq!(h.topics.len(), 50);
         assert!(h.topics.values().all(|s| s.len() == 120));
