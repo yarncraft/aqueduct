@@ -1374,17 +1374,56 @@ mod tests {
             );
         }
         for src in [DASHBOARD, SCRIPT] {
-            for h in [
-                " onclick=",
-                " onload=",
-                " onerror=",
-                " oninput=",
-                " onchange=",
-                " onsubmit=",
-                "javascript:",
-            ] {
-                assert!(!src.to_ascii_lowercase().contains(h), "inline handler {h}");
+            if let Some(i) = inline_handler(src) {
+                let b = src.as_bytes();
+                let end = (i + 24).min(b.len());
+                panic!("inline handler: {}", String::from_utf8_lossy(&b[i..end]));
             }
+            assert!(
+                !src.to_ascii_lowercase().contains("javascript:"),
+                "javascript: URL"
+            );
+        }
+    }
+
+    /// Byte offset of the first inline event-handler attribute in `src`: whitespace or `/`, then
+    /// `on` and letters, then optional whitespace and `=` (`onclick=`, ` onclick =`, `<a/onclick=`).
+    fn inline_handler(src: &str) -> Option<usize> {
+        let b = src.to_ascii_lowercase().into_bytes();
+        (1..b.len()).find(|&i| {
+            if !(b[i - 1].is_ascii_whitespace() || b[i - 1] == b'/') || !b[i..].starts_with(b"on") {
+                return false;
+            }
+            let letters = b[i + 2..]
+                .iter()
+                .take_while(|c| c.is_ascii_lowercase())
+                .count();
+            let after = &b[i + 2 + letters..];
+            let after = &after[after.iter().take_while(|c| c.is_ascii_whitespace()).count()..];
+            letters > 0 && after.first() == Some(&b'=')
+        })
+    }
+
+    #[test]
+    fn inline_handler_scan_catches_every_spelling_and_spares_lookalikes() {
+        for bad in [
+            "<a onmouseover=\"x\">",
+            "<a onclick =\"x\">",
+            "<a/onclick=x>",
+            "<a
+onkeydown
+=x>",
+            "<A ONCLICK=x>",
+        ] {
+            assert!(inline_handler(bad).is_some(), "missed {bad:?}");
+        }
+        for ok in [
+            "addEventListener('x', f, { once: true })",
+            "<button aria-pressed=\"true\">",
+            "let on = 1; once: true",
+            "text · on – ≤ done",
+        ] {
+            assert_eq!(inline_handler(ok), None, "false positive on {ok:?}");
         }
     }
 
