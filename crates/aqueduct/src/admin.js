@@ -42,7 +42,9 @@ const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
 let lastData = null;
-const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee', '#ec9a3c'];
+// Op colours (insert, update, delete, truncate, read) for the cards' op strips, the legend and the per-op chart lines:
+// they differ in lightness as well as hue, so neighbouring shares stay apart in a thin strip.
+const OPLINE = ['#22c55e', '#38bdf8', '#ef4444', '#a855f7', '#facc15'];
 // Stepline points: hold each value until the next sample, then jump.
 const stepPts = (h, x, y) => h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
 // Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H).
@@ -421,6 +423,8 @@ const GRAPH_TABLES = 6, GRAPH_TOPICS = 6, FLOW_MS = 3000;
 const EDGE_BASE = '#404854', EDGE_HL = '#4c90f0', EDGE_FLOW = '#abb3bf', EDGE_RED = '#e76a6e';
 // Outcome counters of a route, in the order of the stream's `rates.routes` rows.
 const ROUTE_COUNTS = ['produced', 'filtered', 'fallback', 'errors'];
+// A route's other outcomes per op and second, in the order of a stream frame's `route_outcome_ops` rows.
+const ROUTE_OUTCOME_OPS = ['filtered_ops', 'fallback_ops', 'errors_ops'];
 // Detail-chart line colours: a route's produced line; the dead-letter topic in red.
 const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
 // Source (table) and sink (topic) step lines are white, so colours only mean route metrics; dead-letter lines stay red.
@@ -458,6 +462,7 @@ function appendRates(f) {
   rates.routes.forEach((r, i) => {
     ROUTE_COUNTS.forEach((k, j) => add(r[k], f.routes[i][j]));
     if (r.ops && f.route_ops) add(r.ops, f.route_ops[i]);
+    if (r.errors_ops && f.route_outcome_ops) ROUTE_OUTCOME_OPS.forEach((k, j) => add(r[k], f.route_outcome_ops[i][j]));
   });
   for (const t of Object.keys(f.topics)) if (!rates.topics[t]) rates.topics[t] = new Array(filled - 1).fill(0);
   for (const [t, a] of Object.entries(rates.topics)) add(a, f.topics[t] || 0);
@@ -515,6 +520,13 @@ const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
     : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
   + '</span>';
+// The ops a route has taken: produced since start plus its other outcomes over the window (the server counts those
+// per op only for the rate history); null without per-op counts (an older server).
+const routeOpTotals = (x, rr) => {
+  const t = opSlots(x.c.ops);
+  if (!t || !rr || !rr.errors_ops) return null;
+  return addSlots([t, ...ROUTE_OUTCOME_OPS.map(k => addSlots(rr[k] || []))]);
+};
 // Sum of series, aligned on their newest sample.
 const sumSeries = list => {
   const n = Math.max(0, ...list.map(a => a.length));
@@ -543,12 +555,13 @@ const nodeLine = id => `<div class="mt-1">${sparkSvg(id, 'block w-full', 'height
 const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
 // A card's op shares since start: a stacked strip down the card's left edge (the legend's colours, top to bottom in
 // OP_LABEL order), filled by fillOpStrip on every frame. A card with a strip is `relative` and padded past it.
-const OP_FILL = ['var(--color-green)', 'var(--color-blue)', 'var(--color-red)', 'var(--color-violet)', 'var(--color-amber)'];
-const STRIP_CARD = 'relative overflow-hidden', STRIP_PAD = 'padding-left:14px';
-const opStrip = id => `<span data-opstrip="${esc(id)}" class="absolute top-0 flex flex-col overflow-hidden" style="left:0;bottom:0;width:5px;background:var(--color-ink-700)"></span>`;
+const STRIP_CARD = 'relative overflow-hidden', STRIP_PAD = 'padding-left:15px';
+// Shares are split by a 1 px gap in the card's own background, so two neighbours never blend into one.
+const opStrip = id => `<span data-opstrip="${esc(id)}" class="absolute top-0 flex flex-col overflow-hidden" style="left:0;bottom:0;width:6px;gap:1px"></span>`;
 function fillOpStrip(el, row, what) {
   const total = row ? row.reduce((a, n) => a + n, 0) : 0;
-  const html = total ? row.map((n, i) => n ? `<span class="block shrink-0" style="height:${(100 * n / total).toFixed(2)}%;background:${OP_FILL[i]}"></span>` : '').join('') : '';
+  const html = total ? row.map((n, i) => n ? `<span class="block" style="flex:${n} 1 0;min-height:2px;background:${OPLINE[i]}"></span>` : '').join('')
+    : '<span class="block h-full w-full bg-ink-700"></span>';
   if (el.dataset.k !== html) { el.dataset.k = html; el.innerHTML = html; }
   el.title = !row ? 'no per-operation counts from this server'
     : !total ? 'no ' + what + ' yet'
@@ -845,7 +858,7 @@ function routeNode(x, last) {
   const r = x.r, sel = graphSel === x.i, folded = rulesFolded();
   const unseen = x.c.unseen_fields || [];
   const counts = { processed: x.c.matched || 0, passed: Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)), fallback: x.c.fallback || 0, errors: x.c.errors || 0 };
-  return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
+  return `<div data-node="${x.id}" data-route="${x.i}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue" style="${STRIP_PAD}">${opStrip(x.id)}`
     // Step and name on top.
     + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
@@ -1079,7 +1092,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, label || k)).join(''));
+    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, label || k)).join('') + opButtons(routeOpTotals(x, routeRate(x.i))));
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1110,6 +1123,12 @@ function drawCardSparks(m) {
   for (const el of document.querySelectorAll('#routing [data-spark]')) { const l = lines[el.dataset.spark]; el.innerHTML = l ? spark(l) : ''; }
 }
 
+// An op that happens for the first time gets its button without reopening the panel.
+function refreshOpButtons(totals) {
+  const btns = document.getElementById('detailopbtns');
+  if (btns && btns.dataset.mask !== opMask(totals)) btns.outerHTML = opButtons(totals);
+}
+
 function drawDetail(m) {
   const dc = $('detailchart');
   if (!dc) return;
@@ -1124,14 +1143,20 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    // A route: four lines, processed, matched, fallback and errors, from the route's own counters.
+    // A route: four lines, processed, matched, fallback and errors, from the route's own counters, each counting only
+    // the ops toggled on (without per-op history, every op).
     const x = m.routes[graphSel];
     if (!x) return;
     const rr = routeRate(x.i) || {};
-    const processed = sumSeries(ROUTE_COUNTS.map(k => rr[k] || []));
-    const series = { processed, passed: sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]), fallback: rr.fallback || [], errors: rr.errors || [] };
+    const tot = routeOpTotals(x, rr), sel = [...detailOps].filter(op => !tot || tot[op] > 0);
+    const pick = (k, rows) => tot ? (rr[rows] || []).map(o => sel.reduce((a, op) => a + (o[op] || 0), 0)) : rr[k] || [];
+    const [produced, filtered, fallback, errors] = ['ops', ...ROUTE_OUTCOME_OPS].map((rows, j) => pick(ROUTE_COUNTS[j], rows));
+    const processed = sumSeries([produced, filtered, fallback, errors]);
+    const series = { processed, passed: sumSeries([produced, fallback, errors]), fallback, errors };
     chart(CARD_METRICS.map(([k], op) => ({ op, h: series[k] })), dc, CARD_METRICS.map(c => c[1]), 160);
-    $('detailstats').textContent = 'processed ' + rateStats(processed);
+    $('detailstats').textContent = tot && !sel.length ? 'no operation selected'
+      : (tot ? '' : 'all operations (no per-op history from this server) · ') + 'processed ' + rateStats(processed);
+    refreshOpButtons(tot);
     const el = document.getElementById('detailops');
     const t = opSlots(x.c.ops);
     if (el) el.textContent = t ? OP_LABEL.map((k, i) => `${k} ${fmt(t[i])}`).join(' · ') : 'no per-operation counts from this server';
@@ -1146,12 +1171,7 @@ function drawDetail(m) {
   if (perOp) chart(perOp, dc, OPLINE, 160); else chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
-  // An op that happens for the first time gets its button without reopening the panel.
-  const btns = document.getElementById('detailopbtns');
-  if (btns && (tableSel != null || topicSel != null)) {
-    const tot = tableSel != null ? ((lastData && lastData.table_ops) || {})[tableSel] || null : totals;
-    if (btns.dataset.mask !== opMask(tot)) btns.outerHTML = opButtons(tot);
-  }
+  refreshOpButtons(seen);
   const el = document.getElementById('detailops');
   if (el) el.textContent = totals ? OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
 }

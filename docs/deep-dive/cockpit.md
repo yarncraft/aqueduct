@@ -189,11 +189,12 @@ second from the stream. Without any `[[sink.routes]]` the graph is all tables â†
 
 **Operation shares and rate.** Every card, routes included, has a step line of its rate over the last 300 s (a route:
 one line, processed; its detail chart has four, processed, matched, fallback and errors). Down its left edge, each
-table and topic card has a stacked strip of its counts per operation since start, as shares, top to bottom (insert
+table, route and topic card has a stacked strip of its counts per operation since start, as shares, top to bottom (insert
 green, update blue, delete red, truncate violet, read amber, as the legend next to the section title shows; hover the
 strip for the counts and percentages). The strip counts:
 
 - a table: events the source delivered for it (`table_ops` in `/api/metrics` and every stream frame);
+- a route: records it produced (`ops` in `/api/routes`);
 - a topic (dead-letter topics have no bar, only their step line): records Kafka acknowledged, counted by the sink after the broker acknowledged
   the produce, so a failed produce never counts and a retried batch counts when it succeeds. A tombstone carries its
   delete's `op` header and counts as a delete. Topic cards also show the acknowledged count;
@@ -206,8 +207,9 @@ records, a dead-letter topic's errors).
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second. A table's and a topic's chart draw one line per operation, in the op colours, for the operations toggled on with the
 buttons above it; only operations that have happened for that table or topic get a button (insert, update, delete,
-truncate, read); the selection is shared by the two. A route's chart has no
-buttons: four lines, processed, matched, fallback and errors, from the route's own counters. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
+truncate, read); the selection is shared by every panel. A route's chart has four lines, processed, matched, fallback
+and errors, from the route's own counters, each counting only the operations toggled on; its buttons are the
+operations it has produced since start or taken in the window under any outcome. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
 operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
 select it), the full table list when the card's `FROM` is cut short, and any other config keys.  A topic's panel lists its acknowledged records per
 operation, the routes that write to it (by template or as their `topic_fallback`), **dead letter**: the dead-letter
@@ -219,9 +221,10 @@ lists the dead-letter topics it has rendered, each opening the inspector.
 
 The history is kept by the server, so the charts are full when the page opens: `GET /api/routes/history` returns
 the window, and each stream frame carries only the newest second (`rates`: `seq`, every route's outcomes in plan
-order as `routes` and its produced records per op as `route_ops`, the topics with records in that second as `topics`
+order as `routes`, its produced records per op as `route_ops` and its filtered, fallback and errors per op as
+`route_outcome_ops` (three rows per route, in that order), the topics with records in that second as `topics`
 and per op as `topic_ops`, and their key, value and header bytes as `topic_bytes`). Per-op rows are `[insert, update, delete, truncate, read]`. The window adds `ops` per route
-(produced per op and second), `topic_ops` (acknowledged per op and second), `topic_bytes` (acknowledged bytes per
+(produced per op and second) and `filtered_ops`, `fallback_ops` and `errors_ops` (the other outcomes, likewise), `topic_ops` (acknowledged per op and second), `topic_bytes` (acknowledged bytes per
 second) and `topic_totals` (acknowledged per op since start, up to `seq`). It needs the admin token like every `/api/*` route. Memory is bounded:
 routes are fixed at startup, and the sink counts at most 500 topics by name and the rest as `(other)`. Topic names can
 contain row values under content routing; they are shown only behind the token, as in the graph. Rates start from
@@ -230,7 +233,10 @@ zero when the process restarts.
 ```json
 {"seq": 431, "interval_ms": 1000, "len": 120,
  "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0],
-             "ops": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 2, 0, 0]]}],
+             "ops": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 2, 0, 0]],
+             "filtered_ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 2, 0, 0, 0]],
+             "fallback_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+             "errors_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]}],
  "topics": {"orders-paid": [3, 0, 7], "orders-paid.dlq": [0, 0, 0]},
  "topic_ops": {"orders-paid": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 4, 0, 0]],
                "orders-paid.dlq": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]},

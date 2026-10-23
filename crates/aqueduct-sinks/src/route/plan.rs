@@ -927,6 +927,8 @@ pub struct RouteStats {
     produced: Vec<AtomicU64>,
     /// `produced` per operation, `[insert, update, delete, truncate, read]`; sums to `produced`.
     produced_ops: Vec<[AtomicU64; 5]>,
+    /// `filtered`, `fallback` and `errors` per operation, in that order, like `produced_ops`.
+    outcome_ops: Vec<[[AtomicU64; 5]; 3]>,
     filtered: Vec<AtomicU64>,
     /// Events sent to a route's `topic_fallback` (content routing).
     fallback: Vec<AtomicU64>,
@@ -959,6 +961,7 @@ struct PendingCounts {
     matched: u64,
     produced: u64,
     produced_ops: [u64; 5],
+    outcome_ops: [[u64; 5]; 3],
     filtered: u64,
     fallback: u64,
     errors: u64,
@@ -971,6 +974,17 @@ enum Outcome {
     Filtered,
     Fallback,
     Errors,
+}
+
+impl Outcome {
+    /// Its row in `outcome_ops`.
+    fn row(self) -> usize {
+        match self {
+            Outcome::Filtered => 0,
+            Outcome::Fallback => 1,
+            Outcome::Errors => 2,
+        }
+    }
 }
 
 /// The outcome counters of one route. Every event a route claims counts `matched`, then exactly
@@ -994,6 +1008,11 @@ pub struct RouteCounts {
     pub tombstones_skipped: u64,
     /// `produced` per operation of the event (a delete's tombstone is not counted again).
     pub ops: OpCounts,
+    /// `filtered`, `fallback` and `errors` per operation of the event, in that order, as
+    /// `[insert, update, delete, truncate, read]` rows. Kept for the cockpit's rate history, not
+    /// part of `/api/routes`.
+    #[serde(skip)]
+    pub outcome_ops: [[u64; 5]; 3],
 }
 
 /// A point-in-time copy of one route's counters. `route` is the route's `name`, else its `match`
@@ -1033,6 +1052,10 @@ impl RouteStats {
                 .iter()
                 .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
+            outcome_ops: names
+                .iter()
+                .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))))
+                .collect(),
             filtered: zeros(),
             fallback: zeros(),
             errors: zeros(),
@@ -1054,12 +1077,17 @@ impl RouteStats {
         f(&mut pending[route]);
     }
 
-    /// Counts an event `route` claimed under `outcome`, together with `matched`. Called only
-    /// once the outcome is final (the record is rendered), so an encode error never leaves
-    /// `matched` above the sum of the outcomes. Pending until [`commit`](Self::commit).
-    fn claimed(&self, outcome: Outcome, route: usize) {
+    /// Counts an event `route` claimed under `outcome`, together with `matched` and its op
+    /// (`op`, an [`op_code`] letter). Called only once the outcome is final (the record is
+    /// rendered), so an encode error never leaves `matched` above the sum of the outcomes.
+    /// Pending until [`commit`](Self::commit).
+    fn claimed(&self, outcome: Outcome, route: usize, op: &str) {
         self.pend(route, |p| {
             p.matched = p.matched.wrapping_add(1);
+            if let Some(i) = OpCounts::slot(op) {
+                let n = &mut p.outcome_ops[outcome.row()][i];
+                *n = n.wrapping_add(1);
+            }
             let n = match outcome {
                 Outcome::Filtered => &mut p.filtered,
                 Outcome::Fallback => &mut p.fallback,
@@ -1102,6 +1130,13 @@ impl RouteStats {
                     self.produced_ops[i][k].fetch_add(n, Ordering::Relaxed);
                 }
             }
+            for (row, ops) in p.outcome_ops.iter().enumerate() {
+                for (k, &n) in ops.iter().enumerate() {
+                    if n != 0 {
+                        self.outcome_ops[i][row][k].fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
             *p = PendingCounts::default();
         }
     }
@@ -1124,6 +1159,9 @@ impl RouteStats {
             ops: OpCounts::from_slots(std::array::from_fn(|k| {
                 self.produced_ops[i][k].load(Ordering::Relaxed)
             })),
+            outcome_ops: std::array::from_fn(|row| {
+                std::array::from_fn(|k| self.outcome_ops[i][row][k].load(Ordering::Relaxed))
+            }),
         }
     }
 
@@ -2155,7 +2193,8 @@ impl RoutePlan {
                 if r.outbox.is_some()
                     && !(event.op == Op::Insert || (event.op == Op::Read && r.filter.is_some()))
                 {
-                    self.stats.claimed(Outcome::Filtered, route);
+                    self.stats
+                        .claimed(Outcome::Filtered, route, op_code(event.op));
                     return Ok(());
                 }
                 self.stats.observe(route, &view);
@@ -2163,7 +2202,8 @@ impl RoutePlan {
                     match filter.eval(&view) {
                         Ok(Tri::True) => {}
                         Ok(Tri::False | Tri::Unknown) => {
-                            self.stats.claimed(Outcome::Filtered, route);
+                            self.stats
+                                .claimed(Outcome::Filtered, route, op_code(event.op));
                             return Ok(());
                         }
                         Err(e) => {
@@ -2173,7 +2213,8 @@ impl RoutePlan {
                                 filter.source()
                             );
                             self.dead_letter(route, reason, event, now_us, out)?;
-                            self.stats.claimed(Outcome::Errors, route);
+                            self.stats
+                                .claimed(Outcome::Errors, route, op_code(event.op));
                             return Ok(());
                         }
                     }
@@ -2186,7 +2227,8 @@ impl RoutePlan {
                     if event.after_is_key && event.op != Op::Delete {
                         self.key_only_dropped(route);
                     }
-                    self.stats.claimed(Outcome::Filtered, route);
+                    self.stats
+                        .claimed(Outcome::Filtered, route, op_code(event.op));
                     return Ok(());
                 }
                 // A row without its unchanged TOAST columns, where the route wants none: the
@@ -2214,7 +2256,8 @@ impl RoutePlan {
                         cols.join(", ")
                     );
                     self.dead_letter(route, reason, event, now_us, out)?;
-                    self.stats.claimed(Outcome::Errors, route);
+                    self.stats
+                        .claimed(Outcome::Errors, route, op_code(event.op));
                     return Ok(());
                 }
                 route_key = r.key.as_ref().map(|k| self.route_key(k, &view));
@@ -2224,7 +2267,8 @@ impl RoutePlan {
                         Err(e) => {
                             let reason = format!("route `{}`: {e}", self.stats.names[route]);
                             self.dead_letter(route, reason, event, now_us, out)?;
-                            self.stats.claimed(Outcome::Errors, route);
+                            self.stats
+                                .claimed(Outcome::Errors, route, op_code(event.op));
                             return Ok(());
                         }
                     }
@@ -2239,7 +2283,8 @@ impl RoutePlan {
                     self.tombstone_skipped(route);
                     if r.shape.format == Format::Row {
                         // The delete is the tombstone itself: nothing safe is left to produce.
-                        self.stats.claimed(Outcome::Filtered, route);
+                        self.stats
+                            .claimed(Outcome::Filtered, route, op_code(event.op));
                         return Ok(());
                     }
                     skip_tombstone = true;
@@ -2314,7 +2359,8 @@ impl RoutePlan {
         out.push(record);
         out.extend(tombstone);
         if fell_back {
-            self.stats.claimed(Outcome::Fallback, route);
+            self.stats
+                .claimed(Outcome::Fallback, route, op_code(event.op));
         } else {
             self.stats.produced(route, op);
         }
@@ -2462,7 +2508,8 @@ impl RoutePlan {
                 self.stats.names[route]
             );
             self.dead_letter(route, reason, event, now_us, out)?;
-            self.stats.claimed(Outcome::Errors, route);
+            self.stats
+                .claimed(Outcome::Errors, route, op_code(event.op));
             return Ok(());
         }
         let payload = texts.pop().unwrap_or_default();
@@ -2480,7 +2527,8 @@ impl RoutePlan {
             content,
         });
         if fell_back {
-            self.stats.claimed(Outcome::Fallback, route);
+            self.stats
+                .claimed(Outcome::Fallback, route, op_code(event.op));
         } else {
             self.stats.produced(route, op_code(event.op));
         }
@@ -2552,6 +2600,8 @@ impl RoutePlan {
                 p.produced = p.produced.wrapping_sub(1);
                 if let Some(i) = OpCounts::slot(out.op) {
                     p.produced_ops[i] = p.produced_ops[i].wrapping_sub(1);
+                    let n = &mut p.outcome_ops[Outcome::Fallback.row()][i];
+                    *n = n.wrapping_add(1);
                 }
                 p.fallback = p.fallback.wrapping_add(1);
             });
@@ -3119,8 +3169,19 @@ mod tests {
         sales.schema = "sales".into();
         p.render(&sales, NOW).unwrap();
         let snap = p.stats().snapshot();
-        let counts: Vec<(&str, RouteCounts)> =
-            snap.iter().map(|c| (c.route.as_str(), c.counts)).collect();
+        for c in &snap {
+            let n = &c.counts;
+            let sums = n.outcome_ops.map(|row| row.iter().sum::<u64>());
+            assert_eq!(sums, [n.filtered, n.fallback, n.errors], "{}", c.route);
+        }
+        let counts: Vec<(&str, RouteCounts)> = snap
+            .iter()
+            .map(|c| {
+                let mut n = c.counts;
+                n.outcome_ops = Default::default();
+                (c.route.as_str(), n)
+            })
+            .collect();
         let c = |matched, produced, filtered, errors| RouteCounts {
             matched,
             produced,
@@ -3133,6 +3194,7 @@ mod tests {
                 insert: produced,
                 ..Default::default()
             },
+            outcome_ops: Default::default(),
         };
         assert_eq!(
             counts,
