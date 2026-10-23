@@ -85,6 +85,7 @@ Details, keys and value encoding: [Kafka sink](docs/deep-dive/configuration.md#k
 | [Deep dives](docs/deep-dive/) | Full reference: [configuration](docs/deep-dive/configuration.md), [routing](docs/deep-dive/routing.md), [snapshots](docs/deep-dive/snapshots.md), [Postgres operations](docs/deep-dive/postgres-operations.md), [Azure identity](docs/deep-dive/azure.md), [cockpit](docs/deep-dive/cockpit.md) |
 | [Architecture](docs/ARCHITECTURE.md) | Components, delivery guarantees, crates |
 | [Runbook](docs/RUNBOOK.md) | Failure handling and recovery |
+| [Upgrading](docs/UPGRADING.md) | Upgrade and roll back without losing the slot or the checkpoint |
 | [Changelog](CHANGELOG.md) | Read the breaking changes in [`changelog/unreleased/breaking/`](changelog/unreleased/breaking/) before upgrading |
 
 ## Limitations

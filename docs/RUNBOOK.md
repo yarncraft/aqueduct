@@ -169,6 +169,7 @@ the failover procedure if Postgres moved. RTO is the container start time; RPO i
 
 ## 5. Planned maintenance
 - **Upgrade Aqueduct:** `docker stop` (graceful, finishes the in-flight event), deploy the new image on the same volume, start.
+  Checks before and after, and rollback: [UPGRADING.md](UPGRADING.md).
 - **Postgres minor upgrade/restart:** nothing to do; Aqueduct restarts itself. Major upgrade: treat as a restore (slot is lost, section 4).
 - **Decommission:** stop the container, then `SELECT pg_drop_replication_slot('aqueduct');`, or the slot holds WAL forever.
 - **Drain before risky changes:** wait until `lag_bytes` is near 0 so a slot loss costs nothing.
