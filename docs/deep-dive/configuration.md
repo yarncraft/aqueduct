@@ -119,7 +119,7 @@ Kafka is the only sink. Each event is one JSON object in the shape of Debezium's
 - Record key: the primary key as a JSON object plus where the row lives,
   `{"db": "app", "schema": "public", "table": "assets", "key": {"id": 6320}}` (MongoDB:
   `{"db": "shop", "collection": "orders", "key": {"_id": ...}}`, the `documentKey`). `key` is `null` for a table
-  without a primary key and for a truncate. Headers: `op` (the letter) and `lsn`. Record timestamp: the commit time.
+  without a primary key and for a truncate. Headers: `op` (the letter) and `lsn`. Record timestamp: the produce time (`[sink] record_timestamp = "commit"` uses the commit time); the commit time is always in `source.ts_ms`.
 
 Delivery is at-least-once, so consumers should tolerate duplicates.
 

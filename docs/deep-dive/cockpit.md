@@ -90,6 +90,9 @@ MongoDB; the rates are `null` for the first 2 s; `eta_secs` is `null` unless the
 left out while unknown. Like the rest of `/api/*` and `/metrics` they need the admin token; none of them carry row
 data. Samples, rates and the window start over when the process restarts.
 
+`timestamp_ms` is the record timestamp: the produce time, or the commit time with
+`[sink] record_timestamp = "commit"`. Every record in a batch shares one produce time.
+
 `/api/events` returns each record's `topic`, `partition`, `offset`, `timestamp_ms`, `key`, `headers` (as text) and
 `event`: the value parsed as JSON, or its text when it is not JSON, and `null` for a tombstone. A value that is not a
 change-event envelope (an outbox payload, a `format = "row"` row, a tombstone) is shown raw, with its op and lsn taken
