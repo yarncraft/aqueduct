@@ -1,7 +1,7 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
     FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink,
-    PartitionBy, RoutePlan, SourceInfo,
+    PartitionBy, RecordTimestamp, RoutePlan, SourceInfo,
 };
 
 use crate::config::{KafkaConfig, KafkaRouteConfig};
@@ -84,6 +84,13 @@ fn partition_by(cfg: &KafkaConfig) -> Result<PartitionBy> {
     }
 }
 
+fn record_timestamp(cfg: &KafkaConfig) -> Result<RecordTimestamp> {
+    match &cfg.record_timestamp {
+        Some(s) => s.parse().map_err(Error::Config),
+        None => Ok(RecordTimestamp::default()),
+    }
+}
+
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
     let sasl = match (&cfg.sasl_mechanism, &cfg.sasl_username, &cfg.sasl_password) {
         (None, None, None) => None,
@@ -115,6 +122,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     let security = security(cfg)?;
     let inspector = KafkaInspector::new(cfg.brokers.clone(), &plan, security.clone());
     let by = partition_by(cfg)?;
+    let stamp = record_timestamp(cfg)?;
     cfg.check_replication_factor().map_err(Error::Config)?;
     let sink = KafkaSink::connect(
         cfg.brokers.clone(),
@@ -125,6 +133,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     )
     .await?
     .with_partition_by(by)
+    .with_record_timestamp(stamp)
     .with_source(source);
     Ok((sink, inspector))
 }

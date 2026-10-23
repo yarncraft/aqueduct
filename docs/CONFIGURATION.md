@@ -68,6 +68,7 @@ Needs a replica set. `database` becomes `schema`, the collection `table`. Other 
 | `topic` | unset | Fallback topic for events no route matches. Supports `{schema}`, `{table}`, `{op}` |
 | `partitions`, `replication_factor` | `1`, `3` | Used when Aqueduct creates a topic |
 | `partition_by` | `key` | `key` keeps a row's changes ordered; `table` gives total order per table |
+| `record_timestamp` | `produce` | Kafka record timestamp: `produce` (when Aqueduct sent it, as Debezium does) or `commit` (the source commit time). With `commit`, a backlog older than the topic's `retention.ms` can be deleted before consumers read it unless the topic uses `message.timestamp.type=LogAppendTime`. The commit time is always in `source.ts_ms` |
 | `tls`, `tls_ca_file` | `false` | Encrypt and verify the brokers. Set `tls` for any non-local cluster |
 | `sasl_mechanism`, `sasl_username`, `sasl_password` | unset | `plain`, `scram-sha-256`, `scram-sha-512` |
 | `max_dynamic_topics` | `100` | Cap on topics created by content routing |
