@@ -393,8 +393,9 @@ pub struct KafkaRouteConfig {
     /// Label for this route in per-route stats; defaults to `match`. Unique.
     #[serde(default)]
     pub name: Option<String>,
-    /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
-    #[serde(rename = "match")]
+    /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`. Left out
+    /// only on a route an earlier route's `otherwise` names.
+    #[serde(rename = "match", default)]
     pub pattern: String,
     /// Destination topic template: `{schema}`, `{table}`, `{op}` and row fields such as
     /// `{row.region}` (content routing, which needs `topic_fallback`). Required, except with
@@ -457,6 +458,10 @@ pub struct KafkaRouteConfig {
     /// Excludes `topic` and `key`.
     #[serde(default)]
     pub outbox: Option<OutboxConfig>,
+    /// The `name` of a later route, without `match`, that takes the rows `where` rejects instead
+    /// of dropping them.
+    #[serde(default)]
+    pub otherwise: Option<String>,
 }
 
 /// `outbox = {...}` on a route. Unset keys take Debezium's outbox event router defaults

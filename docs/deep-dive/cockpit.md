@@ -164,6 +164,11 @@ The **Routing** card shows where each table's events go:
   (violet, sent to `topic_fallback`) and **errors** (red, sent to the dead-letter topic). Produced is in the panel. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 
+  A route with `otherwise` has a sixth row, `OTHERWISE`, naming the route it passes rejected rows on to, and a thin
+  dashed bracket down the left of the cards links the two, labelled with the rows **passed on** so far. A route
+  reached only through `otherwise` has no `match`: its `FROM` reads `otherwise of` the routes that pass to it. Its
+  panel and the passing route's panel link each other.
+
   With more than 3 rules (`[[sink.routes]]`; `default` does not count), **Collapse rules** in the card's header folds
   every route card to its name, metrics and line, without the five rows; **Expand rules** brings them back. The
   browser remembers the choice.
@@ -260,7 +265,9 @@ unset; with a hash key the top level has `hash_key_id`. The hash key itself is n
 `id` and `type` when set); other routes leave the key out. A route with `format = "row"` has `"format": "row"` and
 its `deletes` (`tombstone`, `drop` or `row`, the default included), a route with `tombstones = true` has
 `"tombstones": true`, and a route with `unchanged = "dead_letter"` has `"unchanged": "dead_letter"`; each is left out
-otherwise. `counts` also has `tombstones_skipped`, which is not an outcome, and `ops`: the produced events per
+otherwise. A route with `otherwise` has `"otherwise"` (the next route's name), and a route reached only through one has
+`"match": null`, like `default`. `counts` also has `tombstones_skipped` and, while not zero, `passed_on` (part of
+`filtered`, the rows passed on to `otherwise`), neither an outcome, and `ops`: the produced events per
 operation (`insert`, `update`, `delete`, `truncate`, `read`; they sum to `produced`, and a delete's tombstone is not
 counted again). Every route has its resolved
 `dead_letter_topic` (a `{schema}`/`{table}` template for one rendered per event, `null` only if the default name is

@@ -62,6 +62,7 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             tombstones: r.tombstones,
             unchanged: r.unchanged.clone(),
             dead_letter_topic: r.dead_letter_topic.clone(),
+            otherwise: r.otherwise.clone(),
         })
         .collect();
     let mut plan = RoutePlan::build(

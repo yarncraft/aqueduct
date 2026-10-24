@@ -26,7 +26,8 @@ topic = "audit"
 ```
 
 - **The first matching route owns the event.** If its `where` drops the event, or fails on it, the event does not
-  fall through to a later route or to `topic`.
+  fall through to a later route or to `topic`, unless the route names one with `otherwise` (see
+  [Chaining routes with `otherwise`](#chaining-routes-with-otherwise)).
 - **Operations** are filtered in `where` through `op`: `op in ['insert', 'update']` keeps inserts and updates,
   `op != 'read'` drops snapshot rows. `op` is one of `insert`, `update`, `delete`, `truncate` and `read` (snapshot
   rows), in lower case; any other value fails startup. There is no separate `ops` key: a route that sets one fails
@@ -84,6 +85,42 @@ topic = "audit"
   insert has no `before`) but not the field. Once 1000 such rows have arrived and no row has had the field, it logs a
   warning once and reports the field in `unseen_fields` and `aqueduct_route_field_unseen`. A field seen once is never
   reported, so a column that only some rows have (a delete's before-image holds only the key) does not trigger it.
+
+## Chaining routes with `otherwise`
+
+One table can feed several rules in turn. `otherwise = "<name>"` hands the rows a route's `where` rejects (false or
+unknown) to a later route instead of dropping them; that route has no `match`, so it takes only those rows, and its
+own `where` decides next. The last link usually has no `where` and takes the rest.
+
+```toml
+[[sink.routes]]
+name = "big-orders"
+match = "public.orders"
+where = "row.total > 1000"
+topic = "orders.big"
+otherwise = "eu-orders"
+
+[[sink.routes]]
+name = "eu-orders"                           # no match: reached only through otherwise
+where = "row.region == 'eu'"
+topic = "orders.eu"
+otherwise = "other-orders"
+
+[[sink.routes]]
+name = "other-orders"
+topic = "orders.other"
+```
+
+- **Each link decides on the original row.** A passed-on row is not reshaped first: every route applies its own
+  `where`, `key`, topic and field operations to the event as it came from the source.
+- **A type error stops the chain.** A `where` that fails on a row sends it to that route's dead-letter topic; it is not
+  passed on.
+- **Startup checks.** `otherwise` needs a `where` and names a route that exists, comes **later** (so a row can never
+  loop) and has no `match`. A route without `match` needs a `name` and must be named by at least one `otherwise`;
+  several routes may name the same one. `otherwise` and `outbox` are mutually exclusive.
+- **Counters.** A row passed on counts as `filtered` at the route that passed it, and also as `passed_on` there (part
+  of `filtered`, not a fifth outcome); the next route counts it as `matched`. So matched = produced + filtered +
+  fallback + errors holds on every route.
 
 ## Dead-letter topics
 
@@ -497,6 +534,7 @@ a failed batch the pipeline retries is counted once, when it is delivered. They 
 |--------|---------|
 | `aqueduct_route_records_total{route, outcome}` | Counter. `outcome` is `produced`, `filtered`, `fallback` or `errors`. `matched` is not exported; it is the sum over the outcomes |
 | `aqueduct_route_field_unseen{route, field}` | Gauge, `1` for each field path reported as unseen (absent otherwise) |
+| `aqueduct_route_passed_on_total{route}` | Counter. Events the route's `where` rejected and passed on to its `otherwise` route. Not an outcome: they count as `filtered` too |
 | `aqueduct_route_tombstones_skipped_total{route}` | Counter. Deletes a `tombstones = true` route produced without a tombstone because the row has no key. Not an outcome: the delete itself counts as `produced` |
 | `aqueduct_topic_records_total{topic}` | Counter. Records Kafka acknowledged per topic, counted after each produce succeeds (a failed produce counts when its batch is retried). Tombstones (null-value records) count like any other record. The first 500 topics are counted by name, any further ones under `topic="(other)"` (logged once) |
 | `aqueduct_kafka_bytes_total` | Counter. Key, value and header bytes of the records Kafka acknowledged, all topics together, counted like `aqueduct_topic_records_total` |

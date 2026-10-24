@@ -616,6 +616,10 @@ const graphOpen = new Set();        // 'r:<route>' and 'g:<template>' groups sho
 const flowUntil = {};               // edge id → time until which it counts as having recent traffic
 let flowPrev = null;
 
+// A route without `match` is the default (sink.topic), or one reached only through an earlier route's `otherwise`.
+const isDefaultRoute = r => r.match == null && r.route === 'default';
+const isOtherwiseRoute = r => r.match == null && r.route !== 'default';
+
 // The graph as nodes, edges and the numbers that change with every frame.
 function graphModelOf(d) {
   const live = (d && d.routes) || [];
@@ -624,7 +628,13 @@ function graphModelOf(d) {
     const c = l || Object.assign({ unseen_fields: r.unseen_fields || [] }, r.counts);
     return { r, i, c, id: 'r:' + i, tables: [], topics: new Map(), out: [] };
   });
-  const fallback = routes.findIndex(x => x.r.match == null);
+  const fallback = routes.findIndex(x => isDefaultRoute(x.r));
+  // `otherwise` chains: x.next is the route x passes the rows its where rejects on to, x.from the routes that pass to x.
+  for (const x of routes) x.from = [];
+  for (const x of routes) {
+    x.next = x.r.otherwise != null ? routes.find(y => y.r.route === x.r.otherwise) || null : null;
+    if (x.next) x.next.from.push(x);
+  }
   const claim = name => { const i = routes.findIndex(x => x.r.match != null && globMatch(x.r.match, name)); return i >= 0 ? i : fallback; };
   const evs = (d && d.tables) || {};
   const unrouted = [];
@@ -765,6 +775,13 @@ function graphModelOf(d) {
     for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
     for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true, dlqBw);
   }
+  // otherwise: route → the later route it passes rejected rows on to, drawn as a bracket down the cards' left side.
+  for (const x of routes) {
+    if (!x.next) continue;
+    x.chainEdge = x.id + '>' + x.next.id;
+    edges.push({ id: x.chainEdge, from: x.id, to: x.next.id, w: x.c.passed_on || 0, bw: 0, chain: true });
+    values[x.chainEdge] = fmt(x.c.passed_on || 0);
+  }
   for (const t of unrouted) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
   if (dlqHidden.length) ops['pm:dlq'] = rates && rates.topic_totals ? addSlots(dlqHidden.map(d => ops[d.id])) : null;
@@ -837,6 +854,10 @@ function selectClause(r) {
 // FROM: the match glob, then the tables it claimed, ` / `-joined, the first few and "+N".
 function fromClause(x) {
   const r = x.r, names = x.tables.map(t => t.name).sort();
+  if (isOtherwiseRoute(r)) {
+    const from = x.from.map(y => y.r.route);
+    return `<span class="truncate text-ink-100" title="${esc('Only the rows these routes\' where rejected: ' + from.join(', '))}">otherwise of ${esc(from.join(' / '))}</span>`;
+  }
   const glob = r.match == null ? '* (unmatched)' : r.match;
   const listed = names.length === 1 && names[0] === r.match ? [] : names;
   const more = listed.length - FROM_TABLES;
@@ -850,7 +871,7 @@ function fromClause(x) {
 // INTO: the topic template and, for content routing, ELSE its fallback. The dead-letter topic is in the route's panel.
 function intoClause(r) {
   const vals = r.topic_values;
-  return sqlText(r.topic, r.match == null, r.match == null ? 'sink.topic: ' + r.topic : r.topic)
+  return sqlText(r.topic, isDefaultRoute(r), isDefaultRoute(r) ? 'sink.topic: ' + r.topic : r.topic)
     + (vals ? sqlTag(vals.length + (vals.length === 1 ? ' value' : ' values'), 'topic_values: ' + vals.join(', ')) : '')
     + (r.topic_fallback ? `<span class="shrink-0 text-[10px] text-ink-500">ELSE</span>${sqlText(r.topic_fallback, false, 'topic_fallback: ' + r.topic_fallback)}` : '');
 }
@@ -878,7 +899,7 @@ const COLLAPSE_MIN = 4;
 let rulesCollapsed = false;
 try { rulesCollapsed = localStorage.getItem('aqueduct_rules_collapsed') === '1'; } catch (_) { /* storage blocked */ }
 // Configured rules only: the default route (no match) is not one.
-const ruleCount = () => plan ? plan.routes.filter(r => r.match != null).length : 0;
+const ruleCount = () => plan ? plan.routes.filter(r => !isDefaultRoute(r)).length : 0;
 const rulesFolded = () => rulesCollapsed && ruleCount() >= COLLAPSE_MIN;
 $('routecollapse').addEventListener('click', () => {
   rulesCollapsed = !rulesCollapsed;
@@ -891,7 +912,7 @@ function routeNode(x, last) {
   const unseen = x.c.unseen_fields || [];
   return `<div data-node="${x.id}" data-route="${x.i}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue" style="${STRIP_PAD}">${opStrip(x.id)}`
     // Step and name on top.
-    + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
+    + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${isDefaultRoute(r) ? 'Takes every table no route above matched' : isOtherwiseRoute(r) ? 'Has no match: takes only the rows an earlier route passes on through otherwise' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${isDefaultRoute(r) ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
     + (folded ? '' : `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
       + sqlRow('SELECT', selectClause(r))
@@ -899,6 +920,7 @@ function routeNode(x, last) {
       + sqlRow('FROM', fromClause(x))
       + sqlRow('INTO', intoClause(r))
       + sqlRow('PARTITIONED-BY', partitionClause(r))
+      + (r.otherwise != null ? sqlRow('OTHERWISE', sqlText(r.otherwise, false, 'Rows its where rejects (false or unknown) go on to ' + r.otherwise + '; a type error still dead-letters')) : '')
       + `</div>`)
     // Its rates; the counts are in its panel. Folded, the header's rule already divides them from the name.
     + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">`
@@ -921,7 +943,7 @@ function graphHtml(m) {
   const tables = m.routes.filter(x => x.tables.length).map(x => `<div class="space-y-1">${x.shown.map(tableNode).join('')}${x.hidden.length ? moreNode(x.moreId, x.id, x.hidden.length, 'tables') : graphOpen.has(x.id) ? lessNode(x.id) : ''}</div>`).join('')
     + (m.unrouted.length ? `<div class="space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">no route · events fail</div>${m.unrouted.map(tableNode).join('')}</div>` : '');
   // The default route (sink.topic) is left out while nothing has reached it.
-  const routes = m.routes.filter(x => x.r.match != null || x.tables.length || (x.c.matched || 0) > 0).map((x, i, all) => routeNode(x, i === all.length - 1)).join('');
+  const routes = m.routes.filter(x => !isDefaultRoute(x.r) || x.tables.length || (x.c.matched || 0) > 0).map((x, i, all) => routeNode(x, i === all.length - 1)).join('');
   const topics = m.groups.map(g => `<div class="space-y-1">`
     + g.shown.map(t => topicNodeHtml('p:' + t, t, {})).join('')
     + (g.hidden.length ? moreNode(g.moreId, 'g:' + g.tpl, g.hidden.length, 'topics') : graphOpen.has('g:' + g.tpl) ? lessNode('g:' + g.tpl) : '')
@@ -986,9 +1008,10 @@ function drawEdges() {
   for (const [id, el] of Object.entries(els)) el.classList.toggle('opacity-40', !!hl && !hl.has(id));
   // Widths follow bandwidth (bytes per second now), or, from a server that counts no bytes, records since start.
   const size = e => m.bw ? e.bw : e.w;
-  const max = Math.max(...m.edges.map(size), 0) || 1;
+  const max = Math.max(...m.edges.filter(e => !e.chain).map(size), 0) || 1;
   const now = Date.now();
   for (const e of m.edges) {
+    if (e.chain) { drawChain(e, at, lines, flows, texts, !hl || hl.has(e.id), now); continue; }
     const a = at(e.from, true), b = at(e.to, false);
     if (!a || !b) continue;
     const mx = ((a[0] + b[0]) / 2).toFixed(1);
@@ -1014,11 +1037,32 @@ function drawEdges() {
   lines.done(); flows.done(); texts.done();
 }
 
+// An otherwise edge: from the left of one route card down (or up) to the left of the later one it passes rows on to,
+// bulging out into the gap by CHAIN_BULGE, thin and dashed, its passed-on count written up its side.
+const CHAIN_BULGE = 22;
+function drawChain(e, at, lines, flows, texts, on, now) {
+  const a = at(e.from, false), b = at(e.to, false);
+  if (!a || !b) return;
+  const x = Math.min(a[0], b[0]) - CHAIN_BULGE;
+  const d = `M${a[0].toFixed(1)},${a[1].toFixed(1)} C${x.toFixed(1)},${a[1].toFixed(1)} ${x.toFixed(1)},${b[1].toFixed(1)} ${b[0].toFixed(1)},${b[1].toFixed(1)}`;
+  setAttrs(lines.get(e.id, 'path'), { d, fill: 'none', stroke: on && graphHover ? EDGE_HL : EDGE_FLOW, 'stroke-width': 1, 'stroke-dasharray': '4 3', 'stroke-opacity': on ? 0.8 : 0.15 });
+  if ((flowUntil[e.id] || 0) > now) {
+    setAttrs(flows.get(e.id, 'path'), { d, fill: 'none', stroke: EDGE_FLOW, 'stroke-width': 1.5, 'stroke-linecap': 'round',
+      'stroke-dasharray': '2 10', 'stroke-opacity': on ? 0.9 : 0.15, class: 'motion-safe:animate-flow' });
+  }
+  // The curve's leftmost point is 3/4 of the way out; the label sits just outside it, reading upwards.
+  const lx = (a[0] + 3 * (x - a[0]) / 4 - 4).toFixed(1), ly = ((a[1] + b[1]) / 2).toFixed(1);
+  const t = texts.get(e.id, 'text'), s = 'passed on ' + fmt(e.w);
+  setAttrs(t, { x: lx, y: ly, 'text-anchor': 'middle', transform: `rotate(-90 ${lx} ${ly})`, 'font-family': 'var(--font-mono)', 'font-size': 9,
+    fill: EDGE_FLOW, 'fill-opacity': on ? 1 : 0.3, stroke: 'var(--color-ink-900)', 'stroke-width': 3, 'stroke-linejoin': 'round', 'paint-order': 'stroke' });
+  if (t.textContent !== s) t.textContent = s;
+}
+
 // Marks the edges whose counts moved since the last frame as having recent traffic.
 function trackFlow(m) {
   const now = Date.now(), cur = { t: {}, r: [] };
   for (const x of m.routes) {
-    cur.r[x.i] = { produced: x.c.produced || 0, errors: x.c.errors || 0 };
+    cur.r[x.i] = { produced: x.c.produced || 0, errors: x.c.errors || 0, passed: x.c.passed_on || 0 };
     const was = flowPrev && flowPrev.r[x.i];
     let moved = false;
     for (const t of x.tables) {
@@ -1031,6 +1075,7 @@ function trackFlow(m) {
     }
     if (was && cur.r[x.i].produced > was.produced && !moved) for (const o of x.out) flowUntil[o.id] = now + FLOW_MS;
     if (was && x.dlqEdge && cur.r[x.i].errors > was.errors) flowUntil[x.dlqEdge] = now + FLOW_MS;
+    if (was && x.chainEdge && cur.r[x.i].passed > was.passed) flowUntil[x.chainEdge] = now + FLOW_MS;
   }
   flowPrev = cur;
 }
@@ -1114,13 +1159,15 @@ function routeDetail(m) {
   // counts and the op bar.
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const ON_CARD = ['route', 'match', 'where', 'topic', 'counts', 'unseen_fields', 'include', 'exclude', 'mask', 'hash', 'rename',
-    'format', 'deletes', 'tombstones', 'unchanged', 'key', 'outbox', 'topic_fallback', 'topic_values', 'dead_letter_topic'];
+    'format', 'deletes', 'tombstones', 'unchanged', 'key', 'outbox', 'topic_fallback', 'topic_values', 'dead_letter_topic', 'otherwise'];
   const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
   const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
-  $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
+  $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${isDefaultRoute(r) ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length + (isOtherwiseRoute(r) ? ' · reached only through otherwise' : '')}</span>${closeBtn}</div><div class="space-y-1">`
     + row('counts', CARD_METRICS.map(([k, , label]) => `<span class="mr-3" title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums"></span></span>`).join(''))
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
+    + (x.next ? row('passed on', `<span data-v="${x.chainEdge}" class="tabular-nums"></span> <span class="text-ink-500">of the filtered, to</span> ${routeLink(x.next)}`) : '')
+    + (x.from.length ? row('passed on from', x.from.map(routeLink).join('')) : '')
     + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
     + (r.topic_values && r.topic_values.length ? row('topic values', esc(r.topic_values.join(', '))) : '')
     + (rendered.length ? row('topics written', esc(rendered.join(', '))) : '')

@@ -101,6 +101,7 @@ format = "row"                                # value is the row, deletes become
 |--------|------|---------|
 | `match`, `name` | Pick events by `schema.table`; label the route | [deep dive](deep-dive/routing.md) |
 | `where` | Filter by operation and row values (SQL-style expressions) | [Filtering](deep-dive/routing.md#filtering-events-per-route) |
+| `otherwise` | Pass the rows `where` rejects on to a later route (chain rules on one table) | [Chaining](deep-dive/routing.md#chaining-routes-with-otherwise) |
 | `topic`, `topic_fallback`, `topic_values` | Static, templated or row-content topics (`orders.{row.region}`) | [Routing by row content](deep-dive/routing.md#routing-by-row-content) |
 | `dead_letter_topic` | Where unevaluable rows go (default: topic + `.dlq`) | [Dead-letter topics](deep-dive/routing.md#dead-letter-topics) |
 | `key` | Key records by chosen columns | [Keying a route](deep-dive/routing.md#keying-a-route) |

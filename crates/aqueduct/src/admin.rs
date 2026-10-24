@@ -1069,6 +1069,20 @@ fn route_metrics(o: &mut String, routes: &[RouteCount]) {
     }
     metric(
         o,
+        "aqueduct_route_passed_on_total",
+        "counter",
+        "Events a route's where rejected and passed on to its otherwise route; part of its filtered count.",
+    );
+    for r in routes {
+        let _ = writeln!(
+            o,
+            "aqueduct_route_passed_on_total{{route=\"{}\"}} {}",
+            escape_label(&r.route),
+            r.counts.passed_on
+        );
+    }
+    metric(
+        o,
         "aqueduct_route_field_unseen",
         "gauge",
         "1 for a field path a route references that no row has had yet (a typo?).",
