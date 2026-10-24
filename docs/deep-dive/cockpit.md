@@ -188,7 +188,7 @@ table highlights its whole path, through its route to its topic. The plan is rea
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 **Operation shares and rate.** Every card, routes included, has a step line of its rate over the last 300 s (a route:
-one line, processed; its detail chart has four, processed, matched, fallback and errors). Down its left edge, each
+processed; its detail chart picks one outcome). Down its left edge, each
 table, route and topic card has a stacked strip of its counts per operation since start, as shares, top to bottom (insert
 green, update blue, delete red, truncate violet, read amber, as the legend next to the section title shows; hover the
 strip for the counts and percentages). The strip counts:
@@ -200,17 +200,19 @@ strip for the counts and percentages). The strip counts:
   delete's `op` header and counts as a delete. Topic cards also show the acknowledged count;
 - a "+N more" group: the sum over its tables or topics.
 
-Table, route and topic cards keep their counts (events, the route's produced/filtered/fallback/errors, acknowledged
-records, a dead-letter topic's errors).
+Cards show rates, the mean of the last 15 s: a table its events per second, a topic its records acknowledged per
+second (a dead-letter topic its errors), a "+N more" tables group their sum. A route shows its **match rate**,
+matched over processed across the 300 s window (since start without rate history), and the events per second it
+**funnels** on (matched: produced, fallback and errors). The absolute counts are in the panels: a table's events, a
+route's processed, matched, fallback and errors, a topic's acknowledged records in total and per operation.
 
 **Rates.** Click a table, a route or a topic for a panel with one step line over the last 300 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second. A table's and a topic's chart draw the operations toggled on with the buttons above it, in the op colours: one
 operation as a line, several stacked (the top edge is their sum); only operations that have happened for that table or topic get a button (insert, update, delete,
-truncate, read); the selection is shared by every panel. A route's chart has four lines, processed, matched, fallback
-and errors, from the route's own counters, each toggled on or off with its own button (the stats follow the first one
-shown) and counting only the operations toggled on; with a single line on and several operations, that line is
-stacked by operation instead; its op buttons are the operations it has produced since start or
+truncate, read); the selection is shared by every panel. A route's chart shows one outcome from the route's own counters,
+matched by default, picked from a dropdown (processed, matched, fallback or errors), counting only the operations
+toggled on: several operations stack, one is a line; its op buttons are the operations it has produced since start or
 taken in the window under any outcome. A table's panel names the route that claims it. A route's panel shows only what its card does not: the matched count, its produced events per
 operation, the full `topic_fallback` and `topic_values`, the topics a template wrote, its dead-letter topic (click to
 select it), the full table list when the card's `FROM` is cut short, and any other config keys.  A topic's panel lists its acknowledged records per

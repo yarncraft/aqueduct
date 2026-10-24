@@ -501,6 +501,8 @@ const topicRate = name => (rates && rates.topics[name]) || [];
 // produces.
 const bwKnown = () => !!(rates && rates.topic_bytes);
 const recent = h => avg((h || []).slice(-SMOOTH_WINDOW));
+// A card's rate: the mean of the last SMOOTH_WINDOW s, per second.
+const perSec = v => (v >= 100 ? Math.round(v) : v >= 10 ? v.toFixed(0) : v.toFixed(1)) + '/s';
 const total = h => (h || []).reduce((a, n) => a + n, 0);
 const bytesPerRecord = names => {
   if (!bwKnown()) return 0;
@@ -529,9 +531,14 @@ const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '111
 // A toggle button: when on, tinted in its line's colour (it is the chart's legend); when off, grey.
 const toggleAttrs = (color, on) => on ? `class="${OP_BTN}" style="border-color:${color};color:${color};background-color:${color}26"` : `class="${OP_BTN_OFF}"`;
 const opBtnAttrs = (op, on) => toggleAttrs(OPLINE[op], on);
-// The route panel's lines (CARD_METRICS indices) toggled on; kept while you click from route to route.
-const detailLines = new Set([0, 1, 2, 3]);
-const lineBtn = i => `<button type="button" data-line="${i}" aria-pressed="${detailLines.has(i)}" ${toggleAttrs(CARD_METRICS[i][1], detailLines.has(i))}>${CARD_METRICS[i][2] || CARD_METRICS[i][0]}</button>`;
+// The outcome the route panel charts (a CARD_METRICS index), matched by default; kept while you click from route to
+// route. Picked from a dropdown in the outcome's colour.
+let detailLine = 1;
+const lineSelect = () => {
+  const c = CARD_METRICS[detailLine][1];
+  return `<select id="detailline" class="rounded-sm border bg-ink-900 px-2 py-0.5 uppercase tracking-wider focus:outline-none" style="border-color:${c};color:${c}" title="Outcome to chart">`
+    + CARD_METRICS.map(([k, , label], i) => `<option value="${i}"${i === detailLine ? ' selected' : ''}>${label || k}</option>`).join('') + '</select>';
+};
 const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
     : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
@@ -655,15 +662,23 @@ function graphModelOf(d) {
     x.shown = all.slice(0, cut).sort((a, b) => a.name < b.name ? -1 : 1);
     x.hidden = all.slice(cut);
     x.moreId = 'tm:' + x.i;
-    for (const t of x.tables) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
+    for (const t of x.tables) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
     if (x.hidden.length) {
       values[x.moreId] = fmt(x.hidden.reduce((a, t) => a + t.events, 0));
+      values[x.moreId + ':rate'] = perSec(x.hidden.reduce((a, t) => a + recent(tableEventsRate(t.name)), 0));
       ops[x.moreId] = addSlots(x.hidden.map(t => ops[t.id]));
     }
     ops[x.id] = opSlots(x.c.ops);
     for (const k of ['matched', ...ROUTE_COUNTS]) values[x.id + ':' + k] = fmt(x.c[k] || 0);
     values[x.id + ':processed'] = fmt(x.c.matched || 0);
     values[x.id + ':passed'] = fmt(Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)));
+    // The card: its match rate (matched / processed over the rate window, since start without one) and the events per
+    // second it funnels on (matched).
+    const rr = routeRate(x.i);
+    const proc = rr ? total(sumSeries(ROUTE_COUNTS.map(k => rr[k] || []))) : x.c.matched || 0;
+    const pass = rr ? proc - total(rr.filtered) : Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0));
+    values[x.id + ':matchrate'] = proc ? (100 * pass / proc).toFixed(pass === proc ? 0 : 1) + '%' : '–';
+    values[x.id + ':funnel'] = perSec(rr ? recent(sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []])) : 0);
   }
   // Topics, grouped by the template that renders them; a topic two routes share is drawn once.
   const groups = new Map(), owner = new Map();
@@ -690,6 +705,7 @@ function graphModelOf(d) {
       topicNode.set(t, 'p:' + t);
       ops['p:' + t] = topicTotals(t);
       if (ops['p:' + t]) values['p:' + t] = fmt(ops['p:' + t].reduce((a, n) => a + n, 0));
+      values['p:' + t + ':rate'] = perSec(recent(topicRate(t)));
     }
     for (const t of g.hidden) topicNode.set(t, g.moreId);
     if (g.hidden.length) ops[g.moreId] = rates && rates.topic_totals ? addSlots(g.hidden.map(topicTotals)) : null;
@@ -720,8 +736,11 @@ function graphModelOf(d) {
   const dlqShown = dlqAll.slice(0, dlqCut).sort((a, b) => a.name < b.name ? -1 : 1), dlqHidden = dlqAll.slice(dlqCut);
   for (const d of dlqHidden) d.node = 'pm:dlq';
   for (const d of dlqShown) d.node = d.id;
-  for (const d of dlqAll) values[d.id] = fmt(d.errors);
-  if (dlqHidden.length) values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
+  for (const d of dlqAll) { values[d.id] = fmt(d.errors); values[d.id + ':rate'] = perSec(recent(dlqRate(d.name))); }
+  if (dlqHidden.length) {
+    values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
+    values['pm:dlq:rate'] = perSec(dlqHidden.reduce((a, d) => a + recent(dlqRate(d.name)), 0));
+  }
   for (const x of routes) {
     const g = groups.get(x.r.topic);
     const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
@@ -749,7 +768,7 @@ function graphModelOf(d) {
     for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
     for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true, dlqBw);
   }
-  for (const t of unrouted) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
+  for (const t of unrouted) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
   if (dlqHidden.length) ops['pm:dlq'] = rates && rates.topic_totals ? addSlots(dlqHidden.map(d => ops[d.id])) : null;
   return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlqs, dlqShown, dlqHidden, bw: bwKnown() };
@@ -776,8 +795,8 @@ function dlqFor(x, name) {
 }
 
 // Table, topic and "+N more" cards: name and count on one line, the step line below, the op-share strip down the left edge.
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" style="${STRIP_PAD}" title="${esc(t.name)} · events · click for details">${opStrip(t.id)}<div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${nodeLine(t.id)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="${id === 'pm:dlq' ? '' : STRIP_CARD + ' '}block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100"${id === 'pm:dlq' ? '' : ` style="${STRIP_PAD}"`} title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}">${id === 'pm:dlq' ? '' : opStrip(id)}<span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id)}</button>`;
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" style="${STRIP_PAD}" title="${esc(t.name)} · events per second, last 15 s · click for details">${opStrip(t.id)}<div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}:rate" class="ml-auto tabular-nums text-ink-300"></span></div>${nodeLine(t.id)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="${id === 'pm:dlq' ? '' : STRIP_CARD + ' '}block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100"${id === 'pm:dlq' ? '' : ` style="${STRIP_PAD}"`} title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}${id.startsWith('tm:') ? ', per second' : ''}">${id === 'pm:dlq' ? '' : opStrip(id)}<span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}:rate" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -873,7 +892,6 @@ $('routecollapse').addEventListener('click', () => {
 function routeNode(x, last) {
   const r = x.r, sel = graphSel === x.i, folded = rulesFolded();
   const unseen = x.c.unseen_fields || [];
-  const counts = { processed: x.c.matched || 0, passed: Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)), fallback: x.c.fallback || 0, errors: x.c.errors || 0 };
   return `<div data-node="${x.id}" data-route="${x.i}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue" style="${STRIP_PAD}">${opStrip(x.id)}`
     // Step and name on top.
     + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
@@ -885,9 +903,10 @@ function routeNode(x, last) {
       + sqlRow('INTO', intoClause(r))
       + sqlRow('PARTITIONED-BY', partitionClause(r))
       + `</div>`)
-    // The metrics, each in the colour of its step line below.
-    // Folded, the header's rule already divides them from the name.
-    + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
+    // Its rates; the counts are in its panel. Folded, the header's rule already divides them from the name.
+    + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">`
+    + `<span title="Matched / processed over the last 5 min: the share of the events it took whose where held"><span class="text-ink-500">match rate</span> <span data-v="${x.id}:matchrate" class="tabular-nums text-ink-100"></span></span>`
+    + `<span title="Matched events per second, last 15 s: what it funnels on to its topics (fallback and dead letter included)"><span class="text-ink-500">funneled</span> <span data-v="${x.id}:funnel" class="tabular-nums text-ink-100"></span></span></div>`
     + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
@@ -896,8 +915,8 @@ function routeNode(x, last) {
 function topicNodeHtml(id, name, opts) {
   const sel = topicSel === name;
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
-  const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
-  const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
+  const n = `<span data-v="${esc(id)}:rate" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
+  const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate, per second · click for details` : `${name} · records acknowledged per second, last 15 s · click for details`;
   return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="${opts.dlq ? '' : STRIP_CARD + ' '}cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue"${opts.dlq ? '' : ` style="${STRIP_PAD}"`} title="${esc(title)}">${opts.dlq ? '' : opStrip(id)}<div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${nodeLine(id)}</div>`;
 }
 
@@ -1100,6 +1119,7 @@ function routeDetail(m) {
   const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
   const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
+    + row('counts', CARD_METRICS.map(([k, , label]) => `<span class="mr-3" title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums"></span></span>`).join(''))
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
     + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
@@ -1108,7 +1128,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(CARD_METRICS.map((_, i) => lineBtn(i)).join('') + '<span class="text-ink-500">|</span>' + opButtons(routeOpTotals(x, routeRate(x.i))));
+    + `</div>` + detailChart(lineSelect() + opButtons(routeOpTotals(x, routeRate(x.i))));
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1169,17 +1189,16 @@ function drawDetail(m) {
     const [produced, filtered, fallback, errors] = ['ops', ...ROUTE_OUTCOME_OPS].map((rows, j) => pick(ROUTE_COUNTS[j], rows));
     const processed = sumSeries([produced, filtered, fallback, errors]);
     const series = { processed, passed: sumSeries([produced, fallback, errors]), fallback, errors };
-    const lines = CARD_METRICS.map(([k], op) => ({ op, k, h: series[k] })).filter(s => detailLines.has(s.op));
-    // One outcome and several ops: that outcome stacked by op, in the op colours (the op buttons are its legend).
-    if (tot && lines.length === 1 && sel.length > 1) {
-      const parts = { processed: ['ops', ...ROUTE_OUTCOME_OPS], passed: ['ops', 'fallback_ops', 'errors_ops'], fallback: ['fallback_ops'], errors: ['errors_ops'] }[lines[0].k];
-      const rows = sumRows(parts.map(k => rr[k] || []));
+    const [k, color, label] = CARD_METRICS[detailLine];
+    // Several ops: the outcome stacked by op, in the op colours (the op buttons are its legend); one op, or no per-op
+    // history, a line in the outcome's colour.
+    if (tot && sel.length > 1) {
+      const parts = { processed: ['ops', ...ROUTE_OUTCOME_OPS], passed: ['ops', 'fallback_ops', 'errors_ops'], fallback: ['fallback_ops'], errors: ['errors_ops'] }[k];
+      const rows = sumRows(parts.map(p => rr[p] || []));
       chart(sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })), dc, OPLINE, 160, true);
-    } else chart(lines, dc, CARD_METRICS.map(c => c[1]), 160);
-    // The stats follow the first line shown.
-    const first = lines[0];
-    $('detailstats').textContent = !first ? 'no line selected' : tot && !sel.length ? 'no operation selected'
-      : (tot ? '' : 'all operations (no per-op history from this server) · ') + (CARD_METRICS[first.op][2] || first.k) + ' ' + rateStats(first.h);
+    } else chart([{ op: 0, h: series[k] }], dc, [color], 160);
+    $('detailstats').textContent = tot && !sel.length ? 'no operation selected'
+      : (tot ? '' : 'all operations (no per-op history from this server) · ') + (label || k) + ' ' + rateStats(series[k]);
     refreshOpButtons(tot);
     const el = document.getElementById('detailops');
     const t = opSlots(x.c.ops);
@@ -1198,7 +1217,7 @@ function drawDetail(m) {
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
   refreshOpButtons(seen);
   const el = document.getElementById('detailops');
-  if (el) el.textContent = totals ? OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
+  if (el) el.textContent = totals ? `${fmt(totals.reduce((a, n) => a + n, 0))} · ` + OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
 }
 
 function renderGraph(frame) {
@@ -1277,6 +1296,12 @@ $('graph').addEventListener('click', ev => {
   const route = ev.target.closest('[data-route]');
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
+$('routedetail').addEventListener('change', ev => {
+  if (ev.target.id !== 'detailline') return;
+  detailLine = +ev.target.value;
+  ev.target.outerHTML = lineSelect();
+  if (graphModel) drawDetail(graphModel);
+});
 $('routedetail').addEventListener('click', ev => {
   const opBtn = ev.target.closest('[data-op]');
   if (opBtn) {
@@ -1284,14 +1309,6 @@ $('routedetail').addEventListener('click', ev => {
     on ? detailOps.add(op) : detailOps.delete(op);
     opBtn.setAttribute('aria-pressed', String(on));
     opBtn.outerHTML = `<button type="button" data-op="${op}" aria-pressed="${on}" ${opBtnAttrs(op, on)}>${OP_LABEL[op]}</button>`;
-    if (graphModel) drawDetail(graphModel);
-    return;
-  }
-  const lineEl = ev.target.closest('[data-line]');
-  if (lineEl) {
-    const i = +lineEl.dataset.line;
-    detailLines.has(i) ? detailLines.delete(i) : detailLines.add(i);
-    lineEl.outerHTML = lineBtn(i);
     if (graphModel) drawDetail(graphModel);
     return;
   }
