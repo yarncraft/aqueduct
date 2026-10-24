@@ -532,13 +532,10 @@ const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '111
 const toggleAttrs = (color, on) => on ? `class="${OP_BTN}" style="border-color:${color};color:${color};background-color:${color}26"` : `class="${OP_BTN_OFF}"`;
 const opBtnAttrs = (op, on) => toggleAttrs(OPLINE[op], on);
 // The outcome the route panel charts (a CARD_METRICS index), matched by default; kept while you click from route to
-// route. Picked from a dropdown in the outcome's colour.
+// route. Picked from a dropdown.
 let detailLine = 1;
-const lineSelect = () => {
-  const c = CARD_METRICS[detailLine][1];
-  return `<select id="detailline" class="rounded-sm border bg-ink-900 px-2 py-0.5 uppercase tracking-wider focus:outline-none" style="border-color:${c};color:${c}" title="Outcome to chart">`
-    + CARD_METRICS.map(([k, , label], i) => `<option value="${i}"${i === detailLine ? ' selected' : ''}>${label || k}</option>`).join('') + '</select>';
-};
+const lineSelect = () => `<select id="detailline" class="rounded-sm border border-ink-600 bg-ink-900 px-2 py-0.5 uppercase tracking-wider text-ink-100 focus:border-blue focus:outline-none" title="Outcome to chart">`
+  + CARD_METRICS.map(([k, , label], i) => `<option value="${i}"${i === detailLine ? ' selected' : ''}>${label || k}</option>`).join('') + '</select>';
 const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
     : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
@@ -1042,8 +1039,10 @@ function trackFlow(m) {
 const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name);
 const closeBtn = '<button type="button" id="routeclose" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>';
 // The larger step-line chart in the detail panel; drawn by drawDetail on every frame.
-const detailChart = legend => `<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-300">${legend}<span id="detailstats" class="ml-auto tabular-nums text-ink-200"></span></div>`
-  + `<svg id="detailchart" viewBox="0 0 800 160" preserveAspectRatio="none" class="mt-1 block h-40 w-full"></svg>`;
+// The detail chart under its controls, with its unit (`yLabel`) written up the y axis.
+const detailChart = (legend, yLabel) => `<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-300">${legend}<span id="detailstats" class="ml-auto tabular-nums text-ink-200"></span></div>`
+  + `<div class="mt-1 flex"><span class="shrink-0 text-center text-ink-500" style="writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px">${esc(yLabel)}</span>`
+  + `<svg id="detailchart" viewBox="0 0 800 160" preserveAspectRatio="none" class="block h-40 min-w-0 flex-1"></svg></div>`;
 const legendItem = (color, text) => `<span class="flex items-center gap-1.5"><i class="inline-block h-0.5 w-3" style="background:${color}"></i>${esc(text)}</span>`;
 
 const routeLink = x => `<button type="button" data-route="${x.i}" class="mr-3 text-blue hover:underline">${esc(x.r.route)}</button>`;
@@ -1064,7 +1063,7 @@ function topicDetail(m, name) {
       + wide('dead letter for', served)
       + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
       + wide('acknowledged', '<span id="detailops">–</span>')
-      + `</div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(dlqTotals(name)));
+      + `</div>` + detailChart(opButtons(dlqTotals(name)), 'records acknowledged / s');
     return;
   }
   const writers = topicRoutes(m, name);
@@ -1075,7 +1074,7 @@ function topicDetail(m, name) {
     + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
       : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(topicTotals(name)));
+    + `</div>` + detailChart(opButtons(topicTotals(name)), 'records acknowledged / s');
 }
 
 // A table's panel (source side, no Kafka details): the route that claims it, its events, how far it has got, and its
@@ -1104,7 +1103,7 @@ function tableDetail(m, name) {
   $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
-    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">events / s</span>' + opButtons(((lastData && lastData.table_ops) || {})[name] || null));
+    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(opButtons(((lastData && lastData.table_ops) || {})[name] || null), 'events / s');
 }
 
 function routeDetail(m) {
@@ -1128,7 +1127,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(lineSelect() + opButtons(routeOpTotals(x, routeRate(x.i))));
+    + `</div>` + detailChart(lineSelect() + opButtons(routeOpTotals(x, routeRate(x.i))), 'events / s');
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
