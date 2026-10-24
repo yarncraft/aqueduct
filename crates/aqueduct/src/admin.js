@@ -614,6 +614,15 @@ let plan = null, planError = null, graphModel = null, graphKey = '';
 let graphSel = null, graphHover = null, topicSel = null, tableSel = null;
 const graphOpen = new Set();        // 'r:<route>' and 'g:<template>' groups shown in full
 const flowUntil = {};               // edge id → time until which it counts as having recent traffic
+const passedSeen = {};              // otherwise edge id → [time, passed_on] samples over the last SMOOTH_WINDOW s
+// Rows passed on per second over the last SMOOTH_WINDOW s, from the samples of the route's passed_on count.
+function passedRate(id, n) {
+  const now = Date.now(), s = (passedSeen[id] = passedSeen[id] || []);
+  if (!s.length || s[s.length - 1][1] !== n || now - s[s.length - 1][0] >= 1000) s.push([now, n]);
+  while (s.length > 2 && now - s[1][0] > SMOOTH_WINDOW * 1000) s.shift();
+  const [t0, n0] = s[0], dt = (now - t0) / 1000;
+  return dt >= 1 ? Math.max(0, n - n0) / dt : 0;
+}
 let flowPrev = null;
 
 // A route without `match` is the default (sink.topic), or one reached only through an earlier route's `otherwise`.
@@ -781,6 +790,7 @@ function graphModelOf(d) {
     x.chainEdge = x.id + '>' + x.next.id;
     edges.push({ id: x.chainEdge, from: x.id, to: x.next.id, w: x.c.passed_on || 0, bw: 0, chain: true });
     values[x.chainEdge] = fmt(x.c.passed_on || 0);
+    values[x.chainEdge + ':rate'] = perSec(passedRate(x.chainEdge, x.c.passed_on || 0));
   }
   for (const t of unrouted) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
@@ -931,6 +941,12 @@ function routeNode(x, last) {
     + `</div>`;
 }
 
+// The funnel between a route and the route its otherwise passes rows on to, right below it: the rows passed on per
+// second (the count is in the panels). It sits in the column gap, pulled in so the cards keep their rhythm.
+const funnelNode = x => `<div data-funnel="${x.chainEdge}" class="relative" style="height:34px;margin:-6px 0" title="${esc(`otherwise: the rows ${x.r.route}'s where rejected go on to ${x.next.r.route}, per second over the last 15 s`)}">`
+  + `<svg viewBox="0 0 100 34" preserveAspectRatio="none" class="absolute inset-0 block h-full w-full"><polygon points="8,0 92,0 62,34 38,34" fill="${EDGE_FLOW}" fill-opacity="0.12" stroke="${EDGE_FLOW}" stroke-opacity="0.7" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/></svg>`
+  + `<div class="relative flex h-full items-center justify-center gap-1.5 text-[10px]"><span class="text-ink-300">passed on</span><span data-v="${x.chainEdge}:rate" class="tabular-nums font-medium text-ink-100"></span></div></div>`;
+
 function topicNodeHtml(id, name, opts) {
   const sel = topicSel === name;
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
@@ -943,7 +959,9 @@ function graphHtml(m) {
   const tables = m.routes.filter(x => x.tables.length).map(x => `<div class="space-y-1">${x.shown.map(tableNode).join('')}${x.hidden.length ? moreNode(x.moreId, x.id, x.hidden.length, 'tables') : graphOpen.has(x.id) ? lessNode(x.id) : ''}</div>`).join('')
     + (m.unrouted.length ? `<div class="space-y-1"><div class="text-[10px] uppercase tracking-wider text-red">no route · events fail</div>${m.unrouted.map(tableNode).join('')}</div>` : '');
   // The default route (sink.topic) is left out while nothing has reached it.
-  const routes = m.routes.filter(x => !isDefaultRoute(x.r) || x.tables.length || (x.c.matched || 0) > 0).map((x, i, all) => routeNode(x, i === all.length - 1)).join('');
+  // A route that passes rows on to the card right below it gets a funnel in between; any other otherwise is a bracket.
+  const routes = m.routes.filter(x => !isDefaultRoute(x.r) || x.tables.length || (x.c.matched || 0) > 0)
+    .map((x, i, all) => routeNode(x, i === all.length - 1) + (x.next && all[i + 1] === x.next ? funnelNode(x) : '')).join('');
   const topics = m.groups.map(g => `<div class="space-y-1">`
     + g.shown.map(t => topicNodeHtml('p:' + t, t, {})).join('')
     + (g.hidden.length ? moreNode(g.moreId, 'g:' + g.tpl, g.hidden.length, 'topics') : graphOpen.has('g:' + g.tpl) ? lessNode('g:' + g.tpl) : '')
@@ -957,14 +975,25 @@ function graphHtml(m) {
 
 // What hovering a card lights up. A table: its edge to its route, the route, the route's edge to its topic, the topic.
 // Any other card: its own edges and the cards at their other end.
+// What a hovered card lights up (node and edge ids). A route: its own lines only, to its tables, its topics and the
+// routes otherwise links it with. A source (a table, nothing flows into it): everything downstream of it, through
+// otherwise chains too. A sink (a topic or dead-letter topic): every path that leads to it, back to the tables.
 function graphPath(m, node) {
   const on = new Set([node]);
-  const ids = node.startsWith('t:') && m.tableEdges[node.slice(2)];
-  if (ids) {
-    for (const id of ids) { on.add(id); for (const n of id.split('>')) on.add(n); }
-    return on;
+  if (node.startsWith('r:')) {
+    for (const e of m.edges) if (e.from === node || e.to === node) { on.add(e.id); on.add(e.from); on.add(e.to); }
+  } else {
+    const down = m.edges.some(e => e.from === node), walk = [node];
+    while (walk.length) {
+      const n = walk.pop();
+      for (const e of m.edges) {
+        const [a, b] = down ? [e.from, e.to] : [e.to, e.from];
+        if (a !== n || on.has(e.id)) continue;
+        on.add(e.id);
+        if (!on.has(b)) { on.add(b); walk.push(b); }
+      }
+    }
   }
-  for (const e of m.edges) if (e.from === node || e.to === node) { on.add(e.id); on.add(e.from); on.add(e.to); }
   return on.size > 1 ? on : null;
 }
 
@@ -1006,12 +1035,13 @@ function drawEdges() {
   };
   const hl = graphHover && graphPath(m, graphHover);
   for (const [id, el] of Object.entries(els)) el.classList.toggle('opacity-40', !!hl && !hl.has(id));
+  for (const el of g.querySelectorAll('[data-funnel]')) el.classList.toggle('opacity-40', !!hl && !hl.has(el.dataset.funnel));
   // Widths follow bandwidth (bytes per second now), or, from a server that counts no bytes, records since start.
   const size = e => m.bw ? e.bw : e.w;
   const max = Math.max(...m.edges.filter(e => !e.chain).map(size), 0) || 1;
   const now = Date.now();
   for (const e of m.edges) {
-    if (e.chain) { drawChain(e, at, lines, flows, texts, !hl || hl.has(e.id), now); continue; }
+    if (e.chain) { if (!g.querySelector(`[data-funnel="${e.id}"]`)) drawChain(e, at, lines, flows, texts, !hl || hl.has(e.id), now); continue; }
     const a = at(e.from, true), b = at(e.to, false);
     if (!a || !b) continue;
     const mx = ((a[0] + b[0]) / 2).toFixed(1);
@@ -1052,7 +1082,7 @@ function drawChain(e, at, lines, flows, texts, on, now) {
   }
   // The curve's leftmost point is 3/4 of the way out; the label sits just outside it, reading upwards.
   const lx = (a[0] + 3 * (x - a[0]) / 4 - 4).toFixed(1), ly = ((a[1] + b[1]) / 2).toFixed(1);
-  const t = texts.get(e.id, 'text'), s = 'passed on ' + fmt(e.w);
+  const t = texts.get(e.id, 'text'), s = 'passed on ' + (graphModel.values[e.id + ':rate'] || '');
   setAttrs(t, { x: lx, y: ly, 'text-anchor': 'middle', transform: `rotate(-90 ${lx} ${ly})`, 'font-family': 'var(--font-mono)', 'font-size': 9,
     fill: EDGE_FLOW, 'fill-opacity': on ? 1 : 0.3, stroke: 'var(--color-ink-900)', 'stroke-width': 3, 'stroke-linejoin': 'round', 'paint-order': 'stroke' });
   if (t.textContent !== s) t.textContent = s;

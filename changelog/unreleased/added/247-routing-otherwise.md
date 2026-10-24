@@ -3,5 +3,5 @@
   next; a type error still dead-letters. Startup refuses an `otherwise` without a `where`, to an earlier, missing or
   matching route, or next to `outbox`, and a route without `match` that nothing names. A passed-on row counts as
   `filtered` and `passed_on` at its route and `matched` at the next (`/api/routes`, `/api/metrics`,
-  `aqueduct_route_passed_on_total`). The cockpit shows an `OTHERWISE` row and draws the chain as a dashed bracket
-  labelled with the rows passed on.
+  `aqueduct_route_passed_on_total`). The cockpit shows an `OTHERWISE` row and draws the chain as a funnel between
+  adjacent cards (else a dashed bracket), labelled with the rows passed on.
