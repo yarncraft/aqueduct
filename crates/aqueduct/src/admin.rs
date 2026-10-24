@@ -1877,7 +1877,10 @@ Authorization: Bearer {token}
             routes[0],
             json!({"route": "paid \"orders\"", "produced": [1, 0], "filtered": [1, 0],
                    "fallback": [0, 0], "errors": [1, 0],
-                   "ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]]})
+                   "ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                   "filtered_ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                   "fallback_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                   "errors_ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]]})
         );
         assert_eq!(
             v["topics"],
@@ -1903,6 +1906,7 @@ Authorization: Bearer {token}
             m["rates"],
             json!({"seq": 2, "routes": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
                    "route_ops": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                   "route_outcome_ops": ([[[0u64; 5]; 3]; 3]),
                    "topics": {"cdc.users": 4, "paid--orders-.t": 2},
                    "topic_ops": {"cdc.users": [0, 0, 4, 0, 0], "paid--orders-.t": [0, 2, 0, 0, 0]},
                    "topic_bytes": {"cdc.users": 640}})

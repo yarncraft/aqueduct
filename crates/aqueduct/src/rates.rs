@@ -1,5 +1,5 @@
 //! Per-route and per-topic rate history for the cockpit's Routing card: one sample per second
-//! of the route outcome counters and produced records per operation ([`RouteCount`]), and of the
+//! of the route outcome counters and of each outcome per operation ([`RouteCount`]), and of the
 //! records and bytes Kafka acknowledged per topic and operation ([`aqueduct_sinks::TopicStats`]),
 //! kept over the same window as the event-rate history.
 //!
@@ -18,6 +18,10 @@ pub type Outcomes = [u64; 4];
 /// Records per second per operation: `[insert, update, delete, truncate, read]`.
 pub type Ops = [u64; 5];
 
+/// One route's second: its outcomes, its produced records per op, and its filtered, fallback
+/// and errors per op.
+type RouteSample = (Outcomes, Ops, [Ops; 3]);
+
 fn outcomes(c: &RouteCount) -> Outcomes {
     let c = &c.counts;
     [c.produced, c.filtered, c.fallback, c.errors]
@@ -33,9 +37,9 @@ pub struct RateHistory {
     seq: u64,
     /// Samples in the window so far (at most `len`); every series below has this many.
     filled: usize,
-    /// Per route: its outcomes and its produced records per op, each second.
-    routes: Vec<(String, VecDeque<(Outcomes, Ops)>)>,
-    last_routes: Vec<(Outcomes, Ops)>,
+    /// Per route: its outcomes and each outcome per op, each second.
+    routes: Vec<(String, VecDeque<RouteSample>)>,
+    last_routes: Vec<RouteSample>,
     /// Per topic: acknowledged records per op, each second.
     topics: BTreeMap<String, VecDeque<Ops>>,
     /// The acknowledged totals since start, per topic and op.
@@ -44,7 +48,7 @@ pub struct RateHistory {
     topic_bytes: BTreeMap<String, VecDeque<u64>>,
     last_topic_bytes: BTreeMap<String, u64>,
     /// The newest sample, for the stream: every route, and only the topics that moved.
-    latest_routes: Vec<(Outcomes, Ops)>,
+    latest_routes: Vec<RouteSample>,
     latest_topics: BTreeMap<String, Ops>,
     latest_topic_bytes: BTreeMap<String, u64>,
 }
@@ -84,13 +88,17 @@ impl RateHistory {
                 .iter()
                 .map(|c| (c.route.clone(), VecDeque::with_capacity(self.len)))
                 .collect();
-            self.last_routes = vec![([0; 4], [0; 5]); routes.len()];
+            self.last_routes = vec![([0; 4], [0; 5], [[0; 5]; 3]); routes.len()];
         }
         self.latest_routes.clear();
         for (i, c) in routes.iter().enumerate() {
-            let now = (outcomes(c), c.counts.ops.slots());
+            let now = (outcomes(c), c.counts.ops.slots(), c.counts.outcome_ops);
             let prev = self.last_routes[i];
-            let d = (delta(now.0, prev.0), delta(now.1, prev.1));
+            let d = (
+                delta(now.0, prev.0),
+                delta(now.1, prev.1),
+                std::array::from_fn(|k| delta(now.2[k], prev.2[k])),
+            );
             self.last_routes[i] = now;
             self.latest_routes.push(d);
             push(&mut self.routes[i].1, d, self.filled, self.len);
@@ -123,9 +131,9 @@ impl RateHistory {
         self.last_topic_bytes.clone_from(bytes);
     }
 
-    /// The newest sample for each stream frame: `seq`, every route's outcomes and produced
-    /// records per op in plan order, and the topics with records in that second (their total and
-    /// per op, and their bytes).
+    /// The newest sample for each stream frame: `seq`, every route's outcomes, produced records
+    /// per op and `[filtered, fallback, errors]` per op in plan order, and the topics with records
+    /// in that second (their total and per op, and their bytes).
     pub fn latest(&self) -> Value {
         let topics: BTreeMap<&String, u64> = self
             .latest_topics
@@ -136,6 +144,7 @@ impl RateHistory {
             "seq": self.seq,
             "routes": self.latest_routes.iter().map(|r| r.0).collect::<Vec<_>>(),
             "route_ops": self.latest_routes.iter().map(|r| r.1).collect::<Vec<_>>(),
+            "route_outcome_ops": self.latest_routes.iter().map(|r| r.2).collect::<Vec<_>>(),
             "topics": topics,
             "topic_ops": self.latest_topics,
             "topic_bytes": self.latest_topic_bytes,
@@ -144,7 +153,8 @@ impl RateHistory {
 
     /// The whole window, for `/api/routes/history`. Every series has the same length, oldest
     /// first, and ends with the sample numbered `seq`. Per-op series are rows of
-    /// `[insert, update, delete, truncate, read]`; `topic_totals` are the acknowledged records
+    /// `[insert, update, delete, truncate, read]` (a route's `ops` are its produced records,
+    /// `filtered_ops`, `fallback_ops` and `errors_ops` the other outcomes); `topic_totals` are the acknowledged records
     /// per topic and op since start, up to and including that sample; `topic_bytes` the bytes
     /// acknowledged per topic and second.
     pub fn window(&self, interval_ms: u64) -> Value {
@@ -160,6 +170,9 @@ impl RateHistory {
                     "fallback": col(2),
                     "errors": col(3),
                     "ops": s.iter().map(|o| o.1).collect::<Vec<Ops>>(),
+                    "filtered_ops": s.iter().map(|o| o.2[0]).collect::<Vec<Ops>>(),
+                    "fallback_ops": s.iter().map(|o| o.2[1]).collect::<Vec<Ops>>(),
+                    "errors_ops": s.iter().map(|o| o.2[2]).collect::<Vec<Ops>>(),
                 })
             })
             .collect();
@@ -217,6 +230,8 @@ mod tests {
                     delete: deletes,
                     ..Default::default()
                 },
+                // The other outcomes are all updates.
+                outcome_ops: [filtered, fallback, errors].map(|n| [0, n, 0, 0, 0]),
             },
             unseen_fields: vec![],
         }
@@ -256,6 +271,11 @@ mod tests {
         assert_eq!(l["seq"], 2);
         assert_eq!(l["routes"], json!([[2, 0, 0, 2], [1, 0, 0, 0]]));
         assert_eq!(l["route_ops"], json!([[2, 0, 0, 0, 0], [1, 0, 0, 0, 0]]));
+        // Filtered, fallback and errors per op (all updates here): route a's two errors.
+        assert_eq!(
+            l["route_outcome_ops"][0],
+            json!([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 2, 0, 0, 0]])
+        );
         // Only topics that moved are in the stream frame.
         assert_eq!(l["topics"], json!({"t": 2, "u": 1}));
         assert_eq!(
@@ -283,6 +303,14 @@ mod tests {
         assert_eq!(
             w["routes"][0]["ops"],
             json!([[2, 0, 0, 0, 0], [0, 0, 0, 0, 0], [1, 0, 0, 0, 0]])
+        );
+        assert_eq!(
+            w["routes"][0]["errors_ops"],
+            json!([[0, 2, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]])
+        );
+        assert_eq!(
+            w["routes"][0]["filtered_ops"],
+            json!([[0u64; 5]; 3].to_vec())
         );
         assert_eq!(w["routes"][1]["produced"], json!([1, 0, 0]));
         assert_eq!(w["topics"]["t"], json!([2, 0, 2]));
