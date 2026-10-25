@@ -1,4 +1,4 @@
-- **The Postgres poll transport is removed** (#000). Changes always arrive over a replication connection
+- **The Postgres poll transport is removed** (#251). Changes always arrive over a replication connection
   (`START_REPLICATION`), which drained a backlog about 10x faster than the SQL peeks of `poll` (500k small rows:
   81k against 6.3k events/s) and holds memory flat on large transactions. `transport = "poll"`, the old default, now
   fails startup; `transport = "stream"` is still accepted. On upgrade: delete `transport = "poll"` if set, give the
