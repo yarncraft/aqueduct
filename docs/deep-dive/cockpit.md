@@ -99,7 +99,7 @@ from the headers; the table of a row or tombstone comes from its JSON record key
 
 ## Per-table high-water marks
 
-Click a table (or collection) in the routing graph: its detail panel shows how far it has got on the source side
+Click a table (or collection) in the routing graph: its details pop-up shows how far it has got on the source side
 since the process started (nothing Kafka-side):
 
 | Field | Source |
@@ -216,7 +216,12 @@ matched over processed across the 300 s window (since start without rate history
 **funnels** on (matched: produced, fallback and errors). The absolute counts are in the panels: a table's events, a
 route's processed, matched, fallback and errors, a topic's acknowledged records in total and per operation.
 
-**Rates.** Click a table, a route or a topic for a panel with one step line over the last 300 s, one sample per
+**Details.** Clicking a table, a route or a topic opens its details in a pop-up over the page, like the event inspector:
+Close, Esc or a click outside closes it, and a route, topic or dead-letter topic named inside it switches the pop-up
+to that one. An inspector opened from it shows on top, and Esc closes the inspector first. A route's details start with
+its rule, the card's SELECT / WHERE / FROM / INTO / PARTITIONED-BY rows, wrapped in full rather than cut to one line.
+
+**Rates.** The details pop-up has one step line over the last 300 s, one sample per
 second (nothing animates), with its current, average and maximum rate: a table's events, a route's produced events or
 a topic's acknowledged records per second. A table's and a topic's chart draw the operations toggled on with the buttons above it, in the op colours: one
 operation as a line, several stacked (the top edge is their sum); only operations that have happened for that table or topic get a button (insert, update, delete,
