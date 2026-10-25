@@ -1,7 +1,7 @@
 # Admin cockpit
 
 The HTTP port serves a web console at `/`: whether Aqueduct is **behind its source** and when it catches up,
-throughput, lag, sink latency, errors, a **routing graph**, per-table high-water marks and an **event inspector**
+throughput, lag, the process's CPU and memory, a **routing graph**, per-table high-water marks and an **event inspector**
 (a sample of the newest events read from Kafka). Open `http://host:8080/#token=<admin_token>`; the fragment is never
 sent to the server.
 

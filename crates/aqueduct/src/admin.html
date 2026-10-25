@@ -48,16 +48,16 @@
       <div data-kpi="lag_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
-      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Sink latency</div>
-      <div id="sinkavg" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">–</div>
-      <div id="sinkdet" class="mt-1 font-mono text-[11px] text-ink-300">mean per event</div>
-      <div data-kpi="sink_ms" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">CPU</div>
+      <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="cpu">–</span><span class="ml-1 text-xs text-ink-300">%</span></div>
+      <div id="cpusub" class="mt-1 truncate font-mono text-[11px] text-ink-300">of one core</div>
+      <div data-kpi="cpu_pct" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
     <div class="bg-ink-800 p-4">
-      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Errors</div>
-      <div id="errors" class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100">0</div>
-      <div id="errsub" class="mt-1 font-mono text-[11px] text-ink-300">no faults</div>
-      <div data-kpi="errors" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
+      <div class="text-[11px] font-medium uppercase tracking-widest text-ink-300">Memory</div>
+      <div class="mt-2 font-mono text-3xl font-medium tabular-nums text-ink-100"><span id="mem">–</span><span class="ml-1 text-xs text-ink-300">MB</span></div>
+      <div id="memsub" class="mt-1 truncate font-mono text-[11px] text-ink-300">resident</div>
+      <div data-kpi="mem_mb" class="mt-1"><svg viewBox="0 0 120 20" preserveAspectRatio="none" class="block w-full" style="height:30px" aria-hidden="true"></svg></div>
     </div>
   </section>
 

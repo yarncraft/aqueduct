@@ -304,7 +304,7 @@ when unset.
 `/api/metrics` and `/api/stream` carry the same counts flat, as
 `routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "ops", "unseen_fields"}]`.
 
-The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.js`). Counters, totals, lag and max latency are exact.
+The cockpit smooths throughput, peak and the CPU tile as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.js`). Counters, totals and lag are exact.
 
 ## Top tiles: the last five minutes
 
@@ -316,22 +316,29 @@ cards' lines; nothing is averaged. Hover a line for the newest second and the wi
 | Throughput | events delivered |
 | Kafka bandwidth | key, value and header MB (10^6 bytes) Kafka acknowledged |
 | End-to-end lag | commit to delivery, while the tile shows a lag (not while it reads `idle`) |
-| Sink latency | per event delivered in that second, its batch's time from submit to the broker's ack. With several batches in flight (`sink.in_flight_batches`) that includes waiting behind earlier batches, so it can rise while throughput does too |
-| Errors | the error counter |
+| CPU | CPU time the Aqueduct process used in that second, user and system, all threads, in percent of one core (200 % = two cores busy) |
+| Memory | the process's resident memory (RSS) in MB (10^6 bytes) |
 
 The Kafka bandwidth tile itself shows the mean of the last 15 s, the last second, and the MB acknowledged since start
 (also `aqueduct_kafka_bytes_total` in `/metrics`). Bytes count after the broker acknowledged the produce, like the
 per-topic records.
 
+The CPU tile shows the mean of the last 15 s, the last second, and the CPU time per event delivered over those 15 s
+(`µs/event`): the cost of one change end to end, which throughput alone does not show. The Memory tile shows the
+resident memory now and its high over the window. Both come from `/proc/self` (`stat` and `status`), so they exist on
+Linux, which includes the container image; elsewhere the tiles read `–`. Sink latency and the error count are no longer
+tiles: they stay in `/metrics` (`aqueduct_sink_latency_seconds`, `aqueduct_errors_total`) and `/api/metrics`, and the
+last fault still shows in its own panel.
+
 The lines are drawn like the routing cards' lines: a step line from 0, right-aligned over the window. A second
-without a value (`null` in the API: lag while idle, latency with nothing delivered) is drawn as 0. The server keeps
+without a value (`null` in the API: lag while idle, CPU and memory where the platform reports none) is drawn as 0. The server keeps
 the window in memory (300 samples of five numbers), so the line is full when the page opens but starts over when
 Aqueduct restarts. Every stream frame carries the window as `kpis`; `GET /api/kpis/history` returns the same:
 
 ```json
 {"interval_ms": 1000, "len": 300,
  "throughput": [14.0, 16.0], "kafka_mb_per_sec": [0.0068, 0.0078], "lag_ms": [431.0, null],
- "sink_ms": [3.1, null], "errors": [0.0, 0.0]}
+ "cpu_pct": [4.0, 3.0], "mem_mb": [21.6, 21.7]}
 ```
 
 Every series is oldest first and ends with the newest second.
