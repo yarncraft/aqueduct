@@ -1161,13 +1161,23 @@ impl PostgresSource {
     }
 
     async fn poll(&mut self) -> Result<()> {
+        self.poll_with(true).await
+    }
+
+    /// One poll. A stream fetch waits up to `poll_interval` for data only when `wait`.
+    async fn poll_with(&mut self, wait: bool) -> Result<()> {
         if self.cfg.transport == TransportKind::Stream {
             // The fetch waits for data, so the heartbeat runs after it: a heartbeat started
             // before a fetch that is then cancelled would never finish. The idle target is the
             // last keepalive's position W, not the server's WAL position: W proves receipt of
             // everything committed below it, while the WAL position on a busy cluster (or after
             // the heartbeat action query) is always past W, and the slot would never move.
-            let fetched = self.transport()?.fetch().await?;
+            let t = self.transport()?;
+            let fetched = if wait {
+                t.fetch().await?
+            } else {
+                t.fetch_ready().await?
+            };
             self.learn_keys(&fetched.messages).await?;
             self.apply(fetched.messages)?;
             self.advance_settled().await?;
@@ -1743,6 +1753,24 @@ impl Source for PostgresSource {
 
     fn try_next(&mut self) -> Option<ChangeEvent> {
         self.buffer.pop_front()
+    }
+
+    /// `next` without the idle pause: one poll (a stream fetch that does not wait), so the
+    /// next batch is read while earlier ones are still being delivered.
+    async fn read_ahead(&mut self) -> Result<()> {
+        if !self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.handle_requests().await?;
+        if !self.buffer.is_empty() {
+            return Ok(());
+        }
+        if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref()) {
+            if e.due() {
+                e.start_chunk(c).await?;
+            }
+        }
+        self.poll_with(false).await
     }
 
     async fn ack(&mut self, position: Position) -> Result<()> {

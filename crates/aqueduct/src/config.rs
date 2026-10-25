@@ -359,6 +359,11 @@ pub struct KafkaConfig {
     /// counted from the broker at startup; beyond it events go to the route's `topic_fallback`.
     #[serde(default = "default_max_dynamic_topics")]
     pub max_dynamic_topics: usize,
+    /// Batches produced at once, 1 to 16. Each partition still writes them in order, and a
+    /// batch is checkpointed only after it and every earlier one are acknowledged. 1: one batch
+    /// at a time.
+    #[serde(default = "default_in_flight_batches")]
+    pub in_flight_batches: usize,
     /// Encrypt with TLS and verify the broker certificate.
     #[serde(default)]
     pub tls: bool,
@@ -564,6 +569,10 @@ impl OutboxConfig {
 
 fn default_max_dynamic_topics() -> usize {
     aqueduct_sinks::DEFAULT_MAX_DYNAMIC_TOPICS
+}
+
+fn default_in_flight_batches() -> usize {
+    aqueduct_sinks::DEFAULT_IN_FLIGHT_BATCHES
 }
 
 fn default_true() -> bool {

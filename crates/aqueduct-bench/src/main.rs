@@ -6,7 +6,11 @@
 //!
 //!   cargo run --release -p aqueduct-bench -- [--events N] [--payload BYTES]
 //!       [--sink null|render|kafka] [--profile simple|industrial] [--dir PATH]
-//!       [--brokers HOST:PORT] [--partitions N]
+//!       [--brokers HOST:PORT] [--partitions N] [--in-flight K]
+//!
+//! Events carry a primary key (`id`, from 10 000 distinct values; `asset_id` for the industrial
+//! profile), so `--partitions` spreads them like a real table. `--in-flight` is
+//! `sink.in_flight_batches` (default 4).
 //!
 //! `--sink render` runs the route plan (topic, key, JSON value, headers) on every event without a
 //! broker: the cost of everything the Kafka sink does before the network.
@@ -14,9 +18,9 @@
 //! With `--source postgres --pg-url URL [--transport poll|stream]` it instead measures the
 //! Postgres source against a real server; see `postgres.rs`.
 //!
-//! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), then sends,
-//! flushes, checkpoints and acks once per batch, so the source hands out its events through
-//! `try_next` the way the real sources do.
+//! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), submits it, and
+//! checkpoints and acks once per batch as batches are delivered, so the source hands out its
+//! events through `try_next` the way the real sources do.
 
 mod industrial;
 mod postgres;
@@ -25,10 +29,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use aqueduct_core::{
-    run_pipeline_with_metrics, ChangeEvent, CheckpointStore, Error, Metrics, Op, Position, Result,
-    Sink, Source,
+    run_pipeline_with_metrics, ChangeEvent, CheckpointStore, Delivery, Error, Metrics, Op,
+    Position, Result, Sink, Source,
 };
-use aqueduct_sinks::{KafkaSecurity, KafkaSink, OutRecord, RoutePlan};
+use aqueduct_sinks::{KafkaSecurity, KafkaSink, OutRecord, RoutePlan, DEFAULT_IN_FLIGHT_BATCHES};
 use async_trait::async_trait;
 use serde_json::value::to_raw_value;
 use tokio::sync::watch;
@@ -143,6 +147,24 @@ impl<S: Sink> Sink for Counting<S> {
             None => Ok(()),
         }
     }
+    fn in_flight(&self) -> usize {
+        self.inner.as_ref().map_or(1, Sink::in_flight)
+    }
+    async fn submit(&mut self, events: &[ChangeEvent]) -> Result<Delivery> {
+        if self.inner.is_none() {
+            self.send_batch(events).await?;
+            return Ok(Box::pin(std::future::ready(Ok(()))));
+        }
+        for e in events {
+            self.count(e)?;
+        }
+        // invariant: checked above.
+        self.inner
+            .as_mut()
+            .expect("inner sink")
+            .submit(events)
+            .await
+    }
 }
 
 /// Same strategy as the binary's FileCheckpoint: tmp file + rename.
@@ -205,7 +227,17 @@ async fn main() {
     let pool = if profile == "industrial" {
         industrial::pool(20_000)
     } else {
-        vec![template]
+        // 10 000 rows, so the key spreads them over the partitions.
+        (0..10_000)
+            .map(|id| {
+                let row = serde_json::json!({"id": id, "data": "x".repeat(payload)});
+                ChangeEvent {
+                    after: Some(to_raw_value(&row).unwrap()),
+                    key: Some(format!(r#"{{"id":{id}}}"#)),
+                    ..template.clone()
+                }
+            })
+            .collect()
     };
     let sizes: Vec<u64> = pool
         .iter()
@@ -227,6 +259,8 @@ async fn main() {
         "kafka" => {
             let brokers = arg("--brokers").unwrap_or_else(|| "localhost:9092".into());
             let parts: i32 = arg("--partitions").map_or(3, |v| v.parse().unwrap());
+            let in_flight: usize =
+                arg("--in-flight").map_or(DEFAULT_IN_FLIGHT_BATCHES, |v| v.parse().unwrap());
             let topic = format!("aqueduct-bench-{}", std::process::id());
             let router = RoutePlan::new(vec![], Some(topic)).unwrap();
             let inner = KafkaSink::connect(
@@ -237,7 +271,8 @@ async fn main() {
                 &KafkaSecurity::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .with_in_flight(in_flight);
             let mut sink = Counting {
                 sizes,
                 inner: Some(inner),

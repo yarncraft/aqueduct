@@ -140,6 +140,7 @@ Delivery is at-least-once, so consumers should tolerate duplicates.
 | `sasl_username` | unset | Env: `AQUEDUCT_KAFKA_SASL_USERNAME` |
 | `sasl_password` | unset | Env: `AQUEDUCT_KAFKA_SASL_PASSWORD`. Never logged |
 | `max_dynamic_topics` | `100` | How many topics content routing may create, counted from the broker (existing topics a template could produce count). Beyond it, events go to the route's `topic_fallback`. `0` means no new topics: only topics that already exist are used. See [Routing by row content](routing.md#routing-by-row-content) |
+| `in_flight_batches` | `4` | How many batches are produced at once, `1` to `16`. Each partition has one produce request outstanding and writes the batches in order, and a batch is checkpointed only once it and every earlier batch are acknowledged, so ordering and at-least-once are as with `1`. More batches in flight hide the broker round trip; `1` delivers one batch at a time. See [ADR 0004](../adr/0004-pipelined-kafka-produce.md) |
 | `dead_letter_topic` | unset | Global override: the dead-letter topic of every route that does not set its own `dead_letter_topic`. Unset, each route uses its own topic plus `.dlq`. See [Dead-letter topics](routing.md#dead-letter-topics) |
 | `hash_key_file` | unset | File holding the key for route `hash` (at least 32 bytes; one trailing newline is ignored). Or env `AQUEDUCT_HASH_KEY` (also without one trailing newline), not both. A `hash_key` in this file is rejected. Never logged. See [Protecting fields per route](routing.md#protecting-fields-per-route) |
 | `hash_key_id` | unset | Short label of the hash key (1 to 64 of `A-Z a-z 0-9 . _ : -`), sent as the `aqueduct-hash-key-id` header on every record of a hashing route. Required with a key, and an error without one |
@@ -152,10 +153,12 @@ an update of a primary-key column moves the row to the key's new partition. The 
 so tables with `REPLICA IDENTITY FULL` are keyed by it like any other. Rows of a table without a primary key, and
 every `TRUNCATE`, have `"key": null`, so they share the table's partition and a truncate is not ordered against the
 rows on other partitions; do not use it as a barrier. With `partition_by = "table"`, all of a table's changes stay
-ordered. A produce is acknowledged by the broker before the
-checkpoint moves. A batch's records for one partition go out in requests of at most about 900 KiB each, one after
-another so their order holds, which keeps each request under the broker's default `message.max.bytes` (1 MiB); a
-single record larger than that still goes alone, and the broker (or the topic's `max.message.bytes`) decides. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
+ordered. A batch is checkpointed only after the broker acknowledged it and every batch before it. Each partition
+sends one produce request at a time, filled with the records of every batch waiting for it (up to `in_flight_batches`
+batches), in requests of at most about 900 KiB each, so their order holds and each request stays under the broker's
+default `message.max.bytes` (1 MiB); a single record larger than that still goes alone, and the broker (or the topic's
+`max.message.bytes`) decides. A failed request stops that partition: the batches behind it fail too and the process
+exits, and the restart resumes from the last checkpoint. At least one of `topic` or a route is required; an event that matches nothing while `topic` is unset
 fails the pipeline instead of being silently dropped. Topics are created on first use, so pre-create them (with the
 replication factor and retention you want) in production.
 

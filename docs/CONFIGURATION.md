@@ -73,6 +73,7 @@ Needs a replica set. Plaintext to a non-loopback host is refused unless the URI 
 | `tls`, `tls_ca_file` | `false` | Encrypt and verify the brokers. Set `tls` for any non-local cluster |
 | `sasl_mechanism`, `sasl_username`, `sasl_password` | unset | `plain`, `scram-sha-256`, `scram-sha-512` |
 | `max_dynamic_topics` | `100` | Cap on topics created by content routing |
+| `in_flight_batches` | `4` | Batches produced at once, `1` to `16`. Per-partition order and the checkpoint order hold; `1` delivers one batch at a time |
 | `dead_letter_topic` | unset | Global dead-letter topic override |
 | `hash_key_file`, `hash_key_id` | unset | Key and label for the `hash` field operation |
 

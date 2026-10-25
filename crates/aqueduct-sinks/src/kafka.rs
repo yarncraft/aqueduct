@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::lane::Lane;
 use crate::route::{OutRecord, RoutePlan};
 use crate::topic_stats::TopicStats;
 use crate::{OpCounts, SourceInfo};
-use aqueduct_core::{ChangeEvent, Error, Op, Result, Sink};
+use aqueduct_core::{ChangeEvent, Delivery, Error, Op, Result, Sink};
 use async_trait::async_trait;
 use rskafka::client::error::{Error as ClientError, ProtocolError};
 use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
@@ -287,9 +288,10 @@ fn after_create(configured: Option<i16>, outcome: CreateOutcome<'_>) -> AfterCre
 /// Produces each event as a JSON record to the Kafka topic a [`RoutePlan`] renders it to.
 /// The partition is a hash of the record key (or of the table, see [`PartitionBy`]), so
 /// changes to one row (or table) keep their order. Topics are
-/// opened (and created if missing) on first use. `send` returns once the
-/// broker has acknowledged the record, so the pipeline only checkpoints
-/// durably produced events.
+/// opened (and created if missing) on first use. A submitted batch's delivery resolves once the
+/// broker has acknowledged all its records, so the pipeline only checkpoints durably produced
+/// events. Up to [`with_in_flight`](Self::with_in_flight) batches are in flight at once; each
+/// partition has one lane that writes them in submit order (ADR 0004).
 pub struct KafkaSink {
     client: Client,
     plan: RoutePlan,
@@ -301,7 +303,16 @@ pub struct KafkaSink {
     /// Records acknowledged per topic, shared with the admin server.
     topic_stats: Arc<TopicStats>,
     record_timestamp: RecordTimestamp,
+    /// The produce lane of each (topic, partition index) written to so far.
+    lanes: HashMap<(String, usize), Lane>,
+    /// Batches in flight at once (`sink.in_flight_batches`).
+    in_flight: usize,
 }
+
+/// `sink.in_flight_batches` when unset.
+pub const DEFAULT_IN_FLIGHT_BATCHES: usize = 4;
+/// The most `sink.in_flight_batches` accepts.
+pub const MAX_IN_FLIGHT_BATCHES: usize = 16;
 
 fn err(what: &str, e: &dyn std::fmt::Display) -> Error {
     Error::Sink(format!("kafka {what}: {e}"))
@@ -332,6 +343,8 @@ impl KafkaSink {
             create_attempts: AtomicU64::new(0),
             topic_stats: Arc::new(TopicStats::new()),
             record_timestamp: RecordTimestamp::default(),
+            lanes: HashMap::new(),
+            in_flight: DEFAULT_IN_FLIGHT_BATCHES,
         };
         // Fail fast on a bad broker/topic: open the default topic now (a templated
         // default like `cdc.{table}` only resolves per event, so it opens on first use).
@@ -399,6 +412,13 @@ impl KafkaSink {
     }
 
     /// Choose the Kafka record timestamp (default: the produce time).
+    /// How many batches may be in flight at once, 1 to [`MAX_IN_FLIGHT_BATCHES`]. 1 delivers one
+    /// batch at a time.
+    pub fn with_in_flight(mut self, batches: usize) -> Self {
+        self.in_flight = batches.clamp(1, MAX_IN_FLIGHT_BATCHES);
+        self
+    }
+
     pub fn with_record_timestamp(mut self, stamp: RecordTimestamp) -> Self {
         self.record_timestamp = stamp;
         self
@@ -613,6 +633,21 @@ fn chunk_records(records: Vec<Record>, budget: usize) -> Vec<Vec<Record>> {
     chunks
 }
 
+/// The lane for one partition: requests under [`MAX_REQUEST_BYTES`], one at a time.
+fn lane(client: Arc<PartitionClient>, topic: String) -> Lane {
+    let produce = move |records: Vec<Record>| {
+        let (client, topic) = (client.clone(), topic.clone());
+        async move {
+            client
+                .produce(records, Compression::NoCompression)
+                .await
+                .map(drop)
+                .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))
+        }
+    };
+    Lane::spawn(produce, |records| chunk_records(records, MAX_REQUEST_BYTES))
+}
+
 /// Awaits `produce` and, once the broker acknowledged it, counts its records (`ops`, per
 /// operation) for `topic` and their `bytes`. A failed produce counts nothing: its batch is retried
 /// and counted then.
@@ -652,11 +687,19 @@ impl Sink for KafkaSink {
         self.send_batch(std::slice::from_ref(event)).await
     }
 
-    /// Group the batch by destination partition (keeping event order inside each) and
-    /// produce every group, all partitions in parallel. A group goes out in requests of at most
-    /// [`MAX_REQUEST_BYTES`], one after another, so its order holds. Returns once the broker has
-    /// acknowledged all of them; only then are the batch's route counts applied.
     async fn send_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
+        self.submit(events).await?.await
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Group the batch by destination partition (keeping event order inside each) and hand each
+    /// group to its partition's lane, behind the groups of earlier batches; all partitions write
+    /// in parallel. The delivery resolves once the broker has acknowledged every group; only then
+    /// are the batch's route counts applied.
+    async fn submit(&mut self, events: &[ChangeEvent]) -> Result<Delivery> {
         // Counts left by a batch that failed: it is being retried, and counted when delivered.
         self.plan.discard_counts();
         // Per destination partition: the records, and how many of them carry each op.
@@ -696,26 +739,24 @@ impl Sink for KafkaSink {
                 group.0.push(record(out, self.record_timestamp, now));
             }
         }
-        let stats = &*self.topic_stats;
-        let sends = groups.into_iter().map(|((topic, part), (records, ops))| {
-            let client = self.topics[&topic][part].clone();
-            async move {
-                let bytes = records.iter().map(payload_size).sum();
-                let produce = async {
-                    for chunk in chunk_records(records, MAX_REQUEST_BYTES) {
-                        client
-                            .produce(chunk, Compression::NoCompression)
-                            .await
-                            .map_err(|e| Error::Sink(format!("kafka produce to {topic}: {e}")))?;
-                    }
-                    Ok(())
-                };
-                counted(stats, &topic, &ops, bytes, produce).await
-            }
-        });
-        futures::future::try_join_all(sends).await?;
-        self.plan.commit_counts();
-        Ok(())
+        let mut sends = Vec::with_capacity(groups.len());
+        for ((topic, part), (records, ops)) in groups {
+            let bytes = records.iter().map(payload_size).sum();
+            let topics = &self.topics;
+            let acked = self
+                .lanes
+                .entry((topic.clone(), part))
+                .or_insert_with(|| lane(topics[&topic][part].clone(), topic.clone()))
+                .push(records);
+            let stats = self.topic_stats.clone();
+            sends.push(async move { counted(&stats, &topic, &ops, bytes, acked).await });
+        }
+        let counts = self.plan.take_counts();
+        Ok(Box::pin(async move {
+            futures::future::try_join_all(sends).await?;
+            counts.commit();
+            Ok(())
+        }))
     }
 }
 

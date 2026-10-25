@@ -8,7 +8,7 @@ mod plan;
 
 pub use fields::{FieldSpec, HashKey, HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES};
 pub use plan::{
-    ContentTopic, KafkaRoute, Otherwise, OutRecord, OutboxSpec, RouteCount, RouteCounts,
-    RouteDescription, RoutePlan, RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
-    UNSEEN_FIELD_ROWS,
+    BatchCounts, ContentTopic, KafkaRoute, Otherwise, OutRecord, OutboxSpec, RouteCount,
+    RouteCounts, RouteDescription, RoutePlan, RouteStats, RoutesDescription,
+    DEFAULT_MAX_DYNAMIC_TOPICS, UNSEEN_FIELD_ROWS,
 };

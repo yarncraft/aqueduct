@@ -1,7 +1,7 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
     FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink,
-    PartitionBy, RecordTimestamp, RoutePlan, SourceInfo,
+    PartitionBy, RecordTimestamp, RoutePlan, SourceInfo, MAX_IN_FLIGHT_BATCHES,
 };
 
 use crate::config::{KafkaConfig, KafkaRouteConfig, OtherwiseConfig};
@@ -92,6 +92,16 @@ fn record_timestamp(cfg: &KafkaConfig) -> Result<RecordTimestamp> {
     }
 }
 
+fn in_flight_batches(cfg: &KafkaConfig) -> Result<usize> {
+    let n = cfg.in_flight_batches;
+    if !(1..=MAX_IN_FLIGHT_BATCHES).contains(&n) {
+        return Err(Error::Config(format!(
+            "sink.in_flight_batches must be 1 to {MAX_IN_FLIGHT_BATCHES}, not {n}"
+        )));
+    }
+    Ok(n)
+}
+
 fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
     let sasl = match (&cfg.sasl_mechanism, &cfg.sasl_username, &cfg.sasl_password) {
         (None, None, None) => None,
@@ -124,6 +134,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     let inspector = KafkaInspector::new(cfg.brokers.clone(), &plan, security.clone());
     let by = partition_by(cfg)?;
     let stamp = record_timestamp(cfg)?;
+    let in_flight = in_flight_batches(cfg)?;
     cfg.check_replication_factor().map_err(Error::Config)?;
     let sink = KafkaSink::connect(
         cfg.brokers.clone(),
@@ -135,6 +146,7 @@ pub async fn build(cfg: &KafkaConfig, source: SourceInfo) -> Result<(KafkaSink, 
     .await?
     .with_partition_by(by)
     .with_record_timestamp(stamp)
+    .with_in_flight(in_flight)
     .with_source(source);
     Ok((sink, inspector))
 }
@@ -337,6 +349,18 @@ hash = ['email']
             Some(vec!["id".to_string(), "email".to_string()])
         );
         assert_eq!(d.routes[0].hash, Some(vec!["email".to_string()]));
+    }
+
+    #[test]
+    fn in_flight_batches_default_to_4_and_must_be_1_to_16() {
+        let n = |toml: &str| in_flight_batches(&kafka(toml));
+        assert_eq!(n("topic = 't'").unwrap(), 4);
+        assert_eq!(n("topic = 't'\nin_flight_batches = 1").unwrap(), 1);
+        assert_eq!(n("topic = 't'\nin_flight_batches = 16").unwrap(), 16);
+        for bad in [0, 17] {
+            let e = n(&format!("topic = 't'\nin_flight_batches = {bad}")).unwrap_err();
+            assert!(e.to_string().contains("1 to 16"), "{e}");
+        }
     }
 
     #[test]
