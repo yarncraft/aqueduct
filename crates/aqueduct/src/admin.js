@@ -427,14 +427,20 @@ $('snapcancel').addEventListener('click', async () => {
 for (const id of ['evsearch', 'evop', 'evtable']) $(id).addEventListener('input', renderEvents);
 $('evtopic').addEventListener('input', sampleEvents);
 $('evresample').addEventListener('click', sampleEvents);
-// The inspector is a modal pop-up: Close, Esc or a click outside the window closes it.
+// The inspector is a modal pop-up: Close, Esc or a click outside the window closes it. The page stays locked while the
+// details pop-up is still open below it.
 function closeInspector() {
   $('inspector').hidden = true;
-  document.body.classList.remove('overflow-hidden');
+  document.body.classList.toggle('overflow-hidden', !$('routepop').hidden);
 }
 $('evclose').addEventListener('click', closeInspector);
 $('inspector').addEventListener('click', ev => { if (ev.target === $('inspector')) closeInspector(); });
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && !$('inspector').hidden) closeInspector(); });
+// Esc closes the top pop-up: the inspector, else the details.
+document.addEventListener('keydown', ev => {
+  if (ev.key !== 'Escape') return;
+  if (!$('inspector').hidden) closeInspector();
+  else if (!$('routepop').hidden) closeDetail();
+});
 
 // ---- Routing graph ----
 // Tables (stream + /api/tables) → routes in match order, first match wins → topics, and the dead-letter topic.
@@ -861,10 +867,12 @@ const canDeadLetter = r => readsRow(r.where) || r.unchanged === 'dead_letter' ||
 
 // A route card is five aligned rows, SELECT / WHERE / FROM / INTO / PARTITIONED-BY: keyword in a muted column, value
 // next to it. An unset clause shows its effective default, dimmed. Each row is one line; the full text is its tooltip.
+// The details pop-up shows the same rows, wrapped instead of cut off (sqlWrap, while it renders them).
 const SQL_KW = 'text-[10px] leading-4 text-ink-500';
 const SQL_VAL = 'flex min-w-0 items-baseline gap-1.5 leading-4';
+let sqlWrap = false;
 const sqlTag = (text, title) => `<span class="shrink-0 rounded-sm bg-ink-700 px-1 text-[10px] text-ink-300"${title ? ` title="${esc(title)}"` : ''}>${esc(text)}</span>`;
-const sqlText = (text, dim, title) => `<span class="truncate ${dim ? 'text-ink-500' : 'text-ink-100'}" title="${esc(title ?? text)}">${esc(text)}</span>`;
+const sqlText = (text, dim, title) => `<span class="${sqlWrap ? 'min-w-0 break-all' : 'truncate'} ${dim ? 'text-ink-500' : 'text-ink-100'}" title="${esc(title ?? text)}">${esc(text)}</span>`;
 const FROM_TABLES = 3;
 
 // SELECT: what the record value holds. `*` is the envelope; `include` lists columns, `exclude` is `* EXCEPT (...)`,
@@ -924,6 +932,22 @@ function partitionClause(r) {
 
 const sqlRow = (kw, val) => `<div class="${SQL_KW}">${kw}</div><div class="${SQL_VAL}">${val}</div>`;
 
+// The rule itself: the card's SQL rows, also at the top of the route's details (wrapped there).
+function ruleSql(x, wrap) {
+  const r = x.r;
+  sqlWrap = !!wrap;
+  try {
+    return `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
+      + sqlRow('SELECT', selectClause(r))
+      + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
+      + sqlRow('FROM', fromClause(x))
+      + sqlRow('INTO', intoClause(r))
+      + sqlRow('PARTITIONED-BY', partitionClause(r))
+      + (r.otherwise != null ? sqlRow('OTHERWISE', otherwiseClause(r)) : '')
+      + `</div>`;
+  } finally { sqlWrap = false; }
+}
+
 const CARD_METRIC_HELP = {
   processed: 'Every event the route took (its match fits the table)',
   passed: 'Processed minus filtered: events whose where held (or that it could not evaluate, which also count as errors)',
@@ -951,14 +975,7 @@ function routeNode(x, last) {
     // Step and name on top.
     + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${isDefaultRoute(r) ? 'Takes every table no route above matched' : isOtherwiseRoute(r) ? 'Has no match: takes only the rows an earlier route passes on through otherwise' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${isDefaultRoute(r) ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
-    + (folded ? '' : `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
-      + sqlRow('SELECT', selectClause(r))
-      + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
-      + sqlRow('FROM', fromClause(x))
-      + sqlRow('INTO', intoClause(r))
-      + sqlRow('PARTITIONED-BY', partitionClause(r))
-      + (r.otherwise != null ? sqlRow('OTHERWISE', otherwiseClause(r)) : '')
-      + `</div>`)
+    + (folded ? '' : ruleSql(x))
     // Its rates; the counts are in its panel. Folded, the header's rule already divides them from the name.
     + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">`
     + `<span title="Matched / processed over the last 5 min: the share of the events it took whose where held"><span class="text-ink-500">match rate</span> <span data-v="${x.id}:matchrate" class="tabular-nums text-ink-100"></span></span>`
@@ -1219,16 +1236,19 @@ function tableDetail(m, name) {
 
 function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
-  $('routedetail').hidden = !x && topicSel == null && tableSel == null;
+  const open = !!x || topicSel != null || tableSel != null;
+  $('routepop').hidden = !open;
+  document.body.classList.toggle('overflow-hidden', open || !$('inspector').hidden);
   if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
-  // Only what the card does not already show: the card has SELECT/WHERE/FROM/INTO/PARTITIONED-BY, the outcome
-  // counts and the op bar.
+  // The rule as on the card (SELECT/WHERE/FROM/INTO/PARTITIONED-BY), then what the card does not show; the extra keys
+  // are only those the rule rows do not already cover.
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
   const ON_CARD = ['route', 'match', 'where', 'topic', 'counts', 'unseen_fields', 'include', 'exclude', 'mask', 'hash', 'rename',
     'format', 'deletes', 'tombstones', 'unchanged', 'key', 'outbox', 'topic_fallback', 'topic_values', 'dead_letter_topic', 'otherwise'];
   const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
   const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
-  $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${isDefaultRoute(r) ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length + (isOtherwiseRoute(r) ? ' · reached only through otherwise' : '')}</span>${closeBtn}</div><div class="space-y-1">`
+  $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${isDefaultRoute(r) ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length + (isOtherwiseRoute(r) ? ' · reached only through otherwise' : '')}</span>${closeBtn}</div>`
+    + `<div class="mb-2 rounded-sm border border-ink-700 bg-ink-900 p-2.5">${ruleSql(x, true)}</div><div class="space-y-1">`
     + row('counts', CARD_METRICS.map(([k, , label]) => `<span class="mr-3" title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums"></span></span>`).join(''))
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
@@ -1409,6 +1429,9 @@ $('graph').addEventListener('click', ev => {
   const route = ev.target.closest('[data-route]');
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
 });
+// The details are a modal pop-up like the inspector: Close, Esc or a click outside the window closes them.
+function closeDetail() { graphSel = topicSel = tableSel = null; renderGraph(); }
+$('routepop').addEventListener('click', ev => { if (ev.target === $('routepop')) closeDetail(); });
 $('routedetail').addEventListener('change', ev => {
   if (ev.target.id !== 'detailline') return;
   detailLine = +ev.target.value;
@@ -1425,7 +1448,7 @@ $('routedetail').addEventListener('click', ev => {
     if (graphModel) drawDetail(graphModel);
     return;
   }
-  if (ev.target.closest('#routeclose')) { graphSel = topicSel = tableSel = null; renderGraph(); return; }
+  if (ev.target.closest('#routeclose')) { closeDetail(); return; }
   // A dead-letter topic named in a topic's panel: select its node (opening "+N more" if it is behind it).
   const dead = ev.target.closest('[data-dlq]');
   if (dead) {
