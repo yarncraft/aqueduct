@@ -9,4 +9,4 @@
   An `info` log names each FULL table the first time its Relation message is seen (once per process); it only matters if
   you use `partition_by = "key"`.
 
-Details: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (config reference and the "Securing connections" checklist).
+Details: [`docs/DEPLOYMENT.md`](../../../docs/DEPLOYMENT.md) (config reference and the "Securing connections" checklist).

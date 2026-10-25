@@ -54,7 +54,7 @@ Once a second the admin server takes a sample of both; the card is derived from 
   minus the later of the newest delivered change's commit time and the moment the backlog crossed the threshold (when
   that happened inside the window), so a burst after a quiet hour reads seconds, not an hour; 0 when caught up.
   MongoDB: the head's cluster time minus the newest delivered one. A sparkline shows the backlog over the last 5 minutes, like the other cards (at
-  most 60 values).
+  most 300 values, one a second).
 - **Source vs delivered.** How fast the head and the delivered position move over the window: WAL bytes per second,
   or for MongoDB seconds of cluster time per second (about 1.0 for the source; above 1.0 delivered means catching
   up). Rates need 2 s of samples.
@@ -245,7 +245,7 @@ contain row values under content routing; they are shown only behind the token, 
 zero when the process restarts.
 
 ```json
-{"seq": 431, "interval_ms": 1000, "len": 120,
+{"seq": 431, "interval_ms": 1000, "len": 300,
  "routes": [{"route": "paid-orders", "produced": [3, 0, 5], "filtered": [1, 0, 2], "fallback": [0, 0, 0], "errors": [0, 0, 0],
              "ops": [[2, 1, 0, 0, 0], [0, 0, 0, 0, 0], [3, 0, 2, 0, 0]],
              "filtered_ops": [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 2, 0, 0, 0]],
@@ -304,7 +304,7 @@ when unset.
 `/api/metrics` and `/api/stream` carry the same counts flat, as
 `routes: [{"route", "matched", "produced", "filtered", "fallback", "errors", "tombstones_skipped", "ops", "unseen_fields"}]`.
 
-The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.html`). Counters, totals, lag and max latency are exact.
+The cockpit smooths throughput, peak and recent sink latency as trailing averages over the last 15 one-second snapshots (`SMOOTH_WINDOW` in `admin.js`). Counters, totals, lag and max latency are exact.
 
 ## Top tiles: the last five minutes
 
