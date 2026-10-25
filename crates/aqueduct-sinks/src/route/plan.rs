@@ -27,7 +27,8 @@ const DEFAULT_ROUTE: &str = "default";
 pub struct KafkaRoute {
     /// Label in route stats; defaults to `pattern`.
     pub name: Option<String>,
-    /// `schema.table` with `*` wildcards, e.g. `public.*`, `*.audit_log`, `*`.
+    /// `schema.table` with `*` wildcards, e.g. `public.*`, `*.audit_log`, `*`. Empty for a route
+    /// reached only through an earlier route's `otherwise`.
     pub pattern: String,
     /// Destination topic; `{schema}` and `{table}` are substituted.
     pub topic: String,
@@ -62,6 +63,20 @@ pub struct KafkaRoute {
     /// The route's own dead-letter topic, a fixed name. Unset: `sink.dead_letter_topic`, else the
     /// route's topic plus `.dlq` ([`DLQ_SUFFIX`]).
     pub dead_letter_topic: Option<String>,
+    /// Where the rows this route's `where` rejects (false or unknown) go instead of being dropped:
+    /// a later route without `match`, or a fixed topic. A type error still dead-letters.
+    pub otherwise: Option<Otherwise>,
+}
+
+/// A route's `otherwise`, `{ route = "<name>" }` or `{ topic = "<name>" }`; serialized the same
+/// way in `/api/routes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Otherwise {
+    /// The `name` of a later route without `match`; its `where` decides next.
+    Route(String),
+    /// A fixed topic, written with this route's key and field operations.
+    Topic(String),
 }
 
 /// Appended to a route's topic (or its `topic_fallback`, for a content-routed topic) to name its
@@ -483,6 +498,17 @@ struct CompiledRoute {
     fields: Option<FieldOps>,
     /// `format`, `deletes`, `tombstones` and `unchanged`; the default builds the envelope.
     shape: Shape,
+    /// `otherwise`: where the rows `where` rejects are passed on to.
+    otherwise: Option<PassOn>,
+}
+
+/// A compiled `otherwise`.
+#[derive(Debug, Clone)]
+enum PassOn {
+    /// The index of the later route.
+    Route(usize),
+    /// A fixed topic name.
+    Topic(String),
 }
 
 /// The record value: `format`.
@@ -841,6 +867,14 @@ struct RouteKey {
 }
 
 impl CompiledRoute {
+    /// The `otherwise` topic, when `otherwise` names one.
+    fn otherwise_topic(&self) -> Option<&str> {
+        match &self.otherwise {
+            Some(PassOn::Topic(t)) => Some(t),
+            _ => None,
+        }
+    }
+
     /// The top-level columns `key = [...]` reads, in order; `None` without a per-route key.
     /// Field operations (R6) check these: no masked, hashed or excluded column may be in the key.
     pub(crate) fn key_columns(&self) -> Option<&[String]> {
@@ -930,6 +964,8 @@ pub struct RouteStats {
     /// `filtered`, `fallback` and `errors` per operation, in that order, like `produced_ops`.
     outcome_ops: Vec<[[AtomicU64; 5]; 3]>,
     filtered: Vec<AtomicU64>,
+    /// The part of `filtered` passed on to the route's `otherwise`.
+    passed_on: Vec<AtomicU64>,
     /// Events sent to a route's `topic_fallback` (content routing).
     fallback: Vec<AtomicU64>,
     errors: Vec<AtomicU64>,
@@ -963,6 +999,7 @@ struct PendingCounts {
     produced_ops: [u64; 5],
     outcome_ops: [[u64; 5]; 3],
     filtered: u64,
+    passed_on: u64,
     fallback: u64,
     errors: u64,
     tombstones_skipped: u64,
@@ -998,6 +1035,11 @@ pub struct RouteCounts {
     /// Events dropped by `where` (including a `where` that ends unknown), and outbox changes
     /// other than inserts and snapshot reads.
     pub filtered: u64,
+    /// Not an outcome: the part of `filtered` the route passed on to its `otherwise`: a route,
+    /// which counts them as `matched`, or a topic they were produced to. Left out of the JSON
+    /// while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub passed_on: u64,
     /// Events sent to the route's `topic_fallback`.
     pub fallback: u64,
     /// Events sent to the route's dead-letter topic because a row could not be evaluated.
@@ -1057,6 +1099,7 @@ impl RouteStats {
                 .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))))
                 .collect(),
             filtered: zeros(),
+            passed_on: zeros(),
             fallback: zeros(),
             errors: zeros(),
             tombstones_skipped: zeros(),
@@ -1097,6 +1140,14 @@ impl RouteStats {
         });
     }
 
+    /// Counts an event `route`'s `where` rejected and passed on to its `otherwise`: filtered here,
+    /// and claimed (`matched`) by the next route once its outcome is final, or already produced
+    /// to the `otherwise` topic.
+    fn passed_on(&self, route: usize, op: &str) {
+        self.claimed(Outcome::Filtered, route, op);
+        self.pend(route, |p| p.passed_on = p.passed_on.wrapping_add(1));
+    }
+
     /// Counts an event `route` produced to its topic: `matched`, `produced` and its op. Pending
     /// until [`commit`](Self::commit).
     fn produced(&self, route: usize, op: &str) {
@@ -1122,6 +1173,7 @@ impl RouteStats {
             add(&self.matched, p.matched);
             add(&self.produced, p.produced);
             add(&self.filtered, p.filtered);
+            add(&self.passed_on, p.passed_on);
             add(&self.fallback, p.fallback);
             add(&self.errors, p.errors);
             add(&self.tombstones_skipped, p.tombstones_skipped);
@@ -1153,6 +1205,7 @@ impl RouteStats {
             matched: get(&self.matched),
             produced: get(&self.produced),
             filtered: get(&self.filtered),
+            passed_on: get(&self.passed_on),
             fallback: get(&self.fallback),
             errors: get(&self.errors),
             tombstones_skipped: get(&self.tombstones_skipped),
@@ -1235,9 +1288,14 @@ pub struct RoutesDescription {
 pub struct RouteDescription {
     /// The route's `name`, else its `match`; `default` for the `sink.topic` fallback.
     pub route: String,
-    /// The `match` glob; `null` for the `default` pseudo-route (it takes what no route claims).
+    /// The `match` glob; `null` for the `default` pseudo-route (it takes what no route claims)
+    /// and for a route reached only through an earlier route's `otherwise`.
     #[serde(rename = "match")]
     pub pattern: Option<String>,
+    /// Where the rows `where` rejects are passed on to, `{"route": ...}` or `{"topic": ...}`;
+    /// left out when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otherwise: Option<Otherwise>,
     /// The `where` expression as configured; `null` without one.
     #[serde(rename = "where")]
     pub filter: Option<String>,
@@ -1306,6 +1364,10 @@ pub struct RoutePlan {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A Kafka topic name: 1 to 249 of `[A-Za-z0-9._-]`, and not `.` or `..`.
@@ -1474,6 +1536,9 @@ fn check_collisions(
                 Some(i),
             ));
         }
+        if let Some(t) = r.otherwise_topic() {
+            fixed.push((t, format!("route `{}`'s `otherwise` topic", names[i]), None));
+        }
     }
     // Topics a `{schema}`/`{table}`/`{op}` template writes: a row value must not reach them either.
     let plain: Vec<(String, &str, String)> = routes
@@ -1560,6 +1625,12 @@ fn check_dead_letter(
             {
                 return bad(format!("is also a route's `topic_fallback`{pick}"));
             }
+            if routes
+                .iter()
+                .any(|r| r.otherwise_topic() == Some(t.as_str()))
+            {
+                return bad(format!("is also a route's `otherwise` topic{pick}"));
+            }
         }
         DeadLetter::Template(t) => {
             let glob = t.glob();
@@ -1583,6 +1654,69 @@ fn check_dead_letter(
 /// column the route removes, masks or hashes. `topic_values` constrains the values of those same
 /// template fields, and `topic_fallback` is a fixed topic, so checking the template's fields covers
 /// both.
+/// Resolves each route's `otherwise` to a later route without `match` or a fixed topic, and
+/// refuses a route without `match` that no `otherwise` reaches. A row passed on is only ever
+/// handed forward, so a chain cannot loop.
+fn link_otherwise(
+    routes: &[KafkaRoute],
+    names: &[String],
+    compiled: &mut [CompiledRoute],
+) -> Result<()> {
+    let mut reached = vec![false; routes.len()];
+    for (i, r) in routes.iter().enumerate() {
+        let Some(next) = &r.otherwise else { continue };
+        let name = &names[i];
+        let err = |msg: String| Err(Error::Config(format!("sink route `{name}`: {msg}")));
+        if r.outbox.is_some() {
+            return err("`outbox` and `otherwise` are mutually exclusive".into());
+        }
+        if r.filter.is_none() {
+            return err("`otherwise` needs a `where`: without one no row is ever passed on".into());
+        }
+        let next = match next {
+            Otherwise::Route(next) => next,
+            Otherwise::Topic(t) => {
+                if !valid_topic_name(t) {
+                    return err(format!(
+                        "`otherwise = {{ topic = \"{t}\" }}` is not a valid Kafka topic name (1 to 249 of A-Z a-z 0-9 . _ -, no placeholders)"
+                    ));
+                }
+                if t.starts_with('_') {
+                    return err(format!(
+                        "`otherwise = {{ topic = \"{t}\" }}` must not start with `_` (reserved for internal topics)"
+                    ));
+                }
+                compiled[i].otherwise = Some(PassOn::Topic(t.clone()));
+                continue;
+            }
+        };
+        let Some(j) = names.iter().position(|n| n == next) else {
+            return err(format!(
+                "`otherwise = {{ route = \"{next}\" }}` names no route"
+            ));
+        };
+        if j <= i {
+            return err(format!(
+                "`otherwise` must name a later route, so a row can never loop; `{next}` is not after it"
+            ));
+        }
+        if !routes[j].pattern.is_empty() {
+            return err(format!(
+                "`otherwise` route `{next}` has a `match`; a route reached through `otherwise` has none, it takes only the rows passed on to it"
+            ));
+        }
+        compiled[i].otherwise = Some(PassOn::Route(j));
+        reached[j] = true;
+    }
+    if let Some(i) = (0..routes.len()).find(|&i| routes[i].pattern.is_empty() && !reached[i]) {
+        return Err(Error::Config(format!(
+            "sink route `{}` has no `match`; set one, or name it in an earlier route's `otherwise`",
+            names[i]
+        )));
+    }
+    Ok(())
+}
+
 fn check_field_ops(name: &str, r: &CompiledRoute, hash_key: Option<&HashKey>) -> Result<()> {
     let Some(f) = &r.fields else {
         return Ok(());
@@ -1653,6 +1787,11 @@ impl RoutePlan {
         let mut compiled = Vec::with_capacity(routes.len());
         let mut fields: Vec<Vec<FieldRef>> = Vec::with_capacity(routes.len() + 1);
         for r in &routes {
+            if r.pattern.is_empty() && r.name.is_none() {
+                return Err(Error::Config(
+                    "a sink route needs `match`, or a `name` when an earlier route's `otherwise` reaches it".into(),
+                ));
+            }
             let name = r.name.clone().unwrap_or_else(|| r.pattern.clone());
             if name.is_empty() {
                 return Err(Error::Config("sink route `name` must not be empty".into()));
@@ -1790,11 +1929,13 @@ impl RoutePlan {
                 outbox,
                 fields: field_ops,
                 shape,
+                otherwise: None,
             };
             check_field_ops(&name, &route, hash_key.as_ref())?;
             compiled.push(route);
             names.push(name);
         }
+        link_otherwise(&routes, &names, &mut compiled)?;
         if default.is_some() {
             names.push(DEFAULT_ROUTE.into());
         }
@@ -1960,6 +2101,11 @@ impl RoutePlan {
             .map(|t| t.raw.as_str())
             .chain(self.fallback_topics())
             .chain(
+                self.routes
+                    .iter()
+                    .filter_map(CompiledRoute::otherwise_topic),
+            )
+            .chain(
                 self.dead_letters
                     .iter()
                     .flatten()
@@ -2090,6 +2236,12 @@ impl RoutePlan {
             .map(|r| r.topic.glob())
             .chain(self.default.as_ref().map(TopicTemplate::glob))
             .chain(self.fallback_topics().map(str::to_string))
+            .chain(
+                self.routes
+                    .iter()
+                    .filter_map(CompiledRoute::otherwise_topic)
+                    .map(str::to_string),
+            )
             .collect();
         for g in self.dead_letters.iter().flatten().map(DeadLetter::glob) {
             if !globs.contains(&g) {
@@ -2118,6 +2270,10 @@ impl RoutePlan {
                 rename: spec.and_then(|s| (!s.rename.is_empty()).then(|| s.rename.clone())),
                 route: self.stats.names[i].clone(),
                 pattern,
+                otherwise: r.and_then(|r| r.otherwise.as_ref()).map(|o| match o {
+                    PassOn::Route(j) => Otherwise::Route(self.stats.names[*j].clone()),
+                    PassOn::Topic(t) => Otherwise::Topic(t.clone()),
+                }),
                 filter: r
                     .and_then(|r| r.filter.as_ref())
                     .map(|f| f.source().to_string()),
@@ -2135,7 +2291,10 @@ impl RoutePlan {
             .routes
             .iter()
             .enumerate()
-            .map(|(i, r)| route(i, Some(r.pattern.clone()), Some(r), &r.topic.raw))
+            .map(|(i, r)| {
+                let pattern = (!r.pattern.is_empty()).then(|| r.pattern.clone());
+                route(i, pattern, Some(r), &r.topic.raw)
+            })
             .collect();
         if let Some(d) = &self.default {
             routes.push(route(self.routes.len(), None, None, &d.raw));
@@ -2155,8 +2314,10 @@ impl RoutePlan {
     /// [`commit_counts`](Self::commit_counts), so a batch the broker refused is not counted.
     ///
     /// The first matching route owns the event (ADR 0002 §2): its `where` decides on the original
-    /// event. A `where` that is false or unknown filters the event (no record); one that hits a
-    /// type error sends it to the dead-letter topic. Neither falls through to a later route.
+    /// event. A `where` that is false or unknown filters the event (no record), or, when the route
+    /// sets `otherwise`, passes it on: to that later route, whose `where` decides next, or to that
+    /// topic, rendered by this route as any other row. One that hits a type error sends it to the
+    /// dead-letter topic and never passes it on.
     pub fn render_into(
         &self,
         event: &ChangeEvent,
@@ -2166,7 +2327,7 @@ impl RoutePlan {
         if event.op == Op::Heartbeat {
             return Ok(());
         }
-        let (route, template) = self.resolve(&event.schema, &event.table).ok_or_else(|| {
+        let (mut route, template) = self.resolve(&event.schema, &event.table).ok_or_else(|| {
             Error::Sink(format!(
                 "no kafka route or default topic for {}.{}",
                 event.schema, event.table
@@ -2174,6 +2335,53 @@ impl RoutePlan {
         })?;
         // Parses the rows only on first use, so a route that reads no field pays nothing.
         let view = EventView::new(event);
+        // `where` first, following `otherwise` from route to route while it passes the row on.
+        // `passed_to`: the `otherwise` topic the last route's `where` passed the row on to.
+        let mut passed_to = None;
+        while let Some(r) = self.routes.get(route) {
+            // An outbox publishes inserts, and snapshot reads only when the route has a `where`
+            // (checked below, so it must be true for them; ADR 0002 §5, "As built"): updates,
+            // deletes and truncates of the outbox table are filtered before anything else.
+            if r.outbox.is_some()
+                && !(event.op == Op::Insert || (event.op == Op::Read && r.filter.is_some()))
+            {
+                self.stats
+                    .claimed(Outcome::Filtered, route, op_code(event.op));
+                return Ok(());
+            }
+            self.stats.observe(route, &view);
+            let Some(filter) = &r.filter else { break };
+            match filter.eval(&view) {
+                Ok(Tri::True) => break,
+                Ok(Tri::False | Tri::Unknown) => match &r.otherwise {
+                    Some(PassOn::Route(next)) => {
+                        self.stats.passed_on(route, op_code(event.op));
+                        route = *next;
+                    }
+                    // Counted once the record is rendered, like a produced one.
+                    Some(PassOn::Topic(t)) => {
+                        passed_to = Some(t.as_str());
+                        break;
+                    }
+                    None => {
+                        self.stats
+                            .claimed(Outcome::Filtered, route, op_code(event.op));
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    let reason = format!(
+                        "route `{}`: where `{}`: {e}",
+                        self.stats.names[route],
+                        filter.source()
+                    );
+                    self.dead_letter(route, reason, event, now_us, out)?;
+                    self.stats
+                        .claimed(Outcome::Errors, route, op_code(event.op));
+                    return Ok(());
+                }
+            }
+        }
         // The record key and the partition input, when the route sets its own key.
         let mut route_key = None;
         // Field operations, applied before the topic is chosen, so a row they cannot rewrite goes
@@ -2186,39 +2394,6 @@ impl RoutePlan {
         let topic = match self.routes.get(route) {
             None => template.render(&view),
             Some(r) => {
-                // An outbox publishes inserts, and snapshot reads only when the route has a
-                // `where` (checked below, so it must be true for them; ADR 0002 §5, "As built"):
-                // updates, deletes and truncates of the outbox table are filtered before anything
-                // else.
-                if r.outbox.is_some()
-                    && !(event.op == Op::Insert || (event.op == Op::Read && r.filter.is_some()))
-                {
-                    self.stats
-                        .claimed(Outcome::Filtered, route, op_code(event.op));
-                    return Ok(());
-                }
-                self.stats.observe(route, &view);
-                if let Some(filter) = &r.filter {
-                    match filter.eval(&view) {
-                        Ok(Tri::True) => {}
-                        Ok(Tri::False | Tri::Unknown) => {
-                            self.stats
-                                .claimed(Outcome::Filtered, route, op_code(event.op));
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            let reason = format!(
-                                "route `{}`: where `{}`: {e}",
-                                self.stats.names[route],
-                                filter.source()
-                            );
-                            self.dead_letter(route, reason, event, now_us, out)?;
-                            self.stats
-                                .claimed(Outcome::Errors, route, op_code(event.op));
-                            return Ok(());
-                        }
-                    }
-                }
                 if let Some(outbox) = &r.outbox {
                     return self.render_outbox(route, r, outbox, &view, now_us, out);
                 }
@@ -2289,7 +2464,10 @@ impl RoutePlan {
                     }
                     skip_tombstone = true;
                 }
-                let (topic, c, fallback) = self.route_topic(route, r, &view);
+                let (topic, c, fallback) = match passed_to {
+                    Some(t) => (t.to_string(), None, false),
+                    None => self.route_topic(route, r, &view),
+                };
                 content = c;
                 fell_back = fallback;
                 topic
@@ -2361,6 +2539,8 @@ impl RoutePlan {
         if fell_back {
             self.stats
                 .claimed(Outcome::Fallback, route, op_code(event.op));
+        } else if passed_to.is_some() {
+            self.stats.passed_on(route, op);
         } else {
             self.stats.produced(route, op);
         }
@@ -3148,6 +3328,250 @@ mod tests {
         assert!(!reason.contains("secret-text") && !reason.contains("4242"));
     }
 
+    /// `big` passes what its `where` rejects on to `eu`, `eu` on to `other`: each `where` decides
+    /// on the original row in turn, and a type error dead-letters at the route that hit it.
+    fn chained() -> RoutePlan {
+        plan_with(vec![
+            KafkaRoute {
+                otherwise: Some(Otherwise::Route("eu".into())),
+                ..filtered("big", "public.orders", Some("row.total > 100"))
+            },
+            KafkaRoute {
+                otherwise: Some(Otherwise::Route("other".into())),
+                ..filtered("eu", "", Some("row.region == 'eu'"))
+            },
+            named("other", "", "orders.other"),
+            route("public.*", "p"),
+        ])
+    }
+
+    #[test]
+    fn otherwise_passes_rejected_rows_on_down_the_chain() {
+        let p = chained();
+        for (json, want) in [
+            (r#"{"total":200,"region":"eu"}"#, "big.topic"),
+            (r#"{"total":5,"region":"eu"}"#, "eu.topic"),
+            (r#"{"total":5,"region":"us"}"#, "orders.other"),
+            // Unknown at both: passed on twice.
+            (r#"{}"#, "orders.other"),
+            // A type error stops the chain where it happens.
+            (r#"{"total":"x"}"#, "dlq"),
+            (r#"{"total":5,"region":1}"#, "dlq"),
+        ] {
+            assert_eq!(
+                outcome(&p, &row("orders", Op::Insert, json)),
+                want,
+                "{json}"
+            );
+        }
+        // Only `big` resolves; the continuations take nothing directly.
+        assert_eq!(outcome(&p, &row("users", Op::Insert, "{}")), "p");
+
+        let snap = p.stats().snapshot();
+        let got: Vec<_> = snap
+            .iter()
+            .map(|c| {
+                let n = &c.counts;
+                (
+                    c.route.as_str(),
+                    [n.matched, n.produced, n.filtered, n.passed_on, n.errors],
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("big", [6, 1, 4, 4, 1]),
+                ("eu", [4, 1, 2, 2, 1]),
+                ("other", [2, 2, 0, 0, 0]),
+                ("public.*", [1, 1, 0, 0, 0]),
+                ("default", [0, 0, 0, 0, 0]),
+            ]
+        );
+        for c in &snap {
+            let n = &c.counts;
+            assert_eq!(
+                n.matched,
+                n.produced + n.filtered + n.fallback + n.errors,
+                "{}",
+                c.route
+            );
+        }
+
+        let d = serde_json::to_value(p.describe()).unwrap();
+        let r = &d["routes"];
+        assert_eq!(r[0]["match"], "public.orders");
+        assert_eq!(r[0]["otherwise"], serde_json::json!({ "route": "eu" }));
+        assert_eq!(r[1]["match"], serde_json::Value::Null);
+        assert_eq!(r[1]["otherwise"], serde_json::json!({ "route": "other" }));
+        assert_eq!(r[2]["match"], serde_json::Value::Null);
+        assert!(r[2].get("otherwise").is_none());
+        assert!(r[3].get("otherwise").is_none());
+    }
+
+    /// An `otherwise` topic takes the rejected rows as the route renders any row (its key, its
+    /// field operations), counted as `filtered` and `passed_on`, never `produced`.
+    #[test]
+    fn otherwise_topic_takes_the_rejected_rows_shaped_by_the_route() {
+        let p = plan_with(vec![
+            KafkaRoute {
+                key: Some(vec!["region".into()]),
+                fields: FieldSpec {
+                    exclude: Some(vec!["secret".into()]),
+                    ..FieldSpec::default()
+                },
+                otherwise: Some(Otherwise::Topic("orders.small".into())),
+                ..filtered("big", "public.orders", Some("row.total > 100"))
+            },
+            route("public.*", "p"),
+        ]);
+        for (json, want) in [
+            (r#"{"total":200,"region":"eu"}"#, "big.topic"),
+            (r#"{"total":5,"region":"eu"}"#, "orders.small"),
+            (r#"{"region":"us"}"#, "orders.small"),
+            (r#"{"total":"x"}"#, "dlq"),
+        ] {
+            assert_eq!(
+                outcome(&p, &row("orders", Op::Insert, json)),
+                want,
+                "{json}"
+            );
+        }
+        let out = p
+            .render(
+                &row(
+                    "orders",
+                    Op::Insert,
+                    r#"{"total":5,"region":"eu","secret":"s3"}"#,
+                ),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(out[0].topic, "orders.small");
+        assert!(
+            out[0].key.ends_with(r#""key":{"region":"eu"}}"#),
+            "{}",
+            out[0].key
+        );
+        assert!(!out[0].value.as_deref().unwrap().contains("s3"));
+
+        let snap = p.stats().snapshot();
+        let n = &snap[0].counts;
+        assert_eq!(
+            [n.matched, n.produced, n.filtered, n.passed_on, n.errors],
+            [5, 1, 3, 3, 1]
+        );
+        let d = serde_json::to_value(p.describe()).unwrap();
+        assert_eq!(
+            d["routes"][0]["otherwise"],
+            serde_json::json!({ "topic": "orders.small" })
+        );
+        assert!(p.topic_globs().iter().any(|g| g == "orders.small"));
+    }
+
+    #[test]
+    fn otherwise_is_checked_at_startup() {
+        let next = |name: &str, p: &str, filter: Option<&str>, to: &str| KafkaRoute {
+            otherwise: Some(Otherwise::Route(to.into())),
+            ..filtered(name, p, filter)
+        };
+        let to_topic = |t: &str| KafkaRoute {
+            otherwise: Some(Otherwise::Topic(t.into())),
+            ..filtered("a", "public.a", Some("op == 'insert'"))
+        };
+        let cases: Vec<(Vec<KafkaRoute>, &str)> = vec![
+            (
+                vec![next("a", "public.a", Some("op == 'insert'"), "nope")],
+                "sink route `a`: `otherwise = { route = \"nope\" }` names no route",
+            ),
+            (
+                vec![to_topic("bad topic")],
+                "`otherwise = { topic = \"bad topic\" }` is not a valid Kafka topic name",
+            ),
+            (
+                vec![to_topic("__internal")],
+                "`otherwise = { topic = \"__internal\" }` must not start with `_`",
+            ),
+            (
+                vec![
+                    to_topic("orders.eu"),
+                    KafkaRoute {
+                        topic_fallback: Some("orders.other".into()),
+                        ..named("o", "public.o", "orders.{row.region}")
+                    },
+                ],
+                "could produce `orders.eu`, which is route `a`'s `otherwise` topic",
+            ),
+            (
+                vec![to_topic(DLQ)],
+                "is also a route's `otherwise` topic",
+            ),
+            (
+                vec![
+                    named("b", "", "b.t"),
+                    next("a", "public.a", Some("op == 'insert'"), "b"),
+                ],
+                "`otherwise` must name a later route",
+            ),
+            (
+                vec![next("a", "public.a", Some("op == 'insert'"), "a")],
+                "`otherwise` must name a later route",
+            ),
+            (
+                vec![
+                    next("a", "public.a", Some("op == 'insert'"), "b"),
+                    named("b", "public.b", "b.t"),
+                ],
+                "`otherwise` route `b` has a `match`",
+            ),
+            (
+                vec![next("a", "public.a", None, "b"), named("b", "", "b.t")],
+                "`otherwise` needs a `where`",
+            ),
+            (
+                vec![
+                    KafkaRoute {
+                        outbox: Some(OutboxSpec {
+                            topic: "outbox.events".into(),
+                            ..OutboxSpec::default()
+                        }),
+                        otherwise: Some(Otherwise::Route("b".into())),
+                        filter: Some("op == 'insert'".into()),
+                        ..named("a", "public.outbox", "")
+                    },
+                    named("b", "", "b.t"),
+                ],
+                "`outbox` and `otherwise` are mutually exclusive",
+            ),
+            (
+                vec![named("orphan", "", "o.t")],
+                "sink route `orphan` has no `match`; set one, or name it in an earlier route's `otherwise`",
+            ),
+            (
+                vec![route("", "o.t")],
+                "a sink route needs `match`, or a `name`",
+            ),
+        ];
+        for (routes, want) in cases {
+            let err = RoutePlan::with_dead_letter(routes, None, Some(DLQ.into()))
+                .map(|_| ())
+                .expect_err(want)
+                .to_string();
+            assert!(err.contains(want), "{err}\nshould contain: {want}");
+        }
+        // One continuation may be named by several routes.
+        assert!(RoutePlan::with_dead_letter(
+            vec![
+                next("a", "public.a", Some("op == 'insert'"), "c"),
+                next("b", "public.b", Some("op == 'insert'"), "c"),
+                named("c", "", "c.t"),
+            ],
+            None,
+            Some(DLQ.into()),
+        )
+        .is_ok());
+    }
+
     #[test]
     fn counters_add_up_per_route() {
         let p = plan_with(vec![
@@ -3188,6 +3612,7 @@ mod tests {
             filtered,
             fallback: 0,
             errors,
+            passed_on: 0,
             tombstones_skipped: 0,
             // Every produced event here is an insert.
             ops: OpCounts {

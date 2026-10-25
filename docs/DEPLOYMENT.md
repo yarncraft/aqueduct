@@ -198,10 +198,11 @@ Open the cockpit as `https://aqueduct.example.com/#token=...`. Restrict the prox
 ## Always-on simulation
 
 `docker-compose.sim.yml` runs Postgres, Kafka, Aqueduct and a workload generator (`sim/simulate.sh`) that
-keeps inserting, updating and deleting rows in the industrial schema (`organizations`, `sites`, `assets`, `asset_readings`, `work_orders`, `maintenance_events`) forever (tables are capped
+keeps inserting, updating and deleting rows in the industrial schema (`organizations`, `sites`, `assets`, `events`, `work_orders`) forever (tables are capped
 at roughly 2000 recent rows; Kafka retention is capped at 256 MiB / 24 h).
 
-**Upgrading from the old users/orders/payments sim:** run `podman-compose -f docker-compose.sim.yml -p aqsim down -v` (or `docker compose -f docker-compose.sim.yml -p aqsim down -v`) once first; a bare `down -v` from the repo root targets the regular compose file and deletes your dev Postgres volume. Postgres only runs `sim/init.sql` on an empty volume, so an old volume keeps the old schema, and the simulator then fails every transaction silently (the cockpit just looks idle).
+**Upgrading from the old users/orders/payments sim:** run `podman-compose -f docker-compose.sim.yml -p aqsim down -v` (or `docker compose -f docker-compose.sim.yml -p aqsim down -v`) once first; a bare `down -v` from the repo root targets the regular compose file and deletes your dev Postgres volume. Postgres only runs `sim/init.sql` on an empty volume, so an old volume keeps the old schema, and the simulator then fails every transaction silently (the cockpit just looks idle). The same holds for a sim
+volume from before `events` replaced `asset_readings` and `maintenance_events`.
 
 ```sh
 export AQUEDUCT_ADMIN_TOKEN=$(openssl rand -hex 32)   # required, no default

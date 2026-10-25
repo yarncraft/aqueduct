@@ -22,12 +22,16 @@ CREATE TABLE assets (
   site_id int NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE TABLE asset_readings (
+CREATE TABLE events (
   id bigserial PRIMARY KEY,
   asset_id int NOT NULL,
-  metric text NOT NULL,          -- pressure_bar | flow_lpm | temperature_c | vibration_mms | torque_nm
-  value double precision NOT NULL,
-  recorded_at timestamptz NOT NULL DEFAULT now()
+  work_order_id int,             -- set on maintenance events
+  type text NOT NULL,            -- asset | maintenance | system
+  kind text NOT NULL,            -- asset: heartbeat | threshold_exceeded | alarm; maintenance: opened | started |
+                                 -- part_replaced | closed; system: firmware_update | door_opened | config_synced
+  severity text NOT NULL,        -- info | warning | critical
+  detail jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE work_orders (
   id serial PRIMARY KEY,
@@ -37,14 +41,6 @@ CREATE TABLE work_orders (
   status text NOT NULL DEFAULT 'open',   -- open | in_progress | closed
   opened_at timestamptz NOT NULL DEFAULT now(),
   closed_at timestamptz
-);
-CREATE TABLE maintenance_events (
-  id bigserial PRIMARY KEY,
-  work_order_id int NOT NULL,
-  asset_id int NOT NULL,
-  event_type text NOT NULL,      -- opened | started | part_replaced | closed
-  note text NOT NULL DEFAULT '',
-  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 -- Seed: 6 organizations, 2 sites each, 60 assets spread across them.
@@ -71,7 +67,6 @@ INSERT INTO assets(serial_number, asset_type, model, status, organization_id, si
 ALTER TABLE organizations REPLICA IDENTITY FULL;
 ALTER TABLE sites REPLICA IDENTITY FULL;
 ALTER TABLE assets REPLICA IDENTITY FULL;
-ALTER TABLE asset_readings REPLICA IDENTITY FULL;
+ALTER TABLE events REPLICA IDENTITY FULL;
 ALTER TABLE work_orders REPLICA IDENTITY FULL;
-ALTER TABLE maintenance_events REPLICA IDENTITY FULL;
-CREATE PUBLICATION aqueduct FOR TABLE organizations, sites, assets, asset_readings, work_orders, maintenance_events;
+CREATE PUBLICATION aqueduct FOR TABLE organizations, sites, assets, events, work_orders;

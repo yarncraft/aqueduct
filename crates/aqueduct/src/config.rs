@@ -393,8 +393,9 @@ pub struct KafkaRouteConfig {
     /// Label for this route in per-route stats; defaults to `match`. Unique.
     #[serde(default)]
     pub name: Option<String>,
-    /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`.
-    #[serde(rename = "match")]
+    /// `schema.table` with `*` wildcards, e.g. `public.orders`, `public.*`, `*.audit_*`. Left out
+    /// only on a route an earlier route's `otherwise` names.
+    #[serde(rename = "match", default)]
     pub pattern: String,
     /// Destination topic template: `{schema}`, `{table}`, `{op}` and row fields such as
     /// `{row.region}` (content routing, which needs `topic_fallback`). Required, except with
@@ -457,6 +458,27 @@ pub struct KafkaRouteConfig {
     /// Excludes `topic` and `key`.
     #[serde(default)]
     pub outbox: Option<OutboxConfig>,
+    /// Where the rows `where` rejects go instead of being dropped: `{ route = "<name>" }`, a later
+    /// route without `match`, or `{ topic = "<name>" }`, a fixed topic.
+    #[serde(default)]
+    pub otherwise: Option<OtherwiseConfig>,
+}
+
+/// `otherwise = { route = "..." }` or `otherwise = { topic = "..." }` on a route.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OtherwiseConfig {
+    Route(String),
+    Topic(String),
+}
+
+impl OtherwiseConfig {
+    pub fn spec(&self) -> aqueduct_sinks::Otherwise {
+        match self {
+            Self::Route(n) => aqueduct_sinks::Otherwise::Route(n.clone()),
+            Self::Topic(t) => aqueduct_sinks::Otherwise::Topic(t.clone()),
+        }
+    }
 }
 
 /// `outbox = {...}` on a route. Unset keys take Debezium's outbox event router defaults
@@ -755,6 +777,46 @@ replication_factor = 2
             let mut c = c.clone();
             c.sink.replication_factor = Some(bad);
             assert!(c.sink.check_replication_factor().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn otherwise_names_a_route_or_a_topic() {
+        let parse = |otherwise: &str| {
+            toml::from_str::<Config>(&format!(
+                "[postgres]
+url = \"postgres://u@db/app\"
+[sink]
+brokers = [\"b:9093\"]
+[[sink.routes]]
+match = \"public.a\"
+where = \"op == 'insert'\"
+topic = \"a\"
+otherwise = {otherwise}
+"
+            ))
+            .map(|c| {
+                c.sink.routes[0]
+                    .otherwise
+                    .as_ref()
+                    .map(OtherwiseConfig::spec)
+            })
+        };
+        assert_eq!(
+            parse(r#"{ route = "b" }"#).unwrap(),
+            Some(aqueduct_sinks::Otherwise::Route("b".into()))
+        );
+        assert_eq!(
+            parse(r#"{ topic = "a.other" }"#).unwrap(),
+            Some(aqueduct_sinks::Otherwise::Topic("a.other".into()))
+        );
+        // A bare name says neither, and the kind is one key, never both.
+        for bad in [
+            r#""b""#,
+            r#"{ route = "b", topic = "a.other" }"#,
+            r#"{ table = "b" }"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 

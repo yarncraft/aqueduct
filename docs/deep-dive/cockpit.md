@@ -164,6 +164,14 @@ The **Routing** card shows where each table's events go:
   (violet, sent to `topic_fallback`) and **errors** (red, sent to the dead-letter topic). Produced is in the panel. An amber **never seen** box lists fields its `where` reads that no row has had after enough rows
   (`aqueduct_route_field_unseen`); that is usually a misspelt column, and the route then filters everything.
 
+  A route with `otherwise` has a sixth row, `OTHERWISE`, naming where it passes rejected rows on to, tagged `route`
+  or `topic`. An `otherwise` topic gets a dashed line from the route, next to its solid topic lines. When the
+  `otherwise` route is the card right below, a dashed funnel between the two shows the rows **passed on** per second (last 15 s;
+  the count is in both routes' panels); otherwise a thin dashed bracket down the left of the cards links them,
+  labelled with the same rate. A route
+  reached only through `otherwise` has no `match`: its `FROM` reads `otherwise of` the routes that pass to it. Its
+  panel and the passing route's panel link each other.
+
   With more than 3 rules (`[[sink.routes]]`; `default` does not count), **Collapse rules** in the card's header folds
   every route card to its name, metrics and line, without the five rows; **Expand rules** brings them back. The
   browser remembers the choice.
@@ -179,12 +187,14 @@ A line's width follows its bandwidth: bytes per second now (the last 15 s), rela
 counts bytes per topic, not per route or table, so a line's bandwidth is its records per second times the bytes per
 record its topic averaged over the last 300 s: a route's line to a topic carries the route's produced records there,
 its line to the dead-letter topic its errors, and a table's line its share (by events) of what its route produces.
-Hover any card to light up its lines and show each one's bandwidth on it. A server from before
+Hover any card to light up its lines and show each one's bandwidth on it: a table lights up everything downstream of
+it (its route, that route's topics and dead-letter topic, and on through `otherwise` to the next routes and theirs),
+a route only its own lines (its tables, its topics, and the routes `otherwise` links it with), and a topic every path
+that leads to it, back through `otherwise` to the tables. A server from before
 per-topic bytes sizes the lines by their counts since start instead. Lines with traffic in the last 3 s carry moving dots, which stand still when the browser asks for reduced
 motion. The line from a route to its dead-letter topic is solid red (only the moving dots are striped) and appears once
 that topic has events. A route that
-picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. Hovering a
-table highlights its whole path, through its route to its topic. The plan is read once from `GET /api/routes` when the page loads; counts update every
+picks its topic per row (content routing) animates its lines to the topics it writes whenever it produces. The plan is read once from `GET /api/routes` when the page loads; counts update every
 second from the stream. Without any `[[sink.routes]]` the graph is all tables → `default` → their topics.
 
 **Operation shares and rate.** Every card, routes included, has a step line of its rate over the last 300 s (a route:
@@ -260,7 +270,9 @@ unset; with a hash key the top level has `hash_key_id`. The hash key itself is n
 `id` and `type` when set); other routes leave the key out. A route with `format = "row"` has `"format": "row"` and
 its `deletes` (`tombstone`, `drop` or `row`, the default included), a route with `tombstones = true` has
 `"tombstones": true`, and a route with `unchanged = "dead_letter"` has `"unchanged": "dead_letter"`; each is left out
-otherwise. `counts` also has `tombstones_skipped`, which is not an outcome, and `ops`: the produced events per
+otherwise. A route with `otherwise` has `"otherwise"`, `{"route": "<name>"}` or `{"topic": "<name>"}`, and a route reached only through one has
+`"match": null`, like `default`. `counts` also has `tombstones_skipped` and, while not zero, `passed_on` (part of
+`filtered`, the rows passed on to `otherwise`), neither an outcome, and `ops`: the produced events per
 operation (`insert`, `update`, `delete`, `truncate`, `read`; they sum to `produced`, and a delete's tombstone is not
 counted again). Every route has its resolved
 `dead_letter_topic` (a `{schema}`/`{table}` template for one rendered per event, `null` only if the default name is

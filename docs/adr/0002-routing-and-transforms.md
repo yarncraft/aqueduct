@@ -544,6 +544,28 @@ kept as approved; the code differs as follows:
   true for them (`where = "op in ['insert', 'read']"`). Without `where`, inserts only. Updates, deletes and truncates
   are always filtered. The startup check on an `ops` list without `insert` or `read` went with `ops`.
 
+## As built (2026-10-24): `otherwise` chains routes on one table
+
+Open question 2 kept first-match-wins and left fan-out (`continue = true`) for later. Chaining is a narrower need: one
+table, several rules tried in turn, each row still owned by exactly one route. `otherwise = { route = "<name>" }` on a
+route sends the rows its `where` rejects (false or unknown) to that route instead of filtering them, and
+`otherwise = { topic = "<name>" }` writes them to a fixed topic with the route's own key and field operations, which
+ends a chain without a catch-all route. The kind is always spelled out; a bare string fails startup:
+
+- **The target has no `match`** and is reached only through `otherwise`; it must come later than every route naming it
+  (no loops), and a route without `match` that no `otherwise` names fails startup. `otherwise` needs a `where` and
+  excludes `outbox`.
+- **Each link evaluates the original event**: its own `where`, key, topic and field operations. Nothing is reshaped on
+  the way.
+- **A type error still dead-letters** at the route that hit it (§5a): an error never moves a row on.
+- **Counters stay additive.** A passed-on row is `filtered` at the passing route and `matched` at the next one; a new
+  `passed_on` count (a part of `filtered`) is in `/api/routes`, `/api/metrics` and
+  `aqueduct_route_passed_on_total{route}`; a row written to an `otherwise` topic is `filtered` and `passed_on`, not
+  `produced`. The cockpit draws a chain as a funnel or dashed bracket between the route cards, and an `otherwise`
+  topic as a dashed line to it.
+
+Still one route per row, so ordering (§6) and the outcome invariant are unchanged; fan-out remains open.
+
 ## As built (2026-10-21): a dead-letter topic per route, `<topic>.dlq` by default
 
 Owner's convention: "the convention for dlq (default) is to use the same topic but with .dlq suffix, f.e. sim.assets

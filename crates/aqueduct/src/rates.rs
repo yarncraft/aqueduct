@@ -222,6 +222,7 @@ mod tests {
                 matched: produced + filtered + fallback + errors,
                 produced,
                 filtered,
+                passed_on: 0,
                 fallback,
                 errors,
                 tombstones_skipped: 0,

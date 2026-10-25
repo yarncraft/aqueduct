@@ -4,7 +4,7 @@ use aqueduct_sinks::{
     PartitionBy, RecordTimestamp, RoutePlan, SourceInfo,
 };
 
-use crate::config::{KafkaConfig, KafkaRouteConfig};
+use crate::config::{KafkaConfig, KafkaRouteConfig, OtherwiseConfig};
 
 /// The error for a route that still sets `ops`, which was removed before it was released: the
 /// message is the `where` that does the same.
@@ -62,6 +62,7 @@ fn plan(cfg: &KafkaConfig, hash_key: Option<HashKey>) -> Result<RoutePlan> {
             tombstones: r.tombstones,
             unchanged: r.unchanged.clone(),
             dead_letter_topic: r.dead_letter_topic.clone(),
+            otherwise: r.otherwise.as_ref().map(OtherwiseConfig::spec),
         })
         .collect();
     let mut plan = RoutePlan::build(

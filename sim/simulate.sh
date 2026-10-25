@@ -1,5 +1,5 @@
 #!/bin/bash
-# Endless industrial workload: sensor readings, asset status changes, work orders opened/closed, assets moving
+# Endless industrial workload: asset events, asset status changes, work orders opened/closed, assets moving
 # between organizations, assets commissioned/retired/removed. RATE = loop iterations per second (default 15);
 # each iteration is one short transaction. Row counts are bounded so the sim can run for days.
 export PGHOST=postgres PGUSER=aqueduct PGPASSWORD=aqueduct PGDATABASE=app
@@ -9,14 +9,18 @@ echo "simulator: running at ~${RATE} tx/s"
 while true; do
   psql -q -v ON_ERROR_STOP=0 <<'SQL'
 BEGIN;
--- sensor readings from two running assets (insert-only, capped below)
-INSERT INTO asset_readings(asset_id, metric, value)
-  SELECT a.id,
-         CASE a.asset_type WHEN 'pump' THEN (ARRAY['pressure_bar','flow_lpm'])[1 + floor(random()*2)::int]
-                           WHEN 'compressor' THEN (ARRAY['temperature_c','pressure_bar'])[1 + floor(random()*2)::int]
-                           ELSE (ARRAY['torque_nm','vibration_mms'])[1 + floor(random()*2)::int] END,
-         round((random() * 100)::numeric, 2)
-  FROM assets a WHERE a.status = 'running' ORDER BY random() LIMIT 2;
+-- asset and system events from two live assets (insert-only, capped below); maintenance events come with the work
+-- orders below
+INSERT INTO events(asset_id, type, kind, severity, detail)
+  SELECT a.id, t.type, k.kind,
+         CASE k.kind WHEN 'alarm' THEN 'critical' WHEN 'threshold_exceeded' THEN 'warning' ELSE 'info' END,
+         jsonb_build_object('asset_type', a.asset_type, 'value', round((random() * 100)::numeric, 2))
+  FROM assets a
+  CROSS JOIN LATERAL (SELECT CASE WHEN random() + 0 * a.id < 0.7 THEN 'asset' ELSE 'system' END AS type) t
+  CROSS JOIN LATERAL (SELECT CASE t.type
+                        WHEN 'asset' THEN (ARRAY['heartbeat','heartbeat','heartbeat','threshold_exceeded','alarm'])[1 + floor(random()*5)::int]
+                        ELSE (ARRAY['firmware_update','door_opened','config_synced'])[1 + floor(random()*3)::int] END AS kind) k
+  WHERE a.status IN ('running','fault') ORDER BY random() LIMIT 2;
 -- status change on a random live asset (fault is the least likely outcome)
 UPDATE assets SET status = (ARRAY['running','running','running','idle','idle','fault'])[1 + floor(random()*6)::int],
                   updated_at = now()
@@ -31,8 +35,8 @@ WITH target AS (
     SELECT id, 'corrective', (ARRAY['normal','high','high'])[1 + floor(random()*3)::int] FROM target
     RETURNING id, asset_id
 )
-INSERT INTO maintenance_events(work_order_id, asset_id, event_type, note)
-  SELECT id, asset_id, 'opened', 'fault detected' FROM wo;
+INSERT INTO events(work_order_id, asset_id, type, kind, severity, detail)
+  SELECT id, asset_id, 'maintenance', 'opened', 'info', jsonb_build_object('note', 'fault detected') FROM wo;
 -- occasional scheduled work on a healthy asset
 WITH wo AS (
   INSERT INTO work_orders(asset_id, kind, priority)
@@ -44,18 +48,18 @@ WITH wo AS (
     ORDER BY random() LIMIT 1
     RETURNING id, asset_id
 )
-INSERT INTO maintenance_events(work_order_id, asset_id, event_type, note)
-  SELECT id, asset_id, 'opened', 'scheduled' FROM wo;
+INSERT INTO events(work_order_id, asset_id, type, kind, severity, detail)
+  SELECT id, asset_id, 'maintenance', 'opened', 'info', jsonb_build_object('note', 'scheduled') FROM wo;
 -- work starts, parts get replaced
 WITH wo AS (
   UPDATE work_orders SET status = 'in_progress'
     WHERE id = (SELECT id FROM work_orders WHERE status = 'open' ORDER BY random() LIMIT 1) AND random() < 0.5
     RETURNING id, asset_id
 )
-INSERT INTO maintenance_events(work_order_id, asset_id, event_type, note)
-  SELECT id, asset_id, 'started', 'technician on site' FROM wo;
-INSERT INTO maintenance_events(work_order_id, asset_id, event_type, note)
-  SELECT id, asset_id, 'part_replaced', (ARRAY['seal','bearing','filter','valve'])[1 + floor(random()*4)::int]
+INSERT INTO events(work_order_id, asset_id, type, kind, severity, detail)
+  SELECT id, asset_id, 'maintenance', 'started', 'info', jsonb_build_object('note', 'technician on site') FROM wo;
+INSERT INTO events(work_order_id, asset_id, type, kind, severity, detail)
+  SELECT id, asset_id, 'maintenance', 'part_replaced', 'info', jsonb_build_object('note', (ARRAY['seal','bearing','filter','valve'])[1 + floor(random()*4)::int])
   FROM work_orders WHERE status = 'in_progress' AND random() < 0.3 ORDER BY random() LIMIT 1;
 -- work orders close; a corrective close brings a faulted asset back to running
 WITH closed AS (
@@ -66,8 +70,8 @@ WITH closed AS (
   UPDATE assets SET status = 'running', updated_at = now()
     WHERE id IN (SELECT asset_id FROM closed WHERE kind = 'corrective') AND status = 'fault'
 )
-INSERT INTO maintenance_events(work_order_id, asset_id, event_type, note)
-  SELECT id, asset_id, 'closed', 'verified and released' FROM closed;
+INSERT INTO events(work_order_id, asset_id, type, kind, severity, detail)
+  SELECT id, asset_id, 'maintenance', 'closed', 'info', jsonb_build_object('note', 'verified and released') FROM closed;
 -- an asset moves to another organization (and one of its sites)
 UPDATE assets a SET organization_id = s.organization_id, site_id = s.id, updated_at = now()
   FROM (SELECT id, organization_id FROM sites ORDER BY random() LIMIT 1) s
@@ -86,8 +90,7 @@ INSERT INTO assets(serial_number, asset_type, model, status, organization_id, si
        (SELECT id, organization_id FROM sites ORDER BY random() LIMIT 1) s
   WHERE (SELECT count(*) FROM assets WHERE status <> 'retired') < 60 AND random() < 0.3;
 -- keep the tables bounded so the sim can run for days
-DELETE FROM asset_readings WHERE id < (SELECT max(id) - 3000 FROM asset_readings);
-DELETE FROM maintenance_events WHERE id < (SELECT max(id) - 2000 FROM maintenance_events);
+DELETE FROM events WHERE id < (SELECT max(id) - 3000 FROM events);
 DELETE FROM work_orders WHERE status = 'closed' AND id < (SELECT max(id) - 500 FROM work_orders);
 COMMIT;
 SQL
