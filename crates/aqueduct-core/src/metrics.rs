@@ -374,57 +374,63 @@ impl Metrics {
 
     /// Record one event that the sink accepted, taking `sink_time` to deliver.
     pub fn record_event(&self, ev: &ChangeEvent, sink_time: Duration) {
-        if ev.op == Op::Heartbeat {
+        self.record_events(std::slice::from_ref(ev), sink_time);
+    }
+
+    /// Record a delivered batch, each event taking `sink_time`. One lock per batch, and no
+    /// allocation per event: this runs on the pipeline's hot path.
+    pub fn record_events(&self, events: &[ChangeEvent], sink_time: Duration) {
+        let Some(last) = events.iter().rev().find(|e| e.op != Op::Heartbeat) else {
             return;
-        }
-        self.events.fetch_add(1, Relaxed);
-        match ev.op {
-            Op::Insert => &self.inserts,
-            Op::Update => &self.updates,
-            Op::Delete => &self.deletes,
-            Op::Truncate => &self.truncates,
-            Op::Read => &self.reads,
-            // Unreachable: heartbeats return at the top; the arm keeps the match exhaustive.
-            Op::Heartbeat => return,
-        }
-        .fetch_add(1, Relaxed);
-        *lock(&self.last_position) = Some(ev.position.to_string());
-        self.last_commit_ts_micros
-            .store(ev.commit_ts_micros, Relaxed);
+        };
         let now = now_ms();
-        self.last_event_unix_ms.store(now, Relaxed);
         let us = sink_time.as_micros() as u64;
-        self.sink_us_total.fetch_add(us, Relaxed);
+        let mut t = lock(&self.tables);
+        let mut name = String::new();
+        let mut n = 0u64;
+        for ev in events {
+            let (slot, counter) = match ev.op {
+                Op::Insert => (0, &self.inserts),
+                Op::Update => (1, &self.updates),
+                Op::Delete => (2, &self.deletes),
+                Op::Truncate => (3, &self.truncates),
+                Op::Read => (4, &self.reads),
+                Op::Heartbeat => continue,
+            };
+            counter.fetch_add(1, Relaxed);
+            n += 1;
+            name.clear();
+            name.push_str(&ev.schema);
+            name.push('.');
+            name.push_str(&ev.table);
+            let e = match t.get_mut(name.as_str()) {
+                Some(e) => e,
+                None => t.entry(name.clone()).or_insert_with(|| TableEntry {
+                    ops: [0; OP_SLOTS],
+                    schema: ev.schema.clone(),
+                    table: ev.table.clone(),
+                    last_lsn: None,
+                    last_commit_us: 0,
+                    last_delivered_ms: 0,
+                }),
+            };
+            e.ops[slot] += 1;
+            e.last_lsn = match ev.position {
+                Position::Lsn(l) => Some(l),
+                Position::Text(_) => None,
+            };
+            e.last_commit_us = ev.commit_ts_micros;
+            e.last_delivered_ms = now;
+        }
+        drop(t);
+        self.events.fetch_add(n, Relaxed);
+        *lock(&self.last_position) = Some(last.position.to_string());
+        self.last_commit_ts_micros
+            .store(last.commit_ts_micros, Relaxed);
+        self.last_event_unix_ms.store(now, Relaxed);
+        self.sink_us_total.fetch_add(us * n, Relaxed);
         self.sink_us_last.store(us, Relaxed);
         self.sink_us_max.fetch_max(us, Relaxed);
-        let slot = match ev.op {
-            Op::Insert => 0,
-            Op::Update => 1,
-            Op::Delete => 2,
-            Op::Truncate => 3,
-            Op::Read => 4,
-            // Unreachable: heartbeats return at the top of `record_event`; the arm only
-            // keeps the match exhaustive.
-            Op::Heartbeat => return,
-        };
-        let mut t = lock(&self.tables);
-        let e = t
-            .entry(format!("{}.{}", ev.schema, ev.table))
-            .or_insert_with(|| TableEntry {
-                ops: [0; OP_SLOTS],
-                schema: ev.schema.clone(),
-                table: ev.table.clone(),
-                last_lsn: None,
-                last_commit_us: 0,
-                last_delivered_ms: 0,
-            });
-        e.ops[slot] += 1;
-        e.last_lsn = match ev.position {
-            Position::Lsn(l) => Some(l),
-            Position::Text(_) => None,
-        };
-        e.last_commit_us = ev.commit_ts_micros;
-        e.last_delivered_ms = now;
     }
 
     /// The pipeline saved and acked `position`. Only its display form is kept: while a snapshot

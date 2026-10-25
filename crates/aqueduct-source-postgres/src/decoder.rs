@@ -504,18 +504,21 @@ fn key_object(rel: &Relation, idx: &[usize], tuple: &Tuple, old: Option<&Tuple>)
 
 /// Append `s` as a JSON string literal.
 fn push_json_str(out: &mut String, s: &str) {
+    out.reserve(s.len() + 2);
     out.push('"');
+    // Everything that needs escaping is ASCII, and no byte of a multi-byte UTF-8 sequence is, so
+    // a byte scan finds it all and `start..i` always falls on a char boundary.
     let mut start = 0;
-    for (i, c) in s.char_indices() {
-        let esc = match c {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            c if (c as u32) < 0x20 => {
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            b if b < 0x20 => {
                 out.push_str(&s[start..i]);
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                let _ = write!(out, "\\u{b:04x}");
                 start = i + 1;
                 continue;
             }
@@ -523,7 +526,7 @@ fn push_json_str(out: &mut String, s: &str) {
         };
         out.push_str(&s[start..i]);
         out.push_str(esc);
-        start = i + c.len_utf8();
+        start = i + 1;
     }
     out.push_str(&s[start..]);
     out.push('"');
@@ -563,10 +566,11 @@ fn push_text(out: &mut String, oid: u32, s: &str) {
             }
             None => push_json_str(out, s),
         },
-        1184 => match time::timestamptz_iso(s) {
-            Some(iso) => push_json_str(out, &iso),
-            None => push_json_str(out, s),
-        },
+        1184 => {
+            if !time::push_timestamptz_iso(out, s) {
+                push_json_str(out, s);
+            }
+        }
         _ => push_json_str(out, s),
     }
 }
@@ -600,10 +604,14 @@ mod time {
 
     /// `YYYY-MM-DD` with an optional ` BC`, as days since the epoch.
     fn date(s: &str) -> Option<i64> {
-        let (s, bc) = match s.strip_suffix(" BC") {
-            Some(s) => (s, true),
-            None => (s, false),
-        };
+        match s.strip_suffix(" BC") {
+            Some(s) => ymd(s, true),
+            None => ymd(s, false),
+        }
+    }
+
+    /// `YYYY-MM-DD`, in the BC era if `bc`, as days since the epoch.
+    fn ymd(s: &str, bc: bool) -> Option<i64> {
         let mut it = s.splitn(3, '-');
         let y: i64 = it.next()?.parse().ok()?;
         let m: i64 = it.next()?.parse().ok()?;
@@ -625,11 +633,12 @@ mod time {
         if frac.len() > 6 || !frac.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let us: i64 = if frac.is_empty() {
-            0
-        } else {
-            format!("{frac:0<6}").parse().ok()?
-        };
+        // The digits as microseconds, right-padded: `.5` is 500000.
+        let us = frac
+            .bytes()
+            .chain(std::iter::repeat(b'0'))
+            .take(6)
+            .fold(0i64, |us, b| us * 10 + i64::from(b - b'0'));
         Some(((h * 60 + m) * 60 + sec) * 1_000_000 + us)
     }
 
@@ -642,21 +651,60 @@ mod time {
     /// caller then sends the text.
     pub fn timestamp_micros(s: &str) -> Option<i64> {
         let (s, bc) = match s.strip_suffix(" BC") {
-            Some(s) => (s, " BC"),
-            None => (s, ""),
+            Some(s) => (s, true),
+            None => (s, false),
         };
         let (d, t) = s.split_once(' ')?;
-        let days = date(&format!("{d}{bc}"))?;
+        let days = ymd(d, bc)?;
         days.checked_mul(86_400_000_000)?
             .checked_add(time_of_day(t)?)
     }
 
-    /// `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]][ BC]` as ISO-8601 in UTC,
-    /// `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` (fraction without trailing zeros, as Java prints it).
+    /// [`push_timestamptz_iso`] without the quotes, as a new string.
+    #[cfg(test)]
     pub fn timestamptz_iso(s: &str) -> Option<String> {
+        let mut out = String::new();
+        push_timestamptz_iso(&mut out, s).then(|| out[1..out.len() - 1].to_string())
+    }
+
+    /// Appends `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]][ BC]` as a JSON string of ISO-8601 in
+    /// UTC, `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` (fraction without trailing zeros, as Java prints
+    /// it). False, with `out` untouched, if `s` does not parse.
+    pub fn push_timestamptz_iso(out: &mut String, s: &str) -> bool {
+        use std::fmt::Write;
+        let Some((y, m, dd, secs, frac)) = utc_parts(s) else {
+            return false;
+        };
+        out.push('"');
+        let _ = if (0..=9999).contains(&y) {
+            write!(out, "{y:04}")
+        } else {
+            write!(out, "{y:+05}")
+        };
+        let _ = write!(
+            out,
+            "-{m:02}-{dd:02}T{:02}:{:02}:{:02}",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        );
+        if frac > 0 {
+            let (mut frac, mut digits) = (frac, 6);
+            while frac % 10 == 0 {
+                frac /= 10;
+                digits -= 1;
+            }
+            let _ = write!(out, ".{frac:0digits$}");
+        }
+        out.push_str("Z\"");
+        true
+    }
+
+    /// A `timestamptz` text in UTC: year, month, day, second of the day, microseconds.
+    fn utc_parts(s: &str) -> Option<(i64, i64, i64, i64, i64)> {
         let (s, bc) = match s.strip_suffix(" BC") {
-            Some(s) => (s, " BC"),
-            None => (s, ""),
+            Some(s) => (s, true),
+            None => (s, false),
         };
         let (d, rest) = s.split_once(' ')?;
         let at = rest.rfind(['+', '-'])?;
@@ -666,7 +714,7 @@ mod time {
         let oh: i64 = parts.next()?.parse().ok()?;
         let om: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
         let os: i64 = parts.next().map_or(Some(0), |v| v.parse().ok())?;
-        let local = date(&format!("{d}{bc}"))?
+        let local = ymd(d, bc)?
             .checked_mul(86_400_000_000)?
             .checked_add(time_of_day(t)?)?;
         let utc = local.checked_sub(sign * (oh * 3600 + om * 60 + os) * 1_000_000)?;
@@ -675,25 +723,7 @@ mod time {
             utc.rem_euclid(86_400_000_000),
         );
         let (y, m, dd) = civil_from_days(days);
-        let (secs, frac) = (us / 1_000_000, us % 1_000_000);
-        let year = if (0..=9999).contains(&y) {
-            format!("{y:04}")
-        } else {
-            format!("{y:+05}")
-        };
-        let mut iso = format!(
-            "{year}-{m:02}-{dd:02}T{:02}:{:02}:{:02}",
-            secs / 3600,
-            secs / 60 % 60,
-            secs % 60
-        );
-        if frac > 0 {
-            let f = format!("{frac:06}");
-            iso.push('.');
-            iso.push_str(f.trim_end_matches('0'));
-        }
-        iso.push('Z');
-        Some(iso)
+        Some((y, m, dd, us / 1_000_000, us % 1_000_000))
     }
 
     #[cfg(test)]
