@@ -26,17 +26,13 @@ const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' 
 const bytes = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KiB' : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MiB' : (n / 1073741824).toFixed(2) + ' GiB';
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-// Rates, the chart and recent sink latency are trailing averages over this many 1 s snapshots;
-// counters, lag and max latency stay exact (lag is an alarm signal, a mean would hide a stall).
+// Rates, the chart and the CPU tile are trailing averages over this many 1 s snapshots;
+// counters and lag stay exact (lag is an alarm signal, a mean would hide a stall).
 const SMOOTH_WINDOW = 15;
 const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
 const smooth = (h, w = SMOOTH_WINDOW) => h.map((_, i) => avg(h.slice(Math.max(0, i - w + 1), i + 1)));
-// Sink latency samples, one per snapshot in which events were delivered (sink_last_ms only
-// changes then). Cleared on reconnect so values from before an outage are not blended in.
-let sinkSamples = [], lastTotal = null;
 // The end-to-end lag tile reads "idle" when the source is caught up and nothing was delivered for this long.
 const IDLE_AFTER_MS = 10000;
-const resetSmoothing = () => { sinkSamples = []; lastTotal = null; };
 
 const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red', stopped: 'bg-ink-300' };
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
@@ -175,14 +171,16 @@ function renderBehind(d) {
 // ---- The top tiles' lines: the last 300 s, one sample per second, the same window as the routing cards, kept by the
 // server (/api/kpis/history) and sent with every stream frame (`kpis`). Drawn like the routing cards' lines (spark):
 // a step line from 0 over the whole window, right-aligned, so a younger process draws only its right part. A second
-// without a value (lag while idle, latency with nothing delivered) is drawn as 0.
+// without a value (lag while idle, CPU and memory where the platform reports none) is drawn as 0.
 const KPI = {
   throughput: { name: 'Throughput', f: v => fmt(Math.round(v)) + ' evt/s' },
   kafka_mb_per_sec: { name: 'Kafka bandwidth', f: v => mbps(v) },
   lag_ms: { name: 'End-to-end lag', f: ms },
-  sink_ms: { name: 'Sink latency', f: ms },
-  errors: { name: 'Errors', f: v => fmt(Math.round(v)) },
+  cpu_pct: { name: 'CPU', f: v => pct(v) + ' %' },
+  mem_mb: { name: 'Memory', f: v => mb(v) + ' MB' },
 };
+// Percent of one core: one decimal below 10, none above.
+const pct = v => v < 10 ? v.toFixed(1) : fmt(Math.round(v));
 // MB (10^6 bytes) per second: two decimals below 10, one below 100, none above.
 const mb = v => v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : fmt(Math.round(v));
 const mbps = v => mb(v) + ' MB/s';
@@ -198,6 +196,26 @@ function drawKpi(el, k, w) {
 function drawKpis(w) {
   if (!w) return;
   for (const el of document.querySelectorAll('[data-kpi]')) drawKpi(el, el.dataset.kpi, w);
+}
+
+// CPU and memory of the Aqueduct process, from the same window as the lines. CPU: the mean of the last 15 s in
+// percent of one core, and the CPU time per event delivered over those seconds. Memory: resident now, and its high
+// over the window (5 min, or since start).
+function renderUsage(w) {
+  const vals = k => ((w && w[k]) || []).slice(-SMOOTH_WINDOW).filter(v => v != null);
+  const cpu = vals('cpu_pct'), mem = ((w && w.mem_mb) || []).filter(v => v != null);
+  if (!cpu.length) { $('cpu').textContent = '–'; $('cpusub').textContent = w ? 'not reported on this platform' : 'of one core'; }
+  else {
+    const rate = avg(((w.throughput || []).slice(-SMOOTH_WINDOW)).map(v => v ?? 0));
+    const per = rate > 0 ? ` · ${fmt(Math.round(avg(cpu) / 100 * 1e6 / rate))} µs/event` : ' of one core';
+    $('cpu').textContent = pct(avg(cpu));
+    $('cpusub').textContent = `now ${pct(cpu[cpu.length - 1])} %${per}`;
+  }
+  if (!mem.length) { $('mem').textContent = '–'; $('memsub').textContent = w ? 'not reported on this platform' : 'resident'; }
+  else {
+    $('mem').textContent = mb(mem[mem.length - 1]);
+    $('memsub').textContent = `resident · high ${mb(Math.max(...mem))} MB`;
+  }
 }
 
 function render(d) {
@@ -217,21 +235,12 @@ function render(d) {
   $('kbw-now').textContent = mb(bw.length ? bw[bw.length - 1] : 0);
   $('kbw-total').textContent = fmt(Math.round((d.kafka_bytes_total || 0) / 1e6));
   drawKpis(d.kpis);
-  if (lastTotal !== null && d.events_total > lastTotal) {
-    sinkSamples.push(d.sink_last_ms);
-    if (sinkSamples.length > SMOOTH_WINDOW) sinkSamples.shift();
-  }
-  lastTotal = d.events_total;
+  renderUsage(d.kpis);
   // Caught up with nothing delivered for a while: the lag would only count the idle time up.
   const caughtUp = d.source_lag && d.source_lag.state === 'caught_up';
   const idle = caughtUp && (d.last_event_unix_ms == null || Date.now() - d.last_event_unix_ms > IDLE_AFTER_MS);
   $('lag').textContent = idle ? 'idle' : d.lag_ms == null ? '–' : ms(Math.max(0, d.lag_ms));
   $('lagsub').textContent = idle ? 'caught up · no new changes' : caughtUp ? 'commit → delivered · caught up' : 'commit → delivered';
-  $('sinkavg').textContent = d.events_total ? ms(d.sink_avg_ms) : '–';
-  $('sinkdet').textContent = d.events_total ? `${sinkSamples.length ? 'recent ' + ms(avg(sinkSamples)) : 'last ' + ms(d.sink_last_ms)} · max ${ms(d.sink_max_ms)}` : 'mean per event';
-  $('errors').textContent = fmt(d.errors);
-  $('errors').className = 'mt-2 font-mono text-3xl font-medium tabular-nums ' + (d.errors ? 'text-red' : 'text-ink-100');
-  $('errsub').textContent = d.errors ? 'see last fault below' : 'no faults';
   renderBehind(d);
   renderSnapshot(d);
   lastData = d;
@@ -1485,7 +1494,6 @@ async function streamLoop() {
     } catch (_) { /* fall through to reconnect */ }
     clearTimeout(stall);
     ctl.abort();
-    resetSmoothing();
     setConn(false, 'reconnecting');
     await new Promise(res => setTimeout(res, delay));
     delay = Math.min(delay * 2, 15000);

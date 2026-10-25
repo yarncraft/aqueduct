@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::kpis::KpiHistory;
+use crate::kpis::{self, KpiHistory};
 use crate::rates::RateHistory;
 use aqueduct_core::{
     Metrics, Snapshot, SnapshotCommand, SnapshotRequest, SnapshotSender, State, OP_SLOTS,
@@ -360,7 +360,8 @@ impl Admin {
                 &self.topic_counts(),
                 &self.topic_bytes(),
             );
-            lock(&self.kpis).record(unix_ms(), rate, bytes_rate, &snap);
+            let usage = kpis::process_usage();
+            lock(&self.kpis).record(unix_ms(), rate, bytes_rate, &snap, usage);
             last_ops = snap.table_ops;
             last = now;
             last_bytes = bytes;
@@ -1826,7 +1827,12 @@ Authorization: Bearer {token}
         let addr = listener.local_addr().unwrap();
         let admin = Admin::new(Arc::new(Metrics::new()), Some("k".into()), None);
         tokio::spawn(serve(listener, admin.clone()));
-        lock(&admin.kpis).record(unix_ms(), 7.0, 2_000_000.0, &admin.metrics.snapshot());
+        let usage = Some(kpis::Usage {
+            cpu_secs: 1.0,
+            rss_bytes: 48_000_000,
+        });
+        let snap = admin.metrics.snapshot();
+        lock(&admin.kpis).record(unix_ms(), 7.0, 2_000_000.0, &snap, usage);
 
         for bad in [
             get(addr, "/api/kpis/history").await,
@@ -1843,6 +1849,8 @@ Authorization: Bearer {token}
         assert_eq!(v["throughput"], json!([7.0]));
         assert_eq!(v["kafka_mb_per_sec"], json!([2.0]));
         assert_eq!(v["lag_ms"], json!([null]));
+        assert_eq!(v["cpu_pct"], json!([null]));
+        assert_eq!(v["mem_mb"], json!([48.0]));
     }
 
     #[tokio::test]
