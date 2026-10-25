@@ -18,6 +18,36 @@ WAL position alone is enough on a normal server. If your Postgres produces no WA
 (for example a low-traffic managed database), give the heartbeat something to write with `heartbeat_action_query`.
 Run it once before each heartbeat. A small published table works:
 
+```sql
+CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
+INSERT INTO aqueduct_heartbeat VALUES (1, now());
+ALTER PUBLICATION aqueduct ADD TABLE aqueduct_heartbeat;
+-- the Aqueduct role needs SELECT (already required) and UPDATE on it
+GRANT UPDATE ON aqueduct_heartbeat TO aqueduct;
+```
+
+```toml
+[postgres]
+heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
+```
+
+The table is in the publication, so its changes are delivered as normal events (topic `cdc.public.aqueduct_heartbeat`
+by default, one per interval); route or ignore that topic downstream. Monitor the effect with
+`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots`, or read it from Aqueduct:
+
+| Field on `/api/metrics` and `/api/stream` | Meaning |
+|-------|---------|
+| `slot_lag_bytes` | WAL between the server head and the slot's `confirmed_flush_lsn`, read every second. `null` when unknown (no slot yet, query failed, or a MongoDB source). |
+| `confirmed_flush_lsn` | The slot's confirmed position as text, `null` when unknown. |
+| `heartbeat.interval_ms` | The heartbeat interval, `null` when `heartbeat_interval_secs = 0`. |
+| `heartbeat.last_ms` | Unix ms of the last completed heartbeat, `null` before the first. |
+| `heartbeat.skipped_total` | Heartbeats skipped because the action query or the WAL position query failed. |
+| `heartbeat.last_skip_reason` | Why the latest one was skipped, `null` until one is. |
+
+The `heartbeat` object is absent for sources without heartbeats (MongoDB). Heartbeats are not events: they are not counted in `events_total`
+and never reach the sink. `/metrics` has `aqueduct_slot_lag_bytes`, `aqueduct_heartbeat_skipped_total` and
+`aqueduct_heartbeat_last_timestamp_seconds`; each is left out while its value is unknown.
+
 With a published action table the heartbeat row is itself delivered as an event, so the slot moves when that event is
 acknowledged; the jump to the server's WAL position then rarely fires. Both paths are safe. If the action query or the
 WAL position query fails, the source logs a warning and skips that heartbeat instead of stopping. A standby cannot run
@@ -49,36 +79,6 @@ records the new timeline.
 - If the role cannot call these functions (some managed services), startup fails with a message naming
   `checkpoint_skip_system_check`. Set it to `true` to skip the cluster and timeline comparison; the database is still
   compared.
-
-```sql
-CREATE TABLE aqueduct_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
-INSERT INTO aqueduct_heartbeat VALUES (1, now());
-ALTER PUBLICATION aqueduct ADD TABLE aqueduct_heartbeat;
--- the Aqueduct role needs SELECT (already required) and UPDATE on it
-GRANT UPDATE ON aqueduct_heartbeat TO aqueduct;
-```
-
-```toml
-[postgres]
-heartbeat_action_query = "UPDATE aqueduct_heartbeat SET ts = now() WHERE id = 1"
-```
-
-The table is in the publication, so its changes are delivered as normal events (topic `cdc.public.aqueduct_heartbeat`
-by default, one per interval); route or ignore that topic downstream. Monitor the effect with
-`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots`, or read it from Aqueduct:
-
-| Field on `/api/metrics` and `/api/stream` | Meaning |
-|-------|---------|
-| `slot_lag_bytes` | WAL between the server head and the slot's `confirmed_flush_lsn`, read every second. `null` when unknown (no slot yet, query failed, or a MongoDB source). |
-| `confirmed_flush_lsn` | The slot's confirmed position as text, `null` when unknown. |
-| `heartbeat.interval_ms` | The heartbeat interval, `null` when `heartbeat_interval_secs = 0`. |
-| `heartbeat.last_ms` | Unix ms of the last completed heartbeat, `null` before the first. |
-| `heartbeat.skipped_total` | Heartbeats skipped because the action query or the WAL position query failed. |
-| `heartbeat.last_skip_reason` | Why the latest one was skipped, `null` until one is. |
-
-The `heartbeat` object is absent for sources without heartbeats (MongoDB). Heartbeats are not events: they are not counted in `events_total`
-and never reach the sink. `/metrics` has `aqueduct_slot_lag_bytes`, `aqueduct_heartbeat_skipped_total` and
-`aqueduct_heartbeat_last_timestamp_seconds`; each is left out while its value is unknown.
 
 ## Streaming transport
 

@@ -36,7 +36,7 @@ Fail-closed rules, checked at startup:
   Aqueduct connects to those checked addresses.
 
 The server asks for the token as a cleartext password. That is the same rule as for any password: Aqueduct sends it
-only inside TLS, and the replication connection keeps the [ADR 0003 §6](adr/0003-streaming-replication.md) rules
+only inside TLS, and the replication connection keeps the [ADR 0003 §6](../adr/0003-streaming-replication.md) rules
 (cleartext is never sent over plaintext to a remote host).
 
 Nothing in the image changes: the token exchange is a small built-in HTTPS client, so the distroless image needs no
