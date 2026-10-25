@@ -24,7 +24,7 @@ flowchart LR
     U(["Browser / Prometheus / probes"])
     OC(["OpenTelemetry Collector<br/>(opt-in)"])
 
-    PG -- "peek changes + watermarks (poll)<br/>or replication stream (stream)" --> SRC
+    PG -- "replication stream (changes + watermarks)" --> SRC
     SRC -- "snapshot chunks (keyset SELECT)" --> PG
     MG -- "watch (changes + watermarks)" --> SRC
     SRC -- "snapshot chunks (_id index scan) + watermark inserts" --> MG

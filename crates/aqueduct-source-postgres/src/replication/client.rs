@@ -614,7 +614,7 @@ mod tests {
             "START_REPLICATION SLOT \"My\"\"Slot\" LOGICAL 1/A0 \
              (proto_version '1', publication_names 'Aq_Pub')"
         );
-        // Same text pgoutput gets from the peek: commas split, unquoted names case-fold.
+        // pgoutput parses the list itself: commas split, unquoted names case-fold.
         assert!(start("a,\"B\"")
             .sql()
             .unwrap()

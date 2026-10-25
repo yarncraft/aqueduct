@@ -10,7 +10,6 @@
 //! `RelationCache::key_with_old` takes it from the old key tuple, so the update keeps the key its
 //! insert had, and the row stays on one Kafka partition. The unit tests pin that logic on
 //! hand-built tuples; this test checks that a real server actually sends the old key.
-mod common;
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Op, Source};
@@ -60,7 +59,6 @@ async fn unsent_toast_key_column_keeps_the_insert_key() {
     let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
-    cfg.transport = common::transport();
     let mut s = PostgresSource::new(cfg);
     s.start(None).await.unwrap();
 
@@ -149,7 +147,6 @@ async fn full_identity_update_fills_unchanged_toast_column() {
     let mut cfg = PostgresSourceConfig::new(url, slot.clone(), publication.clone());
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
-    cfg.transport = common::transport();
     let mut s = PostgresSource::new(cfg);
     s.start(None).await.unwrap();
 

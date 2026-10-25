@@ -15,7 +15,7 @@
 //! `--sink render` runs the route plan (topic, key, JSON value, headers) on every event without a
 //! broker: the cost of everything the Kafka sink does before the network.
 //!
-//! With `--source postgres --pg-url URL [--transport poll|stream]` it instead measures the
+//! With `--source postgres --pg-url URL` it instead measures the
 //! Postgres source against a real server; see `postgres.rs`.
 //!
 //! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), submits it, and
@@ -200,11 +200,7 @@ async fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     if arg("--source").as_deref() == Some("postgres") {
         let url = arg("--pg-url").expect("--pg-url is required with --source postgres");
-        let transport = arg("--transport")
-            .unwrap_or_else(|| "poll".into())
-            .parse()
-            .unwrap();
-        return postgres::run(&url, transport, &dir).await;
+        return postgres::run(&url, &dir).await;
     }
 
     let template = ChangeEvent {

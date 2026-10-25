@@ -1,7 +1,7 @@
 //! Postgres logical-replication source for Aqueduct.
 //!
 //! [`decoder`] is a pure pgoutput (protocol v1) parser; [`PostgresSource`]
-//! drives a logical replication slot over a regular SQL connection and
+//! streams a logical replication slot over a replication connection and
 //! implements [`aqueduct_core::Source`].
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -17,8 +17,7 @@ pub mod transport;
 pub use azure::{AccessToken, AzureCredential, AzureIdentity};
 pub use snapshot::{SnapshotConfig, SnapshotMode};
 pub use source::{
-    parse_lsn, PostgresSource, PostgresSourceConfig, SourceAuth, TransportKind,
-    DEFAULT_HEARTBEAT_INTERVAL,
+    parse_lsn, PostgresSource, PostgresSourceConfig, SourceAuth, DEFAULT_HEARTBEAT_INTERVAL,
 };
 pub use tls::SslMode;
 

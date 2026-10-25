@@ -6,7 +6,7 @@ On Azure Database for PostgreSQL (Flexible Server) Aqueduct can sign in with a m
 password: the server accepts a Microsoft Entra access token as the password, so no static database secret is stored
 anywhere. Aqueduct fetches a token, caches it until 5 minutes before the
 expiry the identity endpoint reports (at most 24 hours), and uses a valid one as the password of **every** connection
-it opens: the SQL session and, with `transport = "stream"`, the replication connection. Each start of the source,
+it opens: the SQL session and the replication connection. Each start of the source,
 including a restart after an error, uses a cached or fresh token. A failed token fetch fails that connection like a
 wrong password would (a source error; the restart applies).
 

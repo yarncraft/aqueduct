@@ -7,7 +7,6 @@
 //! AQUEDUCT_TEST_PG_PLAIN=localhost:5434
 //! cargo test -p aqueduct-source-postgres --test toast_unchanged_it -- --ignored
 //! ```
-mod common;
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Source};
@@ -60,7 +59,6 @@ async fn an_unchanged_toast_column_is_named_and_left_out_of_after() {
     .unwrap();
 
     let mut cfg = PostgresSourceConfig::new(url.clone(), slot.clone(), publication.clone());
-    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(100);
     let mut s = PostgresSource::new(cfg);

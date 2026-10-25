@@ -82,11 +82,11 @@ records the new timeline.
 
 ## Streaming transport
 
-`transport = "stream"` reads the slot over a replication connection (`START_REPLICATION`, the protocol
-`pg_recvlogical` uses) instead of polling it with SQL. Changes arrive as they commit, nothing is decoded twice, and
-the idle 500 ms poll goes away. The events, their keys and the checkpoint are the same as with `poll`: both
-transports feed the same decoder, and the integration suite runs in both modes, including a test that compares them
-event by event. `poll` stays the default.
+The source reads the slot over a replication connection (`START_REPLICATION`, the protocol `pg_recvlogical` and
+Debezium use). Changes arrive as they commit and nothing is decoded twice. Earlier builds also had a `poll` transport
+that peeked the slot over SQL; it re-decoded the unacknowledged tail of the slot on every peek and drained a backlog
+about 10x slower, so it was removed (ADR 0003, "Poll removed"). A checkpoint written by it is valid here: both used the same slot, decoder and
+positions. `transport = "stream"` is still accepted, and `transport = "poll"` fails startup with an upgrade hint.
 
 - **Connection:** the same URL, TLS settings and password rules as the SQL connection (`verify-full` by default;
   cleartext and md5 refused over plaintext to a remote host; SCRAM channel binding is never given up once offered).
@@ -95,7 +95,7 @@ event by event. `poll` stays the default.
 - **Server:** each instance uses one more walsender, so `max_wal_senders` must exceed the number of logical
   replication connections. `pg_hba.conf` needs a line that allows the role on **the database** (logical replication
   connections match the database name, not the `replication` keyword), e.g.
-  `host app aqueduct 10.0.0.0/8 scram-sha-256`. The role already has `REPLICATION`.
+  `host app aqueduct 10.0.0.0/8 scram-sha-256`. The role needs `REPLICATION` (which slot creation needs anyway).
 - **Poolers:** a replication connection cannot go through PgBouncer or other transaction poolers; point the URL at
   Postgres directly.
 - **Progress:** the slot is confirmed by status updates, sent within 200 ms of an acknowledgement and at least every

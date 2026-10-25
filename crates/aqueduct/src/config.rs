@@ -177,11 +177,11 @@ pub struct PostgresConfig {
     /// 10 to 13, or wherever `pg_logical_emit_message` is not allowed).
     #[serde(default)]
     pub snapshot_watermark_table: Option<String>,
-    /// `poll | stream`: read the slot by polling over SQL (default) or over a replication
-    /// connection (ADR 0003).
+    /// Only `stream` is accepted: changes always arrive over a replication connection (ADR 0003).
+    /// Kept so configs that set it still load; `poll` was removed.
     #[serde(default)]
     pub transport: Option<String>,
-    /// Stream transport: bytes of received messages buffered ahead of the sink. Default 64 MiB.
+    /// Bytes of received messages buffered ahead of the sink. Default 64 MiB.
     #[serde(default)]
     pub stream_buffer_bytes: Option<usize>,
     /// `password` (default): the URL's password. `azure-workload-identity` (AKS) or
@@ -278,8 +278,21 @@ impl PostgresConfig {
             }
         }
         c.snapshot.watermark_table = self.snapshot_watermark_table.clone();
-        if let Some(t) = &self.transport {
-            c.transport = t.parse().map_err(|e| format!("postgres.{e}"))?;
+        match self.transport.as_deref() {
+            None | Some("stream") => {}
+            Some("poll") => {
+                return Err(
+                    "postgres.transport = \"poll\" was removed: changes always stream \
+                     over a replication connection now. Delete the line; the role needs the \
+                     REPLICATION attribute and pg_hba.conf must allow its replication connection"
+                        .into(),
+                )
+            }
+            Some(other) => {
+                return Err(format!(
+                    "postgres.transport = {other:?}: the only transport is \"stream\""
+                ))
+            }
         }
         if let Some(n) = self.stream_buffer_bytes {
             if n < 64 * 1024 {
@@ -1355,16 +1368,14 @@ snapshot_key_columns = { 'public.events' = ['day', 'seq'] }")
             Some("public.aqueduct_watermarks")
         );
         assert!(pg("snapshot_watermark_table = 'aqueduct_watermarks'").is_err());
-        use aqueduct_source_postgres::TransportKind;
-        assert_eq!(pg("").unwrap().transport, TransportKind::Poll);
         let c = pg("transport = 'stream'
 stream_buffer_bytes = 1048576")
         .unwrap();
-        assert_eq!(
-            (c.transport, c.stream_buffer_bytes),
-            (TransportKind::Stream, 1_048_576)
-        );
-        assert!(pg("transport = 'copy'").unwrap_err().contains("poll"));
+        assert_eq!(c.stream_buffer_bytes, 1_048_576);
+        assert!(pg("transport = 'poll'")
+            .unwrap_err()
+            .contains("was removed"));
+        assert!(pg("transport = 'copy'").unwrap_err().contains("\"stream\""));
         assert!(pg("stream_buffer_bytes = 10").is_err());
     }
 

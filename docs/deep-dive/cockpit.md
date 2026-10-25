@@ -31,8 +31,8 @@ It compares two positions the source reports:
 
 | | Postgres | MongoDB |
 |---|---|---|
-| Head | The server's WAL head: `pg_current_wal_lsn()` (`pg_last_wal_replay_lsn()` on a standby), read once a second with the slot stats by a task of its own on the SQL connection; with `transport = "stream"` also the WAL end of each keepalive, whichever is newer | The newest majority-committed write, `lastWrite.majorityOpTime` from `hello`, run once a second by a task of its own (falls back to `lastWrite.opTime`, then the reply's `operationTime`) |
-| Delivered | The change LSN of the newest acked event, the commit end the slot was advanced to (also by idle heartbeats), and the WAL flush position (`pg_current_wal_flush_lsn()`, read with the slot stats) as of before a peek that drained the slot, or the WAL end of a keepalive that ended a stream fetch, once everything was handed on | The cluster time of the newest acked event's resume token, and of the postBatchResumeToken of an empty change-stream batch once everything was handed on |
+| Head | The server's WAL head: `pg_current_wal_lsn()` (`pg_last_wal_replay_lsn()` on a standby), read once a second with the slot stats by a task of its own on the SQL connection, and the WAL end of each keepalive, whichever is newer | The newest majority-committed write, `lastWrite.majorityOpTime` from `hello`, run once a second by a task of its own (falls back to `lastWrite.opTime`, then the reply's `operationTime`) |
+| Delivered | The change LSN of the newest acked event, the commit end the slot was advanced to (also by idle heartbeats), and the WAL end of a keepalive that ended a fetch, once everything was handed on | The cluster time of the newest acked event's resume token, and of the postBatchResumeToken of an empty change-stream batch once everything was handed on |
 
 The head is read independently of the pipeline loop, so it keeps moving while the sink holds the pipeline up (a Kafka
 outage, up to the 60 s sink timeout). On Postgres the stats query shares the SQL connection, so it waits behind a peek

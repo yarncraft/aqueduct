@@ -12,7 +12,7 @@ a container (Docker or Podman). Keep every feature working inside the distroless
 | Crate | Role |
 |-------|------|
 | `aqueduct-core` | `ChangeEvent`/`Position` (`Lsn(u64)` or `Text`)/`Op`, `Source`/`Sink`/`CheckpointStore` traits, `run_pipeline`, `Metrics` |
-| `aqueduct-source-postgres` | Pure pgoutput decoder (`decoder.rs`) and the polling `Source` (`source.rs`) |
+| `aqueduct-source-postgres` | Pure pgoutput decoder (`decoder.rs`) and the streaming `Source` (`source.rs`) |
 | `aqueduct-source-mongodb` | MongoDB change-stream source; resume token as the `Position` |
 | `aqueduct-sinks` | Kafka sink and the Kafka-backed event inspector reader (`rskafka`, pure Rust). Kafka is the only sink |
 | `aqueduct-tls` | Shared rustls client config (ring, no OpenSSL) used by the Postgres source and the Kafka sink |
@@ -85,10 +85,11 @@ Nothing merges without review, and branch protection is not available, so the ru
 - **Positions**: sources own their `Position` encoding. The event JSON field is still `lsn`, and text positions are checkpointed as `~<text>`. Adding a source = new crate, a `SourceConfig` variant in `config.rs` and a match arm in `main.rs`. SQL Server, Redis and the Kafka source were dropped on purpose.
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.
-- Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it. With
-  `transport = "stream"` the source opens its own replication connection from the same URL (`replication/`, hand-written
-  on `postgres-protocol`, same TLS and auth rules); poll stays the default and is kept permanently. Keys are assigned
-  in one place (`source.rs::apply`) for both transports.
+- Postgres URLs are plain SQL connections. Do not add `replication=database`; tokio-postgres rejects it. The source
+  opens its own replication connection from the same URL (`replication/`, hand-written on `postgres-protocol`, same
+  TLS and auth rules) and receives changes over it; the SQL connection is for slot management, heartbeats and
+  snapshots. The poll transport (SQL peeks) was removed: it re-decoded the unacked tail on every peek and drained a
+  backlog 10x slower. Keys are assigned in one place (`source.rs::apply`).
 - Kafka: events are Debezium-style envelopes (`lib.rs::encode`: `before`/`after`/`source`/`op` letters/`ts_ms`,
   `timestamptz` ISO-8601 UTC, `timestamp` epoch µs, `date` epoch days, from `DateStyle = ISO` text). The record key is
   JSON `{"db","schema","table","key":{<primary key>}}` (MongoDB `{"db","collection","key":<documentKey>}`), built by

@@ -54,8 +54,8 @@ produce-time records, and the unacknowledged tail that the new image replays aft
 6. Check:
    - `GET /readyz` returns `200` and the cockpit state is `streaming`.
    - `pg_replication_slots` still has exactly one slot with that name, and its `confirmed_flush_lsn` moves forward as
-     changes are delivered. A second slot means `slot` changed: stop and fix the config. (`active` is `t` only with
-     `transport = "stream"`; the default poll transport holds no connection on the slot between polls.)
+     changes are delivered. A second slot means `slot` changed: stop and fix the config. `active` is `t` while
+     Aqueduct is connected.
    - The `checkpoint` in `/api/metrics` moves forward from the value you noted.
    - The logs have no `ERROR`. A warning about a checkpoint without origin fields is expected once, after an upgrade
      from a build before #63.

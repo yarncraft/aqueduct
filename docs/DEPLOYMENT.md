@@ -12,9 +12,8 @@ Postgres (logical slot, pgoutput) --> Aqueduct --> Kafka
 ```
 
 1. Aqueduct opens a plain SQL connection and creates a logical replication slot (`pgoutput`) if it does not exist.
-2. It polls the slot (every 500 ms when idle) for whole committed transactions and decodes them into row-level events.
-   With `transport = "stream"` it instead receives them over a replication connection as they commit; see
-   [Streaming transport](deep-dive/postgres-operations.md#streaming-transport).
+2. It opens a replication connection on the slot, receives changes as they commit and decodes them into row-level
+   events; see [Streaming transport](deep-dive/postgres-operations.md#streaming-transport).
 3. Each event is produced to Kafka. Only after the sink succeeds does Aqueduct write the checkpoint and advance the slot to that transaction's commit LSN.
 4. On restart it resumes from the slot and the checkpoint. A crash between "sink succeeded" and "checkpoint written" replays at most that event, so **delivery is at-least-once**: consumers must tolerate duplicates (use `lsn` plus the row key to deduplicate).
 
@@ -28,8 +27,9 @@ Limits to know about:
 
 ## 1. Prepare Postgres
 
-Postgres 12 or newer (tested on 12, 13, 14, 16 and 17). Postgres 10 has no `pg_replication_slot_advance`, and on 11
-repeated slot peeks over one connection fail with `out of relcache_callback_list slots`, so neither works. Snapshots
+Postgres 12 or newer (tested on 12, 13, 14, 16 and 17). Postgres 10 has no `pg_replication_slot_advance`, and 11 is not
+supported. The role needs `REPLICATION`, `pg_hba.conf` must allow its replication connection, and the URL must reach
+Postgres directly, not through PgBouncer or another pooler. Snapshots
 use logical messages on 14 or newer, or a [watermark table](deep-dive/snapshots.md#watermark-table-postgres-12-and-13) on 12 and 13.
 
 ```conf
@@ -132,7 +132,7 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 |-------|---------|
 | [Idle heartbeat](deep-dive/postgres-operations.md#idle-heartbeat) | The slot is advanced while idle so unpublished writes don't pin WAL. On by default |
 | [Checkpoint origin check](deep-dive/postgres-operations.md#checkpoint-origin-check) | Startup refuses a checkpoint from another cluster or database |
-| [Streaming transport](deep-dive/postgres-operations.md#streaming-transport) | `transport = "stream"`: changes arrive as they commit instead of being polled |
+| [Streaming transport](deep-dive/postgres-operations.md#streaming-transport) | The replication connection: `pg_hba.conf`, walsenders, poolers, status updates |
 | [Azure managed identity](deep-dive/azure.md) | Passwordless sign-in on AKS and Container Apps |
 | [Snapshots](deep-dive/snapshots.md) | Copy rows that already exist, at start or on request (Postgres and MongoDB) |
 
