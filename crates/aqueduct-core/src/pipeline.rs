@@ -173,9 +173,7 @@ async fn land(
     if !l.events.is_empty() {
         // The batch is delivered as a unit; report its average per-event time, submit to ack.
         let per_event = l.began.elapsed() / l.events.len() as u32;
-        for event in &l.events {
-            metrics.record_event(event, per_event);
-        }
+        metrics.record_events(&l.events, per_event);
     }
     // A heartbeat position may end up here, but a source that advances its slot on idle
     // heartbeats (Postgres) keeps that position on the server, not in this file. On restart

@@ -258,20 +258,33 @@ pub fn table_key(event: &ChangeEvent, info: &SourceInfo) -> String {
 
 /// The record key around `key`, the JSON of the `"key"` member.
 pub(crate) fn key_json(event: &ChangeEvent, info: &SourceInfo, key: &str) -> String {
-    let s = |v: &str| serde_json::to_string(v).unwrap_or_default();
+    // Built for every record: one allocation, names copied as they are unless they need escaping.
+    let mut out = String::with_capacity(48 + event.schema.len() + event.table.len() + key.len());
+    let mut s = |name: &str, v: &str| {
+        out.push_str(name);
+        if v.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+            out.push_str(&serde_json::to_string(v).unwrap_or_default());
+        } else {
+            out.push('"');
+            out.push_str(v);
+            out.push('"');
+        }
+    };
     match info {
-        SourceInfo::Postgres { db } => format!(
-            r#"{{"db":{},"schema":{},"table":{},"key":{key}}}"#,
-            s(db),
-            s(&event.schema),
-            s(&event.table)
-        ),
-        SourceInfo::Mongodb => format!(
-            r#"{{"db":{},"collection":{},"key":{key}}}"#,
-            s(&event.schema),
-            s(&event.table)
-        ),
+        SourceInfo::Postgres { db } => {
+            s(r#"{"db":"#, db);
+            s(r#","schema":"#, &event.schema);
+            s(r#","table":"#, &event.table);
+        }
+        SourceInfo::Mongodb => {
+            s(r#"{"db":"#, &event.schema);
+            s(r#","collection":"#, &event.table);
+        }
     }
+    out.push_str(r#","key":"#);
+    out.push_str(key);
+    out.push('}');
+    out
 }
 
 #[cfg(test)]

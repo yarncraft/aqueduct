@@ -40,9 +40,10 @@ pub struct Key {
 }
 
 impl Key {
-    /// Checkpoint encoding: `<commit>@<change>#<ord>`, decimal.
+    /// Checkpoint encoding: `<commit>@<change>#<ord>`, decimal (written by [`encode_checkpoint`]).
+    #[cfg(test)]
     pub fn encode(&self) -> String {
-        format!("{}@{}#{}", self.commit, self.change, self.ord)
+        encode_checkpoint(*self, None)
     }
 
     pub fn parse(s: &str) -> Option<Key> {
@@ -79,14 +80,17 @@ struct Stamp {
 /// Checkpoint text: the [`Key`], then the `;name=value` fields (`sys`, `db`, `tli`) of the origin
 /// that is known.
 fn encode_checkpoint(key: Key, origin: Option<Origin>) -> String {
-    let mut t = key.encode();
+    use std::fmt::Write;
+    // Built for every event, so one allocation, sized for the longest form.
+    let mut t = String::with_capacity(96);
+    let _ = write!(t, "{}@{}#{}", key.commit, key.change, key.ord);
     if let Some(o) = origin {
         if let Some(sys) = o.system {
-            t.push_str(&format!(";sys={sys}"));
+            let _ = write!(t, ";sys={sys}");
         }
-        t.push_str(&format!(";db={}", o.database));
+        let _ = write!(t, ";db={}", o.database);
         if let Some(tli) = o.timeline {
-            t.push_str(&format!(";tli={tli}"));
+            let _ = write!(t, ";tli={tli}");
         }
     }
     t
