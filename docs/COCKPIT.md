@@ -16,7 +16,7 @@ The recording uses the compose stack with generated demo rows.
 | `GET /`, `/admin.css` | The dashboard (public) |
 | `GET /healthz` | Liveness; used by the image `HEALTHCHECK` |
 | `GET /readyz` | `200` while streaming, else `503` |
-| `GET /metrics` | Prometheus (`aqueduct_*` series) |
+| `GET /metrics` | Prometheus (`aqueduct_*` series); the same series can also be pushed over [OTLP](DEPLOYMENT.md#opentelemetry-otlp) |
 | `GET /api/metrics`, `/api/stream` | JSON snapshot; Server-Sent Events, one per second |
 | `GET /api/routes`, `/api/routes/history` | Compiled route plan with live counts; the last 300 s of rates |
 | `GET /api/kpis/history` | The top tiles' last 300 s, one sample per second |

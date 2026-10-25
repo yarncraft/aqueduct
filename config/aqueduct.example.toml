@@ -35,3 +35,10 @@ partitions = 1
 # topic = "users-events"
 # where = "row.active == true"           # a type error sends the row to users-events.dlq
 # dead_letter_topic = "users-errors"     # optional; overrides both defaults
+
+# Optional: push the /metrics series and the logs to an OpenTelemetry Collector (OTLP/HTTP).
+# Off unless an endpoint is set here or in OTEL_EXPORTER_OTLP_ENDPOINT; the OTEL_* variables win.
+# [telemetry]
+# otlp_endpoint = "http://otel-collector:4318"
+# service_name = "aqueduct"
+# metrics_interval_secs = 60

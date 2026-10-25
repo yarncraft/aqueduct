@@ -3,7 +3,8 @@
 //! - `GET /`            dashboard (embedded HTML, script at `/admin.js`, Tailwind CSS at `/admin.css`)
 //! - `GET /healthz`     `200 ok` while the process is up (liveness, container HEALTHCHECK)
 //! - `GET /readyz`      `200` only while the pipeline is streaming, else `503` (readiness)
-//! - `GET /metrics`     Prometheus text exposition
+//! - `GET /metrics`     Prometheus text exposition (also pushed over OTLP when enabled, see
+//!   `telemetry.rs`)
 //! - `GET /api/metrics` JSON snapshot
 //! - `GET /api/events`  recent events read back from Kafka (`?topic=<t>&limit=<n>`)
 //! - `GET /api/stream`  Server-Sent Events, one snapshot per second
@@ -319,6 +320,24 @@ impl Admin {
     /// Key, value and header bytes Kafka acknowledged since start.
     fn kafka_bytes(&self) -> u64 {
         self.topic_stats.get().map_or(0, |s| s.bytes())
+    }
+
+    /// The whole `/metrics` body. The OTLP exporter (`telemetry.rs`) reads the same text, so
+    /// both carry the same series.
+    pub fn exposition(&self) -> String {
+        let mut body = prometheus(&self.metrics.snapshot());
+        route_metrics(&mut body, &self.route_counts());
+        topic_metrics(&mut body, &self.topic_counts());
+        if self.topic_stats.get().is_some() {
+            metric(
+                &mut body,
+                "aqueduct_kafka_bytes_total",
+                "counter",
+                "Key, value and header bytes of the records Kafka acknowledged.",
+            );
+            let _ = writeln!(body, "aqueduct_kafka_bytes_total {}", self.kafka_bytes());
+        }
+        body
     }
 
     /// Sample the throughput once a second.
@@ -1257,18 +1276,7 @@ async fn handle(admin: Arc<Admin>, mut sock: TcpStream, probes_only: bool) {
             .await
         }
         "/metrics" => {
-            let mut body = prometheus(&admin.metrics.snapshot());
-            route_metrics(&mut body, &admin.route_counts());
-            topic_metrics(&mut body, &admin.topic_counts());
-            if admin.topic_stats.get().is_some() {
-                metric(
-                    &mut body,
-                    "aqueduct_kafka_bytes_total",
-                    "counter",
-                    "Key, value and header bytes of the records Kafka acknowledged.",
-                );
-                let _ = writeln!(body, "aqueduct_kafka_bytes_total {}", admin.kafka_bytes());
-            }
+            let body = admin.exposition();
             respond(
                 &mut sock,
                 "200 OK",

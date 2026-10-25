@@ -2,7 +2,8 @@
 
 One TOML file, read from `/etc/aqueduct/aqueduct.toml` (override with `AQUEDUCT_CONFIG`). Full example:
 [`config/aqueduct.example.toml`](../config/aqueduct.example.toml). Environment overrides: `AQUEDUCT_PG_URL`,
-`AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`, `AQUEDUCT_KAFKA_SASL_USERNAME`, `AQUEDUCT_KAFKA_SASL_PASSWORD`.
+`AQUEDUCT_ADMIN_TOKEN`, `AQUEDUCT_HASH_KEY`, `AQUEDUCT_KAFKA_SASL_USERNAME`, `AQUEDUCT_KAFKA_SASL_PASSWORD`, and the
+standard `OTEL_*` variables for [`[telemetry]`](#telemetry-opentelemetry).
 
 Every key with its full semantics: [deep dive: configuration](deep-dive/configuration.md).
 
@@ -108,3 +109,22 @@ format = "row"                                # value is the row, deletes become
 | `include`, `exclude`, `mask`, `hash`, `rename` | Protect or reshape columns | [Protecting fields](deep-dive/routing.md#protecting-fields-per-route) |
 | `outbox` | Publish an outbox table's inserts as their own events | [Outbox](deep-dive/routing.md#outbox) |
 | `format`, `deletes`, `tombstones`, `unchanged` | Row-only values, tombstones, TOAST handling | [Shaping the output](deep-dive/routing.md#shaping-the-output) |
+
+## `[telemetry]` (OpenTelemetry)
+
+Off by default. With an endpoint, the `/metrics` series and the logs are also pushed to an OpenTelemetry Collector over
+OTLP/HTTP (protobuf). `/metrics` and the JSON logs on stdout keep working as before. Every key has a standard `OTEL_*`
+variable, which wins. Collector example: [DEPLOYMENT.md](DEPLOYMENT.md#opentelemetry-otlp).
+
+| Key | Env | Default | |
+|-----|-----|---------|-|
+| `otlp_endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (off) | Base URL, e.g. `http://otel-collector:4318`; `/v1/metrics` and `/v1/logs` are appended |
+| `otlp_protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | The only one supported; `grpc` is refused |
+| `service_name` | `OTEL_SERVICE_NAME` | `aqueduct` | `service.name`; other resource attributes via `OTEL_RESOURCE_ATTRIBUTES` |
+| `metrics`, `logs` | `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` = `none` | `true` | Turn one signal off |
+| `metrics_interval_secs` | `OTEL_METRIC_EXPORT_INTERVAL` (ms) | `60` | Seconds between metric pushes |
+
+Also read: `OTEL_EXPORTER_OTLP_{METRICS,LOGS}_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`,
+`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_SDK_DISABLED`. Invalid settings log an error and leave export off; a collector
+that is down is logged once and its data dropped, and never slows the pipeline. Details:
+[deep dive](deep-dive/configuration.md#telemetry).

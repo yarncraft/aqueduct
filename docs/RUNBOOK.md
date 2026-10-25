@@ -129,6 +129,8 @@ FROM pg_replication_slots WHERE slot_type = 'logical';
 `aqueduct_state{state=...}`, `aqueduct_errors_total`, `aqueduct_events_total{op=...}`, `aqueduct_table_events_total{table=...}`,
 `aqueduct_lag_seconds`, `aqueduct_last_event_timestamp_seconds`, `aqueduct_sink_latency_seconds` and `aqueduct_uptime_seconds`
 (see `prometheus()` in `crates/aqueduct/src/admin.rs`). Use `GET /readyz` (`503` unless streaming) as the readiness probe.
+With OTLP export on ([DEPLOYMENT.md](DEPLOYMENT.md#opentelemetry-otlp)) the same series, under the same names, are pushed to
+your OpenTelemetry Collector, so these alerts can live in your OTel backend instead.
 
 ## 4. Disaster recovery
 

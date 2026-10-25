@@ -48,6 +48,49 @@ pub struct Config {
     pub inspector: bool,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
+    /// OTLP export of metrics and logs. Off unless an endpoint is set here or in
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+/// `[telemetry]`: push the `/metrics` series and the logs to an OpenTelemetry Collector over
+/// OTLP/HTTP. The standard `OTEL_*` variables override every key (see `telemetry.rs`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Base OTLP/HTTP URL, e.g. `http://otel-collector:4318`; `/v1/metrics` and `/v1/logs` are
+    /// appended. Or `OTEL_EXPORTER_OTLP_ENDPOINT`. Unset: no export.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Only `http/protobuf`. Or `OTEL_EXPORTER_OTLP_PROTOCOL`.
+    #[serde(default)]
+    pub otlp_protocol: Option<String>,
+    /// The `service.name` resource attribute. Default `aqueduct`. Or `OTEL_SERVICE_NAME`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Push metrics. Default true; `OTEL_METRICS_EXPORTER=none` also turns it off.
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    /// Push logs. Default true; `OTEL_LOGS_EXPORTER=none` also turns it off.
+    #[serde(default = "default_true")]
+    pub logs: bool,
+    /// Seconds between metric pushes. Default 60. Or `OTEL_METRIC_EXPORT_INTERVAL` (ms).
+    #[serde(default)]
+    pub metrics_interval_secs: Option<u64>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            otlp_protocol: None,
+            service_name: None,
+            metrics: true,
+            logs: true,
+            metrics_interval_secs: None,
+        }
+    }
 }
 
 /// The admin token is redacted: `Debug` output can end up in logs.
@@ -65,6 +108,7 @@ impl std::fmt::Debug for Config {
             .field("admin_insecure_no_auth", &self.admin_insecure_no_auth)
             .field("inspector", &self.inspector)
             .field("checkpoint_path", &self.checkpoint_path)
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -756,6 +800,47 @@ topic = \"t\"
 "
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn telemetry_is_off_by_default_and_parses_every_key() {
+        assert_eq!(admin_cfg("").telemetry, TelemetryConfig::default());
+        assert_eq!(admin_cfg("").telemetry.otlp_endpoint, None);
+        let c = admin_cfg(
+            "[telemetry]
+otlp_endpoint = \"http://otel-collector:4318\"
+otlp_protocol = \"http/protobuf\"
+service_name = \"cdc-orders\"
+metrics = false
+metrics_interval_secs = 15
+",
+        );
+        assert_eq!(
+            c.telemetry,
+            TelemetryConfig {
+                otlp_endpoint: Some("http://otel-collector:4318".into()),
+                otlp_protocol: Some("http/protobuf".into()),
+                service_name: Some("cdc-orders".into()),
+                metrics: false,
+                logs: true,
+                metrics_interval_secs: Some(15),
+            }
+        );
+        // A typo must not silently leave export off.
+        let e = toml::from_str::<Config>(
+            "[telemetry]
+otlp_endpiont = \"http://c:4318\"
+[postgres]
+url = \"postgres://u@db/app\"
+[sink]
+brokers = [\"b:9093\"]
+topic = \"t\"
+",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("otlp_endpiont"), "{e}");
     }
 
     #[test]

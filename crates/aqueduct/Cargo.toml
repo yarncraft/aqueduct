@@ -9,6 +9,17 @@ aqueduct-core = { path = "../aqueduct-core" }
 aqueduct-sinks = { path = "../aqueduct-sinks" }
 aqueduct-source-postgres = { path = "../aqueduct-source-postgres" }
 aqueduct-source-mongodb = { path = "../aqueduct-source-mongodb" }
+aqueduct-tls = { path = "../aqueduct-tls" }
+# OTLP export (opt-in). No default features: http/protobuf only, over our own small HTTP client
+# (rustls/ring from aqueduct-tls), so neither hyper, reqwest nor tonic come in.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "http-proto"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+opentelemetry-appender-tracing = { version = "0.33", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+bytes = "1"
+http = "1"
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -16,3 +27,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+# The in-memory metric exporter the OTLP mapping test reads back.
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs", "testing"] }
