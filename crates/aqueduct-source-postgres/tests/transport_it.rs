@@ -1,4 +1,4 @@
-//! Stream transport against poll (ADR 0003 T4, #109). Needs the plaintext server the integration
+//! The stream transport (ADR 0003 T4, #109). Needs the plaintext server the integration
 //! suite uses (`wal_level=logical`, user postgres / password aq):
 //!
 //! ```text
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
-use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode, TransportKind};
+use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
@@ -36,18 +36,11 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}_{}", std::process::id(), nanos % 1_000_000_000)
 }
 
-fn source(
-    url: String,
-    slot: &str,
-    publication: &str,
-    transport: TransportKind,
-    batch: i32,
-) -> PostgresSource {
+fn source(url: String, slot: &str, publication: &str, batch: i32) -> PostgresSource {
     let mut cfg = PostgresSourceConfig::new(url, slot, publication);
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.batch_size = batch;
-    cfg.transport = transport;
     PostgresSource::new(cfg)
 }
 
@@ -134,12 +127,12 @@ async fn drain(s: &mut PostgresSource, want: usize, out: &mut Delivered) -> Opti
     }
 }
 
-/// Poll and stream deliver the same events with the same keys: overlapping transactions across
-/// batch boundaries, a COPY cut by a small batch, a multi-table TRUNCATE, updates and deletes,
-/// and a restart of the stream source in the middle.
+/// A stream restarted in the middle delivers the same events with the same keys as one that
+/// runs straight through: overlapping transactions across batch boundaries, a COPY cut by a
+/// small batch, a multi-table TRUNCATE, updates and deletes.
 #[tokio::test]
 #[ignore = "needs a Postgres server, see the module docs"]
-async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
+async fn a_restarted_stream_delivers_the_same_events_with_the_same_keys() {
     // 5 + 5 + 1 inserts, a 30-row COPY, 3 updates and 5 deletes; then one TRUNCATE event per table.
     const BEFORE_TRUNCATE: usize = 49;
     const ALL: usize = BEFORE_TRUNCATE + 2;
@@ -147,7 +140,7 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     let a = unique("tr_a");
     let b = unique("tr_b");
     let publication = unique("tr_pub");
-    let (poll_slot, stream_slot) = (unique("tr_poll"), unique("tr_stream"));
+    let (straight_slot, stream_slot) = (unique("tr_straight"), unique("tr_stream"));
     db.batch_execute(&format!(
         "CREATE TABLE {a} (id int PRIMARY KEY, v text);
          CREATE TABLE {b} (id int PRIMARY KEY, v text);
@@ -155,7 +148,7 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     ))
     .await
     .unwrap();
-    for slot in [&poll_slot, &stream_slot] {
+    for slot in [&straight_slot, &stream_slot] {
         db.execute(
             "SELECT pg_create_logical_replication_slot($1::text, 'pgoutput')",
             &[slot],
@@ -192,15 +185,15 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     .await
     .unwrap();
 
-    // Poll reads everything in one go.
-    let mut polled = Delivered::new();
-    let mut p = source(url(), &poll_slot, &publication, TransportKind::Poll, 7);
+    // One source reads everything without a restart.
+    let mut straight = Delivered::new();
+    let mut p = source(url(), &straight_slot, &publication, 7);
     p.start(None).await.unwrap();
-    drain(&mut p, BEFORE_TRUNCATE, &mut polled).await;
+    drain(&mut p, BEFORE_TRUNCATE, &mut straight).await;
 
-    // Stream: read part, restart from the last acked checkpoint, read the rest.
+    // The other reads part, restarts from the last acked checkpoint, reads the rest.
     let mut streamed = Delivered::new();
-    let mut s = source(url(), &stream_slot, &publication, TransportKind::Stream, 7);
+    let mut s = source(url(), &stream_slot, &publication, 7);
     s.start(None).await.unwrap();
     let mut first = Delivered::new();
     let mut last = None;
@@ -229,7 +222,7 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
     s.ack(last.clone().unwrap()).await.unwrap();
     drop(s);
     streamed.extend(first);
-    let mut s = source(url(), &stream_slot, &publication, TransportKind::Stream, 7);
+    let mut s = source(url(), &stream_slot, &publication, 7);
     s.start(last).await.unwrap();
     // The multi-table TRUNCATE happens while the restarted stream runs.
     db.batch_execute(&format!("TRUNCATE {a}, {b};"))
@@ -237,19 +230,18 @@ async fn poll_and_stream_deliver_the_same_events_with_the_same_keys() {
         .unwrap();
     drain(&mut s, ALL, &mut streamed).await;
     drop(s);
-    let mut p = p;
-    drain(&mut p, ALL, &mut polled).await;
+    drain(&mut p, ALL, &mut straight).await;
     drop(p);
 
     assert_eq!(
-        polled.len(),
+        straight.len(),
         ALL,
-        "poll delivered other events than written"
+        "the straight run delivered other events than written"
     );
-    assert!(polled.values().filter(|v| v.1 == Op::Truncate).count() == 2);
-    assert_eq!(polled, streamed, "poll and stream disagree");
+    assert!(straight.values().filter(|v| v.1 == Op::Truncate).count() == 2);
+    assert_eq!(straight, streamed, "the restarted stream disagrees");
 
-    drop_slot(&db, &poll_slot).await;
+    drop_slot(&db, &straight_slot).await;
     drop_slot(&db, &stream_slot).await;
     db.batch_execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {a}, {b};"
@@ -274,7 +266,7 @@ async fn a_slow_sink_does_not_lose_the_connection() {
     .await
     .unwrap();
     let slow_url = format!("{}?options=-c%20wal_sender_timeout%3D5s", url());
-    let mut s = source(slow_url, &slot, &publication, TransportKind::Stream, 100);
+    let mut s = source(slow_url, &slot, &publication, 100);
     s.start(None).await.unwrap();
     db.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
         .await
@@ -358,7 +350,7 @@ async fn a_million_row_transaction_streams_in_bounded_memory() {
     ))
     .await
     .unwrap();
-    let mut s = source(url(), &slot, &publication, TransportKind::Stream, 1000);
+    let mut s = source(url(), &slot, &publication, 1000);
     s.start(None).await.unwrap();
     db.batch_execute(&format!(
         "INSERT INTO {table} SELECT g, repeat('x', 40) FROM generate_series(1, 1000000) g;"
@@ -425,7 +417,6 @@ async fn a_quiet_publication_on_a_busy_cluster_does_not_pin_wal() {
     let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
-    cfg.transport = TransportKind::Stream;
     cfg.heartbeat_interval = Some(Duration::from_millis(500));
     let mut s = PostgresSource::new(cfg);
     s.start(None).await.unwrap();

@@ -1,8 +1,8 @@
-//! Postgres source benchmark (ADR 0003 §8, #110): the numbers that decide whether
-//! `transport = "stream"` becomes the default. Needs a local Postgres with `wal_level=logical`.
+//! Postgres source benchmark (ADR 0003 §8, #110). Needs a local Postgres with
+//! `wal_level=logical`.
 //!
 //!   cargo run --release -p aqueduct-bench -- --source postgres --pg-url URL
-//!       [--transport poll|stream] [--rows N] [--latency-samples N] [--big-rows N]
+//!       [--rows N] [--latency-samples N] [--big-rows N]
 //!
 //! - throughput: N rows are committed first (1000 per transaction), then the pipeline (source,
 //!   null sink that encodes every event, file checkpoint) runs until all N are delivered;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use aqueduct_core::{
     run_pipeline_with_metrics, ChangeEvent, Error, Metrics, Op, Result, Sink, Source,
 };
-use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode, TransportKind};
+use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tokio_postgres::NoTls;
@@ -64,10 +64,9 @@ fn rss_bytes() -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-fn source(url: &str, slot: &str, publication: &str, transport: TransportKind) -> PostgresSource {
+fn source(url: &str, slot: &str, publication: &str) -> PostgresSource {
     let mut cfg = PostgresSourceConfig::new(url, slot, publication);
     cfg.ssl_mode = Some(SslMode::Disable);
-    cfg.transport = transport;
     PostgresSource::new(cfg)
 }
 
@@ -115,18 +114,11 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
 }
 
-pub async fn run(url: &str, transport: TransportKind, dir: &Path) {
+pub async fn run(url: &str, dir: &Path) {
     let rows: u64 = crate::arg("--rows").map_or(200_000, |v| v.parse().unwrap());
     let samples: usize = crate::arg("--latency-samples").map_or(200, |v| v.parse().unwrap());
     let big: u64 = crate::arg("--big-rows").map_or(1_000_000, |v| v.parse().unwrap());
-    let name = format!(
-        "bench_{}_{}",
-        match transport {
-            TransportKind::Poll => "poll",
-            TransportKind::Stream => "stream",
-        },
-        std::process::id()
-    );
+    let name = format!("bench_stream_{}", std::process::id());
     let db = sql(url).await;
     db.batch_execute(&format!(
         "CREATE TABLE {name} (id bigint PRIMARY KEY, v text);
@@ -154,14 +146,14 @@ pub async fn run(url: &str, transport: TransportKind, dir: &Path) {
         .unwrap();
         id += n;
     }
-    let mut src = source(url, &name, &name, transport);
+    let mut src = source(url, &name, &name);
     let (took, _) = pipeline_until(&mut src, rows, dir).await;
     let throughput = rows as f64 / took.as_secs_f64();
     // Shadowing would keep it (and its replication connection) alive.
     drop(src);
 
     // Latency on an idle stream: the source is driven directly so nothing batches the wait.
-    let mut src = source(url, &name, &name, transport);
+    let mut src = source(url, &name, &name);
     src.start(None).await.unwrap();
     // Drain whatever is left from the throughput run.
     while tokio::time::timeout(Duration::from_secs(2), src.next())
@@ -198,17 +190,13 @@ pub async fn run(url: &str, transport: TransportKind, dir: &Path) {
     ))
     .await
     .unwrap();
-    let mut src = source(url, &name, &name, transport);
+    let mut src = source(url, &name, &name);
     let before = rss_bytes();
     let (big_took, peak) = pipeline_until(&mut src, big, dir).await;
     drop(src);
 
-    let t = match transport {
-        TransportKind::Poll => "poll",
-        TransportKind::Stream => "stream",
-    };
     println!(
-        "transport={t} throughput: {rows} rows in {:.2}s = {throughput:.0} events/s | \
+        "throughput: {rows} rows in {:.2}s = {throughput:.0} events/s | \
          idle latency over {samples} single-row inserts: p50={:.1}ms p99={:.1}ms max={:.1}ms | \
          {big}-row transaction: {:.2}s, RSS {} MiB before, peak {} MiB",
         took.as_secs_f64(),

@@ -27,8 +27,7 @@ Every key with its full semantics. The short version is [CONFIGURATION.md](../CO
 | `heartbeat_interval_secs` | `10` | While idle, advance the slot to the server's WAL position at most this often, so writes to tables outside the publication do not pin WAL. `0` turns it off. See [Idle heartbeat](postgres-operations.md#idle-heartbeat) |
 | `heartbeat_action_query` | unset | Optional SQL run before each heartbeat, e.g. an upsert into a small published table. See [Idle heartbeat](postgres-operations.md#idle-heartbeat) |
 | `checkpoint_skip_system_check` | `false` | Turn off the [checkpoint origin check](postgres-operations.md#checkpoint-origin-check). Only for servers that refuse `pg_control_system()` to the Aqueduct role; without it such a server fails at startup |
-| `transport` | `poll` | `poll` reads the slot with SQL peeks, every 500 ms while it is idle; `stream` receives changes over a replication connection as they commit. See [Streaming transport](postgres-operations.md#streaming-transport) |
-| `stream_buffer_bytes` | `67108864` (64 MiB) | Stream transport: received messages buffered ahead of the sink before reading pauses |
+| `stream_buffer_bytes` | `67108864` (64 MiB) | Received messages buffered ahead of the sink before reading pauses. See [Streaming transport](postgres-operations.md#streaming-transport) |
 | `snapshot` | `never` | `never`, `on_demand` or `initial`. Copies rows that already exist; see [Snapshots](snapshots.md#snapshots). Anything but `never` needs Postgres 14+, or `snapshot_watermark_table` |
 | `snapshot_chunk_size` | `1024` | Rows per snapshot chunk |
 | `snapshot_max_rows_per_sec` | unset | Upper bound on snapshot rows read per second. Unset is unthrottled |

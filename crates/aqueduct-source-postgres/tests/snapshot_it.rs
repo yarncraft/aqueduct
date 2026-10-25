@@ -8,7 +8,6 @@
 //!
 //! Each test makes its own tables, publication and slot, and drives the source the way the
 //! pipeline does: take events, then ack the last one's checkpoint.
-mod common;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -41,7 +40,6 @@ fn unique(prefix: &str) -> String {
 
 fn source(slot: &str, publication: &str, mode: SnapshotMode, chunk: u32) -> PostgresSource {
     let mut cfg = PostgresSourceConfig::new(url(), slot, publication);
-    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {
@@ -570,7 +568,6 @@ async fn key_columns_let_a_table_without_primary_key_be_copied() {
     .await
     .unwrap();
     let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
-    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {
@@ -936,7 +933,6 @@ async fn a_watermark_table_replaces_logical_messages() {
     .await
     .unwrap();
     let mut cfg = PostgresSourceConfig::new(url(), &slot, &publication);
-    cfg.transport = common::transport();
     cfg.ssl_mode = Some(SslMode::Disable);
     cfg.poll_interval = Duration::from_millis(50);
     cfg.snapshot = SnapshotConfig {

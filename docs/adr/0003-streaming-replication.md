@@ -1,6 +1,6 @@
 # ADR 0003: Streaming replication for the Postgres source
 
-- Status: implemented (2026-10-20); `stream` is opt-in, the default is still `poll` (see "As built")
+- Status: implemented (2026-10-20); `poll` removed (2026-10-25), `stream` is the only transport (see "Poll removed")
 - Issue: #58 (related: #57, #47, #63, ADR 0001)
 - Deciders: Lucas (approval), Megatron (review), Perceptor (author)
 - Date: 2026-10-19
@@ -287,3 +287,20 @@ T1 #111, T2 #131, T3 #132, T4 #135, T5 #136. Where the code differs from the tex
 - **§8 numbers** (#136, dev laptop, postgres:16): stream 213k-269k events/s vs poll 32k-34k; idle single-row p99
   1.5 ms vs ~60 ms; 1M-row transaction peak RSS 74-94 MiB vs ~581 MiB. All three criteria hold; the default stays
   `poll` until the soak period of decision 2.
+
+## Poll removed (2026-10-25)
+
+Decision 1 kept `poll` as a permanent fallback. It was removed instead, before a release made it a commitment:
+
+- **Throughput.** Draining a committed backlog into a 6-partition topic (postgres:16, Kafka in Podman, same network,
+  median of 3): 500k rows of ~280 B, poll 6.3k events/s against stream 81k and Debezium 3.0 78k (86k tuned); 200k
+  rows of ~2 KB, poll 11k against stream 74k and Debezium 48k (69k tuned). Poll re-decodes the slot's unacked tail
+  from `restart_lsn` on every peek, so a backlog costs more the larger it is. With one batch in flight it still
+  reached only 8k.
+- **The fallbacks it covered** (PgBouncer, `max_wal_senders = 0`, a `pg_hba.conf` the operator can't change) are
+  given up: Debezium has the same requirements, and a setup without them now fails at startup with a clear error.
+- One transport means one path through `poll_with`, no `drained` bookkeeping, no idle sleep and half the
+  integration matrix.
+
+`transport = "stream"` is still accepted so existing configs load; `transport = "poll"` fails startup with the
+upgrade step. Checkpoints need no migration (decision 1: same slot, decoder and positions).

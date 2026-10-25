@@ -39,7 +39,6 @@ topic = "cdc.{schema}.{table}"
 | `slot`, `publication` | `aqueduct` | Logical slot (created if missing) and an existing publication |
 | `ssl_mode` | `verify-full` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. A server without TLS fails startup unless `disable` |
 | `ssl_root_cert` | unset | PEM CA bundle |
-| `transport` | `poll` | `stream` receives changes over a replication connection as they commit |
 | `snapshot` | `never` | `initial` or `on_demand` copies existing rows |
 | `auth`, `azure_client_id` | `password` | Azure managed identity instead of a password |
 | `heartbeat_interval_secs` | `10` | Moves the slot while idle so unpublished writes don't pin WAL; `0` disables |

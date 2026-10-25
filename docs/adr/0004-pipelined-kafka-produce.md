@@ -67,8 +67,7 @@ backwards. On each turn the pipeline lands every front delivery that is already 
 queue is full, and otherwise reads the next batch.
 
 - **Reading ahead.** `try_next` only pops what the source has buffered, so `Source` gains `read_ahead()`: one
-  poll, no idle sleep. Postgres implements it as `next()` without the pause, and the stream transport's fetch does
-  not wait for data there (`fetch_ready`). When it finds nothing, the pipeline waits for the oldest delivery. The
+  poll, no idle sleep. Postgres implements it as one fetch that does not wait for data (`fetch_ready`). When it finds nothing, the pipeline waits for the oldest delivery. The
   default reads nothing (MongoDB keeps it for now), so such a source overlaps deliveries only while its buffer
   lasts.
 - A **heartbeat-only batch** becomes an already-resolved delivery: it still lands in order and moves the checkpoint.
@@ -99,8 +98,8 @@ one), so `--partitions` spreads them like a real table, and `--in-flight K` sets
 - At-least-once is unchanged, but a crash can now replay up to `in_flight_batches` batches instead of one.
 - Sink latency in the cockpit and `aqueduct_sink_latency_seconds` is submit to acknowledgement, which includes
   waiting behind earlier batches.
-- The `poll` transport re-decodes the unacked tail of the slot on every peek, and reading ahead means more of it
-  is unacked; `stream` has no such cost.
+- The `poll` transport re-decoded the unacked tail of the slot on every peek, and reading ahead meant more of it
+  was unacked; that was one reason it was removed (ADR 0003, "Poll removed").
 - A single hot partition is still limited to one request of up to 900 KiB per round trip; spreading it needs more
   partitions.
 

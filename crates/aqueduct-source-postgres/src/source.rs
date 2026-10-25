@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,9 +18,7 @@ use crate::snapshot::{
     MIN_SERVER_VERSION,
 };
 use crate::tls::{self, SslMode};
-#[cfg(test)]
-use crate::transport::{peek_sql, PEEK_SQL};
-use crate::transport::{PeekTransport, StreamTransport, Transport};
+use crate::transport::{StreamTransport, Transport};
 
 type Row = Box<RawValue>;
 
@@ -238,10 +235,9 @@ fn check_slot_database(slot: &str, slot_db: Option<&str>, current: &str) -> Resu
     }
 }
 
-/// What decoding carries from one fetch to the next. A peek always starts at a transaction
-/// boundary and re-sends Relation messages, but the stream transport can end a fetch in the
-/// middle of a transaction, so the relation cache, the transaction's keys and its xid and commit
-/// time live on the source.
+/// What decoding carries from one fetch to the next. A fetch can end in the middle of a
+/// transaction, so the relation cache, the transaction's keys and its xid and commit time live on
+/// the source.
 #[derive(Default)]
 struct DecodeState {
     cache: RelationCache,
@@ -290,9 +286,10 @@ pub struct PostgresSourceConfig {
     pub slot: String,
     /// Existing publication to stream.
     pub publication: String,
-    /// Sleep between polls when the slot has no new changes.
+    /// How long a fetch waits for the first change before the source turns over (heartbeats,
+    /// snapshot chunks, admin requests).
     pub poll_interval: Duration,
-    /// Approximate max changes fetched per poll (whole transactions are never split).
+    /// Max messages taken per fetch.
     pub batch_size: i32,
     /// If the slot is missing but a checkpoint exists, changes made while the slot was gone are
     /// lost. By default that is a startup error; set this to accept it and start a fresh slot.
@@ -312,14 +309,11 @@ pub struct PostgresSourceConfig {
     /// check stays on.
     pub skip_system_check: bool,
     /// Ask the slot for logical messages (`'messages', 'true'`), which snapshots use as watermarks.
-    /// Needs Postgres 14+. Off by default, so the peek is unchanged; any snapshot mode but
-    /// `Never` turns it on.
+    /// Needs Postgres 14+. Off by default; any snapshot mode but `Never` turns it on.
     pub logical_messages: bool,
     /// Snapshots of existing rows (ADR 0001). Off by default.
     pub snapshot: SnapshotConfig,
-    /// How changes are read from the slot (ADR 0003). Default: polling over SQL.
-    pub transport: TransportKind,
-    /// Stream transport: bytes of decoded-but-not-taken messages to hold before reading pauses.
+    /// Bytes of decoded-but-not-taken messages to hold before reading pauses.
     pub stream_buffer_bytes: usize,
     /// How every connection authenticates. Default: the URL's password.
     pub auth: SourceAuth,
@@ -342,7 +336,6 @@ impl std::fmt::Debug for PostgresSourceConfig {
             .field("skip_system_check", &self.skip_system_check)
             .field("logical_messages", &self.logical_messages)
             .field("snapshot", &self.snapshot)
-            .field("transport", &self.transport)
             .field("stream_buffer_bytes", &self.stream_buffer_bytes)
             .field("auth", &self.auth)
             .finish()
@@ -358,29 +351,6 @@ pub enum SourceAuth {
     /// A Microsoft Entra access token from an Azure managed identity is the password of every
     /// connection, the SQL session and the replication connection alike (#140).
     Azure(AzureCredential),
-}
-
-/// How the source reads the slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TransportKind {
-    /// `pg_logical_slot_peek_binary_changes` over the SQL connection, every `poll_interval`.
-    #[default]
-    Poll,
-    /// A replication connection (`START_REPLICATION`) that receives changes as they commit.
-    Stream,
-}
-
-impl std::str::FromStr for TransportKind {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, String> {
-        match s {
-            "poll" => Ok(Self::Poll),
-            "stream" => Ok(Self::Stream),
-            other => Err(format!(
-                "transport = {other:?}: expected \"poll\" or \"stream\""
-            )),
-        }
-    }
 }
 
 /// Default for [`PostgresSourceConfig::heartbeat_interval`].
@@ -406,7 +376,6 @@ impl PostgresSourceConfig {
             skip_system_check: false,
             logical_messages: false,
             snapshot: SnapshotConfig::default(),
-            transport: TransportKind::Poll,
             stream_buffer_bytes: crate::replication::DEFAULT_STREAM_BUFFER_BYTES,
             auth: SourceAuth::Password,
         }
@@ -453,13 +422,11 @@ impl PostgresSourceConfig {
     }
 }
 
-/// Reads a pgoutput logical slot over a normal SQL connection.
+/// Reads a pgoutput logical slot over a replication connection (`START_REPLICATION`, ADR 0003).
 ///
-/// Changes are fetched with `pg_logical_slot_peek_binary_changes` (which does
-/// not consume them) and the slot is advanced in [`Source::ack`] with
-/// `pg_replication_slot_advance`, so a crash before ack replays the change.
-/// Replays after a restart may re-deliver the remainder of a transaction
-/// (at-least-once).
+/// Changes arrive as they commit, and the slot is confirmed in [`Source::ack`] by the
+/// connection's status updates, so a crash before ack replays the change. Replays after a
+/// restart may re-deliver the remainder of a transaction (at-least-once).
 pub struct PostgresSource {
     cfg: PostgresSourceConfig,
     client: Option<Arc<Client>>,
@@ -474,7 +441,7 @@ pub struct PostgresSource {
     /// Status of the last snapshot that ended, kept for the admin API.
     last_status: Option<SnapshotStatus>,
     buffer: VecDeque<ChangeEvent>,
-    /// Highest key already queued; later peeks skip changes at or below it.
+    /// Highest key already queued; a replay (after a reconnect) skips changes at or below it.
     emitted: Key,
     /// Highest LSN the slot has been advanced to.
     acked: u64,
@@ -499,21 +466,17 @@ pub struct PostgresSource {
     /// Reads the slot stats and the WAL head once a second, independently of the pipeline loop,
     /// so the cockpit sees the head move while the sink holds the pipeline up (#150).
     stats_task: Option<tokio::task::JoinHandle<()>>,
-    /// The server's WAL flush position as of the newest stats read, `0` before the first.
-    flushed: Arc<AtomicU64>,
     /// The connected cluster and database, stamped on every checkpoint. `None` before `start`.
     origin: Option<Origin>,
 }
 
-/// The slot's `confirmed_flush_lsn`, its lag behind the WAL head, the WAL head (write position)
-/// and the WAL flush position, which is what a peek can decode up to. On a standby both are the
-/// replay position. The head row comes back even without the slot.
+/// The slot's `confirmed_flush_lsn`, its lag behind the WAL head and the WAL head (write
+/// position). On a standby the head is the replay position. The head row comes back even without
+/// the slot.
 const SLOT_STATS_SQL: &str = "SELECT s.confirmed_flush_lsn::text, \
-     pg_wal_lsn_diff(h.lsn, s.confirmed_flush_lsn)::int8, h.lsn::text, h.flushed::text \
+     pg_wal_lsn_diff(h.lsn, s.confirmed_flush_lsn)::int8, h.lsn::text \
      FROM (SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
-     ELSE pg_current_wal_lsn() END AS lsn, \
-     CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
-     ELSE pg_current_wal_flush_lsn() END AS flushed) h \
+     ELSE pg_current_wal_lsn() END AS lsn) h \
      LEFT JOIN pg_replication_slots s ON s.slot_name = $1";
 
 /// How long a transport waits for a slot another connection still holds.
@@ -523,11 +486,10 @@ pub(crate) const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
 /// Once a second, so the cockpit's backlog does not trail a fast catch-up by seconds.
 const SLOT_STATS_EVERY: Duration = Duration::from_secs(1);
 
-/// One read of [`SLOT_STATS_SQL`] into `metrics`, and the flush position into `flushed`.
-/// Telemetry only: a failure clears the slot values and never stops the stream. The query is a
-/// single statement, and nothing on the SQL connection runs inside an explicit transaction, so it
-/// can share the connection with the source (it waits behind a peek in flight).
-async fn read_slot_stats(client: &Client, slot: &str, metrics: &Metrics, flushed: &AtomicU64) {
+/// One read of [`SLOT_STATS_SQL`] into `metrics`. Telemetry only: a failure clears the slot
+/// values and never stops the stream. The query is a single statement, and nothing on the SQL
+/// connection runs inside an explicit transaction, so it can share the connection with the source.
+async fn read_slot_stats(client: &Client, slot: &str, metrics: &Metrics) {
     match client.query_one(SLOT_STATS_SQL, &[&slot]).await {
         Ok(row) => {
             let flush: Option<String> = row.get(0);
@@ -540,9 +502,6 @@ async fn read_slot_stats(client: &Client, slot: &str, metrics: &Metrics, flushed
             metrics.set_slot(lag.map(|n| n.max(0) as u64), flush);
             if let Some(h) = lsn(2) {
                 metrics.report_source_head_lsn(h);
-            }
-            if let Some(f) = lsn(3) {
-                flushed.fetch_max(f, Ordering::Relaxed);
             }
         }
         Err(e) => {
@@ -581,7 +540,6 @@ impl PostgresSource {
             last_heartbeat: Instant::now(),
             metrics: None,
             stats_task: None,
-            flushed: Arc::new(AtomicU64::new(0)),
             origin: None,
         }
     }
@@ -864,13 +822,12 @@ impl PostgresSource {
             return;
         };
         let slot = self.cfg.slot.clone();
-        let flushed = self.flushed.clone();
         self.stats_task = Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(SLOT_STATS_EVERY);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                read_slot_stats(&client, &slot, &metrics, &flushed).await;
+                read_slot_stats(&client, &slot, &metrics).await;
             }
         }));
     }
@@ -920,7 +877,7 @@ impl PostgresSource {
         };
 
         // Time values are converted from their text output, which must be in ISO style; the
-        // peek and the snapshot chunk reads both run in this session.
+        // snapshot chunk reads run in this session.
         client
             .batch_execute("SET DateStyle TO ISO")
             .await
@@ -953,8 +910,8 @@ impl PostgresSource {
     /// Advance the slot past transactions that produced no event, or only events that are already
     /// checkpointed: empty ones (Postgres < 15 sends them for unpublished tables), ones holding only
     /// another tool's logical messages or our watermarks, and replays after a restart. Nothing
-    /// else would release them before the next ack or heartbeat, and until then a capped peek
-    /// re-reads the same rows from the slot's position; with heartbeats off it never moves again.
+    /// else would release them before the next ack or heartbeat; with heartbeats off the slot
+    /// would never move again.
     /// This is heartbeat step 1 ([`heartbeat_targets`]), so an unacknowledged event still holds
     /// the slot.
     async fn advance_settled(&mut self) -> Result<()> {
@@ -1013,8 +970,8 @@ impl PostgresSource {
         )
     }
 
-    /// Queues `ev` unless a change with this key was queued before (a peek re-decodes from the
-    /// slot's confirmed position). Returns whether it was queued.
+    /// Queues `ev` unless a change with this key was queued before (a reconnected stream replays
+    /// from the slot's confirmed position). Returns whether it was queued.
     fn push(&mut self, key: Key, ev: ChangeEvent) -> bool {
         if key <= self.emitted {
             return false;
@@ -1095,8 +1052,7 @@ impl PostgresSource {
     }
 
     /// Starts a heartbeat if one is due: runs the optional action query, then reads the server's
-    /// WAL flush position. This must happen **before** the peek, so every transaction committed
-    /// at or below the returned LSN is visible to that peek.
+    /// WAL flush position. `None` when no heartbeat is due or this one was skipped.
     async fn heartbeat_begin(&mut self) -> Result<Option<u64>> {
         let Some(every) = self.cfg.heartbeat_interval else {
             return Ok(None);
@@ -1164,48 +1120,28 @@ impl PostgresSource {
         self.poll_with(true).await
     }
 
-    /// One poll. A stream fetch waits up to `poll_interval` for data only when `wait`.
+    /// One fetch. It waits up to `poll_interval` for data only when `wait`.
     async fn poll_with(&mut self, wait: bool) -> Result<()> {
-        if self.cfg.transport == TransportKind::Stream {
-            // The fetch waits for data, so the heartbeat runs after it: a heartbeat started
-            // before a fetch that is then cancelled would never finish. The idle target is the
-            // last keepalive's position W, not the server's WAL position: W proves receipt of
-            // everything committed below it, while the WAL position on a busy cluster (or after
-            // the heartbeat action query) is always past W, and the slot would never move.
-            let t = self.transport()?;
-            let fetched = if wait {
-                t.fetch().await?
-            } else {
-                t.fetch_ready().await?
-            };
-            self.learn_keys(&fetched.messages).await?;
-            self.apply(fetched.messages)?;
-            self.advance_settled().await?;
-            self.report_stream_positions(fetched.caught_up, fetched.server_wal_end);
-            if self.heartbeat_begin().await?.is_some() {
-                match fetched.caught_up {
-                    Some(w) => self.heartbeat_end(w, true).await?,
-                    None => self.heartbeat_end(0, false).await?,
-                }
-            }
-            return Ok(());
-        }
-        let heartbeat_wal = self.heartbeat_begin().await?;
-        // A flush position read before this peek: a peek decodes up to the flush position as of
-        // its start, so when it drains the slot with nothing new, everything below was handed on.
-        let flushed = self.flushed.load(Ordering::Relaxed);
-        let fetched = self.transport()?.fetch().await?;
+        // The fetch waits for data, so the heartbeat runs after it: a heartbeat started before a
+        // fetch that is then cancelled would never finish. The idle target is the last
+        // keepalive's position W, not the server's WAL position: W proves receipt of everything
+        // committed below it, while the WAL position on a busy cluster (or after the heartbeat
+        // action query) is always past W, and the slot would never move.
+        let t = self.transport()?;
+        let fetched = if wait {
+            t.fetch().await?
+        } else {
+            t.fetch_ready().await?
+        };
         self.learn_keys(&fetched.messages).await?;
         self.apply(fetched.messages)?;
         self.advance_settled().await?;
-        if fetched.drained && self.buffer.is_empty() {
-            self.report_delivered(flushed);
-        }
-        if let Some(wal) = heartbeat_wal {
-            // A peek drained the slot; a stream is drained up to the WAL position its last
-            // keepalive reported, when nothing followed it.
-            let drained = fetched.drained || fetched.caught_up.is_some_and(|w| w >= wal);
-            self.heartbeat_end(wal, drained).await?;
+        self.report_stream_positions(fetched.caught_up, fetched.server_wal_end);
+        if self.heartbeat_begin().await?.is_some() {
+            match fetched.caught_up {
+                Some(w) => self.heartbeat_end(w, true).await?,
+                None => self.heartbeat_end(0, false).await?,
+            }
         }
         Ok(())
     }
@@ -1699,20 +1635,7 @@ impl Source for PostgresSource {
         // A recreated slot starts a new stream, so an old snapshot's progress no longer applies.
         let resume = parsed.and_then(|p| p.2).filter(|_| !recreated);
         self.start_snapshot(resume, first_start).await?;
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| Error::Source("source not started".into()))?;
-        self.transport = Some(match self.cfg.transport {
-            TransportKind::Poll => Box::new(PeekTransport {
-                client,
-                slot: self.cfg.slot.clone(),
-                publication: self.cfg.publication.clone(),
-                batch_size: self.cfg.batch_size,
-                logical_messages: self.cfg.logical_messages,
-            }),
-            TransportKind::Stream => Box::new(self.open_stream().await?),
-        });
+        self.transport = Some(Box::new(self.open_stream().await?));
         self.spawn_stats();
         Ok(())
     }
@@ -1733,21 +1656,8 @@ impl Source for PostgresSource {
                     e.start_chunk(c).await?;
                 }
             }
+            // The fetch waits up to `poll_interval` for data, so an idle loop does not spin.
             self.poll().await?;
-            if self.buffer.is_empty() {
-                // A chunk in flight waits for its high watermark: poll again soon, but not in a
-                // hot loop (the watermark may not be flushed yet). A due chunk starts at once.
-                let pause = match &self.snapshot {
-                    // A stream fetch already waited for data.
-                    _ if self.cfg.transport == TransportKind::Stream => Duration::ZERO,
-                    Some(e) if e.due() => Duration::ZERO,
-                    Some(e) if e.in_flight() => {
-                        Duration::from_millis(20).min(self.cfg.poll_interval)
-                    }
-                    _ => self.cfg.poll_interval,
-                };
-                tokio::time::sleep(pause).await;
-            }
         }
     }
 
@@ -1844,21 +1754,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn messages_are_only_requested_when_asked_for() {
-        let cfg = PostgresSourceConfig::new("postgres://x", "s", "p");
-        assert!(!cfg.logical_messages);
-        assert_eq!(peek_sql(cfg.logical_messages), PEEK_SQL);
-        assert!(!PEEK_SQL.contains("messages"));
-        assert_eq!(
-            peek_sql(true),
-            PEEK_SQL.replace(
-                "'publication_names', $3::text)",
-                "'publication_names', $3::text, 'messages', 'true')"
-            )
-        );
-    }
-
-    #[test]
     fn lsn_roundtrip() {
         let l = parse_lsn("16/B374D848").unwrap();
         assert_eq!(l, 0x16_B374_D848);
@@ -1902,7 +1797,7 @@ mod tests {
                 ("app", "c", Position::Lsn(100)),
             ]
         );
-        // The next peek re-sends the same message: it must not be queued twice.
+        // A replay re-sends the same message: it must not be queued twice.
         run(&mut src, &mut keys);
         assert_eq!(src.buffer.len(), 3);
     }
@@ -1960,11 +1855,10 @@ fn ack_target(tx_ends: &mut VecDeque<(Key, u64)>, key: Key) -> Option<u64> {
 ///    that covers empty transactions (Postgres < 15 sends them for unpublished tables) and
 ///    replays of transactions already delivered before a restart. The slot may move to the
 ///    last such commit end.
-/// 2. Only if the peek was drained (returned fewer rows than `batch_size`), nothing is queued and
-///    no transaction is still waiting for its checkpoint may the slot move to `wal`. The caller
-///    captured `wal` before the peek, so a drained peek contained every transaction committed at
-///    or below it, all already acknowledged. A capped peek can end below `wal`, so it only gets
-///    step 1.
+/// 2. Only if the stream is caught up to `wal` (the WAL end of a keepalive with nothing after
+///    it), nothing is queued and no transaction is still waiting for its checkpoint may the slot
+///    move to `wal`: every transaction committed below it was received and acknowledged. A fetch
+///    that is not caught up only gets step 1.
 ///
 /// An unacknowledged event therefore always holds the slot back (at-least-once).
 fn heartbeat_targets(
@@ -2005,8 +1899,8 @@ mod heartbeat_tests {
     }
 
     #[test]
-    fn capped_peek_only_gets_the_checkpointed_target() {
-        // Not idle (capped peek): the slot may reach the last checkpointed commit end, never `wal`.
+    fn not_caught_up_only_gets_the_checkpointed_target() {
+        // Not idle (not caught up): the slot may reach the last checkpointed commit end, never `wal`.
         let mut q = VecDeque::from([(k(120, 100), 120), (k(220, 200), 220)]);
         assert_eq!(
             heartbeat_targets(&mut q, false, k(120, 100), 500),
@@ -2376,14 +2270,6 @@ mod key_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("physical slot"), "{err}");
-    }
-
-    /// In-progress transaction streaming (`streaming on`, proto >= 2) must stay off: changes of a
-    /// streamed transaction have no commit LSN, so no key could be built for them.
-    #[test]
-    fn peek_never_enables_streaming() {
-        assert!(!PEEK_SQL.to_lowercase().contains("streaming"));
-        assert!(PEEK_SQL.contains("'proto_version', '1'"));
     }
 }
 

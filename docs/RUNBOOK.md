@@ -18,14 +18,14 @@ Chaos scenarios that exercise the cases below live in `scripts/chaos/` (`scripts
 | Event | What happens | Operator action |
 |-------|--------------|-----------------|
 | Container `kill -9` / OOM / node reboot | Restarts (`restart: unless-stopped` or orchestrator). Resumes from slot + checkpoint. Replay of the in-flight transaction possible | None |
-| Postgres restart or brief outage | The source has no reconnect loop: the next poll fails, the pipeline fails, the process exits non-zero and is restarted by the orchestrator, retrying until Postgres is back | None; make sure the restart policy is on, and alert if restarts loop |
+| Postgres restart or brief outage | The source has no reconnect loop: the replication connection breaks, the pipeline fails, the process exits non-zero and is restarted by the orchestrator, retrying until Postgres is back | None; make sure the restart policy is on, and alert if restarts loop |
 | Kafka down | Sink send fails, pipeline fails, process restarts and retries. Nothing is acknowledged, WAL accumulates in Postgres | Restore the sink; watch slot lag (section 3) |
 | State volume full | Checkpoint or file-sink write fails, pipeline stops without acknowledging; slot is not advanced | Free space; the process recovers on its own |
 | Checkpoint file deleted | Slot position is authoritative; replay limited to un-advanced transactions | None |
 | Checkpoint file corrupt (unparseable) | Startup fails with a checkpoint error, crash loop | Delete the file (replay from slot) and restart |
 | Rolled back to a version older than the commit-order key (#94): the older binary refuses the new checkpoint (`not a Postgres LSN`) and crash-loops | Startup fails with a checkpoint error | Delete the checkpoint file (section "Corrupt checkpoint") and accept a replay from the slot |
 | Replication slot dropped, checkpoint present | With the `feat/hardening` guard: refuses to start. Without it: a new slot is created from "now" and the gap is silent | Section 4 |
-| Two instances on one slot | Both poll and advance; events split or duplicated | Never do this; one instance per slot |
+| Two instances on one slot | The second cannot start: the first holds the slot, and the second retries for 15 s, fails and is restarted | Never do this; one instance per slot |
 | MongoDB: watched database dropped (the change stream is invalidated) | The source fails with `MongoDB invalidated the change stream`, the process exits non-zero, and every restart fails the same way: nothing is captured until the checkpoint is reset | Section "MongoDB change stream invalidated" |
 | MongoDB: a change event over 16 MB (`BSONObjectTooLarge`, code 10334) | The source fails with `larger than MongoDB's 16 MB document limit` at the same event on every restart | Section "MongoDB change event larger than 16 MB" |
 
@@ -111,8 +111,8 @@ FROM pg_replication_slots WHERE slot_type = 'logical';
   Alert on `unreserved` too: invalidation is imminent.
 - Set `max_slot_wal_keep_size` (PG13+). It protects the database disk at the price of invalidating a stuck slot.
   Size it to the longest outage you want to survive without data loss.
-- Note: the source reads with `peek` and advances after delivery, so `active` is often `false`; do not alert on it.
-  Alert on lag growth plus no recent progress instead.
+- `active` is `true` while Aqueduct is connected: its replication connection holds the slot. `false` for longer than a
+  restart means it is down. Alert on that, and on lag growth plus no recent progress.
 
 ### Aqueduct signals
 | Signal | Alert when |

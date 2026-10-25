@@ -1,9 +1,8 @@
-//! Managed identity sign-in (#140) against a real TLS server, in both transports. A mock
+//! Managed identity sign-in (#140) against a real TLS server. A mock
 //! Container Apps identity endpoint on loopback hands out the password of a role whose
 //! `pg_hba` line asks for a cleartext password, which is how Azure Database for PostgreSQL
 //! takes a Microsoft Entra token. The URL carries no password, so a change that streams proves
-//! the token was the password of the SQL session and, in stream mode, of the replication
-//! connection.
+//! the token was the password of the SQL session and of the replication connection.
 //!
 //! Uses the TLS fixture of `tls_it` and the `aq_clear` role of `replication_auth_it`:
 //!
@@ -25,9 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aqueduct_core::{Op, Source};
-use aqueduct_source_postgres::{
-    AzureCredential, PostgresSource, PostgresSourceConfig, SourceAuth, TransportKind,
-};
+use aqueduct_source_postgres::{AzureCredential, PostgresSource, PostgresSourceConfig, SourceAuth};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::Client;
@@ -126,17 +123,11 @@ async fn identity_endpoint(token: &'static str) -> (String, Arc<AtomicUsize>) {
     (url, issued)
 }
 
-fn source(
-    endpoint: &str,
-    slot: &str,
-    publication: &str,
-    transport: TransportKind,
-) -> PostgresSource {
+fn source(endpoint: &str, slot: &str, publication: &str) -> PostgresSource {
     // No password in the URL: the identity endpoint's token is the only one.
     let url = format!("postgres://{ROLE}@{}/postgres", tls());
     let mut cfg = PostgresSourceConfig::new(url, slot, publication);
     cfg.ssl_root_cert = Some(ca());
-    cfg.transport = transport;
     cfg.poll_interval = Duration::from_millis(50);
     cfg.auth = SourceAuth::Azure(
         AzureCredential::container_apps(endpoint, IDENTITY_HEADER, None).unwrap(),
@@ -166,7 +157,7 @@ async fn drop_slot(db: &Client, slot: &str) {
     panic!("slot {slot} stayed in use");
 }
 
-async fn signs_in_and_streams(transport: TransportKind) {
+async fn signs_in_and_streams() {
     let db = admin().await;
     let table = unique("mi_t");
     let publication = unique("mi_pub");
@@ -182,7 +173,7 @@ async fn signs_in_and_streams(transport: TransportKind) {
     // A token that is not the role's password is refused by the server: the token, not some
     // other credential, is what signs in.
     let (wrong, _) = identity_endpoint("not-the-password").await;
-    let mut s = source(&wrong, &slot, &publication, transport);
+    let mut s = source(&wrong, &slot, &publication);
     let e = tokio::time::timeout(Duration::from_secs(20), s.start(None))
         .await
         .expect("start timed out")
@@ -196,7 +187,7 @@ async fn signs_in_and_streams(transport: TransportKind) {
     drop(s);
 
     let (endpoint, issued) = identity_endpoint(ROLE_PASSWORD).await;
-    let mut s = source(&endpoint, &slot, &publication, transport);
+    let mut s = source(&endpoint, &slot, &publication);
     tokio::time::timeout(Duration::from_secs(20), s.start(None))
         .await
         .expect("start timed out")
@@ -234,12 +225,6 @@ async fn signs_in_and_streams(transport: TransportKind) {
 
 #[tokio::test]
 #[ignore = "needs a TLS Postgres server, see the module docs"]
-async fn poll_signs_in_with_a_container_apps_token() {
-    signs_in_and_streams(TransportKind::Poll).await;
-}
-
-#[tokio::test]
-#[ignore = "needs a TLS Postgres server, see the module docs"]
 async fn stream_signs_in_with_a_container_apps_token() {
-    signs_in_and_streams(TransportKind::Stream).await;
+    signs_in_and_streams().await;
 }

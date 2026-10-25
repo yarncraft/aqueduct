@@ -85,12 +85,13 @@ ENV
   # CA paths as the host sees them; scripts/ci-linux.sh overrides them for the test container.
   printf 'AQUEDUCT_TEST_PG_CA=%s/ca.pem\nAQUEDUCT_TEST_PG_WRONG_CA=%s/other.pem\n' "$d" "$d" >> "$d/services.env"
 
-  common="-e POSTGRES_PASSWORD=aq docker.io/library/postgres:16 -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=10"
+  # Every source holds a walsender while it runs, and the tests run in parallel.
+  common="-e POSTGRES_PASSWORD=aq docker.io/library/postgres:16 -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64"
   $CT run -d --name $tls -p $tp:5432 -v $vol:/certs:ro $common -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key >/dev/null
   $CT run -d --name $plain -p $pp:5432 $common >/dev/null
   # Trust authentication, for the replication client, which has no password auth yet.
   $CT run -d --name $trust -p $rp:5432 -e POSTGRES_HOST_AUTH_METHOD=trust \
-    docker.io/library/postgres:16 -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=10 >/dev/null
+    docker.io/library/postgres:16 -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64 >/dev/null
 
   for c in $tls $plain $trust; do
     wait_for "$c" $CT exec $c pg_isready -U postgres
