@@ -638,10 +638,13 @@ function graphModelOf(d) {
     return { r, i, c, id: 'r:' + i, tables: [], topics: new Map(), out: [] };
   });
   const fallback = routes.findIndex(x => isDefaultRoute(x.r));
-  // `otherwise` chains: x.next is the route x passes the rows its where rejects on to, x.from the routes that pass to x.
+  // `otherwise` chains: x.next is the route x passes the rows its where rejects on to, x.from the routes that pass to x;
+  // x.otherTopic the topic x passes them on to instead.
   for (const x of routes) x.from = [];
   for (const x of routes) {
-    x.next = x.r.otherwise != null ? routes.find(y => y.r.route === x.r.otherwise) || null : null;
+    const o = x.r.otherwise || {};
+    x.next = o.route != null ? routes.find(y => y.r.route === o.route) || null : null;
+    x.otherTopic = o.topic ?? null;
     if (x.next) x.next.from.push(x);
   }
   const claim = name => { const i = routes.findIndex(x => x.r.match != null && globMatch(x.r.match, name)); return i >= 0 ? i : fallback; };
@@ -709,6 +712,12 @@ function graphModelOf(d) {
     const g = groups.get(tpl);
     if (!g.dynamic) addTopic(g, tpl, 0);
     for (const [t, n] of x.topics) addTopic(g, g.dynamic ? t : tpl, n);
+  }
+  // An otherwise topic is a fixed topic of its own.
+  for (const x of routes.filter(x => x.otherTopic != null)) {
+    const t = x.otherTopic;
+    if (!groups.has(t)) groups.set(t, { tpl: t, dynamic: false, topics: new Map(), id: 'tpl:' + t });
+    addTopic(groups.get(t), t, 0);
   }
   const topicNode = new Map();
   for (const g of groups.values()) {
@@ -791,6 +800,15 @@ function graphModelOf(d) {
     edges.push({ id: x.chainEdge, from: x.id, to: x.next.id, w: x.c.passed_on || 0, bw: 0, chain: true });
     values[x.chainEdge] = fmt(x.c.passed_on || 0);
     values[x.chainEdge + ':rate'] = perSec(passedRate(x.chainEdge, x.c.passed_on || 0));
+  }
+  // otherwise: route → the topic it passes rejected rows on to, a dashed line like any other route → topic.
+  for (const x of routes.filter(x => x.otherTopic != null && topicNode.get(x.otherTopic))) {
+    const to = topicNode.get(x.otherTopic), n = x.c.passed_on || 0;
+    x.otherEdge = x.id + '>' + to + '>otherwise';
+    const rate = passedRate(x.otherEdge, n);
+    edges.push({ id: x.otherEdge, from: x.id, to, w: n, bw: rate * bytesPerRecord([x.otherTopic]), passed: true });
+    values[x.otherEdge] = fmt(n);
+    values[x.otherEdge + ':rate'] = perSec(rate);
   }
   for (const t of unrouted) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
@@ -930,7 +948,7 @@ function routeNode(x, last) {
       + sqlRow('FROM', fromClause(x))
       + sqlRow('INTO', intoClause(r))
       + sqlRow('PARTITIONED-BY', partitionClause(r))
-      + (r.otherwise != null ? sqlRow('OTHERWISE', sqlText(r.otherwise, false, 'Rows its where rejects (false or unknown) go on to ' + r.otherwise + '; a type error still dead-letters')) : '')
+      + (r.otherwise != null ? sqlRow('OTHERWISE', otherwiseClause(r)) : '')
       + `</div>`)
     // Its rates; the counts are in its panel. Folded, the header's rule already divides them from the name.
     + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">`
@@ -939,6 +957,13 @@ function routeNode(x, last) {
     + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
+}
+
+// OTHERWISE: the route or topic the rows its where rejects go on to, tagged with which of the two it is.
+function otherwiseClause(r) {
+  const [kind, name] = r.otherwise.route != null ? ['route', r.otherwise.route] : ['topic', r.otherwise.topic];
+  const what = kind === 'route' ? `go on to route ${name}, whose where decides next` : `are written to topic ${name}, keyed and shaped by this route`;
+  return sqlText(name, false, `Rows its where rejects (false or unknown) ${what}; a type error still dead-letters`) + sqlTag(kind, `otherwise = { ${kind} = "${name}" }`);
 }
 
 // The funnel between a route and the route its otherwise passes rows on to, right below it: the rows passed on per
@@ -1049,7 +1074,8 @@ function drawEdges() {
     const on = !hl || hl.has(e.id);
     const width = size(e) > 0 ? 1.5 + 4.5 * Math.sqrt(size(e) / max) : 1;
     const color = e.dlq ? EDGE_RED : hl && on ? EDGE_HL : EDGE_BASE;
-    setAttrs(lines.get(e.id, 'path'), { d, fill: 'none', stroke: color, 'stroke-width': width.toFixed(1), 'stroke-opacity': on ? (e.dlq ? 0.7 : 1) : 0.15 });
+    setAttrs(lines.get(e.id, 'path'), { d, fill: 'none', stroke: color, 'stroke-width': width.toFixed(1), 'stroke-opacity': on ? (e.dlq ? 0.7 : 1) : 0.15,
+      ...(e.passed ? { 'stroke-dasharray': '4 3' } : {}) });
     // Recent traffic: a dotted line that flows (static when the viewer prefers reduced motion).
     if ((flowUntil[e.id] || 0) > now) {
       setAttrs(flows.get(e.id, 'path'), { d, fill: 'none', stroke: e.dlq ? EDGE_RED : EDGE_FLOW, 'stroke-width': 1.5, 'stroke-linecap': 'round',
@@ -1106,12 +1132,13 @@ function trackFlow(m) {
     if (was && cur.r[x.i].produced > was.produced && !moved) for (const o of x.out) flowUntil[o.id] = now + FLOW_MS;
     if (was && x.dlqEdge && cur.r[x.i].errors > was.errors) flowUntil[x.dlqEdge] = now + FLOW_MS;
     if (was && x.chainEdge && cur.r[x.i].passed > was.passed) flowUntil[x.chainEdge] = now + FLOW_MS;
+    if (was && x.otherEdge && cur.r[x.i].passed > was.passed) flowUntil[x.otherEdge] = now + FLOW_MS;
   }
   flowPrev = cur;
 }
 
 // The routes that write to a topic: by its template, as their fallback, or (dead-letter topic) on errors.
-const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name);
+const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name || x.otherTopic === name);
 const closeBtn = '<button type="button" id="routeclose" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>';
 // The larger step-line chart in the detail panel; drawn by drawDetail on every frame.
 // The detail chart under its controls, with its unit (`yLabel`) written up the y axis.
@@ -1196,7 +1223,8 @@ function routeDetail(m) {
     + row('counts', CARD_METRICS.map(([k, , label]) => `<span class="mr-3" title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums"></span></span>`).join(''))
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
-    + (x.next ? row('passed on', `<span data-v="${x.chainEdge}" class="tabular-nums"></span> <span class="text-ink-500">of the filtered, to</span> ${routeLink(x.next)}`) : '')
+    + (x.next ? row('passed on', `<span data-v="${x.chainEdge}" class="tabular-nums"></span> <span class="text-ink-500">of the filtered, to route</span> ${routeLink(x.next)}`) : '')
+    + (x.otherEdge ? row('passed on', `<span data-v="${x.otherEdge}" class="tabular-nums"></span> <span class="text-ink-500">of the filtered, to topic</span> ${esc(x.otherTopic)}`) : '')
     + (x.from.length ? row('passed on from', x.from.map(routeLink).join('')) : '')
     + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
     + (r.topic_values && r.topic_values.length ? row('topic values', esc(r.topic_values.join(', '))) : '')

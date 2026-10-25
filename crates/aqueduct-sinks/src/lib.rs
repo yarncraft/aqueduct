@@ -13,9 +13,9 @@ pub use kafka::{
     glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, RecordTimestamp, SaslMechanism,
 };
 pub use route::{
-    ContentTopic, FieldSpec, HashKey, KafkaRoute, OutRecord, OutboxSpec, RouteCount, RouteCounts,
-    RouteDescription, RoutePlan, RouteStats, RoutesDescription, DEFAULT_MAX_DYNAMIC_TOPICS,
-    HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
+    ContentTopic, FieldSpec, HashKey, KafkaRoute, Otherwise, OutRecord, OutboxSpec, RouteCount,
+    RouteCounts, RouteDescription, RoutePlan, RouteStats, RoutesDescription,
+    DEFAULT_MAX_DYNAMIC_TOPICS, HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
 };
 pub use topic_stats::{TopicStats, MAX_TRACKED_TOPICS, OTHER_TOPICS};
 
