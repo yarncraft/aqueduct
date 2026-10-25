@@ -5,6 +5,7 @@ mod config;
 mod kpis;
 mod rates;
 mod sink;
+mod telemetry;
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,26 +19,61 @@ async fn main() {
     if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
         std::process::exit(healthcheck().await);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
-        )
-        .json()
-        .init();
+    // The config comes first: it can turn on the OTLP log layer, which has to be part of the
+    // subscriber. Its error is logged once the subscriber exists.
+    let loaded = config::Config::load();
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let telemetry_cfg = loaded
+        .as_ref()
+        .map(|c| c.telemetry.clone())
+        .unwrap_or_default();
+    // Invalid telemetry settings switch export off; they never stop the pipeline.
+    let (otlp_layer, otlp) = match telemetry::resolve(&telemetry_cfg, &env) {
+        Ok(Some(s)) => match telemetry::start(&s) {
+            Ok(layer) => (layer, Ok(Some(s))),
+            Err(e) => (None, Err(e)),
+        },
+        Ok(None) => (None, Ok(None)),
+        Err(e) => (None, Err(e)),
+    };
+    {
+        use tracing_subscriber::prelude::*;
+        let otlp_layer = otlp_layer.map(|l| {
+            l.with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                telemetry::exported_target(m.target())
+            }))
+        });
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
+            )
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(otlp_layer)
+            .init();
+    }
+    match &otlp {
+        Ok(Some(s)) => tracing::info!(
+            metrics = s.metrics_endpoint.as_deref().map(telemetry::origin),
+            logs = s.logs_endpoint.as_deref().map(telemetry::origin),
+            "OTLP export on"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::error!(error = %e, "OTLP export is off: invalid telemetry settings"),
+    }
 
-    let cfg = match config::Config::load() {
+    let cfg = match loaded {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to load config");
-            std::process::exit(1);
+            exit(1);
         }
     };
     let source_cfg = match cfg.source() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "invalid source config");
-            std::process::exit(1);
+            exit(1);
         }
     };
     tracing::info!(source = source_cfg.type_name(), "aqueduct starting");
@@ -51,7 +87,7 @@ async fn main() {
         Ok(false) => {}
         Err(e) => {
             tracing::error!("{e}");
-            std::process::exit(1);
+            exit(1);
         }
     }
     if cfg.admin_exposed_beyond_loopback() {
@@ -64,7 +100,7 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, addr = %cfg.health_addr, "failed to bind health_addr");
-            std::process::exit(1);
+            exit(1);
         }
     };
     let metrics = Arc::new(aqueduct_core::Metrics::new());
@@ -87,7 +123,7 @@ async fn main() {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "failed to build sink");
-            std::process::exit(1);
+            exit(1);
         }
     };
     // The inspector shows row data, so it needs the admin token as well.
@@ -102,6 +138,11 @@ async fn main() {
     // Records acknowledged per topic, counted by the sink after each produce.
     admin.set_topic_stats(sink.topic_stats());
     tokio::spawn(admin.clone().sample_forever());
+    // OTLP metrics read the same exposition `/metrics` serves (a no-op when export is off).
+    telemetry::export_metrics({
+        let admin = admin.clone();
+        move || admin.exposition()
+    });
     tokio::spawn(admin::serve(listener, admin.clone()));
 
     let mut source: Box<dyn aqueduct_core::Source> = match source_cfg {
@@ -117,13 +158,13 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!(error = %e, "invalid postgres config");
-                std::process::exit(1);
+                exit(1);
             }
         },
         config::SourceConfig::Mongodb(m) => {
             if let Err(e) = m.validate() {
                 tracing::error!(error = %e, "invalid mongodb config");
-                std::process::exit(1);
+                exit(1);
             }
             let (tx, rx) = aqueduct_core::snapshot_channel();
             admin.set_snapshots(tx);
@@ -160,11 +201,19 @@ async fn main() {
         res = &mut pipeline => {
             match res {
                 Ok(Ok(())) => tracing::info!("pipeline finished"),
-                Ok(Err(e)) => { tracing::error!(error = %e, "pipeline failed"); std::process::exit(1); }
-                Err(e) => { tracing::error!(error = %e, "pipeline task panicked"); std::process::exit(1); }
+                Ok(Err(e)) => { tracing::error!(error = %e, "pipeline failed"); exit(1); }
+                Err(e) => { tracing::error!(error = %e, "pipeline task panicked"); exit(1); }
             }
         }
     }
+    let _ = tokio::task::spawn_blocking(telemetry::shutdown).await;
+}
+
+/// Exits with `code` after a bounded flush of the OTLP exporters, so the reason for the exit
+/// reaches the collector too.
+fn exit(code: i32) -> ! {
+    telemetry::shutdown();
+    std::process::exit(code)
 }
 
 /// Resolves on SIGINT or (on Unix) SIGTERM, which is what `docker stop` and Kubernetes send.

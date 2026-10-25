@@ -172,3 +172,49 @@ topic = "orders-events"
 match = "*.audit_*"
 topic = "audit"
 ```
+
+## `[telemetry]`
+
+Opt-in OpenTelemetry export of metrics and logs over OTLP/HTTP with protobuf bodies (the Collector's `otlp` receiver,
+port 4318). Traces are not exported yet. Nothing changes on `/metrics`, `/api/metrics` or the JSON logs on stdout; OTLP
+is a second way out for the same data.
+
+| Key | Env (wins over the key) | Default | Description |
+|-----|-------------------------|---------|-------------|
+| `otlp_endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Base URL (`http://` or `https://`). `/v1/metrics` and `/v1/logs` are appended. Unset, together with the per-signal variables below: no export at all |
+| (none) | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | unset | Full URL for one signal, used as given. Turns that signal on even without a base URL |
+| `otlp_protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` (and the `_METRICS_`/`_LOGS_` forms) | `http/protobuf` | Only `http/protobuf`. `grpc` and `http/json` are refused (export stays off, with an error in the log) |
+| `service_name` | `OTEL_SERVICE_NAME` | `aqueduct` | The `service.name` resource attribute. A `service.name` in `OTEL_RESOURCE_ATTRIBUTES` also counts. `service.version` is the binary's version |
+| `metrics` | `OTEL_METRICS_EXPORTER=none` | `true` | Push metrics |
+| `logs` | `OTEL_LOGS_EXPORTER=none` | `true` | Push logs |
+| `metrics_interval_secs` | `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds) | `60` | Time between metric pushes. At least 1 |
+| (none) | `OTEL_EXPORTER_OTLP_HEADERS` | unset | Extra request headers, `k1=v1,k2=v2` (for example a backend's API key). Never logged |
+| (none) | `OTEL_EXPORTER_OTLP_TIMEOUT` (milliseconds) | `10000` | Connect, write and read timeout of each export request |
+| (none) | `OTEL_EXPORTER_OTLP_CERTIFICATE` | Mozilla roots | PEM CA bundle for an `https://` endpoint. The certificate and the hostname are always verified |
+| (none) | `OTEL_SDK_DISABLED=true` | | Turns all export off |
+| (none) | `OTEL_RESOURCE_ATTRIBUTES` | | More resource attributes, `deployment.environment=prod,k8s.pod.name=...` |
+
+**Metrics.** Each push carries exactly the series `GET /metrics` serves at that moment, under the same names
+(`aqueduct_events_total`, `aqueduct_slot_lag_bytes`, ...). Prometheus labels become attributes, and the `# HELP` text the
+description. A Prometheus `counter` becomes a cumulative monotonic sum, a `gauge` a gauge; no units are attached, so the
+names come through unchanged. The values are read from the same counters as `/metrics` (the exporter renders that text
+and reports each sample), so the two cannot drift. A series that appears later, such as the snapshot gauges, is picked up
+within about 10 s.
+
+**Logs.** Every event that reaches the JSON log (same `RUST_LOG` filter) is also sent as an OTLP log record: level as
+severity, the message as body, the other fields as attributes, and the target (`aqueduct_source_postgres::source`, ...)
+as the instrumentation scope. The exporter's own warnings stay on stdout only.
+
+**Failure handling.** Export runs on the SDK's own threads. Log records wait in a bounded queue (2048) that drops when
+full; metric pushes happen on a timer. Each request has the timeout above. When the collector is unreachable or answers
+with an error, Aqueduct logs `OTLP export failing` once per signal and drops the data until it answers again (then
+`OTLP export recovered`). Invalid settings, such as an unsupported protocol or a malformed URL, log
+`OTLP export is off: invalid telemetry settings` at startup and Aqueduct runs without export. On shutdown the last
+batch is flushed for at most 3 s.
+
+```toml
+[telemetry]
+otlp_endpoint = "http://otel-collector:4318"
+service_name = "aqueduct-orders"
+metrics_interval_secs = 15
+```

@@ -107,7 +107,8 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
   port of `health_addr`, read from the same config file (`AQUEDUCT_CONFIG`): a wildcard bind (`0.0.0.0`, `[::]`) is
   probed on `127.0.0.1` / `[::1]`, any other address as is; without a readable config file it probes `127.0.0.1:8080`.
   `AQUEDUCT_HEALTH_PROBE=<host:port>` overrides the address. It prints nothing; only the exit code counts.
-- Logs are JSON lines on stdout/stderr (`RUST_LOG=debug` for more detail).
+- Logs are JSON lines on stdout/stderr (`RUST_LOG=debug` for more detail). They and the metrics can also be pushed to
+  an OpenTelemetry Collector: [OpenTelemetry (OTLP)](#opentelemetry-otlp).
 
 ## 3. Operating Aqueduct
 
@@ -150,6 +151,61 @@ from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your s
 | `cannot update table ... does not have a replica identity` | Set a primary key or `REPLICA IDENTITY FULL` |
 | Kafka: `InvalidTopicException` | A topic name with illegal characters; check route `topic` values and templates |
 | Same transaction delivered twice after a crash | Expected with at-least-once delivery; deduplicate downstream |
+
+## OpenTelemetry (OTLP)
+
+Besides `/metrics` (pull) and the JSON logs on stdout, Aqueduct can push both to an OpenTelemetry Collector over
+OTLP/HTTP. It is off until an endpoint is set; the standard variables are enough:
+
+```yaml
+# docker-compose.yml (excerpt)
+services:
+  aqueduct:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318   # OTLP/HTTP; gRPC (4317) is not supported
+      OTEL_SERVICE_NAME: aqueduct
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=prod
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"                      # ms; default 60000
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:<version>
+    command: ["--config", "/etc/otelcol.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol.yaml:ro
+```
+
+```yaml
+# otelcol.yaml: print what arrives (debug), and re-serve the metrics for Prometheus
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: detailed
+  prometheus:
+    endpoint: 0.0.0.0:8889
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [debug, prometheus]
+    logs:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+- **Metrics** are the `aqueduct_*` series of `/metrics`, same names and labels (labels become attributes), pushed every
+  interval. Counters arrive as cumulative monotonic sums, gauges as gauges. The Collector's `prometheus` exporter
+  serves them under the same names, with `job` and `otel_scope_*` labels added.
+- **Logs** are the same events as stdout, which keeps working. The target becomes the instrumentation scope.
+- **The pipeline never waits for the Collector.** If it is down, Aqueduct logs `OTLP export failing` once per signal,
+  drops that data, and logs `OTLP export recovered` when it is back.
+- The same settings exist as a [`[telemetry]` table](CONFIGURATION.md#telemetry-opentelemetry) in the config file;
+  the variables win. An `https://` endpoint is verified against the Mozilla roots, or against
+  `OTEL_EXPORTER_OTLP_CERTIFICATE`. Put an API key for a hosted backend in `OTEL_EXPORTER_OTLP_HEADERS`, not in
+  the URL.
+- Traces are not exported yet.
 
 ## Cockpit over TLS
 

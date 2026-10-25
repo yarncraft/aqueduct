@@ -22,6 +22,7 @@ flowchart LR
 
     K[("Kafka topics")]
     U(["Browser / Prometheus / probes"])
+    OC(["OpenTelemetry Collector<br/>(opt-in)"])
 
     PG -- "peek changes + watermarks (poll)<br/>or replication stream (stream)" --> SRC
     SRC -- "snapshot chunks (keyset SELECT)" --> PG
@@ -37,6 +38,7 @@ flowchart LR
     ADM -. "snapshot start / cancel" .-> SRC
     K -- "read back recent events<br/>and topic offsets" --> INS --> ADM
     U -- "Bearer for /api/* and /metrics<br/>/, /healthz, /readyz are open" --> ADM
+    ADM -. "OTLP/HTTP push: the /metrics series + logs" .-> OC
 ```
 
 ## Delivery: at-least-once
