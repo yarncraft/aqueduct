@@ -28,6 +28,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
 
+# glibc malloc spends ~38% of the hot path in _int_free/_int_malloc/malloc_consolidate under
+# cross-thread frees; jemalloc's per-thread caches avoid that. Not built for MSVC targets.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 # The in-memory metric exporter the OTLP mapping test reads back.
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs", "testing"] }
