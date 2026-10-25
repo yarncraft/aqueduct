@@ -20,8 +20,6 @@ const token = (() => {
   try { return sessionStorage.getItem('aqueduct_token'); } catch (_) { return null; }
 })();
 const authInit = extra => Object.assign({}, extra, token ? { headers: { Authorization: 'Bearer ' + token } } : {});
-const OPS = ['inserts', 'updates', 'deletes', 'truncates', 'reads'];
-const OPBAR = { inserts: 'bg-green', updates: 'bg-blue', deletes: 'bg-red', truncates: 'bg-violet', reads: 'bg-amber' };
 const fmt = n => n.toLocaleString('en-US');
 const dur = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
 const ms = v => v < 10 ? v.toFixed(2) + ' ms' : v < 1000 ? v.toFixed(0) + ' ms' : (v / 1000).toFixed(1) + ' s';
@@ -44,13 +42,26 @@ const STATE_DOT = { streaming: 'bg-green', starting: 'bg-amber', failed: 'bg-red
 const DOT_BASE = 'h-1.5 w-1.5 rounded-full ';
 
 let lastData = null;
-const OPLINE = ['#32a467', '#4c90f0', '#e76a6e', '#ad7bee', '#ec9a3c'];
+// Op colours (insert, update, delete, truncate, read) for the cards' op strips, the legend and the per-op chart lines:
+// they differ in lightness as well as hue, so neighbouring shares stay apart in a thin strip.
+const OPLINE = ['#22c55e', '#38bdf8', '#ef4444', '#a855f7', '#facc15'];
 // Stepline points: hold each value until the next sample, then jump.
 const stepPts = (h, x, y) => h.map((v, i) => (i ? x(i).toFixed(1) + ',' + y(h[i - 1]).toFixed(1) + ' ' : '') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
-// Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H).
-function chart(series, el, colors = OPLINE, H = 220) {
+// Draws `series` ({ op, h }, coloured colors[op]) into the SVG `el` (viewBox 0 0 800 H): one step line each, or with
+// `stacked` filled step bands on top of each other in series order (aligned on their newest sample), so the top edge
+// is their sum.
+function chart(series, el, colors = OPLINE, H = 220, stacked = false) {
   const W = 800, PL = 34, PR = 8, PT = 10, PB = 8;
   const len = Math.max(0, ...series.map(s => s.h.length));
+  if (stacked) {
+    let below = new Array(len).fill(0);
+    series = series.map(({ op, h }) => {
+      const top = below.map((v, i) => v + (h[i - (len - h.length)] || 0));
+      const s = { op, h: top, below };
+      below = top;
+      return s;
+    });
+  }
   const max = Math.max(5, ...series.flatMap(s => s.h));
   const n = Math.max(len, 2);
   const x = i => PL + (W - PL - PR) * i / (n - 1);
@@ -63,7 +74,8 @@ function chart(series, el, colors = OPLINE, H = 220) {
   }
   if (len > 1) {
     // Stepline per op: hold each value until the next sample, then jump.
-    for (const { op, h } of series) {
+    for (const { op, h, below } of series) {
+      if (below) g += `<polygon points="${stepPts(h, x, y)} ${stepPts(below, x, y).split(' ').reverse().join(' ')}" fill="${colors[op]}" fill-opacity="0.45" stroke="none"/>`;
       g += `<polyline points="${stepPts(h, x, y)}" fill="none" stroke="${colors[op]}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
     }
   }
@@ -234,29 +246,27 @@ function render(d) {
 
 // ---- Per-table high-water marks (shown in a table's detail panel in the routing graph) ----
 // Pipeline numbers (counts, last LSN, commit and delivery times) come with every stream frame;
-// the topic and its Kafka offsets come from /api/tables, which the server caches for 5 s, so
-// polling it every 5 s costs Kafka one offsets read however many tabs are open. The routing graph
-// also takes each table's topic from it.
+// each table's topic comes from /api/tables, which the server caches for 5 s. The routing graph
+// takes each table's topic from it; the page does not show its Kafka offsets.
 const HWM_POLL_MS = 5000;
 // Last-commit tone, only while streaming: a table whose newest change is this far behind the
 // freshest table's turns amber / red. Measured against the freshest table, not the clock, so a
 // database that is idle as a whole is not flagged.
 const BEHIND_AMBER_MS = 60000, BEHIND_RED_MS = 600000;
-let hwm = { tables: {}, error: null, read_ms: null };
+let hwm = { tables: {} };
 const ago = t => { const a = Math.max(0, Date.now() - t); return a < 1000 ? 'now' : dur(Math.floor(a / 1000)) + ' ago'; };
 
 async function pollTables() {
   try {
     const r = await fetch('/api/tables', authInit());
-    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); hwm.error = r.status === 401 ? 'unauthorized' : 'disabled'; fillTopicHwm(); return; }
+    if (r.status === 401 || r.status === 403) { clearInterval(tablesTimer); return; }
     if (!r.ok) return;
     const d = await r.json();
     const byName = {};
     for (const t of d.tables) byName[t.table] = t;
-    hwm = { tables: byName, error: null, read_ms: d.kafka_read_ms };
+    hwm = { tables: byName };
     renderGraph();
     fillTableMarks();
-    fillTopicHwm();
   } catch (_) { /* the connection badge covers outages */ }
 }
 const tablesTimer = setInterval(pollTables, HWM_POLL_MS);
@@ -425,6 +435,8 @@ const GRAPH_TABLES = 6, GRAPH_TOPICS = 6, FLOW_MS = 3000;
 const EDGE_BASE = '#404854', EDGE_HL = '#4c90f0', EDGE_FLOW = '#abb3bf', EDGE_RED = '#e76a6e';
 // Outcome counters of a route, in the order of the stream's `rates.routes` rows.
 const ROUTE_COUNTS = ['produced', 'filtered', 'fallback', 'errors'];
+// A route's other outcomes per op and second, in the order of a stream frame's `route_outcome_ops` rows.
+const ROUTE_OUTCOME_OPS = ['filtered_ops', 'fallback_ops', 'errors_ops'];
 // Detail-chart line colours: a route's produced line; the dead-letter topic in red.
 const RATE_LINE = { produced: '#32a467', filtered: '#738091', fallback: '#ad7bee', errors: '#e76a6e' };
 // Source (table) and sink (topic) step lines are white, so colours only mean route metrics; dead-letter lines stay red.
@@ -462,6 +474,7 @@ function appendRates(f) {
   rates.routes.forEach((r, i) => {
     ROUTE_COUNTS.forEach((k, j) => add(r[k], f.routes[i][j]));
     if (r.ops && f.route_ops) add(r.ops, f.route_ops[i]);
+    if (r.errors_ops && f.route_outcome_ops) ROUTE_OUTCOME_OPS.forEach((k, j) => add(r[k], f.route_outcome_ops[i][j]));
   });
   for (const t of Object.keys(f.topics)) if (!rates.topics[t]) rates.topics[t] = new Array(filled - 1).fill(0);
   for (const [t, a] of Object.entries(rates.topics)) add(a, f.topics[t] || 0);
@@ -488,6 +501,8 @@ const topicRate = name => (rates && rates.topics[name]) || [];
 // produces.
 const bwKnown = () => !!(rates && rates.topic_bytes);
 const recent = h => avg((h || []).slice(-SMOOTH_WINDOW));
+// A card's rate: the mean of the last SMOOTH_WINDOW s, per second.
+const perSec = v => (v >= 100 ? Math.round(v) : v >= 10 ? v.toFixed(0) : v.toFixed(1)) + '/s';
 const total = h => (h || []).reduce((a, n) => a + n, 0);
 const bytesPerRecord = names => {
   if (!bwKnown()) return 0;
@@ -513,12 +528,25 @@ const OP_BTN = 'rounded-sm border px-2 py-0.5 uppercase tracking-wider ';
 const OP_BTN_OFF = OP_BTN + 'border-ink-600 bg-ink-700 text-ink-500';
 // Op buttons for the ops that have happened (totals per op, insert..read); without totals (an older server) all five.
 const opMask = totals => totals ? totals.map(n => n > 0 ? 1 : 0).join('') : '11111';
-// An op button: when on, tinted in its op's line colour (it is the chart's legend); when off, grey.
-const opBtnAttrs = (op, on) => on ? `class="${OP_BTN}" style="border-color:${OPLINE[op]};color:${OPLINE[op]};background-color:${OPLINE[op]}26"` : `class="${OP_BTN_OFF}"`;
+// A toggle button: when on, tinted in its line's colour (it is the chart's legend); when off, grey.
+const toggleAttrs = (color, on) => on ? `class="${OP_BTN}" style="border-color:${color};color:${color};background-color:${color}26"` : `class="${OP_BTN_OFF}"`;
+const opBtnAttrs = (op, on) => toggleAttrs(OPLINE[op], on);
+// The outcome the route panel charts (a CARD_METRICS index), matched by default; kept while you click from route to
+// route. Picked from a dropdown.
+let detailLine = 1;
+const lineSelect = () => `<select id="detailline" class="rounded-sm border border-ink-600 bg-ink-900 px-2 py-0.5 uppercase tracking-wider text-ink-100 focus:border-blue focus:outline-none" title="Outcome to chart">`
+  + CARD_METRICS.map(([k, , label], i) => `<option value="${i}"${i === detailLine ? ' selected' : ''}>${label || k}</option>`).join('') + '</select>';
 const opButtons = totals => `<span id="detailopbtns" data-mask="${opMask(totals)}" class="contents">`
   + OP_LABEL.map((label, op) => totals && !(totals[op] > 0) ? ''
     : `<button type="button" data-op="${op}" aria-pressed="${detailOps.has(op)}" ${opBtnAttrs(op, detailOps.has(op))}>${label}</button>`).join('')
   + '</span>';
+// The ops a route has taken: produced since start plus its other outcomes over the window (the server counts those
+// per op only for the rate history); null without per-op counts (an older server).
+const routeOpTotals = (x, rr) => {
+  const t = opSlots(x.c.ops);
+  if (!t || !rr || !rr.errors_ops) return null;
+  return addSlots([t, ...ROUTE_OUTCOME_OPS.map(k => addSlots(rr[k] || []))]);
+};
 // Sum of series, aligned on their newest sample.
 const sumSeries = list => {
   const n = Math.max(0, ...list.map(a => a.length));
@@ -528,8 +556,6 @@ const rateStats = h => {
   const max = Math.max(0, ...h);
   return `now ${fmt(h.length ? h[h.length - 1] : 0)}/s · avg ${avg(h).toFixed(1)}/s · max ${fmt(max)}/s`;
 };
-// A card's op shares: one thin stacked bar (OPBAR colours), filled by fillOpBar on every frame. The wrapper's padding
-// is the hover area of its tooltip.
 // A card's step line over the last n samples, 300 s by default (right-aligned, so a short window starts mid-way).
 // lines: [[series, colour, width]], scaled together.
 const SPARK_N = 300;
@@ -543,13 +569,20 @@ function spark(lines, n = SPARK_N) {
   }).join('');
 }
 const sparkSvg = (id, cls, style) => `<svg data-spark="${esc(id)}" viewBox="0 0 120 20" preserveAspectRatio="none" class="${cls}"${style ? ` style="${style}"` : ''} aria-hidden="true"></svg>`;
-const NODE_SPARK = 'mt-1 block h-6 w-full';
+// A table or topic card's step line, under its name and count.
+const nodeLine = id => `<div class="mt-1">${sparkSvg(id, 'block w-full', 'height:36px')}</div>`;
 // A table's events per second, all ops.
 const tableEventsRate = name => ((lastData && lastData.history_ops) || {})[name]?.map(o => o.reduce((a, n) => a + n, 0)) || [];
-const opBar = id => `<div data-opbar="${esc(id)}" class="mt-1 py-0.5"><div class="flex h-1 overflow-hidden rounded-sm bg-ink-700"></div></div>`;
-function fillOpBar(el, row, what) {
+// A card's op shares since start: a stacked strip down the card's left edge (the legend's colours, top to bottom in
+// OP_LABEL order), filled by fillOpStrip on every frame. A card with a strip is `relative` and padded past it.
+const STRIP_CARD = 'relative overflow-hidden', STRIP_PAD = 'padding-left:15px';
+// Shares are split by a 1 px gap in the card's own background, so two neighbours never blend into one.
+const opStrip = id => `<span data-opstrip="${esc(id)}" class="absolute top-0 flex flex-col overflow-hidden" style="left:0;bottom:0;width:6px;gap:1px"></span>`;
+function fillOpStrip(el, row, what) {
   const total = row ? row.reduce((a, n) => a + n, 0) : 0;
-  el.firstChild.innerHTML = total ? row.map((n, i) => n ? `<div class="${OPBAR[OPS[i]]}" style="width:${100 * n / total}%"></div>` : '').join('') : '';
+  const html = total ? row.map((n, i) => n ? `<span class="block" style="flex:${n} 1 0;min-height:2px;background:${OPLINE[i]}"></span>` : '').join('')
+    : '<span class="block h-full w-full bg-ink-700"></span>';
+  if (el.dataset.k !== html) { el.dataset.k = html; el.innerHTML = html; }
   el.title = !row ? 'no per-operation counts from this server'
     : !total ? 'no ' + what + ' yet'
     : what + ' by operation: ' + OP_LABEL.map((k, i) => `${k} ${fmt(row[i])} (${(100 * row[i] / total).toFixed(1)}%)`).join(' · ');
@@ -626,15 +659,23 @@ function graphModelOf(d) {
     x.shown = all.slice(0, cut).sort((a, b) => a.name < b.name ? -1 : 1);
     x.hidden = all.slice(cut);
     x.moreId = 'tm:' + x.i;
-    for (const t of x.tables) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
+    for (const t of x.tables) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
     if (x.hidden.length) {
       values[x.moreId] = fmt(x.hidden.reduce((a, t) => a + t.events, 0));
+      values[x.moreId + ':rate'] = perSec(x.hidden.reduce((a, t) => a + recent(tableEventsRate(t.name)), 0));
       ops[x.moreId] = addSlots(x.hidden.map(t => ops[t.id]));
     }
     ops[x.id] = opSlots(x.c.ops);
     for (const k of ['matched', ...ROUTE_COUNTS]) values[x.id + ':' + k] = fmt(x.c[k] || 0);
     values[x.id + ':processed'] = fmt(x.c.matched || 0);
     values[x.id + ':passed'] = fmt(Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)));
+    // The card: its match rate (matched / processed over the rate window, since start without one) and the events per
+    // second it funnels on (matched).
+    const rr = routeRate(x.i);
+    const proc = rr ? total(sumSeries(ROUTE_COUNTS.map(k => rr[k] || []))) : x.c.matched || 0;
+    const pass = rr ? proc - total(rr.filtered) : Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0));
+    values[x.id + ':matchrate'] = proc ? (100 * pass / proc).toFixed(pass === proc ? 0 : 1) + '%' : '–';
+    values[x.id + ':funnel'] = perSec(rr ? recent(sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []])) : 0);
   }
   // Topics, grouped by the template that renders them; a topic two routes share is drawn once.
   const groups = new Map(), owner = new Map();
@@ -661,6 +702,7 @@ function graphModelOf(d) {
       topicNode.set(t, 'p:' + t);
       ops['p:' + t] = topicTotals(t);
       if (ops['p:' + t]) values['p:' + t] = fmt(ops['p:' + t].reduce((a, n) => a + n, 0));
+      values['p:' + t + ':rate'] = perSec(recent(topicRate(t)));
     }
     for (const t of g.hidden) topicNode.set(t, g.moreId);
     if (g.hidden.length) ops[g.moreId] = rates && rates.topic_totals ? addSlots(g.hidden.map(topicTotals)) : null;
@@ -691,8 +733,11 @@ function graphModelOf(d) {
   const dlqShown = dlqAll.slice(0, dlqCut).sort((a, b) => a.name < b.name ? -1 : 1), dlqHidden = dlqAll.slice(dlqCut);
   for (const d of dlqHidden) d.node = 'pm:dlq';
   for (const d of dlqShown) d.node = d.id;
-  for (const d of dlqAll) values[d.id] = fmt(d.errors);
-  if (dlqHidden.length) values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
+  for (const d of dlqAll) { values[d.id] = fmt(d.errors); values[d.id + ':rate'] = perSec(recent(dlqRate(d.name))); }
+  if (dlqHidden.length) {
+    values['pm:dlq'] = fmt(dlqHidden.reduce((a, d) => a + d.errors, 0));
+    values['pm:dlq:rate'] = perSec(dlqHidden.reduce((a, d) => a + recent(dlqRate(d.name)), 0));
+  }
   for (const x of routes) {
     const g = groups.get(x.r.topic);
     const sum = [...x.topics.values()].reduce((a, n) => a + n, 0);
@@ -720,7 +765,7 @@ function graphModelOf(d) {
     for (const t of x.tables) if (t.topic && topicNode.get(t.topic)) tableEdges[t.name].push(x.id + '>' + topicNode.get(t.topic));
     for (const name of x.dlqNames) if (dlqs.has(name)) x.dlqEdge = edge(x.id, dlqs.get(name).node, x.c.errors || 0, true, dlqBw);
   }
-  for (const t of unrouted) { values[t.id] = fmt(t.events); ops[t.id] = tableOps(t.name); }
+  for (const t of unrouted) { values[t.id] = fmt(t.events); values[t.id + ':rate'] = perSec(recent(tableEventsRate(t.name))); ops[t.id] = tableOps(t.name); }
   for (const d of dlqAll) ops[d.id] = dlqTotals(d.name);
   if (dlqHidden.length) ops['pm:dlq'] = rates && rates.topic_totals ? addSlots(dlqHidden.map(d => ops[d.id])) : null;
   return { routes, groups: [...groups.values()], unrouted, edges, values, ops, tableEdges, dlqs, dlqShown, dlqHidden, bw: bwKnown() };
@@ -746,9 +791,9 @@ function dlqFor(x, name) {
   return t ? fillTopic(x.dlq, t.name) : x.dlq;
 }
 
-// Table, topic and "+N more" cards: name and count on one line, the op-share bar below.
-const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" title="${esc(t.name)} · events · click for details"><div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}" class="ml-auto tabular-nums text-ink-300">${fmt(t.events)}</span></div>${opBar(t.id)}${sparkSvg(t.id, NODE_SPARK)}</div>`;
-const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100" title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}"><span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}" class="ml-auto tabular-nums"></span>` : ''}</span>${id === 'pm:dlq' ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</button>`;
+// Table, topic and "+N more" cards: name and count on one line, the step line below, the op-share strip down the left edge.
+const tableNode = t => `<div data-node="${esc(t.id)}" data-table="${esc(t.name)}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${tableSel === t.name ? 'border-blue' : 'border-ink-600'} bg-ink-900 px-2 py-1 transition-opacity hover:border-blue" style="${STRIP_PAD}" title="${esc(t.name)} · events per second, last 15 s · click for details">${opStrip(t.id)}<div class="flex items-center gap-2"><span class="truncate text-ink-100">${esc(t.name)}</span><span data-v="${esc(t.id)}:rate" class="ml-auto tabular-nums text-ink-300"></span></div>${nodeLine(t.id)}</div>`;
+const moreNode = (id, open, n, what) => `<button type="button" data-node="${esc(id)}" data-open="${esc(open)}" class="${id === 'pm:dlq' ? '' : STRIP_CARD + ' '}block w-full rounded-sm border border-dashed border-ink-600 px-2 py-1 text-left text-ink-300 transition-opacity hover:border-blue hover:text-ink-100"${id === 'pm:dlq' ? '' : ` style="${STRIP_PAD}"`} title="${what === 'topics' ? 'Records acknowledged, all of them together' : 'Events, all of them together'}${id.startsWith('tm:') ? ', per second' : ''}">${id === 'pm:dlq' ? '' : opStrip(id)}<span class="flex items-center gap-2">+${n} more ${what}${id.startsWith('tm:') ? `<span data-v="${esc(id)}:rate" class="ml-auto tabular-nums"></span>` : ''}</span>${nodeLine(id)}</button>`;
 const lessNode = open => `<button type="button" data-open="${esc(open)}" class="px-2 text-left text-[10px] uppercase tracking-wider text-ink-500 hover:text-ink-100">show fewer</button>`;
 const colHead = (title, sub) => `<div class="mb-2 text-[10px] font-medium uppercase tracking-widest text-ink-300">${title}${sub ? ` <span class="normal-case tracking-normal text-ink-500">${sub}</span>` : ''}</div>`;
 // Whether a `where` reads row data (`before.`, `after.`, `row.`), the only part that can fail and dead-letter a row;
@@ -827,23 +872,38 @@ const CARD_METRIC_HELP = {
   fallback: 'Sent to topic_fallback (content routing could not use the row value)',
   errors: 'Sent to the dead-letter topic',
 };
+// More than COLLAPSE_MIN rules: the header offers to collapse every rule card to its name, counts and line. The
+// choice is kept per browser.
+const COLLAPSE_MIN = 4;
+let rulesCollapsed = false;
+try { rulesCollapsed = localStorage.getItem('aqueduct_rules_collapsed') === '1'; } catch (_) { /* storage blocked */ }
+// Configured rules only: the default route (no match) is not one.
+const ruleCount = () => plan ? plan.routes.filter(r => r.match != null).length : 0;
+const rulesFolded = () => rulesCollapsed && ruleCount() >= COLLAPSE_MIN;
+$('routecollapse').addEventListener('click', () => {
+  rulesCollapsed = !rulesCollapsed;
+  try { localStorage.setItem('aqueduct_rules_collapsed', rulesCollapsed ? '1' : '0'); } catch (_) { /* storage blocked */ }
+  renderGraph();
+});
+
 function routeNode(x, last) {
-  const r = x.r, sel = graphSel === x.i;
+  const r = x.r, sel = graphSel === x.i, folded = rulesFolded();
   const unseen = x.c.unseen_fields || [];
-  const counts = { processed: x.c.matched || 0, passed: Math.max(0, (x.c.matched || 0) - (x.c.filtered || 0)), fallback: x.c.fallback || 0, errors: x.c.errors || 0 };
-  return `<div data-node="${x.id}" data-route="${x.i}" class="cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue">`
+  return `<div data-node="${x.id}" data-route="${x.i}" class="${STRIP_CARD} cursor-pointer rounded-sm border ${sel ? 'border-blue' : 'border-ink-600'} bg-ink-900 p-2.5 transition-opacity hover:border-blue" style="${STRIP_PAD}">${opStrip(x.id)}`
     // Step and name on top.
     + `<div class="mb-1.5 flex min-w-0 items-center gap-2 border-b border-ink-700 pb-1.5"><span class="flex h-4 min-w-4 items-center justify-center rounded-full bg-ink-700 px-1 text-[10px] text-ink-100" title="${last && r.match == null ? 'Takes every table no route above matched' : 'Checked in this order; the first route whose match fits a table owns all its events'}">${r.match == null ? 'else' : x.i + 1}</span>`
     + `<span class="truncate font-sans text-[12px] font-medium text-ink-100" title="${esc(r.route)}">${esc(r.route)}</span></div>`
-    + `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
-    + sqlRow('SELECT', selectClause(r))
-    + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
-    + sqlRow('FROM', fromClause(x))
-    + sqlRow('INTO', intoClause(r))
-    + sqlRow('PARTITIONED-BY', partitionClause(r))
-    + `</div>`
-    // The metrics, each in the colour of its step line below.
-    + `<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-ink-700 pt-1.5 text-[10px]">${CARD_METRICS.map(([k, color, label]) => `<span title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums text-ink-100">${fmt(counts[k])}</span></span>`).join('')}</div>`
+    + (folded ? '' : `<div class="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2">`
+      + sqlRow('SELECT', selectClause(r))
+      + sqlRow('WHERE', r.where != null ? sqlText(r.where, false) : sqlText('true', true, 'no where: every event passes'))
+      + sqlRow('FROM', fromClause(x))
+      + sqlRow('INTO', intoClause(r))
+      + sqlRow('PARTITIONED-BY', partitionClause(r))
+      + `</div>`)
+    // Its rates; the counts are in its panel. Folded, the header's rule already divides them from the name.
+    + `<div class="${folded ? '' : 'mt-1.5 border-t border-ink-700 pt-1.5 '}flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">`
+    + `<span title="Matched / processed over the last 5 min: the share of the events it took whose where held"><span class="text-ink-500">match rate</span> <span data-v="${x.id}:matchrate" class="tabular-nums text-ink-100"></span></span>`
+    + `<span title="Matched events per second, last 15 s: what it funnels on to its topics (fallback and dead letter included)"><span class="text-ink-500">funneled</span> <span data-v="${x.id}:funnel" class="tabular-nums text-ink-100"></span></span></div>`
     + `<div class="mt-1" title="Events processed per second, last 5 min; click the route for matched, fallback and errors too">${sparkSvg(x.id, 'block w-full', 'height:30px')}</div>`
     + (unseen.length ? `<div class="mt-2 rounded-sm border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] text-amber" title="Fields this route's where reads that no row has had yet: check the spelling">⚠ never seen: ${esc(unseen.join(', '))}</div>` : '')
     + `</div>`;
@@ -852,9 +912,9 @@ function routeNode(x, last) {
 function topicNodeHtml(id, name, opts) {
   const sel = topicSel === name;
   const tone = (sel ? 'border-blue ' : opts.dlq ? 'border-red/40 ' : 'border-ink-600 ') + (opts.dlq ? 'bg-red/10' : 'bg-ink-900');
-  const n = `<span data-v="${esc(id)}" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
-  const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate · click for details` : `${name} · records acknowledged · click for details`;
-  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue" title="${esc(title)}"><div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${opts.dlq ? '' : opBar(id)}${sparkSvg(id, NODE_SPARK)}</div>`;
+  const n = `<span data-v="${esc(id)}:rate" class="ml-auto tabular-nums ${opts.dlq ? 'text-red' : 'text-ink-300'}"></span>`;
+  const title = opts.dlq ? `${name} · dead-letter topic${name.includes('{') ? ' template' : ''} · rows its routes could not evaluate, per second · click for details` : `${name} · records acknowledged per second, last 15 s · click for details`;
+  return `<div data-node="${esc(id)}" data-topic="${esc(name)}" class="${opts.dlq ? '' : STRIP_CARD + ' '}cursor-pointer rounded-sm border ${tone} px-2 py-1 transition-opacity hover:border-blue"${opts.dlq ? '' : ` style="${STRIP_PAD}"`} title="${esc(title)}">${opts.dlq ? '' : opStrip(id)}<div class="flex items-center gap-2"><span class="truncate ${opts.dlq ? 'text-red' : 'text-ink-100'}">${esc(name)}</span>${n}</div>${nodeLine(id)}</div>`;
 }
 
 function graphHtml(m) {
@@ -979,8 +1039,10 @@ function trackFlow(m) {
 const topicRoutes = (m, name) => m.routes.filter(x => x.r.topic === name || x.topics.has(name) || x.r.topic_fallback === name);
 const closeBtn = '<button type="button" id="routeclose" class="ml-auto rounded-sm border border-ink-600 bg-ink-700 px-2 py-0.5 uppercase tracking-wider text-ink-100 hover:border-blue">Close</button>';
 // The larger step-line chart in the detail panel; drawn by drawDetail on every frame.
-const detailChart = legend => `<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-300">${legend}<span id="detailstats" class="ml-auto tabular-nums text-ink-200"></span></div>`
-  + `<svg id="detailchart" viewBox="0 0 800 160" preserveAspectRatio="none" class="mt-1 block h-40 w-full"></svg>`;
+// The detail chart under its controls, with its unit (`yLabel`) written up the y axis.
+const detailChart = (legend, yLabel) => `<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-300">${legend}<span id="detailstats" class="ml-auto tabular-nums text-ink-200"></span></div>`
+  + `<div class="mt-1 flex"><span class="shrink-0 text-center text-ink-500" style="writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px">${esc(yLabel)}</span>`
+  + `<svg id="detailchart" viewBox="0 0 800 160" preserveAspectRatio="none" class="block h-40 min-w-0 flex-1"></svg></div>`;
 const legendItem = (color, text) => `<span class="flex items-center gap-1.5"><i class="inline-block h-0.5 w-3" style="background:${color}"></i>${esc(text)}</span>`;
 
 const routeLink = x => `<button type="button" data-route="${x.i}" class="mr-3 text-blue hover:underline">${esc(x.r.route)}</button>`;
@@ -1001,7 +1063,7 @@ function topicDetail(m, name) {
       + wide('dead letter for', served)
       + (tpl ? wide('topics', rendered.length ? rendered.map(t => can ? `<button type="button" data-inspect="${esc(t)}" class="mr-3 text-blue hover:underline" title="Open in inspector">${esc(t)}</button>` : `<span class="mr-3">${esc(t)}</span>`).join('') : '<span class="text-ink-500">none created yet: one per table, on its first dead-lettered row</span>') : '')
       + wide('acknowledged', '<span id="detailops">–</span>')
-      + `</div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(dlqTotals(name)));
+      + `</div>` + detailChart(opButtons(dlqTotals(name)), 'records acknowledged / s');
     return;
   }
   const writers = topicRoutes(m, name);
@@ -1012,22 +1074,7 @@ function topicDetail(m, name) {
     + row('dead letter', dead.length ? dead.map(([shown, node]) => `<button type="button" data-dlq="${esc(node)}" class="mr-3 text-red hover:underline" title="${esc(shown === node ? 'Select the dead-letter topic' : 'Select ' + node + ', the template it is rendered from')}">${esc(shown)}</button>`).join('')
       : `<span class="text-ink-500">${writers.length ? 'none: no route writing here can dead-letter a row' : '–'}</span>`)
     + row('acknowledged', '<span id="detailops">–</span>')
-    + `</div><div id="topichwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">records acknowledged / s</span>' + opButtons(topicTotals(name)));
-}
-
-// The Kafka high-water mark of the topic open in the detail panel (sink side), from /api/tables, which reads offsets
-// for the topics tables are routed to; refreshed after every read.
-function fillTopicHwm() {
-  const el = document.getElementById('topichwm');
-  if (!el || topicSel == null) return;
-  const row = (label, v, title) => `<div class="flex gap-3"${title ? ` title="${esc(title)}"` : ''}><span class="w-24 shrink-0 text-ink-500">${label}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
-  const entry = Object.values(hwm.tables).find(t => t.topic === topicSel && t.kafka);
-  const k = entry && entry.kafka;
-  const offsets = k
-    ? `${fmt(k.hwm_total)} <span class="text-ink-500">· ${k.partitions.map(p => 'p' + esc(p.partition) + ' ' + fmt(p.hwm)).join(' · ')}</span>`
-    : `<span class="text-ink-500">${esc(hwm.error || 'only read for topics that tables route to by name')}</span>`;
-  el.innerHTML = row('Kafka HWM', offsets, 'Sum over the topic\'s partitions of the next offset Kafka will assign: the records written to it.')
-    + row('offsets read', hwm.read_ms ? esc(ago(hwm.read_ms)) : '–');
+    + `</div>` + detailChart(opButtons(topicTotals(name)), 'records acknowledged / s');
 }
 
 // A table's panel (source side, no Kafka details): the route that claims it, its events, how far it has got, and its
@@ -1046,8 +1093,7 @@ function fillTableMarks() {
     + row('last LSN', esc(m.last_lsn || '–'))
     + row('last commit', m.last_commit_ms ? `<span class="${tone}">${esc(ago(m.last_commit_ms))}</span> <span class="text-ink-500">${esc(isoMs(m.last_commit_ms))}</span>` : '–',
       'Age of the newest delivered change\'s commit. Amber: more than 1 min behind the freshest table, red: more than 10 min (only while streaming).')
-    + row('delivered', m.last_delivered_ms ? `${esc(ago(m.last_delivered_ms))} <span class="text-ink-500">${esc(isoMs(m.last_delivered_ms))}</span>` : '–')
-    + row('checkpoint', `${esc(d.checkpoint || '–')} <span class="text-ink-500">(global, not per table)</span>`);
+    + row('delivered', m.last_delivered_ms ? `${esc(ago(m.last_delivered_ms))} <span class="text-ink-500">${esc(isoMs(m.last_delivered_ms))}</span>` : '–');
 }
 
 function tableDetail(m, name) {
@@ -1057,13 +1103,13 @@ function tableDetail(m, name) {
   $('routedetail').innerHTML = `<div class="mb-2 flex flex-wrap items-center gap-3"><span class="break-all font-sans text-[12px] font-medium text-ink-100">${esc(name)}</span><span class="text-ink-500">table</span>${closeBtn}</div><div class="space-y-1">`
     + row('claimed by', x ? `<button type="button" data-route="${x.i}" class="text-blue hover:underline">${esc(x.r.route)}</button>` : '<span class="text-red">no route · its events fail</span>')
     + row('events', `<span data-v="${esc('t:' + name)}" class="tabular-nums">${fmt(t ? t.events : 0)}</span>`)
-    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart('<span class="text-ink-500">events / s</span>' + opButtons(((lastData && lastData.table_ops) || {})[name] || null));
+    + `</div><div id="tablehwm" class="mt-1 space-y-1"></div>` + detailChart(opButtons(((lastData && lastData.table_ops) || {})[name] || null), 'events / s');
 }
 
 function routeDetail(m) {
   const x = graphSel == null ? null : m.routes[graphSel];
   $('routedetail').hidden = !x && topicSel == null && tableSel == null;
-  if (!x) { if (topicSel != null) { topicDetail(m, topicSel); fillTopicHwm(); } else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
+  if (!x) { if (topicSel != null) topicDetail(m, topicSel); else if (tableSel != null) { tableDetail(m, tableSel); fillTableMarks(); } return; }
   // Only what the card does not already show: the card has SELECT/WHERE/FROM/INTO/PARTITIONED-BY, the outcome
   // counts and the op bar.
   const r = x.r, row = (k, v) => `<div class="flex gap-3"><span class="w-24 shrink-0 text-ink-500">${k}</span><span class="min-w-0 break-words text-ink-100">${v}</span></div>`;
@@ -1072,6 +1118,7 @@ function routeDetail(m) {
   const extra = Object.keys(r).filter(k => !ON_CARD.includes(k) && r[k] != null);
   const rendered = isTemplate(r.topic) || (r.topic_fallback != null) ? [...x.topics.keys()].filter(t => t !== r.topic_fallback).sort() : [];
   $('routedetail').innerHTML = `<div class="mb-2 flex items-center gap-3"><span class="font-sans text-[12px] font-medium text-ink-100">${esc(r.route)}</span><span class="text-ink-500">${r.match == null ? 'default · takes what no route matched' : 'step ' + (x.i + 1) + ' of ' + m.routes.length}</span>${closeBtn}</div><div class="space-y-1">`
+    + row('counts', CARD_METRICS.map(([k, , label]) => `<span class="mr-3" title="${esc(CARD_METRIC_HELP[k])}"><span class="text-ink-500">${label || k}</span> <span data-v="${x.id}:${k}" class="tabular-nums"></span></span>`).join(''))
     + row('produced', `<span data-v="${x.id}:produced" class="tabular-nums">${fmt(x.c.produced || 0)}</span> <span class="text-ink-500">records written to its topics</span>`)
     + row('produced by op', '<span id="detailops">–</span>')
     + (r.topic_fallback != null ? row('topic fallback', esc(r.topic_fallback)) : '')
@@ -1080,7 +1127,7 @@ function routeDetail(m) {
     + (x.dlq ? row('dead letter', x.dlqNames.length ? x.dlqNames.map(n => `<button type="button" data-dlq="${esc(n)}" class="mr-3 text-red hover:underline">${esc(n)}</button>`).join('') : esc(x.dlq)) : '')
     + (x.tables.length > FROM_TABLES ? row('all tables', esc(x.tables.map(t => t.name).sort().join(', '))) : '')
     + extra.map(k => row(esc(k), esc(JSON.stringify(r[k])))).join('')
-    + `</div>` + detailChart(CARD_METRICS.map(([k, color, label]) => legendItem(color, label || k)).join(''));
+    + `</div>` + detailChart(lineSelect() + opButtons(routeOpTotals(x, routeRate(x.i))), 'events / s');
 }
 
 // The detail panel's chart: one step line, the records per second of the ops toggled on, summed (tables: events,
@@ -1111,6 +1158,12 @@ function drawCardSparks(m) {
   for (const el of document.querySelectorAll('#routing [data-spark]')) { const l = lines[el.dataset.spark]; el.innerHTML = l ? spark(l) : ''; }
 }
 
+// An op that happens for the first time gets its button without reopening the panel.
+function refreshOpButtons(totals) {
+  const btns = document.getElementById('detailopbtns');
+  if (btns && btns.dataset.mask !== opMask(totals)) btns.outerHTML = opButtons(totals);
+}
+
 function drawDetail(m) {
   const dc = $('detailchart');
   if (!dc) return;
@@ -1125,14 +1178,27 @@ function drawDetail(m) {
     rows = ((lastData && lastData.history_ops) || {})[tableSel] || [];
     color = TABLE_LINE;
   } else if (graphSel != null) {
-    // A route: four lines, processed, matched, fallback and errors, from the route's own counters.
+    // A route: four lines, processed, matched, fallback and errors, from the route's own counters, each counting only
+    // the ops toggled on (without per-op history, every op).
     const x = m.routes[graphSel];
     if (!x) return;
     const rr = routeRate(x.i) || {};
-    const processed = sumSeries(ROUTE_COUNTS.map(k => rr[k] || []));
-    const series = { processed, passed: sumSeries([rr.produced || [], rr.fallback || [], rr.errors || []]), fallback: rr.fallback || [], errors: rr.errors || [] };
-    chart(CARD_METRICS.map(([k], op) => ({ op, h: series[k] })), dc, CARD_METRICS.map(c => c[1]), 160);
-    $('detailstats').textContent = 'processed ' + rateStats(processed);
+    const tot = routeOpTotals(x, rr), sel = [...detailOps].filter(op => !tot || tot[op] > 0).sort();
+    const pick = (k, rows) => tot ? (rr[rows] || []).map(o => sel.reduce((a, op) => a + (o[op] || 0), 0)) : rr[k] || [];
+    const [produced, filtered, fallback, errors] = ['ops', ...ROUTE_OUTCOME_OPS].map((rows, j) => pick(ROUTE_COUNTS[j], rows));
+    const processed = sumSeries([produced, filtered, fallback, errors]);
+    const series = { processed, passed: sumSeries([produced, fallback, errors]), fallback, errors };
+    const [k, color, label] = CARD_METRICS[detailLine];
+    // Several ops: the outcome stacked by op, in the op colours (the op buttons are its legend); one op, or no per-op
+    // history, a line in the outcome's colour.
+    if (tot && sel.length > 1) {
+      const parts = { processed: ['ops', ...ROUTE_OUTCOME_OPS], passed: ['ops', 'fallback_ops', 'errors_ops'], fallback: ['fallback_ops'], errors: ['errors_ops'] }[k];
+      const rows = sumRows(parts.map(p => rr[p] || []));
+      chart(sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })), dc, OPLINE, 160, true);
+    } else chart([{ op: 0, h: series[k] }], dc, [color], 160);
+    $('detailstats').textContent = tot && !sel.length ? 'no operation selected'
+      : (tot ? '' : 'all operations (no per-op history from this server) · ') + (label || k) + ' ' + rateStats(series[k]);
+    refreshOpButtons(tot);
     const el = document.getElementById('detailops');
     const t = opSlots(x.c.ops);
     if (el) el.textContent = t ? OP_LABEL.map((k, i) => `${k} ${fmt(t[i])}`).join(' · ') : 'no per-operation counts from this server';
@@ -1144,17 +1210,13 @@ function drawDetail(m) {
   const sel = [...detailOps].filter(op => !seen || seen[op] > 0).sort();
   const perOp = rows ? sel.map(op => ({ op, h: rows.map(o => o[op] || 0) })) : null;
   const h = perOp ? sumSeries(perOp.map(s => s.h)) : all;
-  if (perOp) chart(perOp, dc, OPLINE, 160); else chart([{ op: 0, h }], dc, [color], 160);
+  // Several ops stack (the top edge is their sum); one op is a plain line.
+  if (perOp) chart(perOp, dc, OPLINE, 160, perOp.length > 1); else chart([{ op: 0, h }], dc, [color], 160);
   $('detailstats').textContent = rows && !sel.length ? 'no operation selected'
     : (rows ? '' : 'all operations (no per-op history from this server) · ') + rateStats(h);
-  // An op that happens for the first time gets its button without reopening the panel.
-  const btns = document.getElementById('detailopbtns');
-  if (btns && (tableSel != null || topicSel != null)) {
-    const tot = tableSel != null ? ((lastData && lastData.table_ops) || {})[tableSel] || null : totals;
-    if (btns.dataset.mask !== opMask(tot)) btns.outerHTML = opButtons(tot);
-  }
+  refreshOpButtons(seen);
   const el = document.getElementById('detailops');
-  if (el) el.textContent = totals ? OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
+  if (el) el.textContent = totals ? `${fmt(totals.reduce((a, n) => a + n, 0))} · ` + OP_LABEL.map((k, i) => `${k} ${fmt(totals[i])}`).join(' · ') : 'no per-operation counts from this server';
 }
 
 function renderGraph(frame) {
@@ -1167,7 +1229,12 @@ function renderGraph(frame) {
   if (frame) trackFlow(m);
   const key = JSON.stringify([m.routes.map(x => [x.shown.map(t => t.name), x.hidden.length, x.c.unseen_fields]),
     m.groups.map(g => [g.shown, g.hidden.length]), m.unrouted.map(t => t.name), m.dlqShown.map(d => [d.name, d.routes.length]), m.dlqHidden.length,
-    topicSel && m.dlqs.has(topicSel) && topicSel.includes('{') ? dlqTopics(topicSel) : null, graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector)]);
+    topicSel && m.dlqs.has(topicSel) && topicSel.includes('{') ? dlqTopics(topicSel) : null, graphSel, topicSel, tableSel, [...graphOpen], !!(lastData && lastData.inspector),
+    rulesFolded()]);
+  const btn = $('routecollapse');
+  btn.hidden = ruleCount() < COLLAPSE_MIN;
+  btn.textContent = rulesFolded() ? 'Expand rules' : 'Collapse rules';
+  btn.setAttribute('aria-pressed', String(rulesFolded()));
   graphModel = m;
   if (key !== graphKey) {
     graphKey = key;
@@ -1179,9 +1246,9 @@ function renderGraph(frame) {
     if (v != null) el.textContent = v;
     if (el.dataset.v.endsWith(':errors')) el.classList.toggle('text-red', v != null && v !== '0');
   }
-  for (const el of document.querySelectorAll('#routing [data-opbar]')) {
-    const id = el.dataset.opbar;
-    fillOpBar(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
+  for (const el of document.querySelectorAll('#routing [data-opstrip]')) {
+    const id = el.dataset.opstrip;
+    fillOpStrip(el, m.ops[id], id.startsWith('r:') ? 'produced' : /^(p:|pm:|dlq:)/.test(id) ? 'records acknowledged' : 'events');
   }
   drawCardSparks(m);
   const warn = m.routes.reduce((a, x) => a + (x.c.unseen_fields || []).length, 0);
@@ -1227,6 +1294,12 @@ $('graph').addEventListener('click', ev => {
   if (topic) { topicSel = topicSel === topic.dataset.topic ? null : topic.dataset.topic; graphSel = tableSel = null; renderGraph(); return; }
   const route = ev.target.closest('[data-route]');
   if (route) { graphSel = graphSel === +route.dataset.route ? null : +route.dataset.route; topicSel = tableSel = null; renderGraph(); }
+});
+$('routedetail').addEventListener('change', ev => {
+  if (ev.target.id !== 'detailline') return;
+  detailLine = +ev.target.value;
+  ev.target.outerHTML = lineSelect();
+  if (graphModel) drawDetail(graphModel);
 });
 $('routedetail').addEventListener('click', ev => {
   const opBtn = ev.target.closest('[data-op]');
