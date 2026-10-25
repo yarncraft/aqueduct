@@ -43,8 +43,10 @@ flowchart LR
 
 ## Delivery: at-least-once
 
-The checkpoint is written and the source acknowledged only after Kafka has acknowledged the whole batch. A crash
-before that point replays the batch, so consumers must tolerate duplicates.
+The checkpoint is written and the source acknowledged only after Kafka has acknowledged the whole batch and every
+batch before it. Up to `sink.in_flight_batches` (4) batches are produced at once; each partition writes them in order
+through one lane with one request outstanding ([ADR 0004](adr/0004-pipelined-kafka-produce.md)). A crash before the
+checkpoint replays the batches since it, so consumers must tolerate duplicates.
 
 ```mermaid
 sequenceDiagram
@@ -57,10 +59,11 @@ sequenceDiagram
     loop until shutdown
         P->>S: next() + try_next() (up to 1000 events)
         S-->>P: batch of ChangeEvents
-        P->>K: send_batch(batch) + flush() (60 s timeout)
-        K-->>P: broker ack
-        P->>C: save(last position) (tmp file, fsync, rename)
-        P->>S: ack(last position)
+        P->>K: submit(batch): records queued on their partitions' lanes
+        Note over P,K: up to in_flight_batches submitted; the source reads ahead meanwhile
+        K-->>P: oldest batch acked (60 s from submit)
+        P->>C: save(its last position) (tmp file, fsync, rename)
+        P->>S: ack(its last position)
         Note over S: Postgres: slot advances only to a commit-end LSN
     end
 ```

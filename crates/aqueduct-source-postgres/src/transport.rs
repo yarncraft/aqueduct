@@ -40,6 +40,12 @@ pub trait Transport: Send + Sync {
     /// caller skips changes whose key it already queued.
     async fn fetch(&mut self) -> Result<Fetched>;
 
+    /// Like `fetch`, but returns at once when nothing has arrived yet. A peek never waits, so
+    /// the default is `fetch`.
+    async fn fetch_ready(&mut self) -> Result<Fetched> {
+        self.fetch().await
+    }
+
     /// Tells the server that every transaction ending at or before `lsn` is delivered. `lsn` is
     /// always a commit end LSN: confirming a position inside a transaction replays all of it.
     async fn confirm(&mut self, lsn: u64) -> Result<()>;
@@ -183,11 +189,11 @@ fn ended() -> Error {
     Error::Source("replication connection: the server ended the stream".into())
 }
 
-#[async_trait]
-impl Transport for StreamTransport {
-    async fn fetch(&mut self) -> Result<Fetched> {
+impl StreamTransport {
+    /// Messages that arrive within `wait`, then whatever else is already queued.
+    async fn fetch_within(&mut self, wait: std::time::Duration) -> Result<Fetched> {
         let mut messages = Vec::new();
-        let mut next = match tokio::time::timeout(self.wait, self.handle.recv()).await {
+        let mut next = match tokio::time::timeout(wait, self.handle.recv()).await {
             Ok(m) => m?.ok_or_else(ended)?,
             Err(_) => {
                 return Ok(Fetched {
@@ -232,6 +238,18 @@ impl Transport for StreamTransport {
             caught_up: self.caught_up,
             server_wal_end: self.server_wal_end,
         })
+    }
+}
+
+#[async_trait]
+impl Transport for StreamTransport {
+    async fn fetch(&mut self) -> Result<Fetched> {
+        self.fetch_within(self.wait).await
+    }
+
+    async fn fetch_ready(&mut self) -> Result<Fetched> {
+        // A zero timeout still polls `recv` once, so a message already queued is taken.
+        self.fetch_within(std::time::Duration::ZERO).await
     }
 
     async fn confirm(&mut self, lsn: u64) -> Result<()> {

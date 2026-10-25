@@ -5,12 +5,14 @@
 
 mod inspect;
 mod kafka;
+mod lane;
 pub mod route;
 mod topic_stats;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{
     glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, RecordTimestamp, SaslMechanism,
+    DEFAULT_IN_FLIGHT_BATCHES, MAX_IN_FLIGHT_BATCHES,
 };
 pub use route::{
     ContentTopic, FieldSpec, HashKey, KafkaRoute, Otherwise, OutRecord, OutboxSpec, RouteCount,

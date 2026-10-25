@@ -78,8 +78,10 @@ Nothing merges without review, and branch protection is not available, so the ru
 
 ## Invariants (do not break)
 
-- **At-least-once**: the pipeline checkpoints and acks the source only after `sink.send` and `flush` succeed.
-  Sinks must tolerate redelivery; never ack earlier for speed.
+- **At-least-once**: the pipeline checkpoints and acks a batch only after its delivery (`Sink::submit`) and every
+  earlier batch's succeeded, in submit order (ADR 0004). A sink that keeps batches in flight must keep each
+  partition's order and fail every later batch behind a failed one. Sinks must tolerate redelivery; never ack earlier
+  for speed.
 - **Positions**: sources own their `Position` encoding. The event JSON field is still `lsn`, and text positions are checkpointed as `~<text>`. Adding a source = new crate, a `SourceConfig` variant in `config.rs` and a match arm in `main.rs`. SQL Server, Redis and the Kafka source were dropped on purpose.
 - **Slot advance**: the source advances the replication slot only to a transaction's commit-end LSN.
   Acking a mid-transaction LSN does not move `confirmed_flush_lsn` and replays the transaction.

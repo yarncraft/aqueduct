@@ -316,7 +316,7 @@ cards' lines; nothing is averaged. Hover a line for the newest second and the wi
 | Throughput | events delivered |
 | Kafka bandwidth | key, value and header MB (10^6 bytes) Kafka acknowledged |
 | End-to-end lag | commit to delivery, while the tile shows a lag (not while it reads `idle`) |
-| Sink latency | sink time per event delivered in that second |
+| Sink latency | per event delivered in that second, its batch's time from submit to the broker's ack. With several batches in flight (`sink.in_flight_batches`) that includes waiting behind earlier batches, so it can rise while throughput does too |
 | Errors | the error counter |
 
 The Kafka bandwidth tile itself shows the mean of the last 15 s, the last second, and the MB acknowledged since start

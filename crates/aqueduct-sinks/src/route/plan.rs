@@ -985,8 +985,8 @@ pub struct RouteStats {
     /// Per route, whether the first refused topic create was logged.
     refused_logged: Vec<AtomicBool>,
     /// Per route, the counts of the batch being rendered, applied to the counters above only once
-    /// the broker acknowledged the batch ([`RoutePlan::commit_counts`]), so a failed batch the
-    /// pipeline retries is not counted twice.
+    /// the broker acknowledged the batch ([`RoutePlan::commit_counts`], or a [`BatchCounts`] taken
+    /// for it), so a failed batch the pipeline retries is not counted twice.
     pending: Mutex<Vec<PendingCounts>>,
 }
 
@@ -1162,8 +1162,20 @@ impl RouteStats {
 
     /// Applies the pending counts to the counters and clears them.
     fn commit(&self) {
+        let counts = self.take();
+        self.apply(&counts);
+    }
+
+    /// Takes the pending counts out, leaving them cleared.
+    fn take(&self) -> Vec<PendingCounts> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        for (i, p) in pending.iter_mut().enumerate() {
+        let n = pending.len();
+        std::mem::replace(&mut *pending, vec![PendingCounts::default(); n])
+    }
+
+    /// Adds `counts` (one per route) to the counters.
+    fn apply(&self, counts: &[PendingCounts]) {
+        for (i, p) in counts.iter().enumerate() {
             // `fetch_add` wraps like the deltas, so a moved count (`topic_refused`) nets out.
             let add = |v: &[AtomicU64], n: u64| {
                 if n != 0 {
@@ -1189,7 +1201,6 @@ impl RouteStats {
                     }
                 }
             }
-            *p = PendingCounts::default();
         }
     }
 
@@ -2992,6 +3003,30 @@ impl RoutePlan {
     pub fn discard_counts(&self) {
         self.stats.discard();
     }
+
+    /// Takes the route counts of everything rendered since the last commit, take or discard, for
+    /// a batch that is acknowledged later, while the next batches render: commit them then.
+    pub fn take_counts(&self) -> BatchCounts {
+        BatchCounts {
+            counts: self.stats.take(),
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+/// One batch's route counts, taken by [`RoutePlan::take_counts`]. [`commit`](Self::commit) applies
+/// them once the broker acknowledged the batch; dropping them uncommitted drops them, since a
+/// failed batch is redelivered and counted then.
+#[must_use = "the counts apply only when committed"]
+pub struct BatchCounts {
+    counts: Vec<PendingCounts>,
+    stats: Arc<RouteStats>,
+}
+
+impl BatchCounts {
+    pub fn commit(self) {
+        self.stats.apply(&self.counts);
+    }
 }
 
 #[cfg(test)]
@@ -3668,6 +3703,31 @@ mod tests {
         );
         p.commit_counts();
         assert_eq!(counts(), c);
+    }
+
+    #[test]
+    fn taken_counts_apply_on_commit_and_are_dropped_on_failure() {
+        let p = plan_with(vec![route("public.orders", "orders")]);
+        let one = row("orders", Op::Insert, r#"{"n":1}"#);
+        let render = || p.render_into(&one, NOW, &mut Vec::new()).unwrap();
+        let produced = || p.stats().snapshot()[0].counts.produced;
+        // Two batches in flight: the first fails, the second is acknowledged.
+        render();
+        let failed = p.take_counts();
+        render();
+        render();
+        let acked = p.take_counts();
+        assert_eq!(
+            produced(),
+            0,
+            "nothing counts before its batch is acknowledged"
+        );
+        drop(failed);
+        acked.commit();
+        assert_eq!(produced(), 2, "only the acknowledged batch counts");
+        // Taking cleared the pending counts, so a commit now adds nothing.
+        p.commit_counts();
+        assert_eq!(produced(), 2);
     }
 
     #[test]

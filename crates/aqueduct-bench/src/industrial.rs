@@ -256,6 +256,8 @@ pub fn pool(n: usize) -> Vec<ChangeEvent> {
         .map(|i| {
             let id = r.next() % 2_000_000;
             let row = asset_row(&mut r, id);
+            // The primary key, as a source sets it: it decides the partition.
+            let key = json!({"asset_id": row["asset_id"]}).to_string();
             let roll = r.next() % 100;
             let (op, before, after) = if roll < 30 {
                 (Op::Insert, None, Some(row))
@@ -284,7 +286,7 @@ pub fn pool(n: usize) -> Vec<ChangeEvent> {
                 op,
                 before: before.map(raw),
                 after: after.map(raw),
-                key: None,
+                key: Some(key),
                 checkpoint: None,
                 unchanged: Vec::new(),
                 after_is_key: false,
