@@ -94,6 +94,9 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest a connection may take to send its whole request, body included.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after a failed `accept`. Most failures (out of file descriptors, `EMFILE`) persist
+/// until a connection closes, and retrying at once would spin a core at 100%.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The dashboard only needs same-origin resources plus inline styles (bar widths and colours are
 /// set from data). No inline script: the page loads `/admin.js`.
@@ -1380,10 +1383,20 @@ pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
         PROBE_CONNECTIONS - LOOPBACK_PROBE_CONNECTIONS,
     ));
     let loopback_probes = Arc::new(Semaphore::new(LOOPBACK_PROBE_CONNECTIONS));
+    // Logged once per run of failures, not every retry.
+    let mut failing = false;
     loop {
-        let Ok((sock, peer)) = listener.accept().await else {
-            continue;
+        let (sock, peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                if !std::mem::replace(&mut failing, true) {
+                    tracing::warn!(error = %e, "admin server: accept failed; retrying");
+                }
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
         };
+        failing = false;
         // Shed load instead of queueing: a flood cannot exhaust file descriptors or memory. Once
         // the slots are full, a small reserve still answers the health probes.
         let (permit, probes_only) = match slots.clone().try_acquire_owned() {

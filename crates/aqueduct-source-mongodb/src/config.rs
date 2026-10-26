@@ -19,6 +19,7 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 1024;
 
 /// `[source]` settings for `type = "mongodb"`.
 #[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MongoConfig {
     /// Connection string; carries auth and `tls=true` options. Requires a replica set. Plaintext
     /// to a non-loopback host is refused unless the URI says `tls=false` explicitly.

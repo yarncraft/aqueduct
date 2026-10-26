@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use crate::{ChangeEvent, Metrics, Op, Position, State};
+use crate::{ChangeEvent, Delivered, Metrics, Op, Position, State};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +19,21 @@ pub enum Error {
     Checkpoint(String),
     #[error("config error: {0}")]
     Config(String),
+    /// A source's database server refused a request. `code` is its SQLSTATE (Postgres:
+    /// `55006`, object in use), kept apart from the text so callers decide on the code, not on
+    /// how the message happens to be worded.
+    #[error("source error: {message} ({code})")]
+    Server { code: String, message: String },
+}
+
+impl Error {
+    /// The server's SQLSTATE, for an error the database server itself returned.
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Error::Server { code, .. } => Some(code),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -152,10 +167,11 @@ struct InFlight {
     landed: Landed,
 }
 
-/// What is checkpointed and reported once a batch is delivered.
+/// What is checkpointed and reported once a batch is delivered: a summary, not the events, so
+/// a batch in flight does not hold its rows (the sink has its own encoded copy).
 struct Landed {
     began: Instant,
-    events: Vec<ChangeEvent>,
+    delivered: Delivered,
     last: Position,
 }
 
@@ -170,10 +186,10 @@ async fn land(
     store: &mut dyn CheckpointStore,
     metrics: &Metrics,
 ) -> Result<()> {
-    if !l.events.is_empty() {
+    if !l.delivered.is_empty() {
         // The batch is delivered as a unit; report its average per-event time, submit to ack.
-        let per_event = l.began.elapsed() / l.events.len() as u32;
-        metrics.record_events(&l.events, per_event);
+        let per_event = l.began.elapsed() / l.delivered.len().max(1) as u32;
+        metrics.record_delivered(&l.delivered, per_event);
     }
     // A heartbeat position may end up here, but a source that advances its slot on idle
     // heartbeats (Postgres) keeps that position on the server, not in this file. On restart
@@ -289,7 +305,7 @@ async fn drive(
             delivery,
             landed: Landed {
                 began,
-                events: batch,
+                delivered: Delivered::of(&batch),
                 last,
             },
         });
