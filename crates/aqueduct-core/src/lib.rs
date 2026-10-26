@@ -23,7 +23,8 @@ pub use lag::{
     LAG_WINDOW, STALLED_AFTER_SECS,
 };
 pub use metrics::{
-    HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State, TableMark, OP_SLOTS,
+    Delivered, HeartbeatSnapshot, Metrics, SkippedTable, Snapshot, SnapshotStatus, State,
+    TableMark, OP_SLOTS,
 };
 pub use pipeline::{
     run_pipeline, run_pipeline_with_metrics, CheckpointStore, Delivery, Error, Result, Sink,

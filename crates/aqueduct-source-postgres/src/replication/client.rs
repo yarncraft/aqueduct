@@ -17,6 +17,14 @@ fn err(msg: impl Into<String>) -> Error {
     Error::Source(format!("replication connection: {}", msg.into()))
 }
 
+/// An `ErrorResponse` from the server, keeping its SQLSTATE. `what` names the step that failed.
+pub(crate) fn server_err(what: &str, code: String, message: &str) -> Error {
+    Error::Server {
+        code,
+        message: format!("replication connection: {what}{message}"),
+    }
+}
+
 /// The byte stream under a replication session: TCP, TLS over TCP, or an in-memory pipe in
 /// tests.
 pub(crate) trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -311,7 +319,7 @@ impl ReplicationClient {
                 Backend::ReadyForQuery => return Ok(rows),
                 Backend::Error { code, message } => {
                     self.drain_to_ready().await?;
-                    return Err(err(format!("{message} ({code})")));
+                    return Err(server_err("", code, &message));
                 }
                 other => return Err(proto(format!("unexpected {other:?} after a command"))),
             }
@@ -373,7 +381,7 @@ impl ReplicationClient {
                 }
                 Backend::Notice | Backend::ParameterStatus => {}
                 Backend::Error { code, message } => {
-                    return Err(err(format!("START_REPLICATION failed: {message} ({code})")))
+                    return Err(server_err("START_REPLICATION failed: ", code, &message))
                 }
                 Backend::ReadyForQuery => {
                     return Err(err("server ended START_REPLICATION without streaming"))
@@ -426,7 +434,7 @@ impl ReplicationStream {
                 Backend::Notice | Backend::ParameterStatus | Backend::Notification => {}
                 Backend::Error { code, message } => {
                     self.ended = true;
-                    return Err(err(format!("stream failed: {message} ({code})")));
+                    return Err(server_err("stream failed: ", code, &message));
                 }
                 other => {
                     self.ended = true;
@@ -671,6 +679,21 @@ mod tests {
             assert!(e.contains("while streaming"), "{}: {e}", tag as char);
             assert!(s.next_message().await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn a_server_error_keeps_its_sqlstate() {
+        let (mut s, _server) =
+            stream_of(wire(b'E', b"SERROR C55006 Mreplication slot is active  ")).await;
+        let e = s.next_message().await.unwrap_err();
+        assert_eq!(e.sqlstate(), Some("55006"));
+        // The text reads as before: the code is still in it for logs and the cockpit.
+        assert_eq!(
+            e.to_string(),
+            "source error: replication connection: stream failed: replication slot is active (55006)"
+        );
+        // Other errors carry none.
+        assert_eq!(err("x").sqlstate(), None);
     }
 
     #[tokio::test]

@@ -485,6 +485,8 @@ const SLOT_STATS_SQL: &str = "SELECT s.confirmed_flush_lsn::text, \
 
 /// How long a transport waits for a slot another connection still holds.
 pub(crate) const SLOT_BUSY_RETRY: Duration = Duration::from_secs(15);
+/// SQLSTATE `object_in_use`: the slot is still active for another walsender.
+const OBJECT_IN_USE: &str = "55006";
 
 /// How often the slot lag and the WAL head are read (one cheap query on the SQL connection).
 /// Once a second, so the cockpit's backlog does not trail a fast catch-up by seconds.
@@ -779,7 +781,7 @@ impl PostgresSource {
                 .await;
             match started {
                 Ok((stream, status)) => break (encrypted, stream, status),
-                Err(e) if e.to_string().contains("(55006)") && Instant::now() < deadline => {
+                Err(e) if e.sqlstate() == Some(OBJECT_IN_USE) && Instant::now() < deadline => {
                     tracing::info!(slot = %self.cfg.slot, "slot still held by a previous connection; retrying");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
@@ -1715,7 +1717,10 @@ impl Source for PostgresSource {
 /// and would otherwise reach `last_error`, `/api/metrics` and the logs.
 pub(crate) fn src_err(e: tokio_postgres::Error) -> Error {
     if let Some(db) = e.as_db_error() {
-        return Error::Source(format!("{e}: {} {}", db.code().code(), db.message()));
+        return Error::Server {
+            code: db.code().code().to_string(),
+            message: format!("{e}: {}", db.message()),
+        };
     }
     Error::Source(with_causes(e.to_string(), std::error::Error::source(&e)))
 }

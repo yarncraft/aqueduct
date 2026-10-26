@@ -176,6 +176,94 @@ struct TableEntry {
     last_delivered_ms: u64,
 }
 
+/// What a delivered batch reports to [`Metrics`]: per-table counts and marks, without the rows.
+/// The pipeline builds it when it submits a batch, so the events and their row payloads are
+/// dropped while the batch waits for its delivery instead of being held for the metrics.
+#[derive(Debug, Default)]
+pub struct Delivered {
+    /// In first-seen order; a batch touches few tables.
+    tables: Vec<TableTally>,
+    /// Events per op slot, every table together.
+    ops: [u64; OP_SLOTS],
+    /// The last event's position and commit time (us).
+    last: Option<(Position, i64)>,
+}
+
+#[derive(Debug)]
+struct TableTally {
+    /// `schema.table`, the key of the metrics' table map.
+    name: String,
+    schema: String,
+    table: String,
+    ops: [u64; OP_SLOTS],
+    last_lsn: Option<u64>,
+    last_commit_us: i64,
+}
+
+/// The op's slot in [`OP_SLOTS`]-sized arrays; `None` for a heartbeat, which is never counted.
+fn op_slot(op: Op) -> Option<usize> {
+    match op {
+        Op::Insert => Some(0),
+        Op::Update => Some(1),
+        Op::Delete => Some(2),
+        Op::Truncate => Some(3),
+        Op::Read => Some(4),
+        Op::Heartbeat => None,
+    }
+}
+
+impl Delivered {
+    /// The summary of `events`. Heartbeats are left out.
+    pub fn of(events: &[ChangeEvent]) -> Self {
+        let mut d = Delivered::default();
+        // The table of the previous event: consecutive events are mostly of one table.
+        let mut cur = 0;
+        for ev in events {
+            let Some(slot) = op_slot(ev.op) else { continue };
+            d.ops[slot] += 1;
+            let same = |t: &TableTally| t.schema == ev.schema && t.table == ev.table;
+            if !d.tables.get(cur).is_some_and(same) {
+                cur = match d.tables.iter().position(same) {
+                    Some(i) => i,
+                    None => {
+                        d.tables.push(TableTally {
+                            name: format!("{}.{}", ev.schema, ev.table),
+                            schema: ev.schema.clone(),
+                            table: ev.table.clone(),
+                            ops: [0; OP_SLOTS],
+                            last_lsn: None,
+                            last_commit_us: 0,
+                        });
+                        d.tables.len() - 1
+                    }
+                };
+            }
+            let t = &mut d.tables[cur];
+            t.ops[slot] += 1;
+            t.last_lsn = match ev.position {
+                Position::Lsn(l) => Some(l),
+                Position::Text(_) => None,
+            };
+            t.last_commit_us = ev.commit_ts_micros;
+        }
+        d.last = events
+            .iter()
+            .rev()
+            .find(|e| e.op != Op::Heartbeat)
+            .map(|e| (e.position.clone(), e.commit_ts_micros));
+        d
+    }
+
+    /// Events counted, heartbeats left out.
+    pub fn len(&self) -> u64 {
+        self.ops.iter().sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+}
+
 /// Progress of a snapshot, see [`Metrics::set_snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotStatus {
@@ -377,56 +465,57 @@ impl Metrics {
         self.record_events(std::slice::from_ref(ev), sink_time);
     }
 
-    /// Record a delivered batch, each event taking `sink_time`. One lock per batch, and no
-    /// allocation per event: this runs on the pipeline's hot path.
+    /// Record a delivered batch, each event taking `sink_time`.
     pub fn record_events(&self, events: &[ChangeEvent], sink_time: Duration) {
-        let Some(last) = events.iter().rev().find(|e| e.op != Op::Heartbeat) else {
+        self.record_delivered(&Delivered::of(events), sink_time);
+    }
+
+    /// Record a delivered batch from its [`Delivered`] summary, each event taking `sink_time`.
+    /// One lock per batch, and an allocation only for a table seen for the first time: this runs
+    /// on the pipeline's hot path.
+    pub fn record_delivered(&self, d: &Delivered, sink_time: Duration) {
+        let Some((last_position, last_commit_us)) = &d.last else {
             return;
         };
         let now = now_ms();
         let us = sink_time.as_micros() as u64;
+        let counters = [
+            &self.inserts,
+            &self.updates,
+            &self.deletes,
+            &self.truncates,
+            &self.reads,
+        ];
+        for (counter, n) in counters.into_iter().zip(d.ops) {
+            if n > 0 {
+                counter.fetch_add(n, Relaxed);
+            }
+        }
+        let n = d.len();
         let mut t = lock(&self.tables);
-        let mut name = String::new();
-        let mut n = 0u64;
-        for ev in events {
-            let (slot, counter) = match ev.op {
-                Op::Insert => (0, &self.inserts),
-                Op::Update => (1, &self.updates),
-                Op::Delete => (2, &self.deletes),
-                Op::Truncate => (3, &self.truncates),
-                Op::Read => (4, &self.reads),
-                Op::Heartbeat => continue,
-            };
-            counter.fetch_add(1, Relaxed);
-            n += 1;
-            name.clear();
-            name.push_str(&ev.schema);
-            name.push('.');
-            name.push_str(&ev.table);
-            let e = match t.get_mut(name.as_str()) {
+        for s in &d.tables {
+            let e = match t.get_mut(s.name.as_str()) {
                 Some(e) => e,
-                None => t.entry(name.clone()).or_insert_with(|| TableEntry {
+                None => t.entry(s.name.clone()).or_insert_with(|| TableEntry {
                     ops: [0; OP_SLOTS],
-                    schema: ev.schema.clone(),
-                    table: ev.table.clone(),
+                    schema: s.schema.clone(),
+                    table: s.table.clone(),
                     last_lsn: None,
                     last_commit_us: 0,
                     last_delivered_ms: 0,
                 }),
             };
-            e.ops[slot] += 1;
-            e.last_lsn = match ev.position {
-                Position::Lsn(l) => Some(l),
-                Position::Text(_) => None,
-            };
-            e.last_commit_us = ev.commit_ts_micros;
+            for (total, n) in e.ops.iter_mut().zip(s.ops) {
+                *total += n;
+            }
+            e.last_lsn = s.last_lsn;
+            e.last_commit_us = s.last_commit_us;
             e.last_delivered_ms = now;
         }
         drop(t);
         self.events.fetch_add(n, Relaxed);
-        *lock(&self.last_position) = Some(last.position.to_string());
-        self.last_commit_ts_micros
-            .store(last.commit_ts_micros, Relaxed);
+        *lock(&self.last_position) = Some(last_position.to_string());
+        self.last_commit_ts_micros.store(*last_commit_us, Relaxed);
         self.last_event_unix_ms.store(now, Relaxed);
         self.sink_us_total.fetch_add(us * n, Relaxed);
         self.sink_us_last.store(us, Relaxed);
@@ -554,6 +643,49 @@ mod tests {
             unchanged: Vec::new(),
             after_is_key: false,
         }
+    }
+
+    #[test]
+    fn a_batch_summary_counts_like_its_events() {
+        let hb = ChangeEvent::heartbeat(Position::Lsn(99), 7);
+        // Tables interleaved, a heartbeat inside and at the end.
+        let batch = [
+            ev(Op::Insert, "a", 10),
+            ev(Op::Update, "b", 11),
+            hb.clone(),
+            ev(Op::Insert, "a", 12),
+            ev(Op::Delete, "b", 13),
+            hb,
+        ];
+        let d = Delivered::of(&batch);
+        assert_eq!(d.len(), 4);
+        assert_eq!(d.ops, [2, 1, 1, 0, 0]);
+        let tables: Vec<_> = d
+            .tables
+            .iter()
+            .map(|t| (t.name.as_str(), t.ops, t.last_lsn))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                ("public.a", [2, 0, 0, 0, 0], Some(12)),
+                ("public.b", [0, 1, 1, 0, 0], Some(13)),
+            ]
+        );
+        // The last event, not the trailing heartbeat.
+        assert_eq!(d.last, Some((Position::Lsn(13), 1)));
+        // Recorded, the summary and the events give the same metrics.
+        let (from_events, from_summary) = (Metrics::new(), Metrics::new());
+        from_events.record_events(&batch, Duration::from_millis(2));
+        from_summary.record_delivered(&d, Duration::from_millis(2));
+        let (x, y) = (from_events.snapshot(), from_summary.snapshot());
+        assert_eq!(x.events_total, 4);
+        assert_eq!(
+            (x.events_total, &x.table_ops),
+            (y.events_total, &y.table_ops)
+        );
+        // Only heartbeats: nothing to record.
+        assert!(Delivered::of(&[ChangeEvent::heartbeat(Position::Lsn(1), 0)]).is_empty());
     }
 
     #[test]

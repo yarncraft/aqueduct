@@ -22,7 +22,10 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Unknown keys fail startup here and in every table below, so a misspelled key (`masks`, `wher`)
+/// is an error instead of silently doing nothing.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Shorthand for `[source] type = "postgres"`; kept so existing configs keep working.
     #[serde(default)]
@@ -133,6 +136,7 @@ impl SourceConfig {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresConfig {
     pub url: String,
     #[serde(default = "default_slot")]
@@ -330,6 +334,7 @@ impl PostgresConfig {
 /// stay ordered within one partition. Each event goes to the first matching
 /// `routes` entry, else to `topic`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KafkaConfig {
     pub brokers: Vec<String>,
     /// Fallback topic for tables no route matches; may use `{schema}`/`{table}`.
@@ -451,6 +456,7 @@ impl KafkaConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KafkaRouteConfig {
     /// Label for this route in per-route stats; defaults to `match`. Unique.
     #[serde(default)]
@@ -1541,5 +1547,87 @@ type='stdout'
 "
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_sim_config_parses() {
+        let cfg: Config = toml::from_str(include_str!("../../../sim/aqueduct.sim.toml")).unwrap();
+        assert!(cfg.source().is_ok());
+    }
+
+    #[test]
+    fn a_misspelled_key_fails_startup_instead_of_doing_nothing() {
+        let base = "[postgres]
+url = 'postgres://u@db/app'
+[sink]
+brokers = ['k:9092']
+";
+        for (extra, key) in [
+            // A route whose mask or filter would silently be dropped.
+            (
+                "[[sink.routes]]
+match = 'public.users'
+topic = 'users'
+masks = ['ssn']
+",
+                "masks",
+            ),
+            (
+                "[[sink.routes]]
+match = 'public.users'
+topic = 'users'
+wher = 'row.a == 1'
+",
+                "wher",
+            ),
+            (
+                "health_adr = '0.0.0.0:8080'
+",
+                "health_adr",
+            ),
+        ] {
+            // Top-level keys go before the first table.
+            let text = if extra.starts_with('[') {
+                format!("{base}{extra}")
+            } else {
+                format!("{extra}{base}")
+            };
+            let msg = parse_error(&text, &toml::from_str::<Config>(&text).unwrap_err());
+            assert!(msg.contains(&format!("unknown field `{key}`")), "{msg}");
+        }
+        for text in [
+            "[postgres]
+url = 'postgres://u@db/app'
+slott = 's'
+[sink]
+brokers = ['k:9092']
+",
+            "[postgres]
+url = 'postgres://u@db/app'
+[sink]
+brokers = ['k:9092']
+partitons = 3
+",
+            "[source]
+type = 'mongodb'
+uri = 'mongodb://db/?replicaSet=rs0'
+database = 'app'
+colections = ['a']
+[sink]
+brokers = ['k:9092']
+",
+        ] {
+            let e = toml::from_str::<Config>(text).unwrap_err();
+            assert!(e.message().contains("unknown field"), "{e}");
+        }
+        // The removed `ops` key is still a field: it fails with its own hint, not as unknown.
+        let text = format!(
+            "{base}[[sink.routes]]
+match = 'public.a'
+topic = 'a'
+ops = ['insert']
+"
+        );
+        assert!(toml::from_str::<Config>(&text).is_ok());
     }
 }

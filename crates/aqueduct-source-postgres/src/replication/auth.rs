@@ -256,7 +256,11 @@ pub(crate) async fn authenticate(
             Backend::Notice => {}
             Backend::ReadyForQuery if authenticated => return Ok(method),
             Backend::Error { code, message } => {
-                return Err(err(format!("startup failed: {message} ({code})")))
+                return Err(super::client::server_err(
+                    "startup failed: ",
+                    code,
+                    &message,
+                ))
             }
             other => return Err(proto(format!("unexpected {other:?} during startup"))),
         }
