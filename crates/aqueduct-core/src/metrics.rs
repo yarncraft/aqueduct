@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -193,8 +193,8 @@ pub struct Delivered {
 struct TableTally {
     /// `schema.table`, the key of the metrics' table map.
     name: String,
-    schema: String,
-    table: String,
+    schema: Arc<str>,
+    table: Arc<str>,
     ops: [u64; OP_SLOTS],
     last_lsn: Option<u64>,
     last_commit_us: i64,
@@ -498,8 +498,8 @@ impl Metrics {
                 Some(e) => e,
                 None => t.entry(s.name.clone()).or_insert_with(|| TableEntry {
                     ops: [0; OP_SLOTS],
-                    schema: s.schema.clone(),
-                    table: s.table.clone(),
+                    schema: s.schema.to_string(),
+                    table: s.table.to_string(),
                     last_lsn: None,
                     last_commit_us: 0,
                     last_delivered_ms: 0,
