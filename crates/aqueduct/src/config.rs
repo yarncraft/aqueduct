@@ -274,12 +274,12 @@ impl PostgresConfig {
             }
         }
         c.snapshot.key_columns = self.snapshot_key_columns.clone();
-        if let Some(t) = self.snapshot_watermark_table.as_deref() {
-            if t.split('.').count() != 2 || t.split('.').any(str::is_empty) {
-                return Err(format!(
-                    "postgres.snapshot_watermark_table: {t:?} needs the form \"schema.table\""
-                ));
-            }
+        if let Some(t) = self.snapshot_watermark_table.as_deref()
+            && (t.split('.').count() != 2 || t.split('.').any(str::is_empty))
+        {
+            return Err(format!(
+                "postgres.snapshot_watermark_table: {t:?} needs the form \"schema.table\""
+            ));
         }
         c.snapshot.watermark_table = self.snapshot_watermark_table.clone();
         match self.transport.as_deref() {
@@ -290,12 +290,12 @@ impl PostgresConfig {
                      over a replication connection now. Delete the line; the role needs the \
                      REPLICATION attribute and pg_hba.conf must allow its replication connection"
                         .into(),
-                )
+                );
             }
             Some(other) => {
                 return Err(format!(
                     "postgres.transport = {other:?}: the only transport is \"stream\""
-                ))
+                ));
             }
         }
         if let Some(n) = self.stream_buffer_bytes {
@@ -697,7 +697,9 @@ fn parse_error(text: &str, e: &toml::de::Error) -> String {
         .iter()
         .any(|w| key.contains(w));
     if secret {
-        format!("line {line_no}, column {column}: invalid `{key}` (details hidden: it may hold a secret)")
+        format!(
+            "line {line_no}, column {column}: invalid `{key}` (details hidden: it may hold a secret)"
+        )
     } else {
         format!("line {line_no}, column {column}: {}", e.message())
     }
@@ -995,9 +997,11 @@ otherwise = {otherwise}
         // Default bind is 0.0.0.0, so a bare config must be rejected.
         assert!(admin_cfg("").check_admin_exposure().is_err());
         // An empty token is no token.
-        assert!(admin_cfg("admin_token = \"\"")
-            .check_admin_exposure()
-            .is_err());
+        assert!(
+            admin_cfg("admin_token = \"\"")
+                .check_admin_exposure()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1144,10 +1148,12 @@ slot =
 
         // Neither: no key (a hashing route then fails to compile).
         assert!(sink_cfg("").hash_key(None).unwrap().is_none());
-        assert!(sink_cfg("")
-            .hash_key(Some(String::new()))
-            .unwrap()
-            .is_none());
+        assert!(
+            sink_cfg("")
+                .hash_key(Some(String::new()))
+                .unwrap()
+                .is_none()
+        );
         // A key id without a key fails closed.
         let e = sink_cfg("hash_key_id = 'k1'").hash_key(None).unwrap_err();
         assert!(
@@ -1227,10 +1233,12 @@ slot =
         let e = ok.hash_key(Some(KEY.into())).unwrap_err();
         assert!(e.contains("use one"), "{e}");
         let missing = sink_cfg("hash_key_file = '/nonexistent/aqueduct-key'\nhash_key_id = 'k'");
-        assert!(missing
-            .hash_key(None)
-            .unwrap_err()
-            .contains("sink.hash_key_file /nonexistent/aqueduct-key"));
+        assert!(
+            missing
+                .hash_key(None)
+                .unwrap_err()
+                .contains("sink.hash_key_file /nonexistent/aqueduct-key")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1333,12 +1341,14 @@ url='y'
         ))
         .unwrap();
         assert!(both.source().is_err());
-        assert!(toml::from_str::<Config>(&format!(
-            "[source]
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "[source]
 type='redis'
 {SINK}"
-        ))
-        .is_err());
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1378,9 +1388,11 @@ snapshot_key_columns = { 'public.events' = ['day', 'seq'] }")
 stream_buffer_bytes = 1048576")
         .unwrap();
         assert_eq!(c.stream_buffer_bytes, 1_048_576);
-        assert!(pg("transport = 'poll'")
-            .unwrap_err()
-            .contains("was removed"));
+        assert!(
+            pg("transport = 'poll'")
+                .unwrap_err()
+                .contains("was removed")
+        );
         assert!(pg("transport = 'copy'").unwrap_err().contains("\"stream\""));
         assert!(pg("stream_buffer_bytes = 10").is_err());
     }
@@ -1539,14 +1551,16 @@ auth = 'azure-container-apps'",
         assert_eq!(cfg.sink.brokers, vec!["kafka:9092"]);
         assert!(cfg.inspector);
         // Other sink types are gone: a stdout sink has no brokers, so it is rejected.
-        assert!(toml::from_str::<Config>(
-            "[postgres]
+        assert!(
+            toml::from_str::<Config>(
+                "[postgres]
 url='x'
 [sink]
 type='stdout'
 "
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -23,5 +23,5 @@ pub use frame::Replication;
 #[doc(hidden)]
 pub use task::fuzz_stream;
 pub use task::{
-    ReplicationHandle, StreamOptions, DEFAULT_STATUS_INTERVAL, DEFAULT_STREAM_BUFFER_BYTES,
+    DEFAULT_STATUS_INTERVAL, DEFAULT_STREAM_BUFFER_BYTES, ReplicationHandle, StreamOptions,
 };

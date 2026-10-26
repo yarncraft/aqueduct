@@ -1,16 +1,16 @@
 use crate::config::{MongoConfig, SnapshotMode};
-use crate::mapping::{map_event, Mapped};
+use crate::mapping::{Mapped, map_event};
 use crate::snapshot::{
-    new_snapshot_id, table_id, window_key, Catalog, ChunkError, Closed, Engine, Failure, Live,
-    Watermark, TTL_INDEX, WATERMARK_COLLECTION, WATERMARK_TTL,
+    Catalog, ChunkError, Closed, Engine, Failure, Live, TTL_INDEX, WATERMARK_COLLECTION,
+    WATERMARK_TTL, Watermark, new_snapshot_id, table_id, window_key,
 };
 use aqueduct_core::{ChangeEvent, Error, Metrics, Op, Position, Result, Source};
 use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, SnapshotStatus};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Bson, DateTime, Document};
-use mongodb::change_stream::event::ResumeToken;
+use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::change_stream::ChangeStream;
+use mongodb::change_stream::event::ResumeToken;
 use mongodb::options::{
     FullDocumentBeforeChangeType, FullDocumentType, Hint, IndexOptions, ReadConcern,
     ReadPreference, SelectionCriteria,
@@ -502,10 +502,10 @@ impl MongoSource {
                 // The target now holds the renamed collection's documents, which no insert
                 // announces: a snapshot of it must copy it again from the start, whether a chunk
                 // is in flight or not.
-                if let Some((db, coll)) = to {
-                    if e.collection_replaced(&table_id(db, coll)) {
-                        self.queue_progress();
-                    }
+                if let Some((db, coll)) = to
+                    && e.collection_replaced(&table_id(db, coll))
+                {
+                    self.queue_progress();
                 }
             }
             "dropDatabase" => e.database_dropped(),
@@ -916,7 +916,7 @@ impl Source for MongoSource {
             Some(Position::Lsn(l)) => {
                 return Err(Error::Source(format!(
                     "checkpoint {l} is a Postgres LSN, not a MongoDB resume token"
-                )))
+                )));
             }
             None => (None, None),
         };
@@ -985,13 +985,13 @@ impl Source for MongoSource {
             // The next chunk starts only when everything before it is handed on, so memory stays
             // at one chunk.
             let mut failed = None;
-            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_ref()) {
-                if e.due() {
-                    match e.start_chunk(c).await {
-                        Ok(()) => {}
-                        Err(ChunkError::Fatal(err)) => return Err(err),
-                        Err(ChunkError::Failed(why)) => failed = Some(why),
-                    }
+            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_ref())
+                && e.due()
+            {
+                match e.start_chunk(c).await {
+                    Ok(()) => {}
+                    Err(ChunkError::Fatal(err)) => return Err(err),
+                    Err(ChunkError::Failed(why)) => failed = Some(why),
                 }
             }
             if let Some(why) = failed {
@@ -1015,12 +1015,12 @@ impl Source for MongoSource {
                     // Not checkpointed: a restart replays to it and fails again until the
                     // operator resets the checkpoint.
                     check_invalidate(&doc, &token, &self.cfg.database)?;
-                    if !self.observe(&doc, &token)? {
-                        if let Some(mut ev) = to_change_event(&doc)? {
-                            ev.checkpoint = self.checkpoint_at(&token);
-                            self.last_token = Some(token);
-                            return Ok(Some(ev));
-                        }
+                    if !self.observe(&doc, &token)?
+                        && let Some(mut ev) = to_change_event(&doc)?
+                    {
+                        ev.checkpoint = self.checkpoint_at(&token);
+                        self.last_token = Some(token);
+                        return Ok(Some(ev));
                     }
                     if !self.buffer.is_empty() {
                         continue;
@@ -1029,10 +1029,10 @@ impl Source for MongoSource {
                     // these never reaches the empty-batch branch, so heartbeat at the doc's own
                     // token: it is already consumed, unlike the driver's token, which may sit
                     // past buffered docs.
-                    if self.last_heartbeat.elapsed() >= self.heartbeat_every {
-                        if let Some(hb) = self.heartbeat_at(token) {
-                            return Ok(Some(hb));
-                        }
+                    if self.last_heartbeat.elapsed() >= self.heartbeat_every
+                        && let Some(hb) = self.heartbeat_at(token)
+                    {
+                        return Ok(Some(hb));
                     }
                 }
                 None => {
@@ -1045,17 +1045,17 @@ impl Source for MongoSource {
                     // checkpoint can follow an idle or fully filtered stream. Only here is it
                     // safe, as the driver's token may point past undelivered events otherwise.
                     // With everything handed on, nothing is left below its cluster time.
-                    if self.buffer.is_empty() && self.metrics.is_some() {
-                        if let Some(t) = stream.resume_token() {
-                            if let Ok(text) = token_text(&t) {
-                                self.report_delivered(&text);
-                            }
-                        }
+                    if self.buffer.is_empty()
+                        && self.metrics.is_some()
+                        && let Some(t) = stream.resume_token()
+                        && let Ok(text) = token_text(&t)
+                    {
+                        self.report_delivered(&text);
                     }
-                    if self.last_heartbeat.elapsed() >= self.heartbeat_every {
-                        if let Some(hb) = self.heartbeat()? {
-                            return Ok(Some(hb));
-                        }
+                    if self.last_heartbeat.elapsed() >= self.heartbeat_every
+                        && let Some(hb) = self.heartbeat()?
+                    {
+                        return Ok(Some(hb));
                     }
                 }
             }

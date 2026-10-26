@@ -8,7 +8,7 @@ use rskafka::client::{Client, ClientBuilder};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::kafka::{glob_match, KafkaSecurity};
+use crate::kafka::{KafkaSecurity, glob_match};
 use crate::route::RoutePlan;
 
 /// Most events one inspection returns, however large `limit` is.

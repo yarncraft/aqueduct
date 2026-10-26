@@ -1,11 +1,10 @@
 //! Shared rustls client configuration (ring provider, no OpenSSL) for every
 //! outbound connection Aqueduct makes.
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::sync::Arc;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{

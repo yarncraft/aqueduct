@@ -1,0 +1,3 @@
+# `unwrap_used`/`expect_used` are denied workspace-wide (Cargo.toml); tests may still use them.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,9 +1,11 @@
 //! Needs a replica set: `podman compose -f docker-compose.test.yml up -d`, then
 //! `MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0&directConnection=true' cargo test -p aqueduct-source-mongodb -- --ignored`
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use aqueduct_core::{ChangeEvent, LagState, Metrics, Op, Source};
 use aqueduct_source_mongodb::{MongoConfig, MongoSource};
-use mongodb::bson::{doc, Document};
 use mongodb::Client;
+use mongodb::bson::{Document, doc};
 use std::sync::Arc;
 use std::time::Duration;
 

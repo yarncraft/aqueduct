@@ -3,6 +3,7 @@ name = "aqueduct-tls"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -10,5 +11,8 @@ webpki-roots = "1"
 
 [dev-dependencies]
 rcgen = "0.13"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[lints]
+workspace = true

@@ -84,7 +84,7 @@ Pin a `sha-` or version tag in production. To build locally instead, `docker bui
 as the image name below.
 
 ```sh
-docker run -d --name aqueduct --restart unless-stopped \
+docker run -d --name aqueduct --restart unless-stopped --stop-timeout 30 \
   -e AQUEDUCT_PG_URL='postgres://aqueduct:SECRET@db.internal:5432/app' \
   -e AQUEDUCT_ADMIN_TOKEN='long-random-string' \
   -v aqueduct-state:/var/lib/aqueduct \
@@ -98,6 +98,21 @@ docker run -d --name aqueduct --restart unless-stopped \
 Run a single replica (`strategy: Recreate`, never HPA) with a `PersistentVolumeClaim` on `/var/lib/aqueduct`,
 the TOML in a `ConfigMap` mounted at `/etc/aqueduct/aqueduct.toml`, `AQUEDUCT_PG_URL` and `AQUEDUCT_ADMIN_TOKEN`
 from a `Secret`, and an HTTP probe on `/healthz`. Use `fsGroup: 65532` if your storage class ignores image ownership.
+Keep `terminationGracePeriodSeconds` at 30 or more ([Stopping](#stopping)).
+
+### Stopping
+
+On SIGTERM Aqueduct stops reading, waits up to **25 s** for the in-flight batches to reach Kafka and the checkpoint to
+be written, then exits. Give it at least 30 s before SIGKILL:
+
+| Runner | Default | Setting |
+| --- | --- | --- |
+| The compose files | 30 s | `stop_grace_period: 30s` (already set) |
+| `docker run` / `docker stop` | **10 s** | `docker run --stop-timeout 30`, or `docker stop -t 30` |
+| Kubernetes | 30 s | `terminationGracePeriodSeconds` |
+
+A drain that is cut short loses nothing: the next start replays from the last checkpoint, so consumers may see some
+events twice (at-least-once).
 
 ### Image facts
 

@@ -3,13 +3,14 @@ name = "aqueduct-sinks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 aqueduct-core = { path = "../aqueduct-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
 
 futures = "0.3"
@@ -17,7 +18,8 @@ rskafka = { version = "0.6", features = ["transport-tls"] }
 aqueduct-tls = { path = "../aqueduct-tls" }
 # HMAC for the `hash` field operation; the same ring that rustls already pulls in.
 ring = "0.17"
-hmac = "0.12"
-sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[lints]
+workspace = true

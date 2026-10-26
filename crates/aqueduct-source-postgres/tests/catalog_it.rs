@@ -7,7 +7,9 @@
 //! ```
 //!
 //! Every test makes its own tables and publication, because tests share one server.
-use aqueduct_source_postgres::catalog::{read_catalog, PublishedTable};
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use aqueduct_source_postgres::catalog::{PublishedTable, read_catalog};
 use tokio_postgres::{Client, NoTls};
 
 async fn connect() -> Client {

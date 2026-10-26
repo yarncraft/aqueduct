@@ -48,7 +48,7 @@ produce-time records, and the unacknowledged tail that the new image replays aft
 3. Note the current position, so you can tell later that nothing went backwards:
    - `GET /api/metrics` → `checkpoint` (with `Authorization: Bearer <token>`)
    - `SELECT slot_name, active, confirmed_flush_lsn FROM pg_replication_slots;`
-4. Stop Aqueduct gracefully: `docker stop` (the compose files allow 30 s), or a Kubernetes rollout with
+4. Stop Aqueduct gracefully: `docker stop -t 30` (the compose files allow 30 s already), or a Kubernetes rollout with
    `strategy: Recreate`. Never run the old and the new image at the same time on one slot: a rolling update does that.
 5. Start the new image, pinned by digest, with the same state volume and the same config.
 6. Check:

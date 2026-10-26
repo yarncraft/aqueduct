@@ -1,7 +1,7 @@
 use aqueduct_core::{Error, Result};
 use aqueduct_sinks::{
     FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSasl, KafkaSecurity, KafkaSink,
-    PartitionBy, RecordTimestamp, RoutePlan, SourceInfo, MAX_IN_FLIGHT_BATCHES,
+    MAX_IN_FLIGHT_BATCHES, PartitionBy, RecordTimestamp, RoutePlan, SourceInfo,
 };
 
 use crate::config::{KafkaConfig, KafkaRouteConfig, OtherwiseConfig};
@@ -113,7 +113,7 @@ fn security(cfg: &KafkaConfig) -> Result<KafkaSecurity> {
         _ => {
             return Err(Error::Config(
                 "kafka sasl needs sasl_mechanism, sasl_username and sasl_password together".into(),
-            ))
+            ));
         }
     };
     Ok(KafkaSecurity {
@@ -545,19 +545,21 @@ tombstones = true
             e.contains("route `public.*` uses `tombstones`") && e.contains("per-row key"),
             "{e}"
         );
-        assert!(plan(
-            &kafka(
-                "partition_by = 'table'
+        assert!(
+            plan(
+                &kafka(
+                    "partition_by = 'table'
 [[routes]]
 match = 'public.*'
 topic = 't'
 key = ['id']
 tombstones = true
 "
-            ),
-            None
-        )
-        .is_ok());
+                ),
+                None
+            )
+            .is_ok()
+        );
         let d = plan(
             &kafka(
                 "[[routes]]

@@ -10,6 +10,8 @@
 //!
 //! `AQUEDUCT_TEST_PG_TRUST` must be set: the test fails when it is not, so a run that skips
 //! the server cannot report green.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
 
@@ -219,10 +221,10 @@ async fn a_latin1_database_streams_the_same_utf8_bytes_as_the_peek() {
 
     let streamed = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if let Some(Replication::XLogData { data, .. }) = stream.next_message().await.unwrap() {
-                if data.first() == Some(&b'I') {
-                    break data.to_vec();
-                }
+            if let Some(Replication::XLogData { data, .. }) = stream.next_message().await.unwrap()
+                && data.first() == Some(&b'I')
+            {
+                break data.to_vec();
             }
         }
     })
@@ -341,10 +343,10 @@ async fn the_slot_moves_only_to_what_was_acked() {
     // Commit: tag, flags, commit LSN, end LSN (bytes 10..18), timestamp.
     let end = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if let Some(Replication::XLogData { data, .. }) = handle.recv().await.unwrap() {
-                if data.first() == Some(&b'C') {
-                    break u64::from_be_bytes(data[10..18].try_into().unwrap());
-                }
+            if let Some(Replication::XLogData { data, .. }) = handle.recv().await.unwrap()
+                && data.first() == Some(&b'C')
+            {
+                break u64::from_be_bytes(data[10..18].try_into().unwrap());
             }
         }
     })

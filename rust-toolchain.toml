@@ -1,0 +1,6 @@
+# The one toolchain every build uses: local, CI, `scripts/ci-linux.sh` and the Dockerfile. rustup
+# installs it on first use. Bump it together with `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -9,6 +9,8 @@
 //! AQUEDUCT_TEST_PG_WRONG_CA=/path/other.pem  # an unrelated CA
 //! cargo test -p aqueduct-source-postgres --test tls_it -- --ignored
 //! ```
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use aqueduct_core::Source;
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 

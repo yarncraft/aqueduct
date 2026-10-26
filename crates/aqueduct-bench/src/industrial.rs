@@ -4,8 +4,8 @@
 //! before and after row.
 
 use aqueduct_core::{ChangeEvent, Op, Position};
-use serde_json::value::{to_raw_value, RawValue};
-use serde_json::{json, Map, Value};
+use serde_json::value::{RawValue, to_raw_value};
+use serde_json::{Map, Value, json};
 
 struct Rng(u64);
 

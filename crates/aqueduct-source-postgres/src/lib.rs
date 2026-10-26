@@ -3,7 +3,6 @@
 //! [`decoder`] is a pure pgoutput (protocol v1) parser; [`PostgresSource`]
 //! streams a logical replication slot over a replication connection and
 //! implements [`aqueduct_core::Source`].
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod azure;
 pub mod catalog;
@@ -17,7 +16,7 @@ pub mod transport;
 pub use azure::{AccessToken, AzureCredential, AzureIdentity};
 pub use snapshot::{SnapshotConfig, SnapshotMode};
 pub use source::{
-    parse_lsn, PostgresSource, PostgresSourceConfig, SourceAuth, DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_HEARTBEAT_INTERVAL, PostgresSource, PostgresSourceConfig, SourceAuth, parse_lsn,
 };
 pub use tls::SslMode;
 

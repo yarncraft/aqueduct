@@ -19,12 +19,12 @@ use aqueduct_core::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{
-    ChannelBinding, ScramSha256, SCRAM_SHA_256, SCRAM_SHA_256_PLUS,
+    ChannelBinding, SCRAM_SHA_256, SCRAM_SHA_256_PLUS, ScramSha256,
 };
 use postgres_protocol::message::frontend;
 
 use super::client::{FrameRead, StatusSender};
-use super::frame::{proto, Backend};
+use super::frame::{Backend, proto};
 use crate::SslMode;
 
 fn err(msg: impl Into<String>) -> Error {
@@ -182,7 +182,7 @@ pub(crate) async fn authenticate(
                 reader.set_authenticated();
             }
             Backend::Auth { .. } if authenticated => {
-                return Err(proto("authentication request after AuthenticationOk"))
+                return Err(proto("authentication request after AuthenticationOk"));
             }
             Backend::Auth { code: 3, .. } => {
                 refuse_plaintext_password("cleartext", ctx)?;
@@ -260,7 +260,7 @@ pub(crate) async fn authenticate(
                     "startup failed: ",
                     code,
                     &message,
-                ))
+                ));
             }
             other => return Err(proto(format!("unexpected {other:?} during startup"))),
         }
@@ -352,16 +352,20 @@ mod tests {
             Binding::Unsupported
         );
         // PLUS offered without TLS cannot be used.
-        assert!(choose_mechanism(
-            &offered(&[SCRAM_SHA_256_PLUS]),
-            &ctx(false, true, SslMode::Disable, None)
-        )
-        .is_err());
-        assert!(choose_mechanism(
-            &offered(&["OTHER"]),
-            &ctx(true, true, SslMode::VerifyFull, None)
-        )
-        .is_err());
+        assert!(
+            choose_mechanism(
+                &offered(&[SCRAM_SHA_256_PLUS]),
+                &ctx(false, true, SslMode::Disable, None)
+            )
+            .is_err()
+        );
+        assert!(
+            choose_mechanism(
+                &offered(&["OTHER"]),
+                &ctx(true, true, SslMode::VerifyFull, None)
+            )
+            .is_err()
+        );
     }
 
     #[test]

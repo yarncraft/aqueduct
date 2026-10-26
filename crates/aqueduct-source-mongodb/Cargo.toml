@@ -3,6 +3,7 @@ name = "aqueduct-source-mongodb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 aqueduct-core = { path = "../aqueduct-core" }
@@ -12,5 +13,11 @@ mongodb = { version = "3", default-features = false, features = ["rustls-tls", "
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

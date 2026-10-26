@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqueduct_core::{Error, Result};
 use serde_json::Value;
 
-use http::{form, Request, Url};
+use http::{Request, Url, form};
 
 /// The Entra resource of Azure Database for PostgreSQL.
 pub const RESOURCE: &str = "https://ossrdbms-aad.database.windows.net";
@@ -447,7 +447,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let m: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -480,10 +480,12 @@ mod tests {
             "azure-container-apps".parse::<AzureIdentity>(),
             Ok(AzureIdentity::ContainerApps)
         );
-        assert!("azure"
-            .parse::<AzureIdentity>()
-            .unwrap_err()
-            .contains("password"));
+        assert!(
+            "azure"
+                .parse::<AzureIdentity>()
+                .unwrap_err()
+                .contains("password")
+        );
     }
 
     #[test]
@@ -528,12 +530,10 @@ mod tests {
             .into_iter()
             .filter(|(k, _)| *k != "AZURE_CLIENT_ID")
             .collect();
-        assert!(AzureCredential::from_env(
-            AzureIdentity::WorkloadIdentity,
-            Some("x"),
-            &env_of(&env)
-        )
-        .is_ok());
+        assert!(
+            AzureCredential::from_env(AzureIdentity::WorkloadIdentity, Some("x"), &env_of(&env))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -556,13 +556,14 @@ mod tests {
         assert!(req.body.is_none());
         let c =
             AzureCredential::from_env(AzureIdentity::ContainerApps, Some("uami-id"), &env).unwrap();
-        assert!(c
-            .provider
-            .request("")
-            .unwrap()
-            .url
-            .target
-            .ends_with("&client_id=uami-id"));
+        assert!(
+            c.provider
+                .request("")
+                .unwrap()
+                .url
+                .target
+                .ends_with("&client_id=uami-id")
+        );
         // The secret header never shows in Debug.
         assert!(!format!("{c:?}").contains("s3cr3t"));
     }
@@ -799,7 +800,8 @@ mod tests {
         assert!(req.starts_with(
             "GET /msi/token?api-version=2019-08-01&resource=https%3A%2F%2Fossrdbms-aad.database.windows.net&client_id=uami HTTP/1.1\r\n"
         ), "{req}");
-        assert!(req.contains("\r\nX-IDENTITY-HEADER: hdr\r\n"), "{req}");
+        // hyper sends header names in lower case; HTTP/1.1 names are case-insensitive.
+        assert!(req.contains("\r\nx-identity-header: hdr\r\n"), "{req}");
     }
 
     #[tokio::test]

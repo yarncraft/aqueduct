@@ -8,6 +8,8 @@
 //!
 //! Each test makes its own tables, publication and slot, and drives the source the way the
 //! pipeline does: take events, then ack the last one's checkpoint.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -646,11 +648,11 @@ impl Driven {
                 if tx.send(Ok(ev)).is_err() {
                     return;
                 }
-                if let Some(c) = checkpoint {
-                    if let Err(e) = s.ack(c).await {
-                        let _ = tx.send(Err(e.to_string()));
-                        return;
-                    }
+                if let Some(c) = checkpoint
+                    && let Err(e) = s.ack(c).await
+                {
+                    let _ = tx.send(Err(e.to_string()));
+                    return;
                 }
             }
         });

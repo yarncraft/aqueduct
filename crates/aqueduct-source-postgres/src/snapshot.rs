@@ -20,7 +20,7 @@ use aqueduct_core::{Error, Result};
 use serde_json::value::RawValue;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
-use crate::catalog::{quote_ident, Catalog, PublishedTable, ReplicaIdentity};
+use crate::catalog::{Catalog, PublishedTable, ReplicaIdentity, quote_ident};
 use crate::decoder::{self, Column, Datum, Relation, RelationCache, Tuple, WATERMARK_PREFIX};
 
 /// When a snapshot runs.
@@ -150,7 +150,7 @@ impl Plan {
                 (cols.clone(), types)
             }
             _ if t.primary_key.is_empty() => {
-                return Err("no primary key (set postgres.snapshot_key_columns for it)".into())
+                return Err("no primary key (set postgres.snapshot_key_columns for it)".into());
             }
             _ => (t.primary_key.clone(), t.primary_key_types.clone()),
         };
@@ -855,17 +855,21 @@ mod tests {
     fn tables_without_a_usable_key_are_skipped() {
         let mut nopk = table(ReplicaIdentity::Default);
         nopk.primary_key.clear();
-        assert!(Plan::new(&nopk, None)
-            .unwrap_err()
-            .contains("no primary key"));
+        assert!(
+            Plan::new(&nopk, None)
+                .unwrap_err()
+                .contains("no primary key")
+        );
         // The key must be published, or live events could not be matched to it.
         let mut hidden = table(ReplicaIdentity::Default);
         hidden.columns = vec!["b".into(), "v".into()];
         hidden.column_types = vec![23, 3802];
         hidden.column_type_names = vec!["integer".into(), "jsonb".into()];
-        assert!(Plan::new(&hidden, None)
-            .unwrap_err()
-            .contains("not in the publication"));
+        assert!(
+            Plan::new(&hidden, None)
+                .unwrap_err()
+                .contains("not in the publication")
+        );
         // #91: an override names published key columns.
         let over = vec!["b".to_string()];
         let p = Plan::new(&nopk, Some(&over)).unwrap();
@@ -874,14 +878,18 @@ mod tests {
             (over, vec!["integer".to_string()])
         );
         let bad = vec!["x".to_string()];
-        assert!(Plan::new(&nopk, Some(&bad))
-            .unwrap_err()
-            .contains("not published"));
+        assert!(
+            Plan::new(&nopk, Some(&bad))
+                .unwrap_err()
+                .contains("not published")
+        );
         // ... that are a unique key of NOT NULL columns, or rows would be skipped or merged.
         let loose = vec!["v".to_string()];
-        assert!(Plan::new(&nopk, Some(&loose))
-            .unwrap_err()
-            .contains("not a unique index"));
+        assert!(
+            Plan::new(&nopk, Some(&loose))
+                .unwrap_err()
+                .contains("not a unique index")
+        );
     }
 
     #[test]
@@ -901,13 +909,15 @@ mod tests {
         assert_eq!(e.state().after, Some(vec!["k".into(), "1".into()]));
         assert_eq!(e.status("running").skipped.len(), 1);
         // Nothing usable left: no engine.
-        assert!(Engine::new(
-            "slot",
-            state(&["public.gone"]),
-            &cat,
-            &SnapshotConfig::default()
-        )
-        .is_none());
+        assert!(
+            Engine::new(
+                "slot",
+                state(&["public.gone"]),
+                &cat,
+                &SnapshotConfig::default()
+            )
+            .is_none()
+        );
     }
 
     fn rel(identity: u8) -> Relation {

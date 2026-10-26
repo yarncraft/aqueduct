@@ -11,12 +11,12 @@
 //! - memory: peak RSS while one transaction of `--big-rows` rows streams through the pipeline.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{
-    run_pipeline_with_metrics, ChangeEvent, Error, Metrics, Op, Result, Sink, Source,
+    ChangeEvent, Error, Metrics, Op, Result, Sink, Source, run_pipeline_with_metrics,
 };
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
 use async_trait::async_trait;

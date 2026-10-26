@@ -1,12 +1,14 @@
 //! End-to-end Kafka sink test. Needs a broker, so it is skipped unless
 //! `AQUEDUCT_KAFKA_BROKERS` is set (e.g. `localhost:9092`).
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use aqueduct_core::{ChangeEvent, Op, Position, Sink};
 use aqueduct_sinks::{
     FieldSpec, HashKey, KafkaInspector, KafkaRoute, KafkaSecurity, KafkaSink, OutboxSpec, RoutePlan,
 };
-use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
+use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use serde_json::value::to_raw_value;
 
 fn ev(n: u64, table: &str) -> ChangeEvent {
@@ -322,9 +324,11 @@ async fn filtered_rows_are_absent_and_type_errors_go_to_the_dead_letter_topic() 
     // The templated route's bad row landed on its own rendered dead-letter topic.
     let dead = read_all(&client, &tpl_dlq).await;
     assert_eq!(dead.len(), 1, "one type-error row on {tpl_dlq}");
-    assert!(String::from_utf8(dead[0].1["aqueduct-error"].clone())
-        .unwrap()
-        .starts_with("route `audit`: where `row.n > 10`: type error"));
+    assert!(
+        String::from_utf8(dead[0].1["aqueduct-error"].clone())
+            .unwrap()
+            .starts_with("route `audit`: where `row.n > 10`: type error")
+    );
 
     let snap = stats.snapshot();
     let c = snap[0].counts;
