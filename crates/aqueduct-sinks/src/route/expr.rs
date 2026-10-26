@@ -345,8 +345,8 @@ impl<'a> EventView<'a> {
     fn value(&self, f: &FieldRef) -> Leaf<'a> {
         match f.source {
             Source::Op => Leaf::Str(Cow::Borrowed(op_name(self.ev.op))),
-            Source::Schema => Leaf::Str(Cow::Borrowed(self.ev.schema.as_str())),
-            Source::Table => Leaf::Str(Cow::Borrowed(self.ev.table.as_str())),
+            Source::Schema => Leaf::Str(Cow::Borrowed(&self.ev.schema)),
+            Source::Table => Leaf::Str(Cow::Borrowed(&self.ev.table)),
             _ => self.lookup(f).map_or(Leaf::Null, leaf),
         }
     }

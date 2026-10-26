@@ -12,6 +12,7 @@
 //! watermarks it decodes and asks it for the next chunk when none is in flight.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aqueduct_core::{ChunkRow, Mark, Outcome, SkippedTable, SnapState, SnapshotStatus, Window};
@@ -98,8 +99,8 @@ const SEP: char = '\u{1f}';
 /// How to read and key one table.
 #[derive(Debug, Clone)]
 struct Plan {
-    schema: String,
-    name: String,
+    schema: Arc<str>,
+    name: Arc<str>,
     /// `relation` stands in for the pgoutput Relation message, so [`RelationCache`] encodes chunk
     /// rows exactly like live ones.
     relation: Relation,
@@ -170,10 +171,13 @@ impl Plan {
             ReplicaIdentity::Nothing => false,
             _ => key.iter().all(|k| t.identity_columns.contains(k)),
         };
+        let schema: Arc<str> = t.schema.as_str().into();
+        let name: Arc<str> = t.name.as_str().into();
         let relation = Relation {
             id: t.oid,
-            schema: t.schema.clone(),
-            name: t.name.clone(),
+            qualified: table_id(&t.schema, &t.name).into(),
+            schema: schema.clone(),
+            name: name.clone(),
             columns: t
                 .columns
                 .iter()
@@ -188,8 +192,8 @@ impl Plan {
             identity,
         };
         Ok(Self {
-            schema: t.schema.clone(),
-            name: t.name.clone(),
+            schema,
+            name,
             relation,
             columns: t.columns.clone(),
             key,
@@ -320,8 +324,8 @@ pub enum Live<'a> {
 /// A row read by a chunk, encoded like a live insert.
 #[derive(Debug, Clone)]
 pub struct ReadRow {
-    pub schema: String,
-    pub table: String,
+    pub schema: Arc<str>,
+    pub table: Arc<str>,
     pub row: Box<RawValue>,
     /// Kafka key part, exactly as for a live event of the row.
     pub key: Option<String>,
@@ -912,6 +916,7 @@ mod tests {
             id: 42,
             schema: "public".into(),
             name: "Orders".into(),
+            qualified: "public.Orders".into(),
             columns: vec![
                 Column {
                     name: "a".into(),

@@ -343,20 +343,29 @@ impl Admin {
         body
     }
 
-    /// Sample the throughput once a second.
+    /// Sample the throughput once a second. A tick that is late (a stalled runtime) is not
+    /// made up with a burst of back-to-back ticks, which would read as a dip to zero and then
+    /// a spike: the next tick waits a full second, and its rates are divided by the time that
+    /// really passed.
     pub async fn sample_forever(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(Duration::from_millis(SAMPLE_MS));
+        let period = Duration::from_millis(SAMPLE_MS);
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last = self.metrics.events_total();
         let mut last_bytes = self.kafka_bytes();
         let mut last_ops: BTreeMap<String, [u64; OP_SLOTS]> = BTreeMap::new();
+        let mut last_at = Instant::now();
         loop {
             tick.tick().await;
+            // At least a period: only the first tick, which fires at once, is ever early.
+            let elapsed = last_at.elapsed().max(period);
+            last_at = Instant::now();
             self.metrics.sample_source_lag();
             let now = self.metrics.events_total();
             let snap = self.metrics.snapshot();
-            let rate = now.saturating_sub(last) as f64;
+            let rate = per_sec(now.saturating_sub(last), elapsed);
             let bytes = self.kafka_bytes();
-            let bytes_rate = bytes.saturating_sub(last_bytes) as f64;
+            let bytes_rate = per_sec(bytes.saturating_sub(last_bytes), elapsed);
             self.record_sample(rate, &snap.table_ops, &last_ops);
             lock(&self.rates).record(
                 &self.route_counts(),
@@ -531,6 +540,11 @@ impl Admin {
             }
         }
     }
+}
+
+/// `n` counted over `elapsed`, per second.
+fn per_sec(n: u64, elapsed: Duration) -> f64 {
+    n as f64 / elapsed.as_secs_f64()
 }
 
 /// Now, as Unix ms.
@@ -1440,6 +1454,14 @@ mod tests {
         let d = lock(&admin.detail);
         let series: Vec<_> = d["public.t"].iter().copied().collect();
         assert_eq!(series, vec![[3, 2, 1, 4, 5], [1, 0, 0, 0, 4]]);
+    }
+
+    /// A tick 3 s late reads as the true rate, not a spike of 3 s of events in one second.
+    #[test]
+    fn a_late_sample_is_divided_by_the_time_that_passed() {
+        assert_eq!(per_sec(500, Duration::from_millis(SAMPLE_MS)), 500.0);
+        assert_eq!(per_sec(2000, Duration::from_secs(4)), 500.0);
+        assert_eq!(per_sec(0, Duration::from_secs(4)), 0.0);
     }
 
     /// An inline script or handler would need `'unsafe-inline'` in the CSP (#218).

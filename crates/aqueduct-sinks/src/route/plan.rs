@@ -10,7 +10,7 @@ use serde_json::value::RawValue;
 
 use super::expr::{EventView, Expr, FieldRef, Template, Tri, OP_NAMES};
 use super::fields::{FieldError, FieldOps, FieldSpec, HashKey, HASH_KEY_ID_HEADER};
-use crate::kafka::{glob_match, partition_input, PartitionBy};
+use crate::kafka::{glob_match, PartitionBy};
 use crate::{
     encode, encode_rows, key_json, key_object, op_code, record_key, table_key, OpCounts, SourceInfo,
 };
@@ -134,7 +134,7 @@ pub struct OutRecord {
     pub topic: String,
     pub key: String,
     /// What the partition is hashed from: the key, or only the table (`partition_by`).
-    pub partition_key: String,
+    pub partition_key: PartitionKey,
     /// The JSON event (the envelope), or the transformed value once a route reshapes it
     /// (`format = "row"`). `None` is a tombstone: a record with a null value.
     pub value: Option<String>,
@@ -149,6 +149,25 @@ pub struct OutRecord {
     /// Set when `topic` was chosen from row content: if the broker refuses to create it, the sink
     /// sends the record to this route's fallback instead ([`RoutePlan::topic_refused`]).
     pub content: Option<ContentTopic>,
+}
+
+/// What a record's partition is hashed from, without a copy of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionKey {
+    /// The record key.
+    Key,
+    /// `schema.table` (`partition_by = "table"`), shared by every record of the table.
+    Table(Arc<str>),
+}
+
+impl OutRecord {
+    /// What the partition is hashed from: the key, or only the table.
+    pub fn partition_input(&self) -> &str {
+        match &self.partition_key {
+            PartitionKey::Key => &self.key,
+            PartitionKey::Table(t) => t,
+        }
+    }
 }
 
 /// The route and fallback of a record whose topic came from row content.
@@ -731,8 +750,8 @@ type Rows = (Option<Box<RawValue>>, Option<Box<RawValue>>);
 
 /// A record's parts after the route's field operations, computed before its topic is chosen.
 struct Rewritten {
-    /// The record key and partition input from the rewritten key object; `None` with `key = [...]`.
-    keys: Option<(String, String)>,
+    /// The record key from the rewritten key object; `None` with `key = [...]`.
+    key: Option<String>,
     rows: Rows,
     headers: Vec<(&'static str, String)>,
 }
@@ -1371,6 +1390,41 @@ pub struct RoutePlan {
     fixed: Vec<String>,
     /// Present when configured; required as soon as a route uses `hash`.
     hash_key: Option<HashKey>,
+    /// Each table's route, matched on its first event.
+    resolved: Resolved,
+}
+
+/// The most tables [`Resolved`] remembers. Past it a table is matched on every event, as it
+/// was before the cache; real databases stay far below it.
+const RESOLVED_TABLES: usize = 4096;
+
+/// Per table: its route and `schema.table`, worked out on the table's first event instead of
+/// on every one. A plan's routes never change after it is built, so neither does the answer.
+/// A clone starts empty.
+#[derive(Debug, Default)]
+struct Resolved(RwLock<ResolvedTables>);
+
+#[derive(Debug, Default)]
+struct ResolvedTables {
+    /// By schema, then table, so a lookup borrows the event's names.
+    by_schema: HashMap<Arc<str>, HashMap<Arc<str>, Table>>,
+    len: usize,
+}
+
+impl Clone for Resolved {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// A table as [`RoutePlan::table`] resolved it.
+#[derive(Debug, Clone)]
+struct Table {
+    /// The stats index (routes first, the default last); `None` when nothing matches.
+    route: Option<usize>,
+    /// `schema.table`: what the routes match, and the partition input with
+    /// `partition_by = "table"`.
+    name: Arc<str>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2043,6 +2097,7 @@ impl RoutePlan {
             dynamic: Arc::new(DynamicTopics::new()),
             fixed: Vec::new(),
             hash_key,
+            resolved: Resolved::default(),
         };
         plan.fixed = plan.static_topics();
         // A content-routed name must not collide (`.` vs `_`) with a fixed topic either.
@@ -2225,16 +2280,52 @@ impl RoutePlan {
 
     /// Index into the stats (routes first, default last) and the topic template.
     fn resolve(&self, schema: &str, table: &str) -> Option<(usize, &TopicTemplate)> {
-        let name = format!("{schema}.{table}");
-        if let Some((i, r)) = self
+        self.template(self.table(schema, table).route)
+    }
+
+    /// The topic template of stats index `i`.
+    fn template(&self, i: Option<usize>) -> Option<(usize, &TopicTemplate)> {
+        let i = i?;
+        match self.routes.get(i) {
+            Some(r) => Some((i, &r.topic)),
+            None => self.default.as_ref().map(|t| (i, t)),
+        }
+    }
+
+    /// `schema.table`'s route (the first whose pattern matches, else the default) and name,
+    /// matched once per table and then read from [`Resolved`]: this runs for every event.
+    fn table(&self, schema: &str, table: &str) -> Table {
+        let read = self.resolved.0.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = read.by_schema.get(schema).and_then(|m| m.get(table)) {
+            return t.clone();
+        }
+        drop(read);
+        let name: Arc<str> = format!("{schema}.{table}").into();
+        let route = self
             .routes
             .iter()
-            .enumerate()
-            .find(|(_, r)| glob_match(&r.pattern, &name))
-        {
-            return Some((i, &r.topic));
+            .position(|r| glob_match(&r.pattern, &name))
+            .or_else(|| self.default.as_ref().map(|_| self.routes.len()));
+        let t = Table { route, name };
+        let mut w = self.resolved.0.write().unwrap_or_else(|e| e.into_inner());
+        if w.len < RESOLVED_TABLES {
+            let added = w
+                .by_schema
+                .entry(schema.into())
+                .or_default()
+                .insert(table.into(), t.clone())
+                .is_none();
+            w.len += usize::from(added);
         }
-        self.default.as_ref().map(|t| (self.routes.len(), t))
+        t
+    }
+
+    /// What `table`'s records are partitioned by, unless the route keys them itself.
+    fn partition_key(&self, table: &Table) -> PartitionKey {
+        match self.partition_by {
+            PartitionBy::Key => PartitionKey::Key,
+            PartitionBy::Table => PartitionKey::Table(table.name.clone()),
+        }
     }
 
     /// Globs matching every topic this plan can produce to: each route (a content-routed template
@@ -2338,7 +2429,8 @@ impl RoutePlan {
         if event.op == Op::Heartbeat {
             return Ok(());
         }
-        let (mut route, template) = self.resolve(&event.schema, &event.table).ok_or_else(|| {
+        let table = self.table(&event.schema, &event.table);
+        let (mut route, template) = self.template(table.route).ok_or_else(|| {
             Error::Sink(format!(
                 "no kafka route or default topic for {}.{}",
                 event.schema, event.table
@@ -2486,17 +2578,14 @@ impl RoutePlan {
         };
         let shape = self.routes.get(route).map(|r| r.shape).unwrap_or_default();
         let wants_tombstone = shape.tombstones && event.op == Op::Delete && !skip_tombstone;
-        let rewritten_keys = rewritten.as_mut().and_then(|w| w.keys.take());
-        let (key, partition_key) = match (route_key, rewritten_keys) {
+        let rewritten_key = rewritten.as_mut().and_then(|w| w.key.take());
+        let (key, partition_key) = match (route_key, rewritten_key) {
             // A per-route key partitions by the whole key, whatever `partition_by` says.
-            (Some(key), _) => (key.clone(), key),
-            // The key object after field operations, partitioned like the plain key.
-            (None, Some(keys)) => keys,
-            (None, None) => {
-                let key = record_key(event, &self.source);
-                let partition_key = partition_input(event, &key, self.partition_by);
-                (key, partition_key)
-            }
+            (Some(key), _) => (key, PartitionKey::Key),
+            // The key object after field operations (a hashed key column keeps per-row order),
+            // partitioned like the plain key.
+            (None, Some(key)) => (key, self.partition_key(&table)),
+            (None, None) => (record_key(event, &self.source), self.partition_key(&table)),
         };
         // The value and headers are fixed here, before the sink may re-route the record to the
         // fallback (`topic_refused` changes only the topic), so a fallback record carries the
@@ -2708,7 +2797,7 @@ impl RoutePlan {
         let (topic, content, fell_back) = self.route_topic(route, r, view);
         out.push(OutRecord {
             topic,
-            partition_key: key.clone(),
+            partition_key: PartitionKey::Key,
             key,
             value: Some(payload),
             op: op_code(event.op),
@@ -2854,17 +2943,18 @@ impl RoutePlan {
         own_key: bool,
     ) -> std::result::Result<Rewritten, FieldError> {
         let rows = self.rewrite_rows(fields, event, true)?;
-        let keys = if own_key {
+        let key = if own_key {
             let k = self.rewrite_key(fields, event)?;
-            let key = key_json(event, &self.source, k.as_deref().unwrap_or("null"));
-            // Partitioned by the rewritten key, so a hashed key column keeps per-row order.
-            let partition_key = partition_input(event, &key, self.partition_by);
-            Some((key, partition_key))
+            Some(key_json(
+                event,
+                &self.source,
+                k.as_deref().unwrap_or("null"),
+            ))
         } else {
             None
         };
         Ok(Rewritten {
-            keys,
+            key,
             rows,
             headers: self.hash_headers(fields),
         })
@@ -2963,7 +3053,7 @@ impl RoutePlan {
         };
         out.push(OutRecord {
             topic,
-            partition_key: key.clone(),
+            partition_key: PartitionKey::Key,
             key,
             value: Some(value),
             op: op_code(event.op),
@@ -3069,6 +3159,50 @@ mod tests {
             Some("cdc.orders")
         );
         assert_eq!(p.topic_for("sales", "x").as_deref(), Some("all.sales.x"));
+    }
+
+    /// A table is matched once: later events read its route and name from the cache, and a
+    /// table that matches nothing is remembered as such too.
+    #[test]
+    fn a_table_is_matched_once_and_a_clone_starts_empty() {
+        let mut p = RoutePlan::new(
+            vec![
+                route("public.users", "users-topic"),
+                route("public.*", "cdc.{table}"),
+            ],
+            None,
+        )
+        .unwrap();
+        p.set_partition_by(PartitionBy::Table);
+        let tables = |p: &RoutePlan| p.resolved.0.read().unwrap().len;
+        for _ in 0..3 {
+            assert_eq!(
+                p.topic_for("public", "users").as_deref(),
+                Some("users-topic")
+            );
+            assert_eq!(
+                p.topic_for("public", "orders").as_deref(),
+                Some("cdc.orders")
+            );
+            assert_eq!(p.topic_for("sales", "x"), None);
+        }
+        assert_eq!(tables(&p), 3);
+        // Every record of a table shares one `schema.table` as its partition input.
+        let e = crate::sample();
+        let (a, b) = (p.render(&e, 0).unwrap(), p.render(&e, 0).unwrap());
+        match (&a[0].partition_key, &b[0].partition_key) {
+            (PartitionKey::Table(x), PartitionKey::Table(y)) => {
+                assert_eq!(&**x, "public.users");
+                assert!(Arc::ptr_eq(x, y));
+            }
+            other => panic!("{other:?}"),
+        }
+        let c = p.clone();
+        assert_eq!(tables(&c), 0);
+        assert_eq!(
+            c.topic_for("public", "users").as_deref(),
+            Some("users-topic")
+        );
     }
 
     #[test]
@@ -3349,7 +3483,7 @@ mod tests {
             r.key,
             r#"{"db":"app","schema":"public","table":"orders","key":null}"#
         );
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
         // The route has no field operations, so the value is the envelope as is.
         assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
         assert_eq!((r.op, r.lsn.as_str()), ("u", "7"));
@@ -3961,7 +4095,7 @@ mod tests {
                 r#"{"db":"app","schema":"public","table":"orders","key":{"tenant":"acme","id":5}}"#
             );
             // The whole key is the partition input, whatever `partition_by` says.
-            assert_eq!(r.partition_key, r.key, "{by:?}");
+            assert_eq!(r.partition_input(), r.key, "{by:?}");
             assert_eq!(r.value.text(), encode(&e, &pg(), NOW).unwrap());
         }
     }
@@ -4020,7 +4154,7 @@ mod tests {
             r.key,
             r#"{"db":"app","schema":"public","table":"orders","key":null}"#
         );
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
     }
 
     #[test]
@@ -4037,7 +4171,7 @@ mod tests {
             r.key,
             r#"{"db":"shop","collection":"orders","key":{"tenant":"acme","id":7}}"#
         );
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
     }
 
     #[test]
@@ -5012,7 +5146,7 @@ mod tests {
         assert_eq!(r.topic, "outbox.order");
         // A string's content, not the JSON key of the table.
         assert_eq!(r.key, "A-1");
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
         // A `json`/`jsonb` payload is the JSON text as the row holds it.
         assert_eq!(r.value.text(), r#"{"total":12.50,"items":[1,2]}"#);
         assert_eq!((r.op, r.lsn.as_str()), ("c", "7"));
@@ -5627,7 +5761,7 @@ mod tests {
                     PartitionBy::Key => want.clone(),
                     PartitionBy::Table => "public.t".to_string(),
                 };
-                assert_eq!(r.partition_key, part, "{spec:?} {by:?}");
+                assert_eq!(r.partition_input(), part, "{spec:?} {by:?}");
             }
         }
         // A hashed key column keeps rows apart and the same row together: per-row order holds.
@@ -5635,7 +5769,10 @@ mod tests {
             hash: strs(&["email"]),
             ..Default::default()
         })]);
-        let pk = |email: &str| p.render(&e(email), NOW).unwrap().remove(0).partition_key;
+        let pk = |email: &str| {
+            let r = p.render(&e(email), NOW).unwrap().remove(0);
+            r.partition_input().to_string()
+        };
         assert_eq!(pk("a@b.c"), pk("a@b.c"));
         assert_ne!(pk("a@b.c"), pk("x@y.z"));
         // A MongoDB `_id` object is hashed from its compact JSON, in the key as in the value.
@@ -5956,7 +6093,7 @@ mod tests {
             r.key,
             r#"{"db":"app","schema":"public","table":"users","key":{"id":5}}"#
         );
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
         assert_eq!(json(&r.value)["after"]["email"], hmac_hex("a@b.c").as_str());
         assert!(!r.key.contains("a@b.c"));
     }
@@ -6055,7 +6192,7 @@ mod tests {
             assert_eq!(v["after"]["email"], hmac_hex("a@b.c").as_str());
             assert_eq!(v["after"]["card"], "***");
             assert_eq!(json(&r.key)["key"]["email"], hmac_hex("a@b.c").as_str());
-            assert_eq!(r.partition_key, r.key);
+            assert_eq!(r.partition_input(), r.key);
             assert_eq!(r.headers, vec![(HASH_KEY_ID_HEADER, "k1".to_string())]);
             assert!(!r.value.text().contains("a@b.c") && !r.key.contains("a@b.c"));
             assert!(!r.value.text().contains("4111"));
@@ -6205,7 +6342,10 @@ mod tests {
                     let r = &got[0];
                     assert_eq!(r.topic, topic);
                     let key = record_key(e, &info);
-                    assert_eq!(r.partition_key, partition_input(e, &key, by));
+                    assert_eq!(
+                        r.partition_input(),
+                        crate::kafka::partition_input(e, &key, by)
+                    );
                     assert_eq!(r.key, key);
                     assert_eq!(r.value.text(), encode(e, &info, NOW).unwrap());
                     assert_eq!(r.op, op_code(e.op));
@@ -6227,7 +6367,7 @@ mod tests {
             r.key,
             r#"{"db":"app","schema":"public","table":"users","key":{"id":1}}"#
         );
-        assert_eq!(r.partition_key, r.key);
+        assert_eq!(r.partition_input(), r.key);
         assert_eq!(r.op, "c");
         assert_eq!(r.lsn, "97500059720");
         assert_eq!(
@@ -6260,7 +6400,7 @@ mod tests {
         for _ in 0..n {
             let t = legacy_topic(&routes, Some("rest"), &e.schema, &e.table).unwrap();
             let k = record_key(&e, &pg());
-            let pk = partition_input(&e, &k, PartitionBy::Key);
+            let pk = crate::kafka::partition_input(&e, &k, PartitionBy::Key);
             let v = encode(&e, &pg(), NOW).unwrap();
             // The old `record()` also built both header values.
             let op = op_code(e.op);
@@ -6432,7 +6572,7 @@ mod tests {
             assert_eq!(out.len(), 1, "no extra record: the delete is the tombstone");
             assert_eq!(out[0].value, None);
             assert_eq!((out[0].key.as_str(), out[0].op), (PG_KEY, "d"));
-            assert_eq!(out[0].partition_key, PG_KEY);
+            assert_eq!(out[0].partition_input(), PG_KEY);
             assert!(p.render(&trunc, NOW).unwrap().is_empty());
             let c = p.stats().snapshot()[0].counts;
             assert_eq!((c.matched, c.produced, c.filtered), (2, 1, 1));
@@ -6543,7 +6683,7 @@ mod tests {
             assert_eq!(t.value, None);
             assert!(!t.key.contains("a@b.c"), "{}", t.key);
             assert_eq!(json(&t.key)["key"]["email"], hmac_hex("a@b.c").as_str());
-            assert_eq!(t.partition_key, t.key);
+            assert_eq!(t.partition_input(), t.key);
         }
     }
 

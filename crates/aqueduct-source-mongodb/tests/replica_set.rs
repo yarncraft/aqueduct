@@ -44,7 +44,7 @@ async fn insert_update_delete_then_resume() {
     // faster than the source consumes them would see the later state (or none after a delete).
     coll.insert_one(doc! {"_id": 1, "n": "a"}).await.unwrap();
     let ins = next(&mut src).await;
-    assert_eq!((ins.op, ins.table.as_str()), (Op::Insert, "users"));
+    assert_eq!((ins.op, &*ins.table), (Op::Insert, "users"));
 
     coll.update_one(doc! {"_id": 1}, doc! {"$set": {"n": "b"}})
         .await

@@ -406,7 +406,7 @@ async fn copy_rows_and_multi_table_truncate_lose_no_events() {
     );
     assert_eq!(
         truncated,
-        BTreeSet::from([t, u]),
+        BTreeSet::from([t.into(), u.into()]),
         "a multi-table TRUNCATE must give one event per table"
     );
 }

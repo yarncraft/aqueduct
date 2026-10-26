@@ -1,6 +1,7 @@
 //! Pure decoder for the pgoutput logical replication protocol (version 1).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use std::fmt::Write;
 
@@ -35,8 +36,11 @@ pub struct Column {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relation {
     pub id: u32,
-    pub schema: String,
-    pub name: String,
+    /// Shared with every event of the table, which then allocates no names of its own.
+    pub schema: Arc<str>,
+    pub name: Arc<str>,
+    /// `schema.table`, as [`table_id`](crate::snapshot::table_id) writes it.
+    pub qualified: Arc<str>,
     pub columns: Vec<Column>,
     /// Replica identity byte from the Relation message: `d` default, `n` nothing, `f` full, `i` index.
     pub identity: u8,
@@ -277,8 +281,9 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             }
             Message::Relation(Relation {
                 id,
-                schema,
-                name,
+                qualified: crate::snapshot::table_id(&schema, &name).into(),
+                schema: schema.into(),
+                name: name.into(),
                 columns,
                 identity,
             })
@@ -1113,7 +1118,7 @@ mod tests {
         let Message::Relation(rel) = decode(&relation_bytes()).unwrap() else {
             panic!()
         };
-        assert_eq!(rel.schema, "public");
+        assert_eq!(&*rel.schema, "public");
         assert!(rel.columns[0].key && !rel.columns[1].key);
         let mut cache = RelationCache::default();
         cache.insert(rel);

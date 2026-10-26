@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -67,8 +69,8 @@ impl ChangeEvent {
             position,
             xid: 0,
             commit_ts_micros,
-            schema: String::new(),
-            table: String::new(),
+            schema: Arc::default(),
+            table: Arc::default(),
             op: Op::Heartbeat,
             before: None,
             after: None,
@@ -89,8 +91,9 @@ pub struct ChangeEvent {
     pub xid: u32,
     /// Commit timestamp, microseconds since the Unix epoch.
     pub commit_ts_micros: i64,
-    pub schema: String,
-    pub table: String,
+    /// Shared with the source's relation cache, so an event does not allocate its names.
+    pub schema: Arc<str>,
+    pub table: Arc<str>,
     pub op: Op,
     /// Row before the change (update/delete, when replica identity allows).
     ///
