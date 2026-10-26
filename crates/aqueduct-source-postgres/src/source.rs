@@ -14,8 +14,8 @@ use crate::azure::{AccessToken, AzureCredential};
 use crate::catalog::read_catalog;
 use crate::decoder::{Message, Relation, RelationCache};
 use crate::snapshot::{
-    new_snapshot_id, table_id, table_watermark, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
-    MIN_SERVER_VERSION,
+    Closed, Engine, Live, MIN_SERVER_VERSION, SnapshotConfig, SnapshotMode, new_snapshot_id,
+    table_id, table_watermark,
 };
 use crate::tls::{self, SslMode};
 use crate::transport::{StreamTransport, Transport};
@@ -152,24 +152,24 @@ fn check_origin(saved: Stamp, server: Origin) -> Result<()> {
                  version also makes a new one). Point it back, or remove the checkpoint to start over"
             )));
         }
-        if let (Some(tli), Some(server_tli)) = (saved.timeline, server.timeline) {
-            if tli != server_tli {
-                return Err(Error::Checkpoint(format!(
-                    "checkpoint was written on timeline {tli} of this cluster, but the server is \
-                     on timeline {server_tli}. {RESYNC}"
-                )));
-            }
-        }
-    }
-    if let Some(db) = saved.database {
-        if db != server.database {
+        if let (Some(tli), Some(server_tli)) = (saved.timeline, server.timeline)
+            && tli != server_tli
+        {
             return Err(Error::Checkpoint(format!(
-                "checkpoint was written against database OID {db}, but this connection is to \
-                 database OID {} on the same cluster. Point the URL back at that database, or \
-                 remove the checkpoint to start over",
-                server.database
+                "checkpoint was written on timeline {tli} of this cluster, but the server is \
+                     on timeline {server_tli}. {RESYNC}"
             )));
         }
+    }
+    if let Some(db) = saved.database
+        && db != server.database
+    {
+        return Err(Error::Checkpoint(format!(
+            "checkpoint was written against database OID {db}, but this connection is to \
+                 database OID {} on the same cluster. Point the URL back at that database, or \
+                 remove the checkpoint to start over",
+            server.database
+        )));
     }
     Ok(())
 }
@@ -763,13 +763,13 @@ impl PostgresSource {
             .await?;
             let encrypted = client.encrypted();
             let system = client.identify_system().await?;
-            if let Some(sys) = self.origin.and_then(|o| o.system) {
-                if system.system_id != sys.to_string() {
-                    return Err(Error::Config(format!(
-                        "the replication connection reached cluster {}, the SQL connection cluster {}; {}",
-                        system.system_id, sys, "point the URL at one server"
-                    )));
-                }
+            if let Some(sys) = self.origin.and_then(|o| o.system)
+                && system.system_id != sys.to_string()
+            {
+                return Err(Error::Config(format!(
+                    "the replication connection reached cluster {}, the SQL connection cluster {}; {}",
+                    system.system_id, sys, "point the URL at one server"
+                )));
             }
             let started = client
                 .start_replication(&StartReplication {
@@ -1279,10 +1279,10 @@ impl PostgresSource {
                     let row_key = cache.key(relation, &new, pk).map_err(dec)?;
                     let key = keys.next(lsn);
                     let none = Vec::new();
-                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key, none) {
-                        if let Some(e) = self.snapshot.as_mut() {
-                            e.observe(id, Live::Insert { rel: r, new: &new });
-                        }
+                    if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key, none)
+                        && let Some(e) = self.snapshot.as_mut()
+                    {
+                        e.observe(id, Live::Insert { rel: r, new: &new });
                     }
                 }
                 Message::Update { relation, old, new } => {
@@ -1318,17 +1318,16 @@ impl PostgresSource {
                         after,
                         row_key,
                         unchanged,
-                    ) {
-                        if let Some(e) = self.snapshot.as_mut() {
-                            e.observe(
-                                id,
-                                Live::Update {
-                                    rel: r,
-                                    old: old.as_ref(),
-                                    new: &new,
-                                },
-                            );
-                        }
+                    ) && let Some(e) = self.snapshot.as_mut()
+                    {
+                        e.observe(
+                            id,
+                            Live::Update {
+                                rel: r,
+                                old: old.as_ref(),
+                                new: &new,
+                            },
+                        );
                     }
                 }
                 Message::Delete { relation, old } => {
@@ -1343,10 +1342,10 @@ impl PostgresSource {
                     let row_key = cache.key(relation, &old, pk).map_err(dec)?;
                     let key = keys.next(lsn);
                     let none = Vec::new();
-                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key, none) {
-                        if let Some(e) = self.snapshot.as_mut() {
-                            e.observe(id, Live::Delete { rel: r, old: &old });
-                        }
+                    if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key, none)
+                        && let Some(e) = self.snapshot.as_mut()
+                    {
+                        e.observe(id, Live::Delete { rel: r, old: &old });
                     }
                 }
                 Message::Truncate { relations } => {
@@ -1359,10 +1358,10 @@ impl PostgresSource {
                         let key = keys.next(lsn);
                         let id: &str = &r.qualified;
                         let none = Vec::new();
-                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None, none) {
-                            if let Some(e) = self.snapshot.as_mut() {
-                                e.observe(id, Live::Truncate);
-                            }
+                        if self.queue(key, xid, ts, name, Op::Truncate, None, None, None, none)
+                            && let Some(e) = self.snapshot.as_mut()
+                        {
+                            e.observe(id, Live::Truncate);
                         }
                     }
                 }
@@ -1605,10 +1604,10 @@ impl Source for PostgresSource {
                     // A checkpoint ahead of this server's WAL comes from another cluster (restored
                     // dump, copied state volume). Treating it as acknowledged would move the slot
                     // past data that was never delivered, so refuse it.
-                    if let Some(wal) = self.wal_position().await? {
-                        if l > wal {
-                            return Err(ahead_of_wal(l, wal, false));
-                        }
+                    if let Some(wal) = self.wal_position().await?
+                        && l > wal
+                    {
+                        return Err(ahead_of_wal(l, wal, false));
                     }
                     tracing::warn!(
                         checkpoint = %Position::Lsn(l),
@@ -1620,12 +1619,12 @@ impl Source for PostgresSource {
                     let (k, stamp, _) = split_checkpoint(&t)?;
                     // Same guard as for a plain LSN, on the commit LSN. `check_origin` already
                     // refused another cluster, so a recorded `sys` means a restore of this one.
-                    if let Some(wal) = self.wal_position().await? {
-                        if k.commit > wal {
-                            let known = stamp.system.is_some()
-                                && stamp.system == self.origin.and_then(|o| o.system);
-                            return Err(ahead_of_wal(k.commit, wal, known));
-                        }
+                    if let Some(wal) = self.wal_position().await?
+                        && k.commit > wal
+                    {
+                        let known = stamp.system.is_some()
+                            && stamp.system == self.origin.and_then(|o| o.system);
+                        return Err(ahead_of_wal(k.commit, wal, known));
                     }
                     self.emitted = k;
                     self.checkpointed = k;
@@ -1652,10 +1651,10 @@ impl Source for PostgresSource {
             }
             // The next chunk starts only when everything before it is handed on, so memory stays
             // at one chunk.
-            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref()) {
-                if e.due() {
-                    e.start_chunk(c).await?;
-                }
+            if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref())
+                && e.due()
+            {
+                e.start_chunk(c).await?;
             }
             // The fetch waits up to `poll_interval` for data, so an idle loop does not spin.
             self.poll().await?;
@@ -1676,10 +1675,10 @@ impl Source for PostgresSource {
         if !self.buffer.is_empty() {
             return Ok(());
         }
-        if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref()) {
-            if e.due() {
-                e.start_chunk(c).await?;
-            }
+        if let (Some(e), Some(c)) = (self.snapshot.as_mut(), self.client.as_deref())
+            && e.due()
+        {
+            e.start_chunk(c).await?;
         }
         self.poll_with(false).await
     }

@@ -7,11 +7,13 @@
 //! ```
 //!
 //! Every test makes its own tables, publication and slot, because tests share one server.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aqueduct_core::{ChangeEvent, LagState, Metrics, Op, Position, Source, CAUGHT_UP_BYTES};
-use aqueduct_source_postgres::{parse_lsn, PostgresSource, PostgresSourceConfig, SslMode};
+use aqueduct_core::{CAUGHT_UP_BYTES, ChangeEvent, LagState, Metrics, Op, Position, Source};
+use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode, parse_lsn};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
@@ -378,12 +380,14 @@ async fn unacked_event_is_redelivered_after_a_restart() {
         .expect("the unacked event must come back after a restart");
     assert_eq!(redelivered.position, ev.position);
     assert_eq!(&*redelivered.table, f.publ);
-    assert!(redelivered
-        .after
-        .as_ref()
-        .unwrap()
-        .get()
-        .contains("survives"));
+    assert!(
+        redelivered
+            .after
+            .as_ref()
+            .unwrap()
+            .get()
+            .contains("survives")
+    );
     f.cleanup(again).await;
 }
 

@@ -5,13 +5,13 @@ use tokio_postgres::config::Host;
 
 use super::auth::{self, AuthContext, AuthMethod};
 use super::frame::{
-    self, copy_data, lsn_text, pg_micros, proto, query, quote_ident, quote_literal, reject_nul,
-    startup_message, status_update, terminate, Backend, FrameReader, Replication,
+    self, Backend, FrameReader, Replication, copy_data, lsn_text, pg_micros, proto, query,
+    quote_ident, quote_literal, reject_nul, startup_message, status_update, terminate,
 };
 use super::secure;
+use crate::SslMode;
 use crate::azure::AccessToken;
 use crate::source::parse_lsn;
-use crate::SslMode;
 
 fn err(msg: impl Into<String>) -> Error {
     Error::Source(format!("replication connection: {}", msg.into()))
@@ -108,7 +108,7 @@ impl Target {
             [Host::Tcp(h)] if h.starts_with('/') => {
                 return Err(Error::Config(
                     "streaming replication needs a TCP host, not a unix socket".into(),
-                ))
+                ));
             }
             [Host::Tcp(h)] => h.clone(),
             [] => return Err(Error::Config("postgres url has no host".into())),
@@ -116,12 +116,12 @@ impl Target {
             [Host::Unix(_)] => {
                 return Err(Error::Config(
                     "streaming replication needs a TCP host, not a unix socket".into(),
-                ))
+                ));
             }
             _ => {
                 return Err(Error::Config(
                     "streaming replication does not support a multi-host postgres url".into(),
-                ))
+                ));
             }
         };
         let port = match cfg.get_ports() {
@@ -377,19 +377,19 @@ impl ReplicationClient {
                             ended: false,
                         },
                         self.writer,
-                    ))
+                    ));
                 }
                 Backend::Notice | Backend::ParameterStatus => {}
                 Backend::Error { code, message } => {
-                    return Err(server_err("START_REPLICATION failed: ", code, &message))
+                    return Err(server_err("START_REPLICATION failed: ", code, &message));
                 }
                 Backend::ReadyForQuery => {
-                    return Err(err("server ended START_REPLICATION without streaming"))
+                    return Err(err("server ended START_REPLICATION without streaming"));
                 }
                 other => {
                     return Err(proto(format!(
                         "unexpected {other:?} in reply to START_REPLICATION"
-                    )))
+                    )));
                 }
             }
         }
@@ -623,19 +623,23 @@ mod tests {
              (proto_version '1', publication_names 'Aq_Pub')"
         );
         // pgoutput parses the list itself: commas split, unquoted names case-fold.
-        assert!(start("a,\"B\"")
-            .sql()
-            .unwrap()
-            .ends_with("publication_names 'a,\"B\"')"));
+        assert!(
+            start("a,\"B\"")
+                .sql()
+                .unwrap()
+                .ends_with("publication_names 'a,\"B\"')")
+        );
         assert!(start("it's").sql().unwrap().ends_with("'it''s')"));
         let with_messages = StartReplication {
             logical_messages: true,
             ..start("p")
         };
-        assert!(with_messages
-            .sql()
-            .unwrap()
-            .ends_with("publication_names 'p', messages 'true')"));
+        assert!(
+            with_messages
+                .sql()
+                .unwrap()
+                .ends_with("publication_names 'p', messages 'true')")
+        );
         assert!(start("p\0").sql().is_err());
     }
 
@@ -836,8 +840,10 @@ mod handshake_tests {
             read_untagged(&mut s).await;
             s.write_all(b"N").await.unwrap();
             let startup = read_untagged(&mut s).await;
-            assert!(startup
-                .ends_with(b"replication\0database\0client_encoding\0UTF8\0DateStyle\0ISO\0\0"));
+            assert!(
+                startup
+                    .ends_with(b"replication\0database\0client_encoding\0UTF8\0DateStyle\0ISO\0\0")
+            );
             s.write_all(&ok_and_ready()).await.unwrap();
         })
         .await;
@@ -852,8 +858,8 @@ mod handshake_tests {
     /// Runs a SCRAM exchange up to the client-final message, then `finish` decides the end.
     async fn scram_server(
         finish: impl FnOnce(TcpStream) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
     ) -> u16 {
         let (port, _h) = server(|mut s| async move {
             read_untagged(&mut s).await; // startup

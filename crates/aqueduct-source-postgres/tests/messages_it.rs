@@ -6,11 +6,12 @@
 //! AQUEDUCT_TEST_PG_PLAIN=localhost:5434
 //! cargo test -p aqueduct-source-postgres --test messages_it -- --ignored
 //! ```
-use aqueduct_source_postgres::decoder::{decode, Logical, Mark, Message};
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use aqueduct_source_postgres::decoder::{Logical, Mark, Message, decode};
 use tokio_postgres::NoTls;
 
-const PEEK: &str =
-    "SELECT data FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, NULL, \
+const PEEK: &str = "SELECT data FROM pg_logical_slot_peek_binary_changes($1::text::name, NULL, NULL, \
      'proto_version', '1', 'publication_names', $2::text";
 
 #[tokio::test]

@@ -1,16 +1,18 @@
 //! Snapshots against a real replica set (ADR 0001, #77). Needs `MONGO_URI`, see `replica_set.rs`:
 //! `MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0&directConnection=true' cargo test -p aqueduct-source-mongodb --test snapshot_it -- --ignored`
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use aqueduct_core::{
-    snapshot_channel, ChangeEvent, Checkpoint, Metrics, Op, Position, SnapshotCommand,
-    SnapshotRequest, SnapshotSender, Source,
+    ChangeEvent, Checkpoint, Metrics, Op, Position, SnapshotCommand, SnapshotRequest,
+    SnapshotSender, Source, snapshot_channel,
 };
 use aqueduct_source_mongodb::{MongoConfig, MongoSource, SnapshotMode};
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use mongodb::Client;
+use mongodb::bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -325,7 +327,7 @@ async fn mixed_id_types_are_all_read_and_encoded_like_inserts() {
 
     let mut d = Driver::start(cfg(&db, SnapshotMode::OnDemand, 2), None).await;
     d.step().await; // the start position
-                    // Validation: unknown and foreign collections are refused.
+    // Validation: unknown and foreign collections are refused.
     let err = d
         .request(SnapshotCommand::Start(vec![format!("{db}.nope")]))
         .await
@@ -549,10 +551,11 @@ async fn a_chunk_that_always_fails_skips_its_collection() {
     assert_eq!(st.skipped.len(), 1, "{st:?}");
     assert_eq!(st.skipped[0].table, format!("{db}.bad"));
     assert!(st.skipped[0].reason.contains("chunk read failed"), "{st:?}");
-    assert!(d
-        .events
-        .iter()
-        .all(|e| *e.table != *"bad" || e.op != Op::Read));
+    assert!(
+        d.events
+            .iter()
+            .all(|e| *e.table != *"bad" || e.op != Op::Read)
+    );
     assert_eq!(
         d.events
             .iter()
@@ -570,8 +573,8 @@ async fn a_chunk_that_always_fails_skips_its_collection() {
 #[tokio::test]
 #[ignore]
 async fn an_existing_watermark_index_is_accepted_or_reported() {
-    use mongodb::options::IndexOptions;
     use mongodb::IndexModel;
+    use mongodb::options::IndexOptions;
     let db = db_name("ttl");
     let client = Client::with_uri_str(uri()).await.unwrap();
     let wm = client

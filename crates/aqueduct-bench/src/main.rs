@@ -21,6 +21,8 @@
 //! The pipeline drains every ready event into one batch (up to `MAX_BATCH`), submits it, and
 //! checkpoints and acks once per batch as batches are delivered, so the source hands out its
 //! events through `try_next` the way the real sources do.
+// A benchmark harness: a failed setup panics with its message.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod industrial;
 mod postgres;
@@ -29,10 +31,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use aqueduct_core::{
-    run_pipeline_with_metrics, ChangeEvent, CheckpointStore, Delivery, Error, Metrics, Op,
-    Position, Result, Sink, Source,
+    ChangeEvent, CheckpointStore, Delivery, Error, Metrics, Op, Position, Result, Sink, Source,
+    run_pipeline_with_metrics,
 };
-use aqueduct_sinks::{KafkaSecurity, KafkaSink, OutRecord, RoutePlan, DEFAULT_IN_FLIGHT_BATCHES};
+use aqueduct_sinks::{DEFAULT_IN_FLIGHT_BATCHES, KafkaSecurity, KafkaSink, OutRecord, RoutePlan};
 use async_trait::async_trait;
 use serde_json::value::to_raw_value;
 use tokio::sync::watch;

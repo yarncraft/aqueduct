@@ -3,6 +3,7 @@ name = "aqueduct"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 aqueduct-core = { path = "../aqueduct-core" }
@@ -10,8 +11,8 @@ aqueduct-sinks = { path = "../aqueduct-sinks" }
 aqueduct-source-postgres = { path = "../aqueduct-source-postgres" }
 aqueduct-source-mongodb = { path = "../aqueduct-source-mongodb" }
 aqueduct-tls = { path = "../aqueduct-tls" }
-# OTLP export (opt-in). No default features: http/protobuf only, over our own small HTTP client
-# (rustls/ring from aqueduct-tls), so neither hyper, reqwest nor tonic come in.
+# OTLP export (opt-in). No default features: http/protobuf only, over hyper (below) with
+# rustls/ring from aqueduct-tls, so neither reqwest nor tonic come in.
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "http-proto"] }
@@ -20,10 +21,15 @@ opentelemetry-appender-tracing = { version = "0.33", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 bytes = "1"
 http = "1"
+# The cockpit server and the OTLP client: HTTP/1.1 only, on the tokio runtime.
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util", "fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
@@ -36,3 +42,6 @@ tikv-jemallocator = "0.6"
 [dev-dependencies]
 # The in-memory metric exporter the OTLP mapping test reads back.
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs", "testing"] }
+
+[lints]
+workspace = true

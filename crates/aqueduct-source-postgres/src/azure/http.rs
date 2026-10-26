@@ -1,26 +1,34 @@
-//! A small HTTP/1.1 client for the token endpoints: one request per connection
-//! (`Connection: close`), `Content-Length` or chunked responses, a size cap and a timeout.
+//! A small HTTP/1.1 client for the token endpoints, on hyper: one request per connection
+//! (`Connection: close`), a size cap and a timeout. hyper does the framing (lengths, chunking,
+//! interim responses) and refuses a header value with CR or LF, so neither the request nor a
+//! response is assembled or parsed by hand here.
 //!
 //! HTTPS uses the shared rustls config with `verify-full` and the bundled Mozilla roots. Plain
 //! HTTP is accepted only for a loopback host (the Container Apps identity endpoint, or a test
 //! server), so a credential never crosses the network unencrypted.
 
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Body;
+use hyper::header::{self, HeaderName, HeaderValue};
+use hyper::{Method, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
 
-/// Largest response accepted, headers included. A token response is a few KiB.
+/// Largest response accepted: the body, and separately the buffer the head must fit in. A token
+/// response is a few KiB.
 pub(crate) const MAX_RESPONSE: usize = 64 * 1024;
 
-/// Connect, send and receive must all finish within this.
+/// Connect, send and receive must all finish within this. It also bounds a server that sends
+/// interim (1xx) responses without end.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Interim (1xx) responses accepted before the final one.
-const MAX_INTERIM: usize = 5;
 
 /// An `http://` or `https://` URL, split for the request line and the `Host` header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,29 +164,39 @@ pub(crate) struct Request {
     pub body: Option<(&'static str, String)>,
 }
 
+/// A header value, refused if it holds CR, LF or another control character.
+fn value(v: &str) -> Result<HeaderValue, String> {
+    HeaderValue::from_str(v).map_err(|_| "a header value holds a control character".to_string())
+}
+
 impl Request {
-    /// The bytes on the wire.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut head = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n",
-            self.method,
-            self.url.target,
-            self.url.host_header()
-        );
+    /// The request as hyper sends it. The caller's headers and the body carry credentials, so
+    /// each extra header is marked sensitive.
+    fn to_http(&self) -> Result<hyper::Request<Full<Bytes>>, String> {
+        let body = self.body.as_ref().map_or("", |(_, b)| b.as_str());
+        let mut r = hyper::Request::new(Full::new(Bytes::copy_from_slice(body.as_bytes())));
+        *r.method_mut() =
+            Method::from_bytes(self.method.as_bytes()).map_err(|_| "invalid HTTP method")?;
+        *r.uri_mut() = self
+            .url
+            .target
+            .parse()
+            .map_err(|_| "the URL path is not a valid request target")?;
+        let h = r.headers_mut();
+        h.insert(header::HOST, value(&self.url.host_header())?);
+        h.insert(header::CONNECTION, HeaderValue::from_static("close"));
+        h.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
         for (k, v) in &self.headers {
-            head.push_str(&format!("{k}: {v}\r\n"));
+            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| "invalid header name")?;
+            let mut v = value(v)?;
+            v.set_sensitive(true);
+            h.append(name, v);
         }
-        match &self.body {
-            Some((ct, body)) => {
-                head.push_str(&format!(
-                    "Content-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                ));
-                head.push_str(body);
-            }
-            None => head.push_str("\r\n"),
+        if let Some((ct, body)) = &self.body {
+            h.insert(header::CONTENT_TYPE, value(ct)?);
+            h.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
         }
-        head.into_bytes()
+        Ok(r)
     }
 }
 
@@ -215,8 +233,9 @@ fn check_loopback(host: &str, addrs: &[SocketAddr]) -> Result<(), String> {
     }
     Ok(())
 }
-
 async fn send_inner(req: &Request) -> Result<Response, String> {
+    // Build it first: a malformed header fails before anything is sent.
+    let request = req.to_http()?;
     let url = &req.url;
     let connected = if url.https {
         TcpStream::connect((url.host.as_str(), url.port)).await
@@ -234,167 +253,67 @@ async fn send_inner(req: &Request) -> Result<Response, String> {
             .connect(name, tcp)
             .await
             .map_err(|e| format!("TLS handshake with {}: {e}", url.host))?;
-        exchange(tls, req).await
+        exchange(tls, request).await
     } else {
-        exchange(tcp, req).await
+        exchange(tcp, request).await
     }
 }
 
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
-    mut io: S,
-    req: &Request,
+/// Sends `request` over `io` and reads the response. The connection is driven here rather than
+/// spawned, so it ends with the call (and with the [`TIMEOUT`] around it).
+async fn exchange<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    io: S,
+    request: hyper::Request<Full<Bytes>>,
 ) -> Result<Response, String> {
-    io.write_all(&req.to_bytes())
+    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(MAX_RESPONSE)
+        .handshake(TokioIo::new(io))
         .await
         .map_err(|e| format!("sending the request: {e}"))?;
-    io.flush()
-        .await
-        .map_err(|e| format!("sending the request: {e}"))?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = match io.read(&mut chunk).await {
-            Ok(n) => n,
-            // A TLS peer that closes without close_notify: whatever arrived is judged below.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-            Err(e) => return Err(format!("reading the response: {e}")),
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_RESPONSE {
-            return Err(format!("the response is larger than {MAX_RESPONSE} bytes"));
+    let reply = async {
+        let resp = sender
+            .send_request(request)
+            .await
+            .map_err(|e| format!("reading the response: {e}"))?;
+        let status = resp.status();
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            return Err("the server switched protocols (HTTP 101)".to_string());
         }
-        if let Some(r) = parse_response(&buf, n == 0)? {
-            return Ok(r);
+        let too_large = || format!("the response is larger than {MAX_RESPONSE} bytes");
+        if resp.body().size_hint().lower() > MAX_RESPONSE as u64 {
+            return Err(too_large());
         }
-        if n == 0 {
-            return Err("the connection closed before the response was complete".into());
-        }
-    }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// A non-empty run of digits in `radix`, without the sign `from_str_radix` would accept.
-fn number(v: &str, radix: u32) -> Option<usize> {
-    if v.is_empty() || !v.chars().all(|c| c.is_digit(radix)) {
-        return None;
-    }
-    usize::from_str_radix(v, radix).ok()
-}
-
-/// The response in `buf`, or `None` while more bytes are needed. `eof`: nothing more will come.
-pub(crate) fn parse_response(mut buf: &[u8], eof: bool) -> Result<Option<Response>, String> {
-    let mut interim = 0;
-    let (end, status, head) = loop {
-        let Some(end) = find(buf, b"\r\n\r\n") else {
-            return if eof {
-                Err("the connection closed inside the response headers".into())
-            } else {
-                Ok(None)
-            };
-        };
-        let head = std::str::from_utf8(&buf[..end]).map_err(|_| "non-UTF-8 response headers")?;
-        let status_line = head.split("\r\n").next().unwrap_or_default();
-        let mut parts = status_line.splitn(3, ' ');
-        let version = parts.next().unwrap_or_default();
-        if !version.starts_with("HTTP/1.") {
-            return Err("the server did not answer with HTTP/1.x".into());
-        }
-        let status: u16 = parts
-            .next()
-            .and_then(|s| number(s, 10))
-            .and_then(|s| u16::try_from(s).ok())
-            .ok_or("malformed HTTP status line")?;
-        if status == 101 {
-            return Err("the server switched protocols (HTTP 101)".into());
-        }
-        if !(100..200).contains(&status) {
-            break (end, status, head);
-        }
-        // An interim response (100 Continue): the real one follows.
-        interim += 1;
-        if interim > MAX_INTERIM {
-            return Err(format!("more than {MAX_INTERIM} interim (1xx) responses"));
-        }
-        buf = &buf[end + 4..];
+        let body = Limited::new(resp.into_body(), MAX_RESPONSE)
+            .collect()
+            .await
+            .map_err(|e| {
+                if e.is::<LengthLimitError>() {
+                    too_large()
+                } else {
+                    format!("reading the response: {e}")
+                }
+            })?
+            .to_bytes();
+        Ok(Response {
+            status: status.as_u16(),
+            body: body.to_vec(),
+        })
     };
-    let rest = &buf[end + 4..];
-    let lines = head.split("\r\n").skip(1);
-    let (mut chunked, mut length) = (false, None);
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let v = v.trim();
-        if k.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = v
-                .rsplit(',')
-                .next()
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("chunked"));
-        } else if k.eq_ignore_ascii_case("content-length") {
-            let n = number(v, 10).ok_or("malformed Content-Length header")?;
-            if length.is_some_and(|l| l != n) {
-                return Err("conflicting Content-Length headers".into());
-            }
-            length = Some(n);
-        }
-    }
-    let body = if chunked {
-        match dechunk(rest)? {
-            Some(b) => b,
-            None if eof => return Err("the connection closed inside a chunked body".into()),
-            None => return Ok(None),
-        }
-    } else if let Some(n) = length {
-        if n > MAX_RESPONSE {
-            return Err(format!("the response is larger than {MAX_RESPONSE} bytes"));
-        }
-        match rest.get(..n) {
-            Some(b) => b.to_vec(),
-            None if eof => return Err("the connection closed before Content-Length bytes".into()),
-            None => return Ok(None),
-        }
-    } else if eof {
-        rest.to_vec()
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(Response { status, body }))
-}
-
-/// Decodes a chunked body; `None` while incomplete. Trailers are ignored.
-fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let mut out = Vec::new();
+    let (mut reply, mut conn) = (pin!(reply), pin!(conn));
+    let mut closed = false;
     loop {
-        let Some(eol) = find(rest, b"\r\n") else {
-            return Ok(None);
-        };
-        let line = std::str::from_utf8(&rest[..eol]).map_err(|_| "malformed chunk size")?;
-        let size = line.split(';').next().unwrap_or_default().trim();
-        let size = number(size, 16).ok_or("malformed chunk size")?;
-        if size > MAX_RESPONSE {
-            return Err(format!("the response is larger than {MAX_RESPONSE} bytes"));
+        tokio::select! {
+            r = &mut reply => return r,
+            // Once the connection ends, a reply still waiting on it fails with the reason.
+            _ = &mut conn, if !closed => closed = true,
         }
-        rest = &rest[eol + 2..];
-        if size == 0 {
-            return Ok(Some(out));
-        }
-        if rest.len() < size + 2 {
-            return Ok(None);
-        }
-        if &rest[size..size + 2] != b"\r\n" {
-            return Err("malformed chunk".into());
-        }
-        out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn parses_urls() {
@@ -460,126 +379,163 @@ mod tests {
         assert_eq!(form(&[("a", "1"), ("b c", "x&y")]), "a=1&b%20c=x%26y");
     }
 
-    #[test]
-    fn request_bytes() {
+    /// Answers one request on an in-memory pipe with `reply`, then hangs up. Returns the outcome
+    /// and what the client sent.
+    async fn answer(
+        req: &Request,
+        reply: impl Into<Vec<u8>>,
+    ) -> (Result<Response, String>, String) {
+        let reply = reply.into();
+        let (mut server, client) = tokio::io::duplex(1 << 20);
+        let peer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().to_string())
+                        })
+                        .map_or(0, |v| v.parse::<usize>().unwrap());
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+                match server.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = server.write_all(&reply).await;
+            String::from_utf8(got).unwrap()
+        });
+        let r = exchange(client, req.to_http().unwrap()).await;
+        (r, peer.await.unwrap())
+    }
+
+    fn get() -> Request {
+        Request {
+            method: "GET",
+            url: Url::parse("http://localhost/").unwrap(),
+            headers: vec![],
+            body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_on_the_wire() {
         let r = Request {
             method: "POST",
             url: Url::parse("https://h.example/t/oauth2").unwrap(),
             headers: vec![("X-A", "b".into())],
             body: Some(("application/x-www-form-urlencoded", "a=1".into())),
         };
-        assert_eq!(
-            String::from_utf8(r.to_bytes()).unwrap(),
-            "POST /t/oauth2 HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\
-             Accept: application/json\r\nX-A: b\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=1"
-        );
+        let (resp, sent) = answer(&r, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await;
+        assert_eq!(resp.unwrap().body, b"{}");
+        let sent = sent.to_ascii_lowercase();
+        assert!(sent.starts_with("post /t/oauth2 http/1.1\r\n"), "{sent}");
+        for line in [
+            "host: h.example",
+            "connection: close",
+            "accept: application/json",
+            "x-a: b",
+            "content-type: application/x-www-form-urlencoded",
+            "content-length: 3",
+        ] {
+            assert!(
+                sent.contains(&format!("\r\n{line}\r\n")),
+                "{line} in {sent}"
+            );
+        }
+        assert!(sent.ends_with("\r\n\r\na=1"), "{sent}");
     }
 
     #[test]
-    fn content_length_response() {
-        let full = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello";
+    fn header_injection_is_refused_before_sending() {
+        let mut r = get();
+        r.headers = vec![("X-IDENTITY-HEADER", "s\r\nX-Evil: 1".into())];
+        assert!(r.to_http().unwrap_err().contains("control character"));
+        r.headers = vec![("Bad Name", "v".into())];
+        assert!(r.to_http().is_err());
+    }
+
+    #[test]
+    fn credential_headers_are_sensitive() {
+        let mut r = get();
+        r.headers = vec![("X-IDENTITY-HEADER", "secret".into())];
+        let h = r.to_http().unwrap();
+        assert!(h.headers()["x-identity-header"].is_sensitive());
+        assert!(!format!("{:?}", h.headers()).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn content_length_and_chunked_responses() {
+        let (r, _) = answer(
+            &get(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello",
+        )
+        .await;
         assert_eq!(
-            parse_response(full, false).unwrap(),
-            Some(Response {
+            r.unwrap(),
+            Response {
                 status: 200,
                 body: b"hello".to_vec()
-            })
+            }
         );
-        assert_eq!(
-            parse_response(&full[..full.len() - 1], false).unwrap(),
-            None
-        );
-        assert!(parse_response(&full[..full.len() - 1], true).is_err());
-        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\n", false).unwrap(), None);
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\n", true).is_err());
-    }
-
-    #[test]
-    fn chunked_response() {
-        let full = b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n\
-                     4;ext=1\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        let r = parse_response(full, false).unwrap().unwrap();
+        let (r, _) = answer(
+            &get(),
+            "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n\
+             4;ext=1\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        )
+        .await;
+        let r = r.unwrap();
         assert_eq!(
             (r.status, r.body.as_slice()),
             (400, b"wikipedia".as_slice())
         );
-        assert_eq!(parse_response(&full[..60], false).unwrap(), None);
-        assert!(parse_response(&full[..60], true).is_err());
-        assert!(parse_response(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
-            false
-        )
-        .is_err());
     }
 
-    #[test]
-    fn body_until_close_and_interim_responses() {
-        let r = parse_response(b"HTTP/1.0 200 OK\r\n\r\n{}", true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(r.body, b"{}");
-        assert_eq!(
-            parse_response(b"HTTP/1.0 200 OK\r\n\r\n{}", false).unwrap(),
-            None
-        );
-        let r = parse_response(
-            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
-            false,
+    #[tokio::test]
+    async fn body_until_close_and_interim_responses() {
+        let (r, _) = answer(&get(), "HTTP/1.0 200 OK\r\n\r\n{}").await;
+        assert_eq!(r.unwrap().body, b"{}");
+        let (r, _) = answer(
+            &get(),
+            "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(r.status, 204);
-        assert!(parse_response(b"SSH-2.0\r\n\r\n", true).is_err());
+        .await;
+        assert_eq!(r.unwrap().status, 204);
     }
 
-    #[test]
-    fn interim_responses_are_capped_and_101_is_refused() {
-        let five = "HTTP/1.1 100 Continue\r\n\r\n".repeat(5);
-        let ok = format!("{five}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-        assert_eq!(
-            parse_response(ok.as_bytes(), false).unwrap().unwrap().body,
-            b"ok"
-        );
-        let six = format!("{five}HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n");
-        assert!(parse_response(six.as_bytes(), true)
-            .unwrap_err()
-            .contains("interim"));
-        // A long run of interim heads fails cleanly instead of recursing.
-        let many = "HTTP/1.1 100 Continue\r\n\r\n".repeat(5000);
-        assert!(parse_response(many.as_bytes(), false).is_err());
-        assert!(parse_response(
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n",
-            false
-        )
-        .unwrap_err()
-        .contains("101"));
-    }
-
-    #[test]
-    fn signed_or_conflicting_lengths_are_refused() {
+    #[tokio::test]
+    async fn malformed_or_truncated_responses_are_errors() {
         for bad in [
-            &b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok"[..],
-            b"HTTP/1.1 200 OK\r\nContent-Length: -0\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nokk",
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\n\r\nok",
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+2\r\nok\r\n0\r\n\r\n",
-            b"HTTP/1.1 +200 OK\r\nContent-Length: 0\r\n\r\n",
+            "SSH-2.0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhell",
+            "HTTP/1.1 200 OK\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwi",
+            "HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nokk",
+            "HTTP/1.1 +200 OK\r\nContent-Length: 0\r\n\r\n",
         ] {
-            assert!(
-                parse_response(bad, true).is_err(),
-                "{}",
-                String::from_utf8_lossy(bad)
-            );
+            let (r, _) = answer(&get(), bad).await;
+            assert!(r.is_err(), "{bad:?} gave {r:?}");
         }
-        // The same length twice is harmless.
-        let r = parse_response(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",
-            false,
+    }
+
+    #[tokio::test]
+    async fn switching_protocols_is_refused() {
+        let (r, _) = answer(
+            &get(),
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n",
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(r.body, b"ok");
+        .await;
+        assert!(r.unwrap_err().contains("101"));
     }
 
     #[test]
@@ -598,38 +554,44 @@ mod tests {
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }
 
-    #[test]
-    fn oversized_responses_are_refused() {
+    #[tokio::test]
+    async fn oversized_responses_are_refused() {
         let big = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
             MAX_RESPONSE + 1
         );
-        assert!(parse_response(big.as_bytes(), false).is_err());
+        let (r, _) = answer(&get(), big).await;
+        assert!(r.unwrap_err().contains("larger than"));
+        let chunk = format!("{:x}\r\n{}\r\n", 1000, "a".repeat(1000));
+        let stream = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n",
+            chunk.repeat(100)
+        );
+        let (r, _) = answer(&get(), stream).await;
+        assert!(r.unwrap_err().contains("larger than"));
+        // A head that does not fit the buffer.
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nX: {}\r\n\r\n",
+            "a".repeat(4 * MAX_RESPONSE)
+        );
+        let (r, _) = answer(&get(), head).await;
+        assert!(r.is_err(), "{r:?}");
     }
 
     #[tokio::test]
-    async fn oversized_stream_is_cut_off() {
-        let (mut server, client) = tokio::io::duplex(1 << 20);
+    async fn sends_over_loopback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let mut sink = [0u8; 1024];
-            let _ = server.read(&mut sink).await;
-            let _ = server
-                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await;
-            let chunk = format!("{:x}\r\n{}\r\n", 1000, "a".repeat(1000));
-            for _ in 0..100 {
-                if server.write_all(chunk.as_bytes()).await.is_err() {
-                    return;
-                }
-            }
         });
-        let req = Request {
-            method: "GET",
-            url: Url::parse("http://localhost/").unwrap(),
-            headers: vec![],
-            body: None,
-        };
-        let e = exchange(client, &req).await.unwrap_err();
-        assert!(e.contains("larger than"), "{e}");
+        let mut r = get();
+        r.url = Url::parse(&format!("http://127.0.0.1:{port}/msi/token")).unwrap();
+        assert_eq!(send(&r).await.unwrap().body, b"ok");
     }
 }

@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use aqueduct_sinks::{OpCounts, RouteCount};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A route's outcomes per second: `[produced, filtered, fallback, errors]`.
 pub type Outcomes = [u64; 4];

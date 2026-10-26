@@ -16,7 +16,7 @@ a container (Docker or Podman). Keep every feature working inside the distroless
 | `aqueduct-source-mongodb` | MongoDB change-stream source; resume token as the `Position` |
 | `aqueduct-sinks` | Kafka sink and the Kafka-backed event inspector reader (`rskafka`, pure Rust). Kafka is the only sink |
 | `aqueduct-tls` | Shared rustls client config (ring, no OpenSSL) used by the Postgres source and the Kafka sink |
-| `aqueduct` | Binary: TOML config, file checkpoint, admin HTTP server (`admin.rs`, `admin.html`, `admin.css`) |
+| `aqueduct` | Binary: TOML config, file checkpoint, admin HTTP server (`admin/`, `admin.html`, `admin.css`) |
 | `aqueduct-bench` | Throughput benchmark of the pipeline (null or Kafka sink) |
 
 `docs/ARCHITECTURE.md` has Mermaid diagrams of the components, the at-least-once loop and the crate graph.
@@ -116,7 +116,8 @@ TAILWIND=/path/to/tailwindcss crates/aqueduct/ui/build.sh
 ```
 
 Class names built in JS must appear as literals in `admin.html`, or Tailwind will not generate them.
-The server is a hand-written tokio HTTP loop (no framework); add routes in `admin.rs::handle` and cover them in its tests.
+The server is hyper HTTP/1.1 (`admin/server.rs`: limits, timeouts, accept loop); add routes in `admin/api.rs::route` and
+cover them in `admin/tests.rs`.
 
 ## Conventions
 

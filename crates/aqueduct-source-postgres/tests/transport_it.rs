@@ -5,6 +5,8 @@
 //! AQUEDUCT_TEST_PG_PLAIN=localhost:5434
 //! cargo test -p aqueduct-source-postgres --test transport_it -- --ignored
 //! ```
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 

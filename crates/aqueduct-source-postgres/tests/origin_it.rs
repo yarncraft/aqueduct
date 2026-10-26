@@ -10,6 +10,8 @@
 //! Startup must refuse a checkpoint from another cluster, another timeline or another database of
 //! the same cluster, before it looks up or creates the slot, and must accept a checkpoint written
 //! before the check existed.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Error, Position, Source};

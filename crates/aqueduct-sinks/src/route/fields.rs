@@ -18,8 +18,8 @@ use std::fmt::{self, Write as _};
 
 use aqueduct_core::{Error, Result};
 use ring::hmac;
-use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
 
 /// Shortest accepted hash key, in bytes (HMAC-SHA256 wants at least the digest size).
@@ -244,13 +244,17 @@ impl FieldOps {
             if spec.exclude.as_ref().is_some_and(|e| e.contains(c)) {
                 return Err(bad(
                     route,
-                    format!("`{c}` is in `exclude` and in `{key}`; an excluded column is dropped, so `{key}` has no effect"),
+                    format!(
+                        "`{c}` is in `exclude` and in `{key}`; an excluded column is dropped, so `{key}` has no effect"
+                    ),
                 ));
             }
             if spec.include.as_ref().is_some_and(|i| !i.contains(c)) {
                 return Err(bad(
                     route,
-                    format!("`{c}` is in `{key}` but not in `include`, so it is dropped and `{key}` has no effect"),
+                    format!(
+                        "`{c}` is in `{key}` but not in `include`, so it is dropped and `{key}` has no effect"
+                    ),
                 ));
             }
         }
@@ -262,7 +266,9 @@ impl FieldOps {
             if spec.rename.contains_key(to) {
                 return Err(bad(
                     route,
-                    format!("`rename` target `{to}` is also a renamed column; chains and swaps are not supported"),
+                    format!(
+                        "`rename` target `{to}` is also a renamed column; chains and swaps are not supported"
+                    ),
                 ));
             }
             if targets.contains(&to.as_str()) {
@@ -626,9 +632,10 @@ mod tests {
         );
         let d = hex(b"x");
         assert_eq!(d.len(), 64);
-        assert!(d
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(
+            d.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
     }
 
     #[test]
@@ -859,9 +866,11 @@ mod tests {
             assert!(e.contains("sink route `r`"), "{e}");
         }
         // No operation: the fast path.
-        assert!(FieldOps::compile("r", &FieldSpec::default())
-            .unwrap()
-            .is_none());
+        assert!(
+            FieldOps::compile("r", &FieldSpec::default())
+                .unwrap()
+                .is_none()
+        );
         assert!(
             FieldOps::compile("r", &spec(None, Some(&[]), &[], &[], &[]))
                 .unwrap()

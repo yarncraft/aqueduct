@@ -43,7 +43,7 @@ impl Lane {
     pub(crate) fn push(
         &self,
         records: Vec<Record>,
-    ) -> impl Future<Output = Result<()>> + Send + 'static {
+    ) -> impl Future<Output = Result<()>> + Send + 'static + use<> {
         let (done, rx) = oneshot::channel();
         // A send fails only when the task is gone; `rx` then reports it below.
         let _ = self.tx.send(Part { records, done });

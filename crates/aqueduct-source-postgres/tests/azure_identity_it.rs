@@ -19,15 +19,17 @@
 //! ```
 //!
 //! Every variable must be set: a test fails when one is missing.
-use std::sync::atomic::{AtomicUsize, Ordering};
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aqueduct_core::{Op, Source};
 use aqueduct_source_postgres::{AzureCredential, PostgresSource, PostgresSourceConfig, SourceAuth};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_postgres::error::SqlState;
 use tokio_postgres::Client;
+use tokio_postgres::error::SqlState;
 
 const ROLE: &str = "aq_clear";
 const ROLE_PASSWORD: &str = "aq";
@@ -91,7 +93,13 @@ async fn identity_endpoint(token: &'static str) -> (String, Arc<AtomicUsize>) {
                 let head = String::from_utf8_lossy(&buf);
                 let ok = head.starts_with(
                     "GET /msi/token?api-version=2019-08-01&resource=https%3A%2F%2Fossrdbms-aad.database.windows.net HTTP/1.1\r\n",
-                ) && head.contains(&format!("\r\nX-IDENTITY-HEADER: {IDENTITY_HEADER}\r\n"));
+                ) && head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    // Header names are case-insensitive (hyper sends them in lower case).
+                    .any(|(k, v)| {
+                        k.eq_ignore_ascii_case("x-identity-header") && v.trim() == IDENTITY_HEADER
+                    });
                 let (status, body) = if ok {
                     count.fetch_add(1, Ordering::SeqCst);
                     let exp = std::time::SystemTime::now()

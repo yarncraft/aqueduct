@@ -1,7 +1,6 @@
 //! The Kafka [`Sink`](aqueduct_core::Sink) (the only sink) and the Kafka-backed
 //! event inspector. Events are encoded as one JSON object per record, in the shape of
 //! Debezium's change event envelope ([`encode`]).
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod inspect;
 mod kafka;
@@ -11,15 +10,15 @@ mod topic_stats;
 
 pub use inspect::{InspectedEvent, Inspection, KafkaInspector};
 pub use kafka::{
-    glob_match, KafkaSasl, KafkaSecurity, KafkaSink, PartitionBy, RecordTimestamp, SaslMechanism,
-    DEFAULT_IN_FLIGHT_BATCHES, MAX_IN_FLIGHT_BATCHES,
+    DEFAULT_IN_FLIGHT_BATCHES, KafkaSasl, KafkaSecurity, KafkaSink, MAX_IN_FLIGHT_BATCHES,
+    PartitionBy, RecordTimestamp, SaslMechanism, glob_match,
 };
 pub use route::{
-    ContentTopic, FieldSpec, HashKey, KafkaRoute, Otherwise, OutRecord, OutboxSpec, RouteCount,
-    RouteCounts, RouteDescription, RoutePlan, RouteStats, RoutesDescription,
-    DEFAULT_MAX_DYNAMIC_TOPICS, HASH_KEY_ID_HEADER, MIN_HASH_KEY_BYTES,
+    ContentTopic, DEFAULT_MAX_DYNAMIC_TOPICS, FieldSpec, HASH_KEY_ID_HEADER, HashKey, KafkaRoute,
+    MIN_HASH_KEY_BYTES, Otherwise, OutRecord, OutboxSpec, RouteCount, RouteCounts,
+    RouteDescription, RoutePlan, RouteStats, RoutesDescription,
 };
-pub use topic_stats::{TopicStats, MAX_TRACKED_TOPICS, OTHER_TOPICS};
+pub use topic_stats::{MAX_TRACKED_TOPICS, OTHER_TOPICS, TopicStats};
 
 use aqueduct_core::{ChangeEvent, Error, Op, Result};
 use serde::Serialize;

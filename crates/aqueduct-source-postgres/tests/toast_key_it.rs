@@ -10,12 +10,14 @@
 //! `RelationCache::key_with_old` takes it from the old key tuple, so the update keeps the key its
 //! insert had, and the row stays on one Kafka partition. The unit tests pin that logic on
 //! hand-built tuples; this test checks that a real server actually sends the old key.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Op, Source};
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
-use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
+use tokio_postgres::error::SqlState;
 
 fn addr() -> String {
     std::env::var("AQUEDUCT_TEST_PG_PLAIN")

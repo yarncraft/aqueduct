@@ -2,7 +2,7 @@
 # rust:1-bookworm, pinned by digest (multi-arch index). Bump deliberately.
 FROM rust:1-bookworm@sha256:5c1a1732ac3f77635b24d397ceb67b4d9ea61de348f68c0aa54a79fd01e65c69 AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
 COPY crates ./crates
 # No cache mount on /src/target: cargo trusts mtimes, so a persistent target dir can silently
 # reuse a stale binary after the sources change.

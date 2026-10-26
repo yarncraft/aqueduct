@@ -40,13 +40,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aqueduct_core::{ChunkRow, Mark, Outcome, SkippedTable, SnapState, SnapshotStatus, Window};
 use aqueduct_core::{Error, Result};
-use mongodb::bson::{doc, Bson, DateTime, Document};
+use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::options::{
     Acknowledgment, Hint, ReadConcern, ReadPreference, SelectionCriteria, WriteConcern,
 };
 use mongodb::{Client, ClientSession};
-use serde_json::value::{to_raw_value, RawValue};
 use serde_json::Value;
+use serde_json::value::{RawValue, to_raw_value};
 
 use crate::mapping::map_event;
 

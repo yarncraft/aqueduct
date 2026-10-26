@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use aqueduct_core::{Error, Result};
 use aqueduct_tls::Verify;
-use tokio_postgres::config::Host;
 use tokio_postgres::Config;
+use tokio_postgres::config::Host;
 
 /// libpq-compatible `sslmode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,7 +36,7 @@ impl FromStr for SslMode {
             other => {
                 return Err(format!(
                     "invalid sslmode `{other}` (expected disable, prefer, require, verify-ca or verify-full)"
-                ))
+                ));
             }
         })
     }

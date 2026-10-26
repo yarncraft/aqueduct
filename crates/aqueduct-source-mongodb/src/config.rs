@@ -99,15 +99,16 @@ impl MongoConfig {
                 crate::snapshot::WATERMARK_COLLECTION
             ));
         }
-        if let Some(cs) = self.connection_string() {
-            if transport(&cs) == (Transport::Plaintext { explicit: false }) && !is_local(&cs) {
-                return Err(
-                    "source.uri connects to a non-loopback MongoDB host without TLS, so \
+        if let Some(cs) = self.connection_string()
+            && transport(&cs) == (Transport::Plaintext { explicit: false })
+            && !is_local(&cs)
+        {
+            return Err(
+                "source.uri connects to a non-loopback MongoDB host without TLS, so \
                     documents and credentials would cross the network in cleartext; add tls=true \
                     to the URI, or tls=false to accept plaintext explicitly"
-                        .into(),
-                );
-            }
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -214,12 +215,14 @@ mod tests {
         let c: MongoConfig =
             toml_like(r#"{"uri":"mongodb://h/?tls=true","database":"app","snapshot":"initial"}"#);
         assert_eq!(c.snapshot, SnapshotMode::Initial);
-        assert!(serde_json::from_str::<MongoConfig>(
-            r#"{"uri":"mongodb://h/","database":"app","snapshot":"always"}"#
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("on_demand"));
+        assert!(
+            serde_json::from_str::<MongoConfig>(
+                r#"{"uri":"mongodb://h/","database":"app","snapshot":"always"}"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("on_demand")
+        );
         let mut c = c;
         c.snapshot_chunk_size = 0;
         assert!(c.validate().unwrap_err().contains("snapshot_chunk_size"));

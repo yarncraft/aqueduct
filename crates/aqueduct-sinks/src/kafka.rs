@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::lane::Lane;
 #[cfg(test)]
@@ -472,10 +472,10 @@ impl KafkaSink {
                 );
                 let retry = create(1).await;
                 // The fallback is an explicit factor of 1: anything but success fails.
-                if after_create(Some(1), create_outcome(&retry)) != AfterCreate::Created {
-                    if let Err(e) = &retry {
-                        return Err(failed(&retry, e));
-                    }
+                if after_create(Some(1), create_outcome(&retry)) != AfterCreate::Created
+                    && let Err(e) = &retry
+                {
+                    return Err(failed(&retry, e));
                 }
             }
             AfterCreate::Reject => {
@@ -673,11 +673,12 @@ async fn counted(
 /// content-routed topic (`rerouted`: the refused topic and the fallback), so it stays behind the
 /// delete without a second create attempt. Its count went with the delete.
 fn follow_reroute(out: &mut OutRecord, rerouted: Option<(String, String)>) {
-    if let Some((from, to)) = rerouted {
-        if out.content.as_ref().is_some_and(|c| c.tombstone) && out.topic == from {
-            out.topic = to;
-            out.content = None;
-        }
+    if let Some((from, to)) = rerouted
+        && out.content.as_ref().is_some_and(|c| c.tombstone)
+        && out.topic == from
+    {
+        out.topic = to;
+        out.content = None;
     }
 }
 
@@ -865,9 +866,10 @@ mod tests {
             tls_ca_file: Some("/nope.pem".into()),
             sasl: None,
         };
-        assert!(bad
-            .apply(ClientBuilder::new(vec!["b:9093".into()]))
-            .is_err());
+        assert!(
+            bad.apply(ClientBuilder::new(vec!["b:9093".into()]))
+                .is_err()
+        );
     }
 
     fn rec(n: usize) -> Record {

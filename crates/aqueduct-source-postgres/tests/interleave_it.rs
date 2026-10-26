@@ -10,13 +10,15 @@
 //! change record, so positions are not monotonic across transactions. `queue()` drops every
 //! change at or below the last emitted position; this test overlaps two writers to see whether
 //! that drops a row. Every other integration test runs one transaction at a time.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aqueduct_core::{ChangeEvent, Op, Position, Source};
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
-use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
+use tokio_postgres::error::SqlState;
 
 /// Drops a slot. Dropping a source does not close its connection at once, so the slot can still
 /// be active (55006) for a moment; retry instead of failing the test.

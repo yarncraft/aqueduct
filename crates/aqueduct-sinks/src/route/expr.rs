@@ -49,11 +49,7 @@ pub enum Tri {
 
 impl Tri {
     fn from_bool(b: bool) -> Self {
-        if b {
-            Tri::True
-        } else {
-            Tri::False
-        }
+        if b { Tri::True } else { Tri::False }
     }
     fn not(self) -> Self {
         match self {
@@ -158,10 +154,10 @@ impl FieldRef {
             ("schema", true) => Source::Schema,
             ("table", true) => Source::Table,
             ("op" | "schema" | "table", false) => {
-                return Err(format!("`{head}` has no sub-fields (in `{text}`)"))
+                return Err(format!("`{head}` has no sub-fields (in `{text}`)"));
             }
             ("before" | "after" | "row", true) => {
-                return Err(format!("`{head}` needs a column: `{head}.<column>`"))
+                return Err(format!("`{head}` needs a column: `{head}.<column>`"));
             }
             ("before", false) => Source::Before,
             ("after", false) => Source::After,
@@ -169,7 +165,7 @@ impl FieldRef {
             _ => {
                 return Err(format!(
                     "unknown field `{text}`: use op, schema, table, before.<col>, after.<col> or row.<col>"
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -459,14 +455,14 @@ impl Dec {
                     Ordering::Greater
                 } else {
                     Ordering::Less
-                }
+                };
             }
             (false, true) => {
                 return if self.neg {
                     Ordering::Less
                 } else {
                     Ordering::Greater
-                }
+                };
             }
             _ => {}
         }
@@ -841,7 +837,7 @@ fn lex(s: &str) -> Result<Vec<Token>, ParseError> {
                         "unexpected character `{}`",
                         s.get(pos..).map_or('?', first_char)
                     ),
-                )
+                );
             }
         };
         out.push(Token { tok, pos });
@@ -946,7 +942,7 @@ impl Parser<'_> {
                 return perr(
                     pos,
                     "expected a field (op, schema, table, before.x, after.x, row.x) or `(`",
-                )
+                );
             }
             None => return perr(pos, "unexpected end of expression"),
         };
@@ -974,17 +970,17 @@ impl Parser<'_> {
                 check_metadata(&field, lit, *at)?;
             }
             let lits: Vec<Lit> = lits.into_iter().map(|(l, _)| l).collect();
-            if let Some(first) = lits.first() {
-                if let Some(other) = lits.iter().find(|l| l.kind() != first.kind()) {
-                    return perr(
-                        pos,
-                        format!(
-                            "`in` mixes a {} and a {}; all items must have one type",
-                            first.kind(),
-                            other.kind()
-                        ),
-                    );
-                }
+            if let Some(first) = lits.first()
+                && let Some(other) = lits.iter().find(|l| l.kind() != first.kind())
+            {
+                return perr(
+                    pos,
+                    format!(
+                        "`in` mixes a {} and a {}; all items must have one type",
+                        first.kind(),
+                        other.kind()
+                    ),
+                );
             }
             return Ok(Node::In(field, lits));
         }
@@ -1008,7 +1004,7 @@ impl Parser<'_> {
                     return perr(
                         lit_pos,
                         "ordering a string is not supported (timestamp text does not sort reliably): use == / != / in",
-                    )
+                    );
                 }
                 Lit::Bool(_) => return perr(lit_pos, "a boolean only supports == and !="),
                 Lit::Num(_) => {}

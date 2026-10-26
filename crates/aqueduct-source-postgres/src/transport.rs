@@ -8,7 +8,7 @@
 use aqueduct_core::{Error, Result};
 use async_trait::async_trait;
 
-use crate::decoder::{decode, Message};
+use crate::decoder::{Message, decode};
 use crate::replication::{Replication, ReplicationHandle};
 
 /// Decoded messages, each with the LSN of its WAL record, in stream order.
@@ -83,7 +83,7 @@ impl StreamTransport {
                     messages,
                     caught_up: self.caught_up,
                     server_wal_end: self.server_wal_end,
-                })
+                });
             }
         };
         loop {
@@ -143,7 +143,7 @@ impl Transport for StreamTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replication::{streaming, StreamOptions};
+    use crate::replication::{StreamOptions, streaming};
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 

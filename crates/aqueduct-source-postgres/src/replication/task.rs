@@ -19,12 +19,12 @@
 //! task is stalled is read only when space frees up; the timer keeps the server satisfied
 //! meanwhile.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aqueduct_core::{Error, Result};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::client::{ReplicationStream, StatusSender};

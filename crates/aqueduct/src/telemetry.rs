@@ -13,25 +13,30 @@
 //! - **Never in the way.** The SDK exports from its own threads; log records go into a bounded
 //!   queue that drops when full; every request has a timeout. A failing collector is logged once
 //!   (and once more when it answers again); the data in between is dropped.
-//! - Transport: a small blocking HTTP/1.1 client on `std::net`, with TLS from `aqueduct-tls`
-//!   (rustls, ring) for `https://` endpoints, so no HTTP stack or gRPC comes in. `grpc` is
+//! - Transport: hyper's HTTP/1.1 client on a one-worker tokio runtime of its own, with TLS from
+//!   `aqueduct-tls` (rustls, ring) for `https://` endpoints; no gRPC stack comes in. `grpc` is
 //!   refused with a clear error; the Collector's OTLP/HTTP receiver listens on 4318.
 
 use std::any::Any;
 use std::collections::HashSet;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use opentelemetry::metrics::{Meter, MeterProvider as _};
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::header::{self, HeaderValue};
+use hyper_util::rt::TokioIo;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{Protocol, WithExportConfig as _, WithHttpConfig as _};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::Resource;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
+use tokio_rustls::TlsConnector;
 
 use crate::config::TelemetryConfig;
 
@@ -373,11 +378,12 @@ pub fn parse_exposition(text: &str) -> Vec<Family> {
             } else {
                 Kind::Gauge
             };
-        } else if !line.is_empty() && !line.starts_with('#') {
-            if let Some((name, sample)) = parse_sample(line) {
-                let i = family(&mut families, name);
-                families[i].samples.push(sample);
-            }
+        } else if !line.is_empty()
+            && !line.starts_with('#')
+            && let Some((name, sample)) = parse_sample(line)
+        {
+            let i = family(&mut families, name);
+            families[i].samples.push(sample);
         }
     }
     families
@@ -445,10 +451,10 @@ impl Latest {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, families)) = cache.as_ref() {
-            if at.elapsed() < EXPOSITION_TTL {
-                return families.clone();
-            }
+        if let Some((at, families)) = cache.as_ref()
+            && at.elapsed() < EXPOSITION_TTL
+        {
+            return families.clone();
         }
         let families = Arc::new(parse_exposition(&(self.exposition)()));
         *cache = Some((Instant::now(), families.clone()));
@@ -531,8 +537,8 @@ impl Bridge {
     }
 }
 
-/// OTLP/HTTP transport: one short-lived HTTP/1.1 connection per export, on the SDK's export
-/// thread. Logs the first failure of an outage and the recovery, nothing in between.
+/// OTLP/HTTP transport: one short-lived HTTP/1.1 connection per export, run on [`runtime`].
+/// Logs the first failure of an outage and the recovery, nothing in between.
 #[derive(Debug)]
 struct OtlpHttp {
     signal: &'static str,
@@ -544,13 +550,13 @@ struct OtlpHttp {
 #[async_trait::async_trait]
 impl HttpClient for OtlpHttp {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let res = post(&request, self.timeout, self.tls.as_ref());
+        let at = origin(&request.uri().to_string());
+        let res = send(request, self.timeout, self.tls.clone()).await;
         let problem = match &res {
             Ok(r) if r.status().is_success() => None,
             Ok(r) => Some(format!("HTTP {}", r.status())),
             Err(e) => Some(e.to_string()),
         };
-        let at = origin(&request.uri().to_string());
         match problem {
             Some(error) if !self.failing.swap(true, Ordering::Relaxed) => tracing::warn!(
                 signal = self.signal,
@@ -568,154 +574,104 @@ impl HttpClient for OtlpHttp {
     }
 }
 
-fn post(
-    req: &Request<Bytes>,
+/// The SDK calls the client from its own threads, outside any tokio runtime, so the requests
+/// run here: one worker, kept apart from the pipeline's runtime. `None` if it could not start.
+fn runtime() -> Option<&'static Runtime> {
+    static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("otlp-http")
+                .enable_all()
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// [`post`] on [`runtime`], awaitable from any executor.
+async fn send(
+    req: Request<Bytes>,
     timeout: Duration,
-    tls: Option<&Arc<rustls::ClientConfig>>,
+    tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Response<Bytes>, HttpError> {
-    let uri = req.uri();
+    let rt = runtime().ok_or("the OTLP client runtime did not start")?;
+    rt.spawn(async move {
+        tokio::time::timeout(timeout, post(req, tls))
+            .await
+            .map_err(|_| format!("no response within {}s", timeout.as_secs_f32()))?
+    })
+    .await?
+}
+
+async fn post(
+    req: Request<Bytes>,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<Response<Bytes>, HttpError> {
+    let (parts, body) = req.into_parts();
+    let uri = &parts.uri;
     let host = uri.host().ok_or("endpoint has no host")?;
     let https = uri.scheme_str() == Some("https");
     let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let mut last = None;
-    let mut tcp = None;
-    for addr in (bare, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(s) => {
-                tcp = Some(s);
-                break;
-            }
-            Err(e) => last = Some(e),
-        }
-    }
-    let tcp = match (tcp, last) {
-        (Some(s), _) => s,
-        (None, Some(e)) => return Err(e.into()),
-        (None, None) => return Err(format!("{bare}: no address").into()),
-    };
-    tcp.set_read_timeout(Some(timeout))?;
-    tcp.set_write_timeout(Some(timeout))?;
-    let _ = tcp.set_nodelay(true);
-
-    let path = uri.path_and_query().map_or("/", |p| p.as_str());
     // Built from host and port, never `uri.authority()`, which would carry userinfo.
     let authority = match uri.port_u16() {
         Some(p) => format!("{host}:{p}"),
         None => host.to_string(),
     };
-    let mut head = format!(
-        "{} {path} HTTP/1.1\r\nhost: {authority}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        req.method(),
-        req.body().len()
-    );
-    for (name, value) in req.headers() {
-        if matches!(name.as_str(), "host" | "content-length" | "connection") {
+
+    let mut out = hyper::Request::new(Full::new(body));
+    *out.method_mut() = parts.method.clone();
+    *out.uri_mut() = uri.path_and_query().map_or("/", |p| p.as_str()).parse()?;
+    let headers = out.headers_mut();
+    for (name, value) in &parts.headers {
+        if matches!(
+            name.as_str(),
+            "host" | "content-length" | "connection" | "transfer-encoding"
+        ) {
             continue;
         }
-        if let Ok(v) = value.to_str() {
-            head.push_str(&format!("{name}: {v}\r\n"));
-        }
+        // The exporter's headers may carry the collector's credentials (OTEL_EXPORTER_OTLP_HEADERS).
+        let mut value = value.clone();
+        value.set_sensitive(true);
+        headers.append(name.clone(), value);
     }
-    head.push_str("\r\n");
+    headers.insert(header::HOST, HeaderValue::from_str(&authority)?);
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
 
+    let tcp = TcpStream::connect((bare, port)).await?;
+    let _ = tcp.set_nodelay(true);
     if https {
         let cfg = tls.ok_or("https endpoint without a TLS config")?;
         let name = rustls::pki_types::ServerName::try_from(bare.to_string())?;
-        let conn = rustls::ClientConnection::new(cfg.clone(), name)?;
-        exchange(rustls::StreamOwned::new(conn, tcp), &head, req.body())
+        let stream = TlsConnector::from(cfg).connect(name, tcp).await?;
+        exchange(stream, out).await
     } else {
-        exchange(tcp, &head, req.body())
+        exchange(tcp, out).await
     }
 }
 
-fn exchange(
-    mut s: impl Read + Write,
-    head: &str,
-    body: &[u8],
+/// Sends `request` over `io` and reads the reply, its body capped at [`MAX_RESPONSE`]. The
+/// connection is driven here rather than spawned, so it ends with the call.
+async fn exchange<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    io: S,
+    request: hyper::Request<Full<Bytes>>,
 ) -> Result<Response<Bytes>, HttpError> {
-    s.write_all(head.as_bytes())?;
-    s.write_all(body)?;
-    s.flush()?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = match s.read(&mut chunk) {
-            Ok(n) => n,
-            // A TLS peer that closes without close_notify: whatever arrived is all there is.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-            Err(e) => return Err(e.into()),
-        };
-        if n == 0 {
-            return parse_response(&buf, true)?.ok_or_else(|| "truncated response".into());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_RESPONSE {
-            return Err("response too large".into());
-        }
-        if let Some(r) = parse_response(&buf, false)? {
-            return Ok(r);
-        }
-    }
-}
-
-/// The response in `buf`, once it is complete (by `content-length`, chunked framing, or at EOF).
-fn parse_response(buf: &[u8], eof: bool) -> Result<Option<Response<Bytes>>, HttpError> {
-    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return Ok(None);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let reply = async {
+        let (parts, body) = sender.send_request(request).await?.into_parts();
+        let body = Limited::new(body, MAX_RESPONSE).collect().await?.to_bytes();
+        Ok::<_, HttpError>(Response::from_parts(parts, body))
     };
-    let head = std::str::from_utf8(&buf[..end])?;
-    let mut lines = head.split("\r\n");
-    let status: u16 = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .ok_or("bad status line")?;
-    let mut res = Response::builder().status(status);
-    let (mut length, mut chunked) = (None, false);
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let (k, v) = (k.trim(), v.trim());
-        if k.eq_ignore_ascii_case("content-length") {
-            length = v.parse::<usize>().ok();
-        } else if k.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = v.to_ascii_lowercase().contains("chunked");
-        }
-        res = res.header(k, v);
-    }
-    let raw = &buf[end + 4..];
-    let body = if chunked {
-        dechunk(raw)
-    } else if let Some(n) = length {
-        (raw.len() >= n).then(|| raw[..n].to_vec())
-    } else {
-        eof.then(|| raw.to_vec())
-    };
-    match body {
-        Some(b) => Ok(Some(res.body(Bytes::from(b))?)),
-        None if eof => Err("truncated response".into()),
-        None => Ok(None),
-    }
-}
-
-/// The body of a complete chunked message, or `None` while chunks are still missing.
-fn dechunk(mut raw: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+    let (mut reply, mut conn) = (std::pin::pin!(reply), std::pin::pin!(conn));
+    let mut closed = false;
     loop {
-        let eol = raw.windows(2).position(|w| w == b"\r\n")?;
-        let size = std::str::from_utf8(&raw[..eol]).ok()?;
-        let size = usize::from_str_radix(size.split(';').next()?.trim(), 16).ok()?;
-        raw = &raw[eol + 2..];
-        if size == 0 {
-            return Some(out);
+        tokio::select! {
+            r = &mut reply => return r,
+            // Once the connection ends, a reply still waiting on it fails with the reason.
+            _ = &mut conn, if !closed => closed = true,
         }
-        if raw.len() < size + 2 {
-            return None;
-        }
-        out.extend_from_slice(&raw[..size]);
-        raw = &raw[size + 2..];
     }
 }
 
@@ -724,7 +680,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -966,8 +922,8 @@ mod tests {
     /// attributes, under the exact Prometheus names; families that appear later are picked up.
     #[test]
     fn the_bridge_reports_the_exposition_through_the_sdk() {
-        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
         use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 
         let text = Arc::new(Mutex::new(String::from(
             "# HELP aqueduct_events_total Events.\n\
@@ -1050,6 +1006,7 @@ mod tests {
 
     /// A one-shot HTTP server that answers `reply` and hands back the request it got.
     fn serve_once(reply: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
@@ -1083,7 +1040,7 @@ mod tests {
     fn posts_the_body_with_headers_and_reads_the_reply() {
         let (url, server) =
             serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: x\r\n\r\nokEXTRA");
-        let res = post(&request(&url), Duration::from_secs(5), None).unwrap();
+        let res = block_on(send(request(&url), Duration::from_secs(5), None)).unwrap();
         assert_eq!(res.status(), 200);
         assert_eq!(res.body().as_ref(), b"ok");
         let got = String::from_utf8(server.join().unwrap()).unwrap();
@@ -1102,27 +1059,48 @@ mod tests {
         let (url, server) = serve_once(
             b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\nRetry-After: 3\r\n\r\n4\r\nbusy\r\n0\r\n\r\n",
         );
-        let res = post(&request(&url), Duration::from_secs(5), None).unwrap();
+        let res = block_on(send(request(&url), Duration::from_secs(5), None)).unwrap();
         assert_eq!(res.status(), 503);
         assert_eq!(res.headers()["retry-after"], "3");
         assert_eq!(res.body().as_ref(), b"busy");
         server.join().unwrap();
-        assert_eq!(
-            parse_response(b"HTTP/1.1 200 OK\r\n\r\nall", true)
-                .unwrap()
-                .unwrap()
-                .body()
-                .as_ref(),
-            b"all"
-        );
-        assert!(
-            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", true).is_err()
-        );
-        assert!(
-            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", false)
-                .unwrap()
-                .is_none()
-        );
+        // No length: the body runs to the close.
+        let (url, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\nall");
+        let res = block_on(send(request(&url), Duration::from_secs(5), None)).unwrap();
+        assert_eq!(res.body().as_ref(), b"all");
+        server.join().unwrap();
+        // Cut short of its length: an error, not a short body.
+        let (url, server) = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort");
+        assert!(block_on(send(request(&url), Duration::from_secs(5), None)).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_silent_collector_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+        let started = Instant::now();
+        let res = block_on(send(request(&url), Duration::from_millis(300), None));
+        assert!(res.unwrap_err().to_string().contains("no response"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(listener);
+    }
+
+    #[test]
+    fn oversized_replies_are_refused() {
+        static BIG: OnceLock<Vec<u8>> = OnceLock::new();
+        let big = BIG.get_or_init(|| {
+            let mut r = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_RESPONSE + 1
+            )
+            .into_bytes();
+            r.resize(r.len() + MAX_RESPONSE + 1, b'a');
+            r
+        });
+        let (url, server) = serve_once(big);
+        assert!(block_on(send(request(&url), Duration::from_secs(5), None)).is_err());
+        let _ = server.join();
     }
 
     #[test]

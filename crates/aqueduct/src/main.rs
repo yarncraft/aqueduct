@@ -1,4 +1,3 @@
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 mod admin;
 mod checkpoint;
 mod config;
@@ -196,10 +195,12 @@ async fn main() {
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received, draining");
             let _ = shutdown_tx.send(true);
-            // Stay inside the orchestrator's grace period (docker stop = 10 s by default).
-            match tokio::time::timeout(std::time::Duration::from_secs(25), &mut pipeline).await {
+            match tokio::time::timeout(DRAIN_TIMEOUT, &mut pipeline).await {
                 Ok(_) => tracing::info!("clean shutdown"),
-                Err(_) => tracing::error!("pipeline did not stop within 25 s, exiting"),
+                Err(_) => tracing::error!(
+                    "pipeline did not stop within {} s, exiting",
+                    DRAIN_TIMEOUT.as_secs()
+                ),
             }
         }
         res = &mut pipeline => {
@@ -220,11 +221,17 @@ fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// How long a stop waits for the in-flight batches to land and the checkpoint to be written.
+/// It must fit in the orchestrator's grace period, or SIGKILL cuts the drain short: the compose
+/// files allow 30 s, but plain `docker run` and `docker stop` default to 10 s and Kubernetes to 30 s
+/// (DEPLOYMENT.md, "Stopping"). A cut drain only replays from the last checkpoint; nothing is lost.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// Resolves on SIGINT or (on Unix) SIGTERM, which is what `docker stop` and Kubernetes send.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => {
                 tokio::select! {

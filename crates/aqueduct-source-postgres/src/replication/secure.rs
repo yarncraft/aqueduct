@@ -6,8 +6,8 @@ use bytes::BytesMut;
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
 use x509_cert::der::asn1::ContextSpecific;
 use x509_cert::der::{Decode, SliceReader, TagNumber};
 use x509_cert::spki::AlgorithmIdentifierOwned;
@@ -66,7 +66,7 @@ pub(crate) async fn negotiate(
             return Err(Error::Config(format!(
                 "server does not support TLS, and sslmode={} requires it",
                 mode_name(mode)
-            )))
+            )));
         }
         b'E' => return Err(err("the server rejected the TLS request")),
         other => return Err(err(format!("unexpected answer {other:#04x} to SSLRequest"))),

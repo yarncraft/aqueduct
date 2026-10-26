@@ -7,12 +7,14 @@
 //! AQUEDUCT_TEST_PG_PLAIN=localhost:5434
 //! cargo test -p aqueduct-source-postgres --test toast_unchanged_it -- --ignored
 //! ```
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{ChangeEvent, Op, Source};
 use aqueduct_source_postgres::{PostgresSource, PostgresSourceConfig, SslMode};
-use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
+use tokio_postgres::error::SqlState;
 
 fn addr() -> String {
     std::env::var("AQUEDUCT_TEST_PG_PLAIN")

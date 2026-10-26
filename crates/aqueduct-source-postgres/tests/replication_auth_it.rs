@@ -28,9 +28,11 @@
 //!
 //! Every variable must be set: a test fails when one is missing, so a run that skips the
 //! servers cannot report green.
+// The workspace denies these outside tests; this whole crate is one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use aqueduct_source_postgres::replication::{AuthMethod, ConnectOptions, ReplicationClient};
 use aqueduct_source_postgres::SslMode;
+use aqueduct_source_postgres::replication::{AuthMethod, ConnectOptions, ReplicationClient};
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("set {name}, see the module docs"))

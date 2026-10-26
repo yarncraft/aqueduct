@@ -4,15 +4,23 @@ members = ["crates/aqueduct-tls", "crates/aqueduct-core", "crates/aqueduct", "cr
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
+# The toolchain `rust-toolchain.toml` pins, which is the only one CI builds with. Bump both together.
+rust-version = "1.99"
+
+# Every crate opts in with `[lints] workspace = true`. `clippy.toml` lets tests unwrap.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [workspace.dependencies]
 async-trait = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util", "io-std", "fs"] }
+thiserror = "2"
+# No features here: each crate asks for the parts of tokio it uses.
+tokio = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "0.8"

@@ -37,7 +37,7 @@ Chaos scenarios that exercise the cases below live in `scripts/chaos/` (`scripts
 
 ### Corrupt checkpoint
 ```sh
-docker stop aqueduct
+docker stop -t 30 aqueduct   # the default 10 s can cut the drain short
 docker run --rm -v aqueduct-state:/v busybox rm -f /v/checkpoint
 docker start aqueduct       # resumes from the slot; may replay recent transactions
 ```
@@ -45,7 +45,7 @@ docker start aqueduct       # resumes from the slot; may replay recent transacti
 ### Deliberately reset a slot (accepting loss of everything not yet delivered)
 Only when the pipeline's backlog is unwanted, or after a restore (section 4).
 ```sh
-docker stop aqueduct
+docker stop -t 30 aqueduct   # the default 10 s can cut the drain short
 psql -c "SELECT pg_drop_replication_slot('aqueduct');"
 docker run --rm -v aqueduct-state:/v busybox rm -f /v/checkpoint
 # acknowledge the slot recreation explicitly (guard from feat/hardening):
@@ -128,7 +128,7 @@ FROM pg_replication_slots WHERE slot_type = 'logical';
 `GET /metrics` serves the same signals in Prometheus format (Bearer token required when `admin_token` is set):
 `aqueduct_state{state=...}`, `aqueduct_errors_total`, `aqueduct_events_total{op=...}`, `aqueduct_table_events_total{table=...}`,
 `aqueduct_lag_seconds`, `aqueduct_last_event_timestamp_seconds`, `aqueduct_sink_latency_seconds` and `aqueduct_uptime_seconds`
-(see `prometheus()` in `crates/aqueduct/src/admin.rs`). Use `GET /readyz` (`503` unless streaming) as the readiness probe.
+(see `prometheus()` in `crates/aqueduct/src/admin/prometheus.rs`). Use `GET /readyz` (`503` unless streaming) as the readiness probe.
 With OTLP export on ([DEPLOYMENT.md](DEPLOYMENT.md#opentelemetry-otlp)) the same series, under the same names, are pushed to
 your OpenTelemetry Collector, so these alerts can live in your OTel backend instead.
 
@@ -170,7 +170,8 @@ the failover procedure if Postgres moved. RTO is the container start time; RPO i
 "everything since the last delivered LSN, re-synced from the database" when it does not.
 
 ## 5. Planned maintenance
-- **Upgrade Aqueduct:** `docker stop` (graceful, finishes the in-flight event), deploy the new image on the same volume, start.
+- **Upgrade Aqueduct:** `docker stop -t 30` (graceful: lands the in-flight batches and saves the checkpoint),
+  deploy the new image on the same volume, start.
   Checks before and after, and rollback: [UPGRADING.md](UPGRADING.md).
 - **Postgres minor upgrade/restart:** nothing to do; Aqueduct restarts itself. Major upgrade: treat as a restore (slot is lost, section 4).
 - **Decommission:** stop the container, then `SELECT pg_drop_replication_slot('aqueduct');`, or the slot holds WAL forever.

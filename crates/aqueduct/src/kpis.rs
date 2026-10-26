@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 
 use aqueduct_core::{LagState, Snapshot};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SECOND_MS: u64 = 1_000;
 /// Same as the page's `IDLE_AFTER_MS`: the lag tile reads "idle" past this.
