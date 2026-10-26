@@ -12,7 +12,7 @@ use aqueduct_core::{Checkpoint, SnapState, SnapshotCommand, SnapshotReceiver, Sn
 
 use crate::azure::{AccessToken, AzureCredential};
 use crate::catalog::read_catalog;
-use crate::decoder::{Message, RelationCache};
+use crate::decoder::{Message, Relation, RelationCache};
 use crate::snapshot::{
     new_snapshot_id, table_id, table_watermark, Closed, Engine, Live, SnapshotConfig, SnapshotMode,
     MIN_SERVER_VERSION,
@@ -457,7 +457,7 @@ pub struct PostgresSource {
     last_end: u64,
     /// Relations already logged as `REPLICA IDENTITY FULL`; every poll re-sends the Relation messages,
     /// so this lives on the source, not in the per-poll relation cache.
-    full_identity_logged: HashSet<(String, String)>,
+    full_identity_logged: HashSet<Arc<str>>,
     /// Primary-key columns per published `schema.table` (empty without one), from the
     /// catalog: the record key, as Debezium keys records, whatever the replica identity.
     pks: HashMap<String, Vec<String>>,
@@ -948,7 +948,7 @@ impl PostgresSource {
         key: Key,
         xid: u32,
         commit_ts_micros: i64,
-        (schema, table): (String, String),
+        (schema, table): (Arc<str>, Arc<str>),
         op: Op,
         before: Option<Row>,
         after: Option<Row>,
@@ -1181,7 +1181,7 @@ impl PostgresSource {
         let unknown: Vec<String> = messages
             .iter()
             .filter_map(|(_, m)| match m {
-                Message::Relation(r) => Some(table_id(&r.schema, &r.name)),
+                Message::Relation(r) => Some(r.qualified.to_string()),
                 _ => None,
             })
             .filter(|id| !self.pks.contains_key(id))
@@ -1197,13 +1197,13 @@ impl PostgresSource {
         Ok(())
     }
 
-    /// Whether `(schema, table)` is the watermark table (#92): its rows are never events.
-    fn is_watermark_table(&self, (schema, table): &(String, String)) -> bool {
+    /// Whether `rel` is the watermark table (#92): its rows are never events.
+    fn is_watermark_table(&self, rel: &Relation) -> bool {
         self.cfg
             .snapshot
             .watermark_table
             .as_deref()
-            .is_some_and(|w| w == table_id(schema, table))
+            .is_some_and(|w| w == &*rel.qualified)
     }
 
     /// A watermark of this slot at `lsn`, from a logical message or a watermark-table row.
@@ -1249,15 +1249,10 @@ impl PostgresSource {
                     keys.begin(final_lsn);
                 }
                 Message::Relation(rel) => {
-                    let no_pk = self
-                        .pks
-                        .get(&table_id(&rel.schema, &rel.name))
-                        .is_none_or(Vec::is_empty);
+                    let no_pk = self.pks.get(&*rel.qualified).is_none_or(Vec::is_empty);
                     if rel.identity_full()
                         && no_pk
-                        && self
-                            .full_identity_logged
-                            .insert((rel.schema.clone(), rel.name.clone()))
+                        && self.full_identity_logged.insert(rel.qualified.clone())
                     {
                         tracing::info!(
                             table = %format!("{}.{}", rel.schema, rel.name),
@@ -1265,42 +1260,42 @@ impl PostgresSource {
                         );
                     }
                     if let Some(e) = self.snapshot.as_mut() {
-                        e.relation(&table_id(&rel.schema, &rel.name), &rel);
+                        e.relation(&rel.qualified, &rel);
                     }
                     cache.insert(rel)
                 }
                 Message::Insert { relation, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
-                    if self.is_watermark_table(&name) {
+                    if self.is_watermark_table(r) {
                         if let Some(wm) = table_watermark(r, &new, &self.cfg.slot) {
                             self.on_watermark(&wm, lsn, &mut keys, xid, ts)?;
                         }
                         continue;
                     }
                     let after = Some(cache.row(relation, &new).map_err(dec)?);
-                    let id = table_id(&name.0, &name.1);
-                    let pk = self.pks.get(&id).map(Vec::as_slice);
+                    let id: &str = &r.qualified;
+                    let pk = self.pks.get(id).map(Vec::as_slice);
                     let row_key = cache.key(relation, &new, pk).map_err(dec)?;
                     let key = keys.next(lsn);
                     let none = Vec::new();
                     if self.queue(key, xid, ts, name, Op::Insert, None, after, row_key, none) {
                         if let Some(e) = self.snapshot.as_mut() {
-                            e.observe(&id, Live::Insert { rel: r, new: &new });
+                            e.observe(id, Live::Insert { rel: r, new: &new });
                         }
                     }
                 }
                 Message::Update { relation, old, new } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
-                    if self.is_watermark_table(&name) {
+                    if self.is_watermark_table(r) {
                         continue;
                     }
                     let new = cache
                         .fill_unchanged(relation, new, old.as_ref())
                         .map_err(dec)?;
-                    let id = table_id(&name.0, &name.1);
-                    let pk = self.pks.get(&id).map(Vec::as_slice);
+                    let id: &str = &r.qualified;
+                    let pk = self.pks.get(id).map(Vec::as_slice);
                     let row_key = cache
                         .key_with_old(relation, &new, old.as_ref(), pk)
                         .map_err(dec)?;
@@ -1326,7 +1321,7 @@ impl PostgresSource {
                     ) {
                         if let Some(e) = self.snapshot.as_mut() {
                             e.observe(
-                                &id,
+                                id,
                                 Live::Update {
                                     rel: r,
                                     old: old.as_ref(),
@@ -1339,18 +1334,18 @@ impl PostgresSource {
                 Message::Delete { relation, old } => {
                     let r = cache.get(relation).map_err(dec)?;
                     let name = (r.schema.clone(), r.name.clone());
-                    if self.is_watermark_table(&name) {
+                    if self.is_watermark_table(r) {
                         continue;
                     }
                     let before = Some(cache.row(relation, &old).map_err(dec)?);
-                    let id = table_id(&name.0, &name.1);
-                    let pk = self.pks.get(&id).map(Vec::as_slice);
+                    let id: &str = &r.qualified;
+                    let pk = self.pks.get(id).map(Vec::as_slice);
                     let row_key = cache.key(relation, &old, pk).map_err(dec)?;
                     let key = keys.next(lsn);
                     let none = Vec::new();
                     if self.queue(key, xid, ts, name, Op::Delete, before, None, row_key, none) {
                         if let Some(e) = self.snapshot.as_mut() {
-                            e.observe(&id, Live::Delete { rel: r, old: &old });
+                            e.observe(id, Live::Delete { rel: r, old: &old });
                         }
                     }
                 }
@@ -1358,15 +1353,15 @@ impl PostgresSource {
                     for rel_id in relations {
                         let r = cache.get(rel_id).map_err(dec)?;
                         let name = (r.schema.clone(), r.name.clone());
-                        if self.is_watermark_table(&name) {
+                        if self.is_watermark_table(r) {
                             continue;
                         }
                         let key = keys.next(lsn);
-                        let id = table_id(&name.0, &name.1);
+                        let id: &str = &r.qualified;
                         let none = Vec::new();
                         if self.queue(key, xid, ts, name, Op::Truncate, None, None, None, none) {
                             if let Some(e) = self.snapshot.as_mut() {
-                                e.observe(&id, Live::Truncate);
+                                e.observe(id, Live::Truncate);
                             }
                         }
                     }
@@ -1795,7 +1790,7 @@ mod tests {
         let got: Vec<_> = src
             .buffer
             .iter()
-            .map(|e| (e.schema.as_str(), e.table.as_str(), e.position.clone()))
+            .map(|e| (&*e.schema, &*e.table, e.position.clone()))
             .collect();
         // One WAL message, one LSN, one event per table.
         assert_eq!(

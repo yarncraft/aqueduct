@@ -325,7 +325,7 @@ async fn published_change_after_a_quiet_period_is_delivered() {
     let ev = drive(&mut s, Duration::from_secs(10))
         .await
         .expect("the published insert must still arrive");
-    assert_eq!(ev.table, f.publ);
+    assert_eq!(&*ev.table, f.publ);
     assert_eq!(ev.op, Op::Insert);
     assert!(ev.after.as_ref().unwrap().get().contains("after"));
     assert!(
@@ -345,7 +345,7 @@ async fn action_query_runs_before_each_heartbeat() {
     let ev = drive(&mut s, Duration::from_secs(10))
         .await
         .expect("the action query's published write must arrive");
-    assert_eq!(ev.table, f.publ);
+    assert_eq!(&*ev.table, f.publ);
     assert!(ev.after.as_ref().unwrap().get().contains("beat"));
     f.cleanup(s).await;
 }
@@ -377,7 +377,7 @@ async fn unacked_event_is_redelivered_after_a_restart() {
         .await
         .expect("the unacked event must come back after a restart");
     assert_eq!(redelivered.position, ev.position);
-    assert_eq!(redelivered.table, f.publ);
+    assert_eq!(&*redelivered.table, f.publ);
     assert!(redelivered
         .after
         .as_ref()

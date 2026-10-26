@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::lane::Lane;
+#[cfg(test)]
+use crate::route::PartitionKey;
 use crate::route::{OutRecord, RoutePlan};
 use crate::topic_stats::TopicStats;
 use crate::{OpCounts, SourceInfo};
@@ -553,7 +555,10 @@ pub(crate) fn partition_index(key: &str, n: usize) -> usize {
     (h % n as u64) as usize
 }
 
-/// What decides the partition: the whole record key, or only the table.
+/// What decides the partition: the whole record key, or only the table. The plan's
+/// [`PartitionKey`](crate::route::PartitionKey) gives the same without building it; the tests
+/// hold it to this.
+#[cfg(test)]
 pub(crate) fn partition_input(event: &ChangeEvent, key: &str, by: PartitionBy) -> String {
     match by {
         PartitionBy::Key => key.to_owned(),
@@ -732,8 +737,10 @@ impl Sink for KafkaSink {
                         (false, _) => return Err(e.error),
                     }
                 }
-                let part = partition_index(&out.partition_key, self.topics[&out.topic].len());
-                let group = groups.entry((out.topic.clone(), part)).or_default();
+                let part = partition_index(out.partition_input(), self.topics[&out.topic].len());
+                // The record is consumed below, so its topic moves into the group key.
+                let topic = std::mem::take(&mut out.topic);
+                let group = groups.entry((topic, part)).or_default();
                 // A tombstone carries its delete's op, so it counts under `delete`.
                 group.1.add(out.op, 1);
                 group.0.push(record(out, self.record_timestamp, now));
@@ -964,7 +971,7 @@ mod tests {
         let rec = |topic: &str, tombstone: bool| OutRecord {
             topic: topic.into(),
             key: "k".into(),
-            partition_key: "k".into(),
+            partition_key: PartitionKey::Key,
             value: None,
             op: "d",
             lsn: "1".into(),

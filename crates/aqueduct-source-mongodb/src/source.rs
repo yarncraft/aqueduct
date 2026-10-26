@@ -424,8 +424,8 @@ impl MongoSource {
                 position: Position::Text(token.to_owned()),
                 xid: 0,
                 commit_ts_micros: r.commit_ts_micros,
-                schema: r.schema,
-                table: r.table,
+                schema: r.schema.into(),
+                table: r.table.into(),
                 op: Op::Read,
                 before: None,
                 after: Some(r.row),
@@ -886,8 +886,8 @@ pub(crate) fn to_change_event(doc: &Document) -> Result<Option<ChangeEvent>> {
         position: Position::Text(token.to_string()),
         xid: 0,
         commit_ts_micros: commit_micros(&ev),
-        schema,
-        table,
+        schema: schema.into(),
+        table: table.into(),
         op,
         before: raw(before)?,
         after: raw(after)?,
@@ -1149,7 +1149,7 @@ mod tests {
         "ns": {"db": "app", "coll": "u"}, "fullDocument": {"_id": 1, "n": "a"},
         "documentKey": {"_id": 1}};
         let e = to_change_event(&d).unwrap().unwrap();
-        assert_eq!(e.table, "u");
+        assert_eq!(&*e.table, "u");
         assert_eq!(e.position, Position::Text(r#"{"_data":"8265A1"}"#.into()));
         assert!(e.after.unwrap().get().contains("\"n\":\"a\""));
         assert_eq!(e.key.as_deref(), Some(r#"{"_id":1}"#));

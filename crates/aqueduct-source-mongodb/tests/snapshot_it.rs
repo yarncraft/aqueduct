@@ -147,7 +147,7 @@ fn key_of(doc: &Document) -> String {
 /// Last write wins over `events` of `table`, by `key`.
 fn fold(events: &[ChangeEvent], table: &str) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
-    for e in events.iter().filter(|e| e.table == table) {
+    for e in events.iter().filter(|e| *e.table == *table) {
         let k = e.key.clone().expect("every event has a key");
         match e.op {
             Op::Delete => {
@@ -283,7 +283,7 @@ async fn initial_snapshot_is_complete_while_writes_run() {
         "too few concurrent writes ({writes}) to test anything"
     );
     assert!(d.reads() > 2000, "only {} reads", d.reads());
-    assert!(d.events.iter().all(|e| e.table != "aqueduct_watermarks"));
+    assert!(d.events.iter().all(|e| *e.table != *"aqueduct_watermarks"));
     assert_eq!(
         fold(&d.events, "items"),
         contents(&client, &db, "items").await
@@ -552,11 +552,11 @@ async fn a_chunk_that_always_fails_skips_its_collection() {
     assert!(d
         .events
         .iter()
-        .all(|e| e.table != "bad" || e.op != Op::Read));
+        .all(|e| *e.table != *"bad" || e.op != Op::Read));
     assert_eq!(
         d.events
             .iter()
-            .filter(|e| e.table == "good" && e.op == Op::Read)
+            .filter(|e| *e.table == *"good" && e.op == Op::Read)
             .count(),
         10
     );

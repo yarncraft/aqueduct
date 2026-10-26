@@ -201,7 +201,7 @@ async fn signs_in_and_streams() {
     let ev = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let ev = s.next().await.unwrap().expect("the source never ends");
-            if ev.op == Op::Insert && ev.table == table {
+            if ev.op == Op::Insert && *ev.table == *table {
                 return ev;
             }
         }

@@ -100,7 +100,7 @@ fn after(ev: &ChangeEvent) -> serde_json::Value {
 /// Folds events into the current rows by `id`, as a last-write-wins consumer would.
 fn fold(events: &[ChangeEvent], table: &str) -> BTreeMap<i64, serde_json::Value> {
     let mut rows = BTreeMap::new();
-    for ev in events.iter().filter(|e| e.table == table) {
+    for ev in events.iter().filter(|e| *e.table == *table) {
         match ev.op {
             Op::Insert | Op::Update | Op::Read => {
                 let v = after(ev);
@@ -245,7 +245,7 @@ async fn read_rows_are_encoded_exactly_like_inserts() {
     );
     assert_eq!(read[0].key, insert.key);
     assert_eq!(
-        (read[0].schema.as_str(), read[0].table.as_str()),
+        (&*read[0].schema, &*read[0].table),
         ("public", table.as_str())
     );
     drop(s);
@@ -581,10 +581,13 @@ async fn key_columns_let_a_table_without_primary_key_be_copied() {
     let mut s = PostgresSource::new(cfg);
     s.start(None).await.unwrap();
     let events = collect(&mut s, Duration::from_secs(3), |_| false).await;
-    assert!(events.iter().all(|e| e.table != skipped), "no key: skipped");
+    assert!(
+        events.iter().all(|e| *e.table != *skipped),
+        "no key: skipped"
+    );
     let mut ids: Vec<i64> = events
         .iter()
-        .filter(|e| e.op == Op::Read && e.table == keyed)
+        .filter(|e| e.op == Op::Read && *e.table == *keyed)
         .map(|e| after(e)["id"].as_i64().unwrap())
         .collect();
     ids.sort();
@@ -963,7 +966,7 @@ async fn a_watermark_table_replaces_logical_messages() {
     writer.await.unwrap();
     events.extend(collect(&mut s, Duration::from_secs(3), |_| false).await);
     assert!(
-        events.iter().all(|e| e.table != marks),
+        events.iter().all(|e| *e.table != *marks),
         "watermark rows are never events"
     );
     assert!(events.iter().filter(|e| e.op == Op::Read).count() >= 1400);
